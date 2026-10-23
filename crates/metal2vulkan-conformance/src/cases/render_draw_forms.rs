@@ -1598,6 +1598,34 @@ mod tests {
                 assert_eq!(at[0].fract(), 0.5);
             }
         }
+        // The three coverages are three different shapes, which is the claim this test's name
+        // makes and the part a sweep of indistinguishable values would fail.
+        //
+        // A **point** draw covers one pixel a vertex, so its covered count is its vertex count. A
+        // **triangle** draw of the same six vertices fills a 16 by 2 band: 32 pixels, which
+        // `metal_filled_each_triangle_band_as_its_assembly_says` holds as the 16 and 16 the shared
+        // diagonal splits them into, and 32 is not 6. A **line** draw's band is one row tall where
+        // a triangle band is two, so no line draw can cover a triangle band and no triangle draw
+        // can cover a line band.
+        let point_draw = &point_rows()[0];
+        assert_eq!(vertices(&point_draw.form).len(), 6);
+        assert_eq!(
+            points
+                .values()
+                .filter(|held| held.mark == point_draw.mark)
+                .count(),
+            vertices(&point_draw.form).len(),
+            "a point draw covers one pixel a vertex"
+        );
+        let triangle_band = TRIANGLE_SIZE[0] * 2;
+        assert_eq!(triangle_band, 32);
+        assert_ne!(triangle_band as usize, vertices(&point_draw.form).len());
+        // A line band is one row and a triangle band is two, read off the two cases' own layouts.
+        let line_band_rows = line_rows()[0].shift;
+        let triangle_band_rows = triangle_rows()[0].shift;
+        assert_eq!(line_band_rows, 1);
+        assert_eq!(triangle_band_rows, 2);
+        assert_ne!(line_band_rows, triangle_band_rows);
     }
 
     /// **The points map names every draw apart, and the rows nobody drew hold the clear.**
