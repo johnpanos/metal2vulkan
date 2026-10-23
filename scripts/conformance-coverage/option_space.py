@@ -292,13 +292,17 @@ def by_hand(root: Path, types: dict[str, Type]) -> list[tuple[str, str, list[str
             if "tests" in path.parts or path.name in ("generated.rs", "tests.rs"):
                 continue
             source = path.read_text()
-            # `blanked` keeps every offset, so the brace walk below reads against the source.
-            text = metal_leg.blanked(source)
+            # `blanked` keeps every offset, so the brace walk below reads against the source. It
+            # is a character loop over the whole file, so it runs only where a match needs it:
+            # almost no file in these crates declares one of these types.
+            text: str | None = None
             for found in MODELS.finditer(source):
                 metal = found.group(1)
                 if metal in types or not _opens_the_doc(source, found.start()):
                     continue
                 if found.group(2):
+                    if text is None:
+                        text = metal_leg.blanked(source)
                     start, end = metal_leg.block(text, found.end() - 1)
                     names = re.findall(r"^\s*([A-Z]\w*)\s*(?:,|\{|\(|$)", text[start:end], re.M)
                     out[metal] = (found.group(3), names)
