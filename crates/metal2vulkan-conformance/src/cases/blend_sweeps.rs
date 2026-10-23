@@ -12,7 +12,7 @@
 //! `BlendOperation::ALL` and `ColorWriteMask::KNOWN`, which
 //! `scripts/regen-metal-enums/regen_metal_enums.py` extracts from the SDK headers, and each site's
 //! name is the SDK enumerator's own name in kebab case. So a value the SDK adds appears as an
-//! unclassified factor in [`tests::every_blend_factor_of_the_sdk_table_is_classified`] rather than
+//! unclassified factor in `tests::every_blend_factor_of_the_sdk_table_is_classified` rather than
 //! as silence, and a value renamed upstream renames its site loudly.
 //!
 //! # What is not swept, and why
@@ -48,7 +48,7 @@
 //! one of the two factors beside it. With the alpha destination sweeping across `1 - 17/64` the
 //! minimum takes its left branch at the pixels below 48 and its right branch above, so over the
 //! image it equals neither `SourceAlpha` nor `OneMinusDestinationAlpha` and an implementation that
-//! lowered it to either is caught. [`tests::the_saturated_factor_takes_both_of_its_branches`] holds
+//! lowered it to either is caught. `tests::the_saturated_factor_takes_both_of_its_branches` holds
 //! that by construction.
 //!
 //! Each case isolates one slot by making the other three terms carry a constant: the source-RGB
@@ -76,13 +76,13 @@
 //! A sweep that cannot distinguish its values compares nothing many times, so three things are
 //! checked rather than assumed:
 //!
-//! - [`tests::metals_recorded_texels_are_the_blend_model_at_every_pixel`] holds **every** site of
+//! - `tests::metals_recorded_texels_are_the_blend_model_at_every_pixel` holds **every** site of
 //!   **every** case, pixel by pixel and channel by channel, against one written statement of
 //!   Metal's blend equation. A destination that never reached the target, a source buffer that was
 //!   never bound, a blend colour that went unset — each fails it, because the model's answer at
 //!   each site depends on all of them.
-//! - [`tests::the_sweeps_separate_every_value_except_the_named_collapses`] groups each case's
-//!   sites by the answer the model gives and holds the groups against [`COLLAPSED`], which names
+//! - `tests::the_sweeps_separate_every_value_except_the_named_collapses` groups each case's
+//!   sites by the answer the model gives and holds the groups against `COLLAPSED`, which names
 //!   every pair that must agree and why. A pair that collapses for a reason not listed there fails,
 //!   which is how a badly chosen input reads as a failure rather than as twenty passes.
 //! - `blend-sweep-enabled` is the control that the blend state is read at all: blending off and
@@ -91,7 +91,7 @@
 //!
 //! # Where values agree by Metal's own definition
 //!
-//! [`COLLAPSED`] is that list, and it is short. In the **alpha** slots a factor named for a colour
+//! `COLLAPSED` is that list, and it is short. In the **alpha** slots a factor named for a colour
 //! reads the colour's alpha channel, so seven pairs are one value there and nothing can separate
 //! them: `SourceColor`/`SourceAlpha`, `DestinationColor`/`DestinationAlpha`,
 //! `BlendColor`/`BlendAlpha`, each with its `OneMinus` partner, and `SourceAlphaSaturated`, whose
@@ -104,10 +104,10 @@
 //!
 //! # What the sweep measured about Metal that nothing here knew before
 //!
-//! The ten cases hold **177 blend states**, each over 64 pixels and four channels, so Metal's
-//! answer is held against the written blend equation at **45,312** compared channels; the counts
-//! are the subject of [`tests::the_sweep_is_the_size_its_prose_claims`] rather than of this
-//! sentence. **45,308 of them agree** on this M3 Max, macOS 27.0.1. The four that do not are one
+//! The eleven cases hold **179 blend states**, each over 64 pixels and four channels, so Metal's
+//! answer is held against the written blend equation at **45,824** compared channels; the counts
+//! are the subject of `tests::the_sweep_is_the_size_its_prose_claims` rather than of this
+//! sentence. **45,820 of them agree** on this M3 Max, macOS 27.0.1. The four that do not are one
 //! fact, and it is the sort a sweep finds and a once-each suite cannot:
 //!
 //! **`MTLBlendOperationSubtract` stores negative zero where both factored terms are zero.** The
@@ -117,13 +117,26 @@
 //! measurement: `Add` and `ReverseSubtract` over the same two terms store `+0`, and `Subtract`
 //! itself stores `+0` at the leaves of the same site where its two terms are equal and **non**-zero.
 //! So the condition is exactly "both terms zero" and nothing wider, which is why
-//! [`tests::metals_subtract_stores_a_negative_zero_where_both_terms_are_zero`] holds the boundary
+//! `tests::metals_subtract_stores_a_negative_zero_where_both_terms_are_zero` holds the boundary
 //! as well as the fact. What the blend unit does to arrive there is not something this suite can
 //! see, and it does not guess.
 //!
 //! It is a bit a Metal program can read -- a sign test, or a division -- so the model states it and
 //! no site is loosened for it. A device that stores `+0` there is divergent from Metal, and that is
 //! the honest verdict rather than a rounding to wave through.
+//!
+//! The sweep also put a fact in the recording's **second** oracle. Metal's own API validation layer
+//! stops a pass that sets the blend colour and then sets it again, with `previous setBlendColorRed
+//! was unused`, while plain Metal takes the second value and draws. Both halves are recorded:
+//! `blend-sweep-blend-color-order` carries the layer's stop, and its `once` and `twice` rows store
+//! the identical image because the last call is the one the draw reads. Nothing of ours is refused
+//! by it, and nothing here is excused by it.
+//!
+//! Splitting that case off bought a second fact, which is the whole reason it is split: with the
+//! redundant call in its own case, `blend-sweep-blend-color`'s validated leg **ran to the end**, so
+//! Metal's validation layer accepts a blend colour of `(-0.5, -1, -1.5, -2)` and one of
+//! `(1.5, 2, 2.5, 3)` without a word. Out of range is not out of bounds, and a recording now says
+//! so instead of a stop three rows earlier hiding it.
 //!
 //! # Nothing here can fault a GPU
 //!
@@ -192,7 +205,7 @@ const ABOVE: [f32; 4] = [96.0 * Q, 128.0 * Q, 160.0 * Q, 192.0 * Q];
 /// The blend colour below it, which is `1 - ABOVE` channel for channel: `(-32, -64, -96, -128) / 64`.
 ///
 /// Chosen so that `OneMinusBlendColor` of one is `BlendColor` of the other, which is why
-/// `above-complement` and `below` are a [`COLLAPSED`] pair: they agree only where Metal computes
+/// `above-complement` and `below` are a `COLLAPSED` pair: they agree only where Metal computes
 /// `1 - c` exactly and clamps neither side.
 const BELOW: [f32; 4] = [-32.0 * Q, -64.0 * Q, -96.0 * Q, -128.0 * Q];
 
@@ -259,7 +272,7 @@ enum Family {
 }
 
 /// Which family `factor` is in. The wildcard is what
-/// [`tests::every_blend_factor_of_the_sdk_table_is_classified`] turns into a failure, since
+/// `tests::every_blend_factor_of_the_sdk_table_is_classified` turns into a failure, since
 /// `BlendFactor` is `#[non_exhaustive]` and no match outside its own crate can be exhaustive.
 fn family(factor: F) -> Family {
     match factor {
@@ -505,7 +518,7 @@ impl Slot {
 ///
 /// Each is a pair whose two terms are different numbers, so `Add`, `Subtract` and `ReverseSubtract`
 /// give three answers under it -- except `one-zero`, whose destination term is nothing to subtract,
-/// which is a [`COLLAPSED`] row rather than a gap. Between them they cover a constant pair, the
+/// which is a `COLLAPSED` row rather than a gap. Between them they cover a constant pair, the
 /// consumer's alpha pair, two destination-reading factors, the blend colour and the saturated
 /// factor, so "the operation ignores the factors" is a claim this case can make about six different
 /// factor pairs rather than one.
@@ -534,8 +547,18 @@ enum Sweep {
     WriteMasks,
     /// Blending off, the identity blend, and a blend that moves, with otherwise identical state.
     Enabled,
-    /// The blend colour at its boundaries, outside the unit range, unset, and set twice.
+    /// The blend colour at its boundaries, outside the unit range, and unset.
     BlendColour,
+    /// The same blend colour reached by one call and by two, and the two in the other order, which
+    /// is what says the last `setBlendColor:green:blue:alpha:` of a pass is the one the draw reads.
+    ///
+    /// Its own case rather than three more rows of [`Sweep::BlendColour`], because a pass that sets
+    /// the blend colour and then sets it again is something **Metal's own API validation layer
+    /// stops on** (`previous setBlendColorRed was unused`). Recorded together, that stop cost the
+    /// nine rows beside it their validated leg -- including the layer's opinion on a blend colour
+    /// outside `[0, 1]`, which is a fact that case is there to collect. Split, each case keeps the
+    /// second oracle's answer to its own question.
+    BlendColourOrder,
     /// The four `Source1` factors in each slot, through a fragment function with a second output.
     SecondSource,
 }
@@ -600,6 +623,7 @@ pub fn all() -> Vec<BlendSweep> {
         case("blend-sweep-write-masks", Sweep::WriteMasks),
         case("blend-sweep-enabled", Sweep::Enabled),
         case("blend-sweep-blend-color", Sweep::BlendColour),
+        case("blend-sweep-blend-color-order", Sweep::BlendColourOrder),
         case("blend-sweep-second-source", Sweep::SecondSource),
     ]
 }
@@ -736,10 +760,25 @@ impl BlendSweep {
                     row("mid", direct, vec![BLEND_COLOR]),
                     row("above", direct, vec![ABOVE]),
                     row("below", direct, vec![BELOW]),
-                    row("twice", direct, vec![BELOW, BLEND_COLOR]),
                     row("mid-complement", complement, vec![BLEND_COLOR]),
                     row("above-complement", complement, vec![ABOVE]),
                     row("below-complement", complement, vec![BELOW]),
+                ]
+            }
+            Sweep::BlendColourOrder => {
+                let direct = plain.blended(Blend::separate(
+                    (F::BlendColor, F::Zero, O::Add),
+                    (F::BlendAlpha, F::Zero, O::Add),
+                ));
+                let row = |name: &str, blend_colors: Vec<[f32; 4]>| Variant {
+                    name: name.to_owned(),
+                    color: direct,
+                    blend_colors,
+                };
+                vec![
+                    row("once", vec![BLEND_COLOR]),
+                    row("twice", vec![BELOW, BLEND_COLOR]),
+                    row("reversed", vec![BLEND_COLOR, BELOW]),
                 ]
             }
             Sweep::SecondSource => {
@@ -797,8 +836,8 @@ fn masks() -> Vec<(ColorWriteMask, String)> {
 ///
 /// A pair here is a fact about Metal that the recording measures, not permission for anything: the
 /// model gives the two sites the same image, and
-/// [`tests::metals_recorded_texels_are_the_blend_model_at_every_pixel`] holds the model against
-/// Metal. [`tests::the_sweeps_separate_every_value_except_the_named_collapses`] fails on any other
+/// `tests::metals_recorded_texels_are_the_blend_model_at_every_pixel` holds the model against
+/// Metal. `tests::the_sweeps_separate_every_value_except_the_named_collapses` fails on any other
 /// pair that agrees, which is what makes a badly chosen input a failure rather than a pass.
 #[cfg(test)]
 const COLLAPSED: &[(&str, &str, &str, &str)] = &[
@@ -983,8 +1022,8 @@ const COLLAPSED: &[(&str, &str, &str, &str)] = &[
         "Metal's blend colour before anything sets it is (0, 0, 0, 0)",
     ),
     (
-        "blend-sweep-blend-color",
-        "mid",
+        "blend-sweep-blend-color-order",
+        "once",
         "twice",
         "the last setBlendColor: of a pass is the one the draw reads",
     ),
@@ -1386,7 +1425,7 @@ mod tests {
         }
     }
 
-    /// The groups of sites the model gives one answer to are exactly the pairs [`COLLAPSED`] names,
+    /// The groups of sites the model gives one answer to are exactly the pairs `COLLAPSED` names,
     /// and every other site of every case is its own answer.
     ///
     /// This is the family's whole guard against a vacuous sweep. A source colour or a destination
@@ -1586,7 +1625,8 @@ mod tests {
             ("blend-sweep-operation-pairs", ops * ops),
             ("blend-sweep-write-masks", 2 * masks().len()),
             ("blend-sweep-enabled", 3),
-            ("blend-sweep-blend-color", 10),
+            ("blend-sweep-blend-color", 9),
+            ("blend-sweep-blend-color-order", 3),
             ("blend-sweep-second-source", 1 + 4 * second),
         ];
         let held: Vec<(&str, usize)> = all()
@@ -1595,8 +1635,8 @@ mod tests {
             .collect();
         assert_eq!(held, want);
         let states: usize = held.iter().map(|(_, rows)| rows).sum();
-        assert_eq!(states, 177, "the family holds {states} blend states");
-        assert_eq!(states * PIXELS * 4, 45_312);
+        assert_eq!(states, 179, "the family holds {states} blend states");
+        assert_eq!(states * PIXELS * 4, 45_824);
         // And every state is compared over the whole level, which is what makes the channel count
         // the comparison's own size rather than a multiplication in the prose.
         assert_eq!(layout().extent(), LEVEL);

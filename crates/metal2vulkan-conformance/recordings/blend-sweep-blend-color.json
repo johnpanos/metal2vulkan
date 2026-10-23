@@ -172,16 +172,6 @@
                       }
                     },
                     {
-                      "name": "variant:twice",
-                      "observed": {
-                        "value": "absent",
-                        "digest": {
-                          "kind": "sha256",
-                          "hex": "8704b219f0e15bae1cdbe4850578c951afd3c7d20286c08790fece529876807f"
-                        }
-                      }
-                    },
-                    {
                       "name": "variant:mid-complement",
                       "observed": {
                         "value": "absent",
@@ -511,50 +501,6 @@
                   }
                 },
                 {
-                  "name": "pipeline/twice",
-                  "observed": {
-                    "value": {
-                      "variant": {
-                        "name": "Ok",
-                        "payload": "absent"
-                      }
-                    }
-                  }
-                },
-                {
-                  "name": "target/twice",
-                  "observed": {
-                    "value": {
-                      "variant": {
-                        "name": "Ok",
-                        "payload": "absent"
-                      }
-                    }
-                  }
-                },
-                {
-                  "name": "replace-region/twice",
-                  "observed": {
-                    "value": {
-                      "variant": {
-                        "name": "Ok",
-                        "payload": "absent"
-                      }
-                    }
-                  }
-                },
-                {
-                  "name": "buffer/texels/twice",
-                  "observed": {
-                    "value": {
-                      "variant": {
-                        "name": "Ok",
-                        "payload": "absent"
-                      }
-                    }
-                  }
-                },
-                {
                   "name": "pipeline/mid-complement",
                   "observed": {
                     "value": {
@@ -773,17 +719,6 @@
                 },
                 {
                   "name": "read-back/below",
-                  "observed": {
-                    "value": {
-                      "variant": {
-                        "name": "Ok",
-                        "payload": "absent"
-                      }
-                    }
-                  }
-                },
-                {
-                  "name": "read-back/twice",
                   "observed": {
                     "value": {
                       "variant": {
@@ -1061,44 +996,6 @@
                       }
                     },
                     {
-                      "name": "twice",
-                      "observed": {
-                        "value": {
-                          "bytes": "AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPgAA0jwAAGE9AIC8PQBADD4AANI8AABhPQCAvD0AQAw+AADSPAAAYT0AgLw9AEAMPg=="
-                        },
-                        "shape": {
-                          "bytes": {
-                            "region": {
-                              "texture": {
-                                "level": 0,
-                                "slice": 0,
-                                "aspect": "color",
-                                "sample": 0,
-                                "origin": [
-                                  0,
-                                  0,
-                                  0
-                                ],
-                                "size": [
-                                  8,
-                                  8,
-                                  1
-                                ]
-                              }
-                            },
-                            "element": "f32",
-                            "row_offset": 0,
-                            "row_elements": 4,
-                            "row_pitch": 16,
-                            "rows": 64,
-                            "image_pitch": 1024,
-                            "images": 1,
-                            "gaps": "ignored"
-                          }
-                        }
-                      }
-                    },
-                    {
                       "name": "mid-complement",
                       "observed": {
                         "value": {
@@ -1243,12 +1140,7 @@
           }
         }
       ],
-      "validated": {
-        "stopped": {
-          "call": "render",
-          "message": "Set Blend Color Validation\nprevious setBlendColorRed was unused."
-        }
-      }
+      "validated": "ran"
     }
   ]
 }
