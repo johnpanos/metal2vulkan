@@ -13,11 +13,22 @@ Every test owns its inputs. Nothing here reads the repository.
 """
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 import option_space
+
+#: Every tree `tree` made, removed by `tearDownModule`. Each test wants a fresh one and none of
+#: them wants it afterwards, so one list and one sweep is the whole lifetime.
+MADE: list[Path] = []
+
+
+def tearDownModule() -> None:
+    """Remove the trees the tests built."""
+    while MADE:
+        shutil.rmtree(MADE.pop(), ignore_errors=True)
 
 #: A generated table of one enum and one option set, as `regen-metal-enums` writes them.
 GENERATED = """\
@@ -62,6 +73,7 @@ def tree(
 ) -> Path:
     """A repository-shaped tree of exactly these sources and recordings."""
     root = Path(tempfile.mkdtemp(prefix="option-space-selftest-"))
+    MADE.append(root)
     for name in option_space.GENERATED:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
