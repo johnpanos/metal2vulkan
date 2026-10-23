@@ -1466,10 +1466,19 @@ mod tests {
                 right += 1;
             }
         }
-        assert!(left > 0 && right > 0, "{left} left, {right} right");
-        // And the whole image differs from both, in each slot that can hold the factor.
-        for case in all() {
-            let Sweep::Slot(_) = case.sweep else { continue };
+        assert!(
+            left > 0 && right > 0,
+            "the minimum takes one branch only: {left} pixels left, {right} right"
+        );
+        // And over the whole image its answer is neither of the two factors it equals pixel by
+        // pixel. Asked of the two **colour** slots: in an alpha slot the factor is 1 and collapses
+        // with `One` instead, which the collapse table names.
+        for case in all().into_iter().filter(|case| {
+            matches!(
+                case.sweep,
+                Sweep::Slot(Slot::SourceRgb | Slot::DestinationRgb)
+            )
+        }) {
             let rows = case.variants();
             let of = |name: &str| {
                 rows.iter()
@@ -1479,14 +1488,12 @@ mod tests {
             };
             let saturated = of("source-alpha-saturated");
             for other in ["source-alpha", "one-minus-destination-alpha"] {
-                // The alpha slots collapse it with `one` instead, which the collapse table names;
-                // there it is 1 and neither of these.
-                if matches!(
-                    case.sweep,
-                    Sweep::Slot(Slot::SourceRgb | Slot::DestinationRgb)
-                ) {
-                    assert_ne!(saturated, of(other), "{}: {other}", case.name);
-                }
+                assert_ne!(
+                    saturated,
+                    of(other),
+                    "{}: the saturated factor is indistinguishable from {other}",
+                    case.name
+                );
             }
         }
     }
@@ -1595,9 +1602,8 @@ mod tests {
         let mut both_zero = Vec::new();
         let mut equal_and_not_zero = Vec::new();
         for pixel in 0..PIXELS {
-            for channel in 0..4usize {
+            for (channel, s) in SOURCE.into_iter().enumerate() {
                 let d = destination(pixel)[channel];
-                let s = SOURCE[channel];
                 let from_source = s * d;
                 let from_destination = d * (1.0 - d);
                 if from_source == 0.0 && from_destination == 0.0 {
