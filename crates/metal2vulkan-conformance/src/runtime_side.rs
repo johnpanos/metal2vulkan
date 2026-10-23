@@ -406,9 +406,15 @@ fn read_compute_descriptor(
 }
 
 /// Set every field [`TILE_AWAY`] states on a tile render pipeline descriptor and its options.
+///
+/// `resets` says whether the caller will replace the descriptor afterwards, and the buffer
+/// mutability is stated only where it will not -- matching the Metal leg, which cannot state it on
+/// a descriptor it is about to reset
+/// ([`TileDescriptorFacts::buffers`](crate::tile_descriptors::TileDescriptorFacts::buffers)).
 fn state_tile_descriptor(
     descriptor: &mut TileRenderPipelineDescriptor,
     options: &mut PipelineOptions,
+    resets: bool,
 ) {
     options.label = Some(TILE_AWAY.label.to_owned());
     descriptor.raster_sample_count = TILE_AWAY.raster_sample_count;
@@ -423,8 +429,10 @@ fn state_tile_descriptor(
             *slot = Some(*format);
         }
     }
-    for (index, mutability) in TILE_AWAY.buffers {
-        descriptor.buffers.insert(*index, *mutability);
+    if !resets {
+        for (index, mutability) in TILE_AWAY.buffers {
+            descriptor.buffers.insert(*index, *mutability);
+        }
     }
 }
 
@@ -456,7 +464,9 @@ fn read_tile_descriptor(
             })
             .collect(),
         threadgroup_size_matches_tile_size: descriptor.threadgroup_size_matches_tile_size,
-        buffers: read_mutability(&descriptor.buffers),
+        // Read only where the Metal leg can read Metal's, which is every shape but the reset
+        // ([`TileDescriptorFacts::buffers`](crate::tile_descriptors::TileDescriptorFacts::buffers)).
+        buffers: supplied.then(|| read_mutability(&descriptor.buffers)),
         max_total_threads_per_threadgroup: u64::from(
             descriptor.max_total_threads_per_threadgroup.unwrap_or(0),
         ),
@@ -2299,7 +2309,7 @@ impl Side for RuntimeSide<'_> {
         let mut descriptor = TileRenderPipelineDescriptor::new(stage()?);
         let mut options = PipelineOptions::default();
         if spec.shape.sets() {
-            state_tile_descriptor(&mut descriptor, &mut options);
+            state_tile_descriptor(&mut descriptor, &mut options, spec.shape.resets());
         }
         if spec.shape.resets() {
             descriptor = TileRenderPipelineDescriptor::new(stage()?);

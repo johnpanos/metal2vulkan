@@ -65,7 +65,12 @@ pub struct Away {
     /// [`crate::render_descriptors::READ_COLORS`].
     pub colors: &'static [(u32, metal::PixelFormat)],
     pub threadgroup_size_matches_tile_size: bool,
-    /// `tileBuffers[i].mutability`, by index.
+    /// `tileBuffers[i].mutability`, by index. Stated by [`Shape::Set`] **alone**, for the measured
+    /// defect [`TileDescriptorFacts::buffers`] states: subscripting `tileBuffers` and then
+    /// resetting the descriptor leaves a freed array behind, and the descriptor's own `dealloc`
+    /// then ends the process. A shape that resets therefore never touches the array at all. The
+    /// table is still part of every shape's input fingerprint, which over-covers rather than
+    /// under-covers: a change to it invalidates the reset recording too.
     pub buffers: &'static [(u32, metal::Mutability)],
     pub max_total_threads_per_threadgroup: u32,
     pub support_adding_binary_functions: bool,
@@ -190,8 +195,33 @@ pub struct TileDescriptorFacts {
     /// [`crate::render_descriptors::READ_COLORS`].
     pub colors: Vec<u32>,
     pub threadgroup_size_matches_tile_size: bool,
-    /// `tileBuffers[i].mutability` for `i` below [`crate::render_descriptors::READ_BUFFERS`].
-    pub buffers: Vec<u32>,
+    /// `tileBuffers[i].mutability` for `i` below [`crate::render_descriptors::READ_BUFFERS`], which
+    /// [`Shape::Reset`] does not read.
+    ///
+    /// **Metal's `reset` leaves a freed array in `tileBuffers`**, measured on this family's oracle
+    /// (an Apple M3 Max, macOS 27.0.1, build 26A434). Subscripting `tileBuffers` and then sending
+    /// `reset` releases the descriptor's `MTLPipelineBufferDescriptorArrayInternal` without
+    /// clearing the pointer to it, with two consequences, both reproduced twice in a row:
+    ///
+    /// - the next `tileBuffers` answers recycled memory, and sending `mutability` to one of its
+    ///   elements dies with `invalid message send to
+    ///   -[MTLTileRenderPipelineColorAttachmentDescriptorInternal mutability]: method not found`;
+    /// - the descriptor's own `-[MTLTileRenderPipelineDescriptorInternal dealloc]` releases the
+    ///   freed array again and dies in `objc_release` with `EXC_BAD_ACCESS`, whether or not
+    ///   anything read the array after the reset. Under Metal's API validation layer that is where
+    ///   the process goes.
+    ///
+    /// A descriptor whose `tileBuffers` was never subscripted before the `reset` survives both,
+    /// which is how the dependence was narrowed, and neither
+    /// `MTLComputePipelineDescriptor.buffers` nor `MTLRenderPipelineDescriptor`'s two arrays do any
+    /// of it -- each is stated and read on its own family's reset shape. So this is one Metal
+    /// class's defect, not a rule about `reset`.
+    ///
+    /// So [`Shape::Reset`] neither states nor reads `tileBuffers`: a shape that reset a descriptor
+    /// whose array it had touched could not be a committed case at all, because releasing the
+    /// descriptor ends the process. Nine of the descriptor's items are still compared after the
+    /// reset, and the buffer mutability's round trip is compared on [`Shape::Set`].
+    pub buffers: Option<Vec<u32>>,
     pub max_total_threads_per_threadgroup: u64,
     /// `binaryArchives`' length; a nil list is 0.
     pub binary_archives: u64,
@@ -231,15 +261,6 @@ impl TileDescriptorFacts {
                 value(Value::Bool(self.threadgroup_size_matches_tile_size)),
             ))
             .with(Node::leaf(
-                "tile_buffers",
-                value(Value::List(
-                    self.buffers
-                        .iter()
-                        .map(|raw| ordinal(*raw, metal::Mutability::name))
-                        .collect(),
-                )),
-            ))
-            .with(Node::leaf(
                 "max_total_threads_per_threadgroup",
                 value(Value::Uint(self.max_total_threads_per_threadgroup)),
             ))
@@ -261,6 +282,17 @@ impl TileDescriptorFacts {
                     &self.required_threads_per_threadgroup,
                 )),
             ));
+        if let Some(buffers) = &self.buffers {
+            node = node.with(Node::leaf(
+                "tile_buffers",
+                value(Value::List(
+                    buffers
+                        .iter()
+                        .map(|raw| ordinal(*raw, metal::Mutability::name))
+                        .collect(),
+                )),
+            ));
+        }
         if let Some(supplied) = &self.supplied {
             node = node
                 .with(Node::leaf(

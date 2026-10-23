@@ -24,10 +24,19 @@
 //! - **the same descriptor after `reset`** (`tile-descriptor-reset`): every field stated, then
 //!   `reset`, then the tile function set again. Its answer must be the first shape's, which is the
 //!   only way to say "a reset descriptor is a fresh one" with both shapes in one recording. It
-//!   reads every field the first shape does **except** the two lists of supplied objects, for the
-//!   measured reason [`crate::render_descriptors::SuppliedLists`] states: `reset` leaves
-//!   `preloadedLibraries` nil where `init` leaves a non-nil empty array, and `objc2-metal` 0.3.2
-//!   declares the property non-null and panics on the nil.
+//!   reads every field the first shape does **except** three, and each exclusion is itself a
+//!   measurement:
+//!   - the two lists of supplied objects, for the reason
+//!     [`crate::render_descriptors::SuppliedLists`] states: `reset` leaves `preloadedLibraries`
+//!     nil where `init` leaves a non-nil empty array, and `objc2-metal` 0.3.2 declares the
+//!     property non-null and panics on the nil;
+//!   - `tileBuffers`, because **Metal's `reset` corrupts it**. A descriptor whose `tileBuffers`
+//!     array has been subscripted and then `reset` answers an object that is not a pipeline buffer
+//!     array, and reading one of its elements' `mutability` ends the process. Nothing of this is
+//!     true of `MTLComputePipelineDescriptor.buffers` or of `MTLRenderPipelineDescriptor`'s two
+//!     arrays, whose own families read them on their reset shapes;
+//!     [`TileDescriptorFacts::buffers`](crate::tile_descriptors::TileDescriptorFacts::buffers)
+//!     holds the measurement and how it was narrowed.
 //!
 //! The runtime has no mutable descriptor, so its `reset` is `TileRenderPipelineDescriptor::new`
 //! again (the coverage map says so), and the case makes our side build the stated descriptor and

@@ -1316,7 +1316,12 @@ fn read_compute_supplied(
 }
 
 /// Set every field [`TileAway`] states on a tile render pipeline descriptor.
-fn state_tile_descriptor(descriptor: &Retained<MTLTileRenderPipelineDescriptor>) {
+///
+/// `resets` says whether the caller will send `reset` afterwards, because the buffer mutability is
+/// stated only where it will not: subscripting `tileBuffers` and then resetting the descriptor
+/// leaves a freed array behind that the descriptor's own `dealloc` releases again
+/// ([`TileDescriptorFacts::buffers`](crate::tile_descriptors::TileDescriptorFacts::buffers)).
+fn state_tile_descriptor(descriptor: &Retained<MTLTileRenderPipelineDescriptor>, resets: bool) {
     descriptor.setLabel(Some(&NSString::from_str(TILE_AWAY.label)));
     // SAFETY: the sample count is the stated table's own 4, a count every Metal device supports,
     // and nothing of this family compiles the descriptor.
@@ -1336,8 +1341,10 @@ fn state_tile_descriptor(descriptor: &Retained<MTLTileRenderPipelineDescriptor>)
             unsafe { colors.objectAtIndexedSubscript(*index as usize) };
         attachment.setPixelFormat(MTLPixelFormat(format.as_raw() as usize));
     }
-    let buffers: Retained<MTLPipelineBufferDescriptorArray> = descriptor.tileBuffers();
-    state_mutability(&buffers, TILE_AWAY.buffers);
+    if !resets {
+        let buffers: Retained<MTLPipelineBufferDescriptorArray> = descriptor.tileBuffers();
+        state_mutability(&buffers, TILE_AWAY.buffers);
+    }
 }
 
 /// What a tile render pipeline descriptor answers of itself.
@@ -1354,7 +1361,6 @@ fn read_tile_descriptor(
             unsafe { colors.objectAtIndexedSubscript(index as usize) };
         formats.push(attachment.pixelFormat().0 as u32);
     }
-    let buffers: Retained<MTLPipelineBufferDescriptorArray> = descriptor.tileBuffers();
     let archives = descriptor.binaryArchives();
     // Non-null in `objc2-metal` although a fresh descriptor's is nil, so every shape of the family
     // sets it before this runs ([`crate::tile_descriptors`]).
@@ -1366,7 +1372,13 @@ fn read_tile_descriptor(
         raster_sample_count: descriptor.rasterSampleCount() as u64,
         colors: formats,
         threadgroup_size_matches_tile_size: descriptor.threadgroupSizeMatchesTileSize(),
-        buffers: read_mutability(&buffers),
+        // Read only where the shape asks for it, which is every shape that does not reset: a reset
+        // descriptor's `tileBuffers` is memory Metal has freed
+        // ([`TileDescriptorFacts::buffers`](crate::tile_descriptors::TileDescriptorFacts::buffers)).
+        buffers: supplied.then(|| {
+            let buffers: Retained<MTLPipelineBufferDescriptorArray> = descriptor.tileBuffers();
+            read_mutability(&buffers)
+        }),
         max_total_threads_per_threadgroup: descriptor.maxTotalThreadsPerThreadgroup() as u64,
         binary_archives: archives.map_or(0, |held| held.len() as u64),
         supplied: supplied.then(|| read_tile_supplied(descriptor)),
@@ -2780,7 +2792,7 @@ impl Side for MetalSide {
         // is non-null in `objc2-metal` and a descriptor with none would panic rather than answer.
         unsafe { descriptor.setTileFunction(&*tile()?) };
         if spec.shape.sets() {
-            state_tile_descriptor(&descriptor);
+            state_tile_descriptor(&descriptor, spec.shape.resets());
         }
         if spec.shape.resets() {
             descriptor.reset();
