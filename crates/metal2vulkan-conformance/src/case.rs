@@ -811,6 +811,24 @@ pub trait Side {
         Err(Failure::unavailable("render_pipeline_under_options"))
     }
 
+    /// What an `MTLRenderPipelineFunctionsDescriptor` answers after `spec`'s writes
+    /// ([`FunctionsDescriptorFacts`](crate::pipeline_functions::FunctionsDescriptorFacts)).
+    ///
+    /// The writes and the reads in one call, because the descriptor is mutable and what a case
+    /// means is "the descriptor these writes made answers this": a side that kept the object
+    /// between calls would be answering about a different descriptor than the one the case
+    /// states.
+    fn render_pipeline_functions_descriptor_facts(
+        &mut self,
+        library: Handle,
+        spec: &crate::pipeline_functions::FunctionsDescriptorSpec<'_>,
+    ) -> Answer<crate::pipeline_functions::FunctionsDescriptorFacts> {
+        let _ = (library, spec);
+        Err(Failure::unavailable(
+            "render_pipeline_functions_descriptor_facts",
+        ))
+    }
+
     /// `newComputePipelineStateWithDescriptor:options:reflection:error:` of the descriptor
     /// `spec` describes whole ([`ComputeStateSpec`](crate::pipeline_facts::ComputeStateSpec)).
     ///

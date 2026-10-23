@@ -406,6 +406,16 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
             .render_pipeline_under_options(library, vertex, fragment, attachment, options)
     }
 
+    fn render_pipeline_functions_descriptor_facts(
+        &mut self,
+        library: Handle,
+        spec: &crate::pipeline_functions::FunctionsDescriptorSpec<'_>,
+    ) -> Answer<crate::pipeline_functions::FunctionsDescriptorFacts> {
+        let _span = self.watch("render_pipeline_functions_descriptor_facts");
+        self.inner
+            .render_pipeline_functions_descriptor_facts(library, spec)
+    }
+
     fn constant_data_offset(&mut self, encoder: Handle, index: u32) -> Answer<u64> {
         let _span = self.watch("constant_data_offset");
         self.inner.constant_data_offset(encoder, index)

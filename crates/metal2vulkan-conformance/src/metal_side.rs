@@ -11,127 +11,42 @@
 //!
 //! Metal announces no degrade notice, so this side announces none: a notice in a transcript is
 //! ours, and a case that holds one must name what justifies it.
-
 use crate::argument_encoders::{ArgumentDescriptorSpec, ArgumentWrite, EncoderFacts};
-use crate::case::{
-    Answer, ArgumentSlot, Bindings, CommandDraw, CoordinateProbe, Failure, FragmentFill,
-    FragmentFilled, Handle, MappedCoordinates, MeshCommand, MeshFunctions, MeshStep, PassOutcome,
-    RateMapFacts, RateMapForm, RateMapLayer, RateMapRequest, SamplerSpec, ShaderSource, Side,
-    StageInRegion, StageInput, TextureRole, TextureSpec, TileFacts, TilePipelineSpec, TileStep,
-    Venue,
-};
+use crate::case::{Answer, ArgumentSlot, Bindings, CommandDraw, CoordinateProbe, Failure, FragmentFill, FragmentFilled, Handle, MappedCoordinates, MeshCommand, MeshFunctions, MeshStep, PassOutcome, RateMapFacts, RateMapForm, RateMapLayer, RateMapRequest, SamplerSpec, ShaderSource, Side, StageInRegion, StageInput, TextureRole, TextureSpec, TileFacts, TilePipelineSpec, TileStep, Venue};
 use crate::command_buffer_facts::CommandBufferFacts;
-use crate::compute_descriptors::{
-    ComputeDescriptorFacts, DescriptorSpec as ComputeDescriptorSpec,
-    SuppliedLists as ComputeSuppliedLists, AWAY as COMPUTE_AWAY,
-};
-use crate::compute_pass::{
-    ComputePass, ComputePassOutcome, ComputeStep, Dispatching, PassResource,
-};
+use crate::compute_descriptors::{AWAY as COMPUTE_AWAY, ComputeDescriptorFacts, DescriptorSpec as ComputeDescriptorSpec, SuppliedLists as ComputeSuppliedLists};
+use crate::compute_pass::{ComputePass, ComputePassOutcome, ComputeStep, Dispatching, PassResource};
 use crate::device_queries::{Box6, HeapBufferQuery, RegionQuery};
-use crate::function_bindings::{
-    ArrayFacts, BindingFacts, BufferFacts, MemberFacts, PointerFacts, ReferenceFacts, StructFacts,
-    TextureFacts, ThreadgroupFacts, TypeFacts,
-};
-use crate::function_facts::{
-    AttributeFacts, ConstantAt, ConstantFacts, ConstantValue, FunctionFacts,
-};
+use crate::function_bindings::{ArrayFacts, BindingFacts, BufferFacts, MemberFacts, PointerFacts, ReferenceFacts, StructFacts, TextureFacts, ThreadgroupFacts, TypeFacts};
+use crate::function_facts::{AttributeFacts, ConstantAt, ConstantFacts, ConstantValue, FunctionFacts};
 use crate::heap_query::{HeapBufferSpec, HeapOwnFacts, HeapSpec, QueriedResource, ResourceFacts};
-use crate::indirect_commands::{
-    CommandsMade, ComputeCommandStep, EncodedCommand, IcbDescriptor, RenderCommandStep,
-};
+use crate::indirect_commands::{CommandsMade, ComputeCommandStep, EncodedCommand, IcbDescriptor, RenderCommandStep};
 use crate::library_facts::{FunctionDescriptorSpec, LibraryFacts};
-use crate::mesh_descriptors::{
-    DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists,
-    AWAY as MESH_AWAY,
-};
-use crate::pass_descriptors::{
-    AttachmentFacts, Indices, Numbers, PassDescriptorFacts, PassSpec, Reads, Row, Shape,
-    ASSIGNED_COLOR, DEPTH_AT, MUTATED_AFTER, READ_COLORS as PASS_COLORS, STENCIL_AT, SWEPT_COLOR,
-};
+use crate::mesh_descriptors::{AWAY as MESH_AWAY, DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists};
+use crate::pass_descriptors::{ASSIGNED_COLOR, AttachmentFacts, DEPTH_AT, Indices, MUTATED_AFTER, Numbers, PassDescriptorFacts, PassSpec, READ_COLORS as PASS_COLORS, Reads, Row, STENCIL_AT, SWEPT_COLOR, Shape};
 use crate::pipeline_facts::{ComputeStateFacts, ComputeStateSpec, RenderStateFacts};
-use crate::pipeline_handlers::{ BothPaths, Delivered, Form as PipelineForm, Handled, StateFacts, IMAGEBLOCK as HANDLER_IMAGEBLOCK, WAIT as HANDLER_WAIT, };
+use crate::pipeline_functions::{FunctionsDescriptorFacts, FunctionsDescriptorSpec, Write};
+use crate::pipeline_handlers::{BothPaths, Delivered, Form as PipelineForm, Handled, IMAGEBLOCK as HANDLER_IMAGEBLOCK, StateFacts, WAIT as HANDLER_WAIT};
 use crate::pipeline_option_reflection::UnderOptions;
-use crate::pipeline_options::{OptionOutcome, FRAGMENT_STAGE, KERNEL_STAGE, VERTEX_STAGE};
+use crate::pipeline_options::{FRAGMENT_STAGE, KERNEL_STAGE, OptionOutcome, VERTEX_STAGE};
 use crate::queue_slots::QueueSlots;
-use crate::render::{
-    Dispatch, RenderPass, RenderPipelineSpec, RenderStep, RenderWork, StageFunction, StepResource,
-    TargetSpec,
-};
-use crate::render_descriptors::{
-    AttributeFacts as DescriptorAttributeFacts, ColorAway, ColorFacts, DescriptorSpec, LayoutFacts,
-    LinkedCounts, RenderDescriptorFacts, SuppliedLists, VertexDescriptorFacts, AWAY, READ_BUFFERS,
-    READ_COLORS, READ_VERTEX_SLOTS,
-};
-use crate::sparse_mapping::{
-    MappingMode, MappingStep, SparseMapped, SparseMappingProgram, TileRect,
-};
-use crate::sparse_query::{
-    HeapFacts, QueryPage, SparseHeapSpec, SparseTextureFacts, SparseTextureSpec, SparseTileQuery,
-    TileSize,
-};
+use crate::render::{Dispatch, RenderPass, RenderPipelineSpec, RenderStep, RenderWork, StageFunction, StepResource, TargetSpec};
+use crate::render_descriptors::{AWAY, AttributeFacts as DescriptorAttributeFacts, ColorAway, ColorFacts, DescriptorSpec, LayoutFacts, LinkedCounts, READ_BUFFERS, READ_COLORS, READ_VERTEX_SLOTS, RenderDescriptorFacts, SuppliedLists, VertexDescriptorFacts};
+use crate::sparse_mapping::{MappingMode, MappingStep, SparseMapped, SparseMappingProgram, TileRect};
+use crate::sparse_query::{HeapFacts, QueryPage, SparseHeapSpec, SparseTextureFacts, SparseTextureSpec, SparseTileQuery, TileSize};
 use crate::texture_query::{HeapTextureQuery, SizeAndAlign, Storage};
 use crate::texture_views::{SharedHandleFacts, ViewCall, ViewFacts, ViewRequest};
-use crate::tile_descriptors::{
-    DescriptorSpec as TileDescriptorSpec, SuppliedLists as TileSuppliedLists, TileDescriptorFacts,
-    AWAY as TILE_AWAY,
-};
+use crate::tile_descriptors::{AWAY as TILE_AWAY, DescriptorSpec as TileDescriptorSpec, SuppliedLists as TileSuppliedLists, TileDescriptorFacts};
 use crate::transcript::Value;
 use metal2vulkan::library::LibraryType;
+use metal2vulkan::metal::{BindingAccess, BindingType, FunctionOptions, FunctionType, PatchType, PixelFormat, RenderStages};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
-use metal2vulkan::metal::{
-    BindingAccess, BindingType, FunctionOptions, FunctionType, PatchType, PixelFormat, RenderStages,
-};
 use metal2vulkan_runtime::{PurgeableState, SparsePageSize};
+use objc2::{AnyThread, ClassType};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, ClassType};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSObjectProtocol, NSRange, NSString, NSUInteger, NSURL};
-use objc2_metal::{
-    MTLArgumentDescriptor, MTLArgumentEncoder, MTLArrayType, MTLAttribute, MTLAttributeFormat,
-    MTLBarrierScope, MTLBinding, MTLBindingAccess, MTLBindingType, MTLBlendFactor,
-    MTLBlendOperation, MTLBlitCommandEncoder, MTLBuffer, MTLBufferBinding, MTLCPUCacheMode,
-    MTLClearColor, MTLColorWriteMask, MTLCommandBuffer, MTLCommandBufferHandler,
-    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLCompareFunction,
-    MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineReflection,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDataType,
-    MTLDepthClipMode, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLDispatchType,
-    MTLDynamicLibrary, MTLEvent, MTLFence, MTLFunction, MTLFunctionConstant,
-    MTLFunctionConstantValues, MTLFunctionDescriptor, MTLFunctionOptions, MTLHazardTrackingMode,
-    MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLIndexType, MTLIndirectCommandBuffer,
-    MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
-    MTLIndirectRenderCommand, MTLLibrary, MTLLinkedFunctions, MTLLoadAction,
-    MTLMeshRenderPipelineDescriptor, MTLMultisampleDepthResolveFilter,
-    MTLMultisampleStencilResolveFilter, MTLMutability, MTLOrigin, MTLPipelineBufferDescriptor,
-    MTLPipelineBufferDescriptorArray, MTLPipelineOption, MTLPixelFormat, MTLPointerType,
-    MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLPurgeableState,
-    MTLRasterizationRateLayerDescriptor, MTLRasterizationRateMap,
-    MTLRasterizationRateMapDescriptor, MTLRegion, MTLRenderCommandEncoder,
-    MTLRenderPassAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptor,
-    MTLRenderPassColorAttachmentDescriptorArray, MTLRenderPassDepthAttachmentDescriptor,
-    MTLRenderPassDescriptor, MTLRenderPassStencilAttachmentDescriptor,
-    MTLRenderPipelineColorAttachmentDescriptor, MTLRenderPipelineColorAttachmentDescriptorArray,
-    MTLRenderPipelineDescriptor, MTLRenderPipelineReflection, MTLRenderPipelineState,
-    MTLRenderStages, MTLResource, MTLResourceOptions, MTLResourceStateCommandEncoder,
-    MTLResourceUsage, MTLSamplePosition, MTLSamplerAddressMode, MTLSamplerBorderColor,
-    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLScissorRect, MTLSharedEvent,
-    MTLSharedEventHandle, MTLSize, MTLSparsePageSize, MTLSparseTextureMappingMode,
-    MTLSparseTextureRegionAlignmentMode, MTLStageInputOutputDescriptor, MTLStencilDescriptor,
-    MTLStencilOperation, MTLStepFunction, MTLStorageMode, MTLStoreAction, MTLStoreActionOptions,
-    MTLStructMember, MTLStructType, MTLTessellationControlPointIndexType,
-    MTLTessellationFactorFormat, MTLTessellationFactorStepFunction, MTLTessellationPartitionMode,
-    MTLTexture, MTLTextureBinding, MTLTextureDescriptor, MTLTextureReferenceType,
-    MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType, MTLTextureUsage,
-    MTLTextureViewDescriptor, MTLThreadgroupBinding,
-    MTLTileRenderPipelineColorAttachmentDescriptor,
-    MTLTileRenderPipelineColorAttachmentDescriptorArray, MTLTileRenderPipelineDescriptor,
-    MTLTriangleFillMode, MTLVertexAttribute, MTLVertexAttributeDescriptor,
-    MTLVertexAttributeDescriptorArray, MTLVertexBufferLayoutDescriptor,
-    MTLVertexBufferLayoutDescriptorArray, MTLVertexDescriptor, MTLVertexFormat,
-    MTLVertexStepFunction, MTLViewport, MTLVisibilityResultMode, MTLVisibleFunctionTable,
-    MTLWinding,
-};
-
+use objc2_metal::{MTLArgumentDescriptor, MTLArgumentEncoder, MTLArrayType, MTLAttribute, MTLAttributeFormat, MTLBarrierScope, MTLBinding, MTLBindingAccess, MTLBindingType, MTLBlendFactor, MTLBlendOperation, MTLBlitCommandEncoder, MTLBuffer, MTLBufferBinding, MTLCPUCacheMode, MTLClearColor, MTLColorWriteMask, MTLCommandBuffer, MTLCommandBufferHandler, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLCompareFunction, MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineReflection, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDataType, MTLDepthClipMode, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLDispatchType, MTLDynamicLibrary, MTLEvent, MTLFence, MTLFunction, MTLFunctionConstant, MTLFunctionConstantValues, MTLFunctionDescriptor, MTLFunctionOptions, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLIndexType, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand, MTLIndirectRenderCommand, MTLLibrary, MTLLinkedFunctions, MTLLoadAction, MTLMeshRenderPipelineDescriptor, MTLMultisampleDepthResolveFilter, MTLMultisampleStencilResolveFilter, MTLMutability, MTLOrigin, MTLPipelineBufferDescriptor, MTLPipelineBufferDescriptorArray, MTLPipelineOption, MTLPixelFormat, MTLPointerType, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLPurgeableState, MTLRasterizationRateLayerDescriptor, MTLRasterizationRateMap, MTLRasterizationRateMapDescriptor, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptorArray, MTLRenderPassDepthAttachmentDescriptor, MTLRenderPassDescriptor, MTLRenderPassStencilAttachmentDescriptor, MTLRenderPipelineColorAttachmentDescriptor, MTLRenderPipelineColorAttachmentDescriptorArray, MTLRenderPipelineDescriptor, MTLRenderPipelineFunctionsDescriptor, MTLRenderPipelineReflection, MTLRenderPipelineState, MTLRenderStages, MTLResource, MTLResourceOptions, MTLResourceStateCommandEncoder, MTLResourceUsage, MTLSamplePosition, MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLScissorRect, MTLSharedEvent, MTLSharedEventHandle, MTLSize, MTLSparsePageSize, MTLSparseTextureMappingMode, MTLSparseTextureRegionAlignmentMode, MTLStageInputOutputDescriptor, MTLStencilDescriptor, MTLStencilOperation, MTLStepFunction, MTLStorageMode, MTLStoreAction, MTLStoreActionOptions, MTLStructMember, MTLStructType, MTLTessellationControlPointIndexType, MTLTessellationFactorFormat, MTLTessellationFactorStepFunction, MTLTessellationPartitionMode, MTLTexture, MTLTextureBinding, MTLTextureDescriptor, MTLTextureReferenceType, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType, MTLTextureUsage, MTLTextureViewDescriptor, MTLThreadgroupBinding, MTLTileRenderPipelineColorAttachmentDescriptor, MTLTileRenderPipelineColorAttachmentDescriptorArray, MTLTileRenderPipelineDescriptor, MTLTriangleFillMode, MTLVertexAttribute, MTLVertexAttributeDescriptor, MTLVertexAttributeDescriptorArray, MTLVertexBufferLayoutDescriptor, MTLVertexBufferLayoutDescriptorArray, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction, MTLViewport, MTLVisibilityResultMode, MTLVisibleFunctionTable, MTLWinding};
 /// The Metal level this side answers at: the host's own, since Metal answers as the release it runs
 /// on.
 const METAL_LEVEL: &str = crate::recording::ORACLE_OS_VERSION;
@@ -515,6 +430,18 @@ fn our_texture_type(raw: usize) -> Answer<metal2vulkan::metal::TextureType> {
 ///
 /// Which subprotocol to read is decided by the binding's own `type`, which is how Metal states it:
 /// `MTLBindingTypeBuffer` is the fact that the binding conforms to `MTLBufferBinding`.
+/// The `name` of each function of one of an `MTLRenderPipelineFunctionsDescriptor`'s three
+/// properties, in order; a nil property has none, which is the fold
+/// [`crate::pipeline_functions`] states.
+fn function_names(list: Option<&NSArray<ProtocolObject<dyn MTLFunction>>>) -> Vec<String> {
+    let Some(list) = list else {
+        return Vec::new();
+    };
+    list.iter()
+        .map(|function| function.name().to_string())
+        .collect()
+}
+
 fn metal_binding(binding: &ProtocolObject<dyn MTLBinding>) -> Answer<BindingFacts> {
     let kind = binding.r#type();
     let mut facts = BindingFacts {
@@ -3138,6 +3065,67 @@ impl Side for MetalSide {
             },
         );
         Ok(outcome)
+    }
+
+    fn render_pipeline_functions_descriptor_facts(
+        &mut self,
+        library: Handle,
+        spec: &FunctionsDescriptorSpec<'_>,
+    ) -> Answer<FunctionsDescriptorFacts> {
+        let library = self
+            .libraries
+            .get(library.0 as usize)
+            .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+        let mut made: Vec<(&str, Retained<ProtocolObject<dyn MTLFunction>>)> = Vec::new();
+        for name in spec.names() {
+            let function = library
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| Failure::named("NewFunctionWithName", name.to_owned()))?;
+            made.push((name, function));
+        }
+        let held = |name: &str| -> Answer<Retained<ProtocolObject<dyn MTLFunction>>> {
+            made.iter()
+                .find(|(held, _)| *held == name)
+                .map(|(_, function)| function.clone())
+                .ok_or_else(|| Failure::named("NoSuchFunction", name.to_owned()))
+        };
+        let descriptor = MTLRenderPipelineFunctionsDescriptor::new();
+        // Each property's writes in the order the case states them, so "set and then set again"
+        // and "set and then put back to nil" are what the descriptor actually saw.
+        for writes in [spec.vertex, spec.fragment, spec.tile].iter().enumerate() {
+            let (stage, writes) = writes;
+            for write in *writes {
+                let functions = match write {
+                    Write::Functions(names) => {
+                        let mut objects = Vec::new();
+                        for name in *names {
+                            objects.push(held(name)?);
+                        }
+                        Some(NSArray::from_retained_slice(&objects))
+                    }
+                    Write::Nil => None,
+                };
+                let list = functions.as_deref();
+                // SAFETY: the array holds this library's own functions, which is what the
+                // property takes; Metal copies it.
+                unsafe {
+                    match stage {
+                        0 => descriptor.setVertexAdditionalBinaryFunctions(list),
+                        1 => descriptor.setFragmentAdditionalBinaryFunctions(list),
+                        _ => descriptor.setTileAdditionalBinaryFunctions(list),
+                    }
+                }
+            }
+        }
+        // Each getter bound to a local, so the coverage derivation types the receiver.
+        let vertex = descriptor.vertexAdditionalBinaryFunctions();
+        let fragment = descriptor.fragmentAdditionalBinaryFunctions();
+        let tile = descriptor.tileAdditionalBinaryFunctions();
+        Ok(FunctionsDescriptorFacts {
+            vertex: function_names(vertex.as_deref()),
+            fragment: function_names(fragment.as_deref()),
+            tile: function_names(tile.as_deref()),
+        })
     }
 
     fn compute_pipeline_with_descriptor(
