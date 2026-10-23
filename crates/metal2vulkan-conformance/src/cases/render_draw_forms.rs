@@ -13,7 +13,8 @@
 //! |---|---|
 //! | `render-draw-forms-points` | `MTLPrimitiveTypePoint` through all **eight** draw selectors, sweeping the vertex start, the instance count, the base vertex (0, positive and negative), the base instance and the index-buffer offset |
 //! | `render-draw-forms-triangles` | `MTLPrimitiveTypeTriangle` and `MTLPrimitiveTypeTriangleStrip` over the same quad, through seven of the selectors |
-//! | `render-draw-forms-lines` | `MTLPrimitiveTypeLine` and `MTLPrimitiveTypeLineStrip` over horizontal segments, through four of the selectors |
+//! | `render-draw-forms-lines` | `MTLPrimitiveTypeLine` and `MTLPrimitiveTypeLineStrip` over horizontal segments, through five of the selectors |
+//! | `render-draw-forms-empty` | the documented **zero** of every count, through each selector that takes one, between two draws that write |
 //!
 //! # What makes each parameter visible
 //!
@@ -30,9 +31,9 @@
 //!   records the index it read.
 //! - **`instanceCount`** reaches the row: each instance of a draw whose frame shifts by a row lands
 //!   a row lower, so `n` instances write `n` rows and `n - 1` write one fewer.
-//! - **`baseVertex`** reaches `vid` through the index, which is why this family states it three
-//!   ways: 0, `+84` and **`-16`**, each with indices chosen so a side that dropped it would write
-//!   into another draw's band.
+//! - **`baseVertex`** reaches `vid` through the index, which is why this family states it at all
+//!   three signs: 0 (the five selectors that name none), positive, and **negative**, each with
+//!   indices chosen so a side that dropped it would write into another draw's band.
 //! - **`baseInstance`** reaches the `base` channel outright.
 //! - **`indexBufferOffset`** and the indirect `indexStart` reach which indices a draw reads, and
 //!   each draw that states one carries a **spare index** its honoured form never reads: the pixel
@@ -62,7 +63,7 @@
 //!
 //! # Nothing here can fault a GPU
 //!
-//! One pass a case, at most nine draws, at most 24 primitives a draw, over a 16 by 16 or 16 by 20
+//! One pass a case, at most ten draws, at most 24 primitives a draw, over a 16 by 16 or 16 by 20
 //! target, no loop in the fixture. Every index a draw can read names a vertex of the case's own
 //! positions array, which `every_index_names_a_position_the_case_states` holds with no device
 //! asked -- an index past it would be an out-of-bounds read of a `device const` pointer. Every
