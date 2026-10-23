@@ -255,7 +255,8 @@ def answered(root: Path, types: dict[str, Type]) -> dict[tuple[str, str], set[st
 #: descriptor is neither, so the shape of the item is what tells the three apart.
 MODELS = re.compile(
     r"///\s*`(MTL\w+)`[^\n]*\n(?:[ \t]*(?:///[^\n]*|#\[[^\n]*\])\n)*"
-    r"[ \t]*pub\s+(?:(enum)\s+([A-Za-z_]\w*)\s*\{|(struct)\s+([A-Za-z_]\w*)\s*\(\s*u(?:8|16|32|64|size)\s*\)\s*;)"
+    r"[ \t]*pub\s+(?:(enum)\s+([A-Za-z_]\w*)\s*\{"
+    r"|(struct)\s+([A-Za-z_]\w*)\s*\(\s*u(?:8|16|32|64|size)\s*\)\s*;)"
 )
 
 
@@ -288,7 +289,7 @@ def by_hand(root: Path, types: dict[str, Type]) -> list[tuple[str, str, list[str
     out: dict[str, tuple[str, list[str]]] = {}
     for where in BY_HAND:
         for path in sorted((root / where).rglob("*.rs")):
-            if "tests" in path.parts or path.name.startswith("tests") or path.name == "generated.rs":
+            if "tests" in path.parts or path.name in ("generated.rs", "tests.rs"):
                 continue
             source = path.read_text()
             # `blanked` keeps every offset, so the brace walk below reads against the source.

@@ -554,7 +554,8 @@ def write_option_space(w, space) -> None:
     w(f"| share compared | {100.0 * compared / values:.0f}% |")
     w(f"| values only the suite's shared sources name | {shared} |")
     w(f"| values no source names and no recording holds | {missing} |")
-    w(f"| types every value of which is compared | {sum(1 for r in rows if not r['missing'] and not r['shared'])} |")
+    whole = sum(1 for row in rows if not row["missing"] and not row["shared"])
+    w(f"| types every value of which is compared | {whole} |")
     w(f"| types no value of which is compared | {sum(1 for r in rows if not r['compared'])} |")
     w("")
     largest = sorted(rows, key=lambda r: -len(r["values"]))[:4]
