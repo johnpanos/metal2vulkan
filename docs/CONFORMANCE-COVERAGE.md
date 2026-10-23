@@ -32,7 +32,7 @@ Its limits, measured rather than asserted:
 | case modules | 107 |
 | committed recordings | 828 |
 | distinct SDK items the Metal leg calls | 618 |
-| ledger rows (a case whose gap is recorded) | 43 |
+| ledger rows (a case whose gap is recorded) | 42 |
 
 A tolerance names a **site of a transcript**, not an item, so the last two rows are read as written: a case that loosens one site of its own transcript may compare every other field of it exactly, and this derivation cannot tell which of a case's fields came from which Metal call. Where the distinction matters, read the case.
 
@@ -1897,5 +1897,4 @@ A case whose difference from Metal is recorded rather than compared away. The le
 | `resource-own-getters` | `Texture::resource_options` does not carry the hazard tracking mode it resolved. Metal never reports `MTLHazardTrackingModeDefault` from a resource: it resolves… |
 | `resource-own-getters` | `Texture::resource_options` does not carry the hazard tracking mode it resolved. Metal never reports `MTLHazardTrackingModeDefault` from a resource: it resolves… |
 | `resource-own-getters` | `Texture::resource_options` does not carry the hazard tracking mode it resolved. Metal never reports `MTLHazardTrackingModeDefault` from a resource: it resolves… |
-| `resource-purgeable-states` | `Texture::resource_options` does not carry the hazard tracking mode it resolved. Metal never reports `MTLHazardTrackingModeDefault` from a resource: it resolves… |
 

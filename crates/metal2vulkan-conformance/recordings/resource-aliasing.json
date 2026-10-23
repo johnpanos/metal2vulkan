@@ -35,7 +35,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "1f25da3064e7e9059d94b9b12e9c62f3b43af0d9f7b63c444fdbe45aa8545782"
+                          "hex": "c9b969ac73356c158ef5b2bdbe08656ea0f7383a0ee51d6bcab564a8d4251ba1"
                         }
                       }
                     },
@@ -52,7 +52,7 @@
                   ]
                 },
                 {
-                  "name": "automatic-heap-buffer-4096-shared",
+                  "name": "automatic-heap-buffer-4096-shared-default-cache-hazard-default",
                   "observed": {
                     "value": "absent"
                   },
@@ -415,7 +415,7 @@
                   ]
                 },
                 {
-                  "name": "automatic-heap-buffer-8192-shared",
+                  "name": "automatic-heap-buffer-8192-shared-default-cache-hazard-default",
                   "observed": {
                     "value": "absent"
                   },
@@ -778,7 +778,7 @@
                   ]
                 },
                 {
-                  "name": "automatic-heap-buffer-65536-shared",
+                  "name": "automatic-heap-buffer-65536-shared-default-cache-hazard-default",
                   "observed": {
                     "value": "absent"
                   },

@@ -15,7 +15,12 @@
 //!   immediate parent, or the root of the chain. The runtime models the immediate parent
 //!   (`Texture::parent_relative_level` subtracts the parent's own base level), and nothing in this
 //!   tree had asked Metal. The base texture's own row is the baseline: a texture that is not a view
-//!   answers no parent and 0 for both relative getters.
+//!   answers no parent and 0 for both relative getters. The case also sweeps **every**
+//!   `MTLTextureSwizzle` value as a parent's swizzle — each of the six in all four channels, and
+//!   each of the six in one channel over the default, twelve parents in all — and reads each back
+//!   off a view made by a selector that states no swizzle. That reading is Metal's choice between
+//!   the parent's swizzle and the default, so it is the one place in the suite where the swizzle
+//!   enum is compared value by value rather than at one representative.
 //! - **`texture-view-selectors`**: the same whole-texture view through all four selectors, and the
 //!   same sub-range view through the three that can state one. Two facts: whether
 //!   `newTextureViewWithPixelFormat:` and the `textureType:levels:slices:` form agree over the
@@ -46,8 +51,23 @@
 //!   0 at every site, which is also what a side that ignored the ranges would answer;
 //! - **the parent carries a non-default swizzle**, so the two possible answers for a view made
 //!   without one are two different values;
+//! - **the swizzle sweep moves the view's recorded answer at every row**: measured on this chip
+//!   the view inherits its parent's swizzle exactly, at all twelve, so a side answering the
+//!   default for an inheriting view differs at eleven of them. The sweep states each value in one
+//!   channel as well as in four, which is what tells a per-channel reading from a side that read
+//!   one channel and broadcast it;
 //! - **`shareable` is recorded both ways**, because the shared-handle table holds an ordinary
 //!   texture and a shared one.
+//!
+//! # The swizzle space, and what of it is a mirror
+//!
+//! `MTLTextureSwizzle` has six values and all six are swept, but only as the **parent's**: a
+//! view's own stated swizzle is read straight back from what the case wrote, so sweeping that is
+//! indistinguishable by construction and `texture-view-descriptors` states three of them for the
+//! different reason that the descriptor path and the selector path must agree on each. The
+//! `MTLTextureUsage` bitfield is the other small space this family touches and does **not** sweep:
+//! `usage` reads back what the descriptor said, and the usage bits that decide anything decide it
+//! by Metal's validation refusing a call — which ends Metal's process and so cannot be a case.
 //!
 //! # Why every case here is safe
 //!
@@ -69,7 +89,7 @@
 use crate::case::{Abort, Case, Handle, Input, MetalSource, Side};
 use crate::texture::TextureRequest;
 use crate::texture_query::{HeapTextureQuery, Storage};
-use crate::texture_views::{ParentShape, ViewCall, ViewRequest};
+use crate::texture_views::{swizzle_word, ParentShape, ViewCall, ViewRequest};
 use crate::transcript::{Node, Observed, Sites};
 use metal2vulkan::metal::{
     PixelFormat, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage,
@@ -110,6 +130,51 @@ const VIEW_SWIZZLE: TextureSwizzleChannels = TextureSwizzleChannels {
     blue: TextureSwizzle::Green,
     alpha: TextureSwizzle::Red,
 };
+
+/// Every value `MTLTextureSwizzle` has, in Metal's own order.
+///
+/// Six, which is all of them. They are swept as the **parent's** swizzle, through a selector that
+/// states none, because that is the one reading Metal decides: a view's own stated swizzle is read
+/// back from what the case wrote and is indistinguishable by construction. What the sweep asks is
+/// whether every one of the six survives into a view that never mentioned it.
+const EVERY_SWIZZLE: [TextureSwizzle; 6] = [
+    TextureSwizzle::Zero,
+    TextureSwizzle::One,
+    TextureSwizzle::Red,
+    TextureSwizzle::Green,
+    TextureSwizzle::Blue,
+    TextureSwizzle::Alpha,
+];
+
+/// The parent swizzles the inheritance sweep states: Metal's default, each of the six values in
+/// **all four** channels, and each of the six in **one** channel over the default.
+///
+/// The second half is what makes the sweep a sweep of a swizzle and not of a value: a side that
+/// read one channel and filled the other three from it would answer every all-four row correctly
+/// and differ at all six of the others.
+fn parent_swizzles() -> Vec<TextureSwizzleChannels> {
+    let mut swizzles = vec![TextureSwizzleChannels::DEFAULT];
+    for channel in EVERY_SWIZZLE {
+        swizzles.push(TextureSwizzleChannels {
+            red: channel,
+            green: channel,
+            blue: channel,
+            alpha: channel,
+        });
+    }
+    for channel in EVERY_SWIZZLE {
+        let one_channel = TextureSwizzleChannels {
+            green: channel,
+            ..TextureSwizzleChannels::DEFAULT
+        };
+        // `green: Green` **is** the default, so the one-channel loop reaches it twice. One site a
+        // swizzle: two nodes of one name would leave a diff unable to say which row moved.
+        if !swizzles.contains(&one_channel) {
+            swizzles.push(one_channel);
+        }
+    }
+    swizzles
+}
 
 /// The shape of the 2D parent, as a view request reads it.
 const FLAT: ParentShape = ParentShape::texture_2d(FORMAT, LEVELS);
@@ -171,6 +236,9 @@ pub struct TextureViewCase {
     /// Whether the case also asks `newSharedTextureWithDescriptor:` and the handle calls, which
     /// `texture-shared-handles` alone does.
     asks_sharing: bool,
+    /// Whether the case also sweeps every `MTLTextureSwizzle` as a parent's swizzle and reads it
+    /// back off a view that states none, which `texture-view-parents` alone does.
+    asks_inherited_swizzles: bool,
 }
 
 /// Every case of the family.
@@ -231,6 +299,7 @@ fn parents() -> TextureViewCase {
         parent: ARRAY,
         rows,
         asks_sharing: false,
+        asks_inherited_swizzles: true,
     }
 }
 
@@ -278,6 +347,7 @@ fn selectors() -> TextureViewCase {
         parent: FLAT,
         rows,
         asks_sharing: false,
+        asks_inherited_swizzles: false,
     }
 }
 
@@ -307,6 +377,7 @@ fn descriptors() -> TextureViewCase {
         parent: ARRAY,
         rows,
         asks_sharing: true,
+        asks_inherited_swizzles: false,
     }
 }
 
@@ -330,6 +401,7 @@ fn shared_handles() -> TextureViewCase {
             ),
         ],
         asks_sharing: true,
+        asks_inherited_swizzles: false,
     }
 }
 
@@ -364,12 +436,17 @@ impl Case for TextureViewCase {
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
-        let mut words = parent_texture(self.parent).words();
+        let mut words = parent_texture(self.parent, PARENT_SWIZZLE).words();
         for row in &self.rows {
             words.extend(row.words());
         }
         if self.asks_sharing {
             words.extend(shared_descriptor().words());
+        }
+        if self.asks_inherited_swizzles {
+            for swizzle in parent_swizzles() {
+                words.extend(parent_texture(self.parent, swizzle).words());
+            }
         }
         Ok(vec![
             Input::bytes("views", &words),
@@ -390,7 +467,7 @@ impl Case for TextureViewCase {
         let parent = crate::case::made(
             sites,
             "parent-texture",
-            side.texture(&parent_texture(self.parent)),
+            side.texture(&parent_texture(self.parent, PARENT_SWIZZLE)),
         )?;
         sites.push(view_facts(side, parent, None, site::PARENT));
         for row in &self.rows {
@@ -417,11 +494,51 @@ impl Case for TextureViewCase {
         if self.asks_sharing {
             self.sharing(side, sites);
         }
+        if self.asks_inherited_swizzles {
+            self.inherited_swizzles(side, sites);
+        }
         Ok(())
     }
 }
 
 impl TextureViewCase {
+    /// Every `MTLTextureSwizzle` as a parent's swizzle, each read back off a view made by a
+    /// selector that states none.
+    ///
+    /// One parent and one view a swizzle, each at its own site, so the recording holds the
+    /// parent's reading beside the view's: the parent's is the case's own value and the view's is
+    /// Metal's choice between it and the default. The thirteen swizzles are
+    /// [`parent_swizzles`] — the default, each of the six in all four channels, and each of the
+    /// six in one channel — which is every value of the enum twice over in two positions.
+    ///
+    /// Nothing is encoded or dispatched: thirteen 64 by 64 four-level textures are made and their
+    /// getters read.
+    fn inherited_swizzles(&self, side: &mut dyn Side, sites: &mut Sites) {
+        for swizzle in parent_swizzles() {
+            let at = format!("inherited-{}", swizzle_word(swizzle));
+            let mut node = Node::branch(at.clone(), Vec::new());
+            let parent = match side.texture(&parent_texture(self.parent, swizzle)) {
+                Ok(parent) => parent,
+                Err(failure) => {
+                    sites.push(node.with(Node::leaf(
+                        site::PARENT,
+                        Observed::value(failure.recorded()),
+                    )));
+                    continue;
+                }
+            };
+            node = node.with(view_facts(side, parent, None, site::PARENT));
+            // The four-argument selector, which states no swizzle at all: what the view answers is
+            // the parent's swizzle or Metal's default, and never a value this call carried.
+            let request = ViewRequest::whole(ViewCall::LevelsSlices, &self.parent, FORMAT);
+            node = node.with(match side.texture_view(parent, &request) {
+                Ok(view) => view_facts(side, view, Some(parent), site::VIEW),
+                Err(failure) => Node::leaf(site::VIEW, Observed::value(failure.recorded())),
+            });
+            sites.push(node);
+        }
+    }
+
     /// `newSharedTextureWithDescriptor:`, the shared texture's answers, a view of it, and the
     /// handle calls.
     fn sharing(&self, side: &mut dyn Side, sites: &mut Sites) {
@@ -456,12 +573,11 @@ impl TextureViewCase {
     }
 }
 
-/// The parent texture a case makes: `shape`'s own type, levels and slices, with
-/// [`PARENT_SWIZZLE`].
-fn parent_texture(shape: ParentShape) -> TextureRequest<'static> {
+/// The parent texture a case makes: `shape`'s own type, levels and slices, carrying `swizzle`.
+fn parent_texture(shape: ParentShape, swizzle: TextureSwizzleChannels) -> TextureRequest<'static> {
     let mut request = TextureRequest::read_2d(FORMAT.as_raw(), SIDE, SIDE)
         .levels(shape.levels as u32)
-        .swizzled(PARENT_SWIZZLE);
+        .swizzled(swizzle);
     if matches!(shape.texture_type, TextureType::Type2DArray) {
         request.texture_type = TextureType::Type2DArray;
         request.slices = shape.slices as u32;
@@ -495,7 +611,7 @@ fn view_facts(side: &mut dyn Side, texture: Handle, parent: Option<Handle>, at: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::texture_views::swizzle_word;
+    use crate::texture_views::swizzle_channels;
     use std::collections::BTreeSet;
 
     /// No view of the family is one Metal's validation stops, against the shape of the texture it
@@ -620,6 +736,58 @@ mod tests {
             "the default, the parent's and the view's swizzle are not three distinct values, so a \
              view made by a selector that states none records one answer whichever rule Metal \
              follows: {words:?}"
+        );
+    }
+
+    /// The inheritance sweep states **every** `MTLTextureSwizzle` value, and states each of them
+    /// in a channel of its own as well as in all four at once.
+    ///
+    /// This is the depth claim for `MTLTextureSwizzleChannels`: six values, all six compared.
+    /// A sweep of all-four-channel swizzles alone would pass a side that read one channel and
+    /// filled the rest from it, which is why the one-channel half is asserted too.
+    ///
+    /// Verified to fail: dropping `TextureSwizzle::Zero` from [`EVERY_SWIZZLE`] fails here naming
+    /// it; dropping [`parent_swizzles`]' second loop fails the per-channel half naming all six.
+    #[test]
+    fn the_inheritance_sweep_states_every_swizzle_value() {
+        let swizzles = parent_swizzles();
+        let mut missing = Vec::new();
+        let mut not_alone = Vec::new();
+        for channel in EVERY_SWIZZLE {
+            let appears = swizzles
+                .iter()
+                .any(|swizzle| swizzle_channels(*swizzle).contains(&channel));
+            if !appears {
+                missing.push(channel.as_raw());
+            }
+            // A swizzle where this value is in one channel and the others are not it: the shape
+            // that tells a per-channel reading from a broadcast one.
+            let alone = swizzles.iter().any(|swizzle| {
+                let channels = swizzle_channels(*swizzle);
+                channels.iter().filter(|held| **held == channel).count() == 1
+            });
+            if !alone {
+                not_alone.push(channel.as_raw());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these `MTLTextureSwizzle` values are compared against Metal nowhere in the suite:              {missing:?}"
+        );
+        assert!(
+            not_alone.is_empty(),
+            "these values appear only with all four channels the same, so a side that broadcast              one channel over the other three would pass every row: {not_alone:?}"
+        );
+        assert!(
+            parents().asks_inherited_swizzles,
+            "the sweep is not switched on in the case that is supposed to run it"
+        );
+        let distinct: BTreeSet<String> = swizzles.iter().copied().map(swizzle_word).collect();
+        assert_eq!(
+            distinct.len(),
+            swizzles.len(),
+            "two rows of the sweep are the same swizzle, so one site name is emitted twice and a \
+             diff cannot say which row moved"
         );
     }
 

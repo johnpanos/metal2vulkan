@@ -10,9 +10,10 @@
 //!
 //! # The cases, and what each one would catch
 //!
-//! - **`resource-own-getters`**: the ten answers of eleven resources — a shared and a private
-//!   buffer of the device's, a shared and a private automatic-heap buffer, placement-heap buffers
-//!   at offsets 0, 256 and 512 and one of length 0, a shared and a private texture, and a view.
+//! - **`resource-own-getters`**: the ten answers of 22 resources — two lengths of a device
+//!   buffer, a shared and a private texture, placement-heap buffers at offsets 0, 256 and 512 and
+//!   one of length 0, a view, and the **whole** mode space of a heap-placed buffer: every storage
+//!   mode against every CPU cache mode against every hazard tracking mode, twelve rows.
 //!   The facts here are relations Metal settles and a descriptor does not: whether a buffer the
 //!   device made answers **no** heap while one placed in a heap answers **that** heap, what
 //!   `heapOffset` a resource outside a heap answers, what a **view's** heap and offset are, and
@@ -26,10 +27,14 @@
 //!   the other two is a different number from one that lost all three or none. The per-row half
 //!   also records whether a placement-heap resource, which the heap never suballocated, answers
 //!   aliasable at all.
-//! - **`resource-purgeable-states`**: the `Volatile`, `Empty`, `KeepCurrent` chain on a buffer of
-//!   the device's, on a heap-placed one and on a texture. Each answer is the state **before** its
-//!   call, so none of the three is the argument handed in, and whether a resource placed in a heap
-//!   answers the chain the same way as one outside it is Metal's to settle.
+//! - **`resource-purgeable-states`**: **every** ordered transition between the three states
+//!   `setPurgeableState:` can put a resource in — nine pairs, both directions of each, each on a
+//!   resource of its own — on a buffer of the device's, a heap-placed one, a placement-heap one
+//!   and a texture. Each answer is the state **before** its call, read through the `KeepCurrent`
+//!   query either side, so none of them is the argument handed in. Both directions are what the
+//!   sweep is for: measured on a shared automatic heap, `Volatile` after `Empty` leaves the object
+//!   **Empty** while `Empty` after `Volatile` takes, so the rule is not symmetric and a sweep in
+//!   one direction could not have said so.
 //! - **`resource-labels`**: [`crate::heap_query::LABEL_CHAIN`] on a buffer, a texture and a view of
 //!   that texture, with the parent's label read **between** the view's sets. Two measured facts:
 //!   whether Metal tells `nil` from `@""` — the runtime answers `Some("")`, which would be a
@@ -52,11 +57,35 @@
 //! - the label chain's own control is the non-empty label: a side that dropped every `setLabel:`
 //!   would answer `nil` where the other answers the label.
 //!
+//! # What each swept mode decides, and what it cannot
+//!
+//! A heap-placed resource never had a descriptor stating a CPU cache mode or a hazard tracking
+//! mode: Metal gives it the **heap's**, which is why the getter sweep moves them through the heap
+//! and why reading them back is Metal's composition rather than the case's own words. Measured
+//! over the twelve mode rows on this chip:
+//!
+//! - **cache mode** gives `cpuCacheMode` 0 and 1, six rows each, and the low nibble of
+//!   `resourceOptions` with it;
+//! - **storage mode** gives `storageMode` 0 and 2, and the option word's storage nibble;
+//! - **hazard tracking mode** gives `hazardTrackingMode` 1 for `Default` **and** for `Untracked`
+//!   and 2 for `Tracked`: three asked values, two answers, and the two that coincide do so by
+//!   Metal's own resolution. The contrast that makes it a measurement is the texture rows, where a
+//!   resource **outside** a heap answers 2 for the same `Default` — so the resolution depends on
+//!   where the resource lives and not on what was asked for;
+//! - the twelve rows together give **eight** distinct `resourceOptions` words, which is the whole
+//!   2 x 2 x 2 of storage, cache and resolved hazard.
+//!
+//! Two things this family cannot sweep, named rather than left implied: a **managed** resource,
+//! because a managed heap is one Metal's validation stops and the suite's texture request states
+//! private-or-shared rather than a storage mode; and a cache or hazard mode on a resource
+//! **outside** a heap, because `Side::zeroed_buffer` and the texture request state neither.
+//!
 //! # Why every case here is safe
 //!
 //! Nothing is encoded, dispatched or committed and no case reaches a queue: resources are made,
-//! getters are read, `makeAliasable` is called and the purgeable chain is asked last. The textures
-//! are 64 by 64 `RGBA8Unorm`, the buffers at most 64 KiB, and the heaps 1 MiB.
+//! getters are read, `makeAliasable` is called, and a resource the transition sweep made is asked
+//! nothing but its own states. The textures are 64 by 64 `RGBA8Unorm`, the buffers at most 64 KiB,
+//! and the heaps 1 MiB; the widest table is the transition sweep's four rows times nine pairs.
 //!
 //! The hazards are the heap descriptor's, named in [`crate::heap_query::HeapSpec`]'s own guard, and
 //! the placement offsets': an offset that is not a multiple of 256, or a placement that runs past
@@ -64,13 +93,15 @@
 
 use crate::case::{Abort, Case, Handle, Input, MetalSource, Side};
 use crate::heap_query::{
-    purgeable_word, HeapBufferSpec, HeapSpec, QueriedResource, LABEL_CHAIN, PURGEABLE_CHAIN,
+    cache_word, hazard_word, purgeable_pairs, purgeable_word, HeapBufferSpec, HeapSpec,
+    QueriedResource, CACHE_MODES, HAZARD_MODES, LABEL_CHAIN,
 };
 use crate::texture::TextureRequest;
 use crate::texture_query::Storage;
 use crate::texture_views::{ParentShape, ViewCall, ViewRequest};
 use crate::transcript::{Node, Observed, Sites, Value};
 use metal2vulkan::metal::PixelFormat;
+use metal2vulkan_runtime::{CpuCacheMode, HazardTrackingMode, PurgeableState};
 
 /// The case names, as the report and the recordings spell them.
 pub const OWN_GETTERS: &str = "resource-own-getters";
@@ -111,8 +142,18 @@ pub enum Row {
     DeviceTexture { storage: Storage },
     /// A view of a device texture: a resource with no memory of its own.
     View,
-    /// `newBufferWithLength:options:` of an automatic heap.
-    HeapBuffer { length: u64, storage: Storage },
+    /// `newBufferWithLength:options:` of an automatic heap of these modes.
+    ///
+    /// The CPU cache mode and the hazard tracking mode are the **heap's**, not the buffer's: Metal
+    /// takes a heap-placed resource's from the heap, and that inheritance is the whole reason they
+    /// are row fields. A buffer never had a descriptor stating either, so reading them back off it
+    /// is Metal reporting what it composed rather than what the case wrote.
+    HeapBuffer {
+        length: u64,
+        storage: Storage,
+        cache: CpuCacheMode,
+        hazard: HazardTrackingMode,
+    },
     /// `newBufferWithLength:options:offset:` of a placement heap.
     PlacedBuffer {
         length: u64,
@@ -128,9 +169,17 @@ impl Row {
             Row::DeviceBuffer { length } => format!("device-buffer-{length}"),
             Row::DeviceTexture { storage } => format!("device-texture-{}", storage.word()),
             Row::View => "view-of-a-device-texture".to_owned(),
-            Row::HeapBuffer { length, storage } => {
-                format!("automatic-heap-buffer-{length}-{}", storage.word())
-            }
+            Row::HeapBuffer {
+                length,
+                storage,
+                cache,
+                hazard,
+            } => format!(
+                "automatic-heap-buffer-{length}-{}-{}-{}",
+                storage.word(),
+                cache_word(*cache),
+                hazard_word(*hazard)
+            ),
             Row::PlacedBuffer {
                 length,
                 offset,
@@ -220,8 +269,17 @@ pub fn all() -> Vec<ResourceFactsCase> {
 /// synchronization no case here encodes, and a managed heap is one Metal's validation stops.
 const BOTH_STORAGE: [Storage; 2] = [Storage::Shared, Storage::Private];
 
-/// Every kind of resource `MTLResource` covers, in every storage mode it takes here, with three
+/// Every kind of resource `MTLResource` covers, and the **whole** mode space a resource can be in:
+/// every storage mode against every CPU cache mode against every hazard tracking mode, with three
 /// placement offsets and a placement of length 0.
+///
+/// The twelve mode rows go through heaps, because that is the only way this vocabulary can put a
+/// resource in a cache mode or a hazard tracking mode at all: `MTLBuffer` and `MTLTexture` take
+/// theirs from the heap they are placed in, and `Side::zeroed_buffer` states none. A row is
+/// therefore `BOTH_STORAGE` x [`crate::heap_query::CACHE_MODES`] x
+/// [`crate::heap_query::HAZARD_MODES`], and `hazardTrackingMode` is the field that makes the
+/// sweep more than a packing check: Metal resolves `Default` on a heap-placed resource, and what
+/// it resolves it to is not what any descriptor said.
 fn own_getters() -> ResourceFactsCase {
     // Two lengths of a device buffer, which is the one row whose storage mode the suite's
     // vocabulary does not vary: the lengths are what keep two such rows apart.
@@ -230,11 +288,17 @@ fn own_getters() -> ResourceFactsCase {
         Row::DeviceBuffer { length: 1 },
     ];
     for storage in BOTH_STORAGE {
-        resources.push(Row::HeapBuffer {
-            length: 4096,
-            storage,
-        });
         resources.push(Row::DeviceTexture { storage });
+        for cache in CACHE_MODES {
+            for hazard in HAZARD_MODES {
+                resources.push(Row::HeapBuffer {
+                    length: 4096,
+                    storage,
+                    cache,
+                    hazard,
+                });
+            }
+        }
     }
     // Three offsets, so `heapOffset` is three values: a side that answered 0 always differs at two
     // sites rather than passing.
@@ -271,6 +335,8 @@ fn aliasing() -> ResourceFactsCase {
         resources.push(Row::HeapBuffer {
             length,
             storage: Storage::Shared,
+            cache: CpuCacheMode::DefaultCache,
+            hazard: HazardTrackingMode::Default,
         });
     }
     resources.push(Row::PlacedBuffer {
@@ -299,6 +365,8 @@ fn purgeable_states() -> ResourceFactsCase {
             Row::HeapBuffer {
                 length: 4096,
                 storage: Storage::Shared,
+                cache: CpuCacheMode::DefaultCache,
+                hazard: HazardTrackingMode::Default,
             },
             Row::PlacedBuffer {
                 length: 4096,
@@ -326,6 +394,8 @@ fn labels() -> ResourceFactsCase {
             Row::HeapBuffer {
                 length: 4096,
                 storage: Storage::Shared,
+                cache: CpuCacheMode::DefaultCache,
+                hazard: HazardTrackingMode::Default,
             },
         ],
     }
@@ -396,8 +466,9 @@ impl Case for ResourceFactsCase {
             }
             Ask::Purgeable => {
                 let mut out = b"setPurgeableState:".to_vec();
-                for state in PURGEABLE_CHAIN {
-                    out.extend(state.raw().to_le_bytes());
+                for (from, to) in purgeable_pairs() {
+                    out.extend(from.raw().to_le_bytes());
+                    out.extend(to.raw().to_le_bytes());
                 }
                 out
             }
@@ -418,6 +489,10 @@ impl Case for ResourceFactsCase {
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
         for row in &self.resources {
+            if matches!(self.ask, Ask::Purgeable) {
+                sites.push(transitions(side, row));
+                continue;
+            }
             let mut node = Node::branch(row.site(), Vec::new());
             // Each row makes its own heap and its own texture, so one row that could not be made
             // leaves the others' answers readable and no row reads an object another row changed.
@@ -434,9 +509,9 @@ impl Case for ResourceFactsCase {
             match self.ask {
                 Ask::OwnGetters => {}
                 Ask::Aliasing => node = aliasing_of(side, &made, node),
-                // Last of everything this case asks of the resource: `Empty` lets Metal discard
-                // its bytes, and nothing is read through it afterwards but the chain's answers.
-                Ask::Purgeable => node = purgeable_of(side, &made, node),
+                // Taken below: the transition sweep makes a resource of its own for every pair,
+                // because a resource already put in one state cannot be the `from` of another.
+                Ask::Purgeable => {}
                 Ask::Labels => node = labels_of(side, &made, node),
             }
             sites.push(node);
@@ -571,8 +646,13 @@ fn make(side: &mut dyn Side, row: &Row) -> Result<Made, crate::case::Failure> {
                 parent: Some(parent),
             })
         }
-        Row::HeapBuffer { length, storage } => {
-            let heap = side.heap(&automatic_heap(storage))?;
+        Row::HeapBuffer {
+            length,
+            storage,
+            cache,
+            hazard,
+        } => {
+            let heap = side.heap(&automatic_heap(storage).cached(cache).tracked(hazard))?;
             let buffer = side.heap_buffer(heap, &HeapBufferSpec::suballocated(length))?;
             Ok(Made {
                 resource: QueriedResource::Buffer(buffer),
@@ -630,17 +710,47 @@ fn aliasing_of(side: &mut dyn Side, made: &Made, mut node: Node) -> Node {
     node
 }
 
-/// The purgeable chain's three answers, each at its own site.
-fn purgeable_of(side: &mut dyn Side, made: &Made, mut node: Node) -> Node {
-    for state in PURGEABLE_CHAIN {
-        let answered = match side.resource_purgeable_state(made.resource, state) {
-            Ok(was) => Value::ok(Value::Uint(was)),
-            Err(failure) => failure.recorded(),
+/// Every ordered transition between the three purgeable states, each on a resource of `row` made
+/// for that pair alone.
+///
+/// Four answers a pair, and only the last is a query of ours: the state Metal **made** the
+/// resource in, the state before `from` was set, the state before `to` was set — which is what
+/// `from` resolved to, and the transition's own answer — and the state `to` left behind.
+/// [`crate::heap_query::purgeable_pairs`] says why both directions and the same-state pairs are
+/// in it.
+///
+/// `Empty` is asked in both directions, which is why each pair gets its own resource: nothing is
+/// read through a resource after it has been emptied but these answers.
+fn transitions(side: &mut dyn Side, row: &Row) -> Node {
+    let mut node = Node::branch(row.site(), Vec::new());
+    for (from, to) in purgeable_pairs() {
+        let at = format!(
+            "{}/{}-then-{}",
+            site::PURGEABLE,
+            purgeable_word(from),
+            purgeable_word(to)
+        );
+        let made = match make(side, row) {
+            Ok(made) => made,
+            Err(failure) => {
+                node = node.with(Node::leaf(at, Observed::value(failure.recorded())));
+                continue;
+            }
         };
-        node = node.with(Node::leaf(
-            format!("{}/{}", site::PURGEABLE, purgeable_word(state)),
-            Observed::value(answered),
-        ));
+        let mut pair = Node::branch(at, Vec::new());
+        for (name, state) in [
+            ("fresh", PurgeableState::KeepCurrent),
+            ("from", from),
+            ("to", to),
+            ("read-back", PurgeableState::KeepCurrent),
+        ] {
+            let answered = match side.resource_purgeable_state(made.resource, state) {
+                Ok(was) => Value::ok(Value::Uint(was)),
+                Err(failure) => failure.recorded(),
+            };
+            pair = pair.with(Node::leaf(name, Observed::value(answered)));
+        }
+        node = node.with(pair);
     }
     node
 }
@@ -677,6 +787,7 @@ fn labels_of(side: &mut dyn Side, made: &Made, mut node: Node) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heap_query::PURGEABLE_STATES;
     use std::collections::BTreeSet;
 
     /// No row and no heap of the family is one Metal's validation stops.
@@ -764,6 +875,81 @@ mod tests {
             "{} placement offsets, so a side answering a constant `heapOffset` would differ at no \
              site: {offsets:?}",
             offsets.len()
+        );
+    }
+
+    /// The getter sweep states the **whole** mode space a heap-placed resource can be in: every
+    /// storage mode against every CPU cache mode against every hazard tracking mode.
+    ///
+    /// This is the depth claim for `MTLResource`'s three mode getters. A table that stated one
+    /// cache mode would compare `cpuCacheMode` and the low nibble of `resourceOptions` at one
+    /// value, and a side that dropped the field entirely would pass.
+    ///
+    /// Verified to fail: dropping the inner `HAZARD_MODES` loop from [`own_getters`] fails here
+    /// naming the eight missing combinations, and pinning its `cache` to `DefaultCache` fails
+    /// naming six.
+    #[test]
+    fn the_getter_sweep_states_every_inherited_mode_combination() {
+        let rows: BTreeSet<String> = own_getters().resources.iter().map(Row::site).collect();
+        let mut missing = Vec::new();
+        for storage in BOTH_STORAGE {
+            for cache in CACHE_MODES {
+                for hazard in HAZARD_MODES {
+                    let row = Row::HeapBuffer {
+                        length: 4096,
+                        storage,
+                        cache,
+                        hazard,
+                    };
+                    if !rows.contains(&row.site()) {
+                        missing.push(row.site());
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "no case puts a resource in these modes, so Metal's answer for them is compared \
+             nowhere in the suite: {}",
+            missing.join(", ")
+        );
+    }
+
+    /// The transition sweep holds every ordered pair of the three settable purgeable states, in
+    /// both directions, and reads each through the query that changes nothing.
+    ///
+    /// Verified to fail: filtering `purgeable_pairs` to `from != to` fails here naming the three
+    /// same-state pairs it drops.
+    #[test]
+    fn the_transition_sweep_holds_every_ordered_pair() {
+        let pairs: BTreeSet<(u64, u64)> = purgeable_pairs()
+            .into_iter()
+            .map(|(from, to)| (from.raw(), to.raw()))
+            .collect();
+        let mut missing = Vec::new();
+        for from in PURGEABLE_STATES {
+            for to in PURGEABLE_STATES {
+                if !pairs.contains(&(from.raw(), to.raw())) {
+                    missing.push(format!(
+                        "{}-then-{}",
+                        purgeable_word(from),
+                        purgeable_word(to)
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the sweep never asks these transitions of a resource: {}",
+            missing.join(", ")
+        );
+        assert!(
+            purgeable_states()
+                .resources
+                .iter()
+                .any(|row| matches!(row, Row::DeviceTexture { .. })),
+            "no texture in the transition table, and a texture is the one resource whose states \
+             this chip was measured to walk at all"
         );
     }
 

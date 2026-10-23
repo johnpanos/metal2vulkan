@@ -485,6 +485,35 @@ pub const PURGEABLE_CHAIN: [PurgeableState; 3] = [
     PurgeableState::KeepCurrent,
 ];
 
+/// The three states `setPurgeableState:` can **put** an object in.
+///
+/// `MTLPurgeableState` has four values and this is all of them but `KeepCurrent`, which is not a
+/// state at all: it is the query that reads one back without changing it, and it is how every
+/// transition below is observed rather than a place a transition can go.
+pub const PURGEABLE_STATES: [PurgeableState; 3] = [
+    PurgeableState::NonVolatile,
+    PurgeableState::Volatile,
+    PurgeableState::Empty,
+];
+
+/// Every ordered transition between [`PURGEABLE_STATES`], including each state to itself: nine
+/// pairs, each of which a case asks of an object of its own.
+///
+/// Both directions of each pair are in it by construction — `(a, b)` and `(b, a)` are separate
+/// elements — which is the whole point: Metal's answer to `Volatile` after `Empty` need not be the
+/// mirror of its answer to `Empty` after `Volatile`, and a sweep in one direction could not tell.
+/// The same-state pairs are in it because "set what it already is" is the one place a side could
+/// answer the argument it was handed instead of the state before the call.
+pub fn purgeable_pairs() -> Vec<(PurgeableState, PurgeableState)> {
+    let mut pairs = Vec::new();
+    for from in PURGEABLE_STATES {
+        for to in PURGEABLE_STATES {
+            pairs.push((from, to));
+        }
+    }
+    pairs
+}
+
 /// The labels every label case sets, in order, and what each is for.
 ///
 /// - `""` first: whether Metal tells a label set to the empty string from a label never set is a

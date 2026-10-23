@@ -35,7 +35,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "c249306264883b605186628fe60d4772915d8dc692409a78368688b237be6c5c"
+                          "hex": "3c8fd80bbcf0e387eaaedfa834f0219a9f79791d200cd496fb81c0ccc5acb589"
                         }
                       }
                     },
@@ -1402,7 +1402,7 @@
                   ]
                 },
                 {
-                  "name": "automatic-heap-buffer-4096-shared",
+                  "name": "automatic-heap-buffer-4096-shared-default-cache-hazard-default",
                   "observed": {
                     "value": "absent"
                   },

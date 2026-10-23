@@ -12,14 +12,16 @@
 //!
 //! # The cases, and what each one would catch
 //!
-//! - **`heap-own-getters`**: twelve heaps — both types, both storage modes a heap takes, both CPU
-//!   cache modes and all three hazard tracking modes — each one's ten answers. The row that
+//! - **`heap-own-getters`**: 24 heaps, which is the **whole** cross product of the four fields
+//!   this vocabulary states — both heap types, both storage modes a heap takes, both CPU cache
+//!   modes and all three hazard tracking modes — each one's ten answers. The row that
 //!   matters most is `hazardTrackingMode` of a heap whose descriptor said `Default`: the runtime
 //!   models it as **untracked**, which is the opposite of what a resource outside a heap resolves
 //!   to, and nothing in this tree had asked Metal. A release where Apple resolves it the other way
 //!   changes which barriers a consumer needs, and this is the case that would say so.
-//! - **`heap-available-sizes`**: `maxAvailableSizeWithAlignment:` at seven alignments on an
-//!   automatic heap, read **three times** — fresh, after one buffer is placed, and after a second
+//! - **`heap-available-sizes`**: `maxAvailableSizeWithAlignment:` at ten alignments — every power
+//!   of two that is a boundary of something, from 1 to one past the whole heap — read **three
+//!   times** on each heap: fresh, after one buffer is placed, and after a second
 //!   — with the heap's `usedSize` and `currentAllocatedSize` beside each reading, and the same
 //!   sweep on a placement heap. This is where Metal's own suballocator is the only possible
 //!   oracle: the runtime models the longest free run at a multiple of the alignment, 0 for a
@@ -34,9 +36,11 @@
 //!   it is 0 at every row: an automatic heap's buffer reports no offset, so the suballocator's own
 //!   placement is not observable through `MTLResource` at all. That is a hole this family names
 //!   rather than one it closes.
-//! - **`heap-purgeable-states`**: the `Volatile`, `Empty`, `KeepCurrent` chain on a shared and on a
-//!   private automatic heap. Every answer is the state **before** its call, so the three readings
-//!   are a transcript of Metal's own transition rule and none of them is the argument handed in.
+//! - **`heap-purgeable-states`**: **every** ordered transition between the three states
+//!   `setPurgeableState:` can put a heap in — nine pairs, both directions of each, each on a heap
+//!   of its own — on all four heaps of both types and both storage modes. Every answer is the
+//!   state **before** its call, read through the `KeepCurrent` query either side, so a pair is a
+//!   transcript of Metal's own transition rule and not the argument handed in.
 //! - **`heap-labels`**: a heap's `label` before anything set one, then through
 //!   [`crate::heap_query::LABEL_CHAIN`]. The first reading and the empty-string readings are the
 //!   measured ones: whether Metal tells `nil` from `@""` is a fact about its own storage of the
@@ -54,11 +58,46 @@
 //! a number nothing in the case wrote. A run that read a heap nobody made would answer the
 //! unmade-handle refusal at every site rather than a size of 16384.
 //!
+//! # What each swept field decides, and what it cannot
+//!
+//! A sweep makes vacuity cheaper to hide, so each field says here what changes when it moves,
+//! measured on this chip:
+//!
+//! - **hazard tracking mode** decides `hazardTrackingMode`, which Metal **resolves**: measured
+//!   over all 24, a descriptor saying `Default` answers `Untracked` (1) and one saying `Tracked`
+//!   answers 2. So three asked values give **two** answers, and `Default` and `Untracked` are
+//!   indistinguishable through every getter a heap has, `resourceOptions` included — that is
+//!   Metal's own resolution and not a gap in the sweep. What it buys is the contrast with a
+//!   resource **outside** a heap, where [`crate::cases::resource_facts`] measures `Default`
+//!   resolving to `Tracked` instead.
+//! - **CPU cache mode** decides `cpuCacheMode` and the low nibble of `resourceOptions`:
+//!   write-combined reads 1 where the default reads 0.
+//! - **storage mode** decides `storageMode` and the storage nibble of `resourceOptions`: a shared
+//!   heap's word is 0x100 and a private one's 0x120 at the same cache and hazard modes. Read on
+//!   its own, `storageMode` is the one field of the four whose answer is the value the descriptor
+//!   was given, and is named here as such; `resourceOptions` is where it is composed with the
+//!   other two, which is Metal's doing and not the case's.
+//! - **heap type** decides `maxAvailableSizeWithAlignment:` outright — a placement heap answers 0
+//!   at every one of the ten alignments and an automatic heap answers its free run — and decides
+//!   which placement call the heap takes at all.
+//! - **the alignment** decides nothing on a **fresh** automatic heap, which answers its whole
+//!   1048576 even at an alignment twice the heap's size, and decides a great deal once something
+//!   is placed: after two placements the same heap answers 978944 up to an alignment of 4096,
+//!   966656 at 16 KiB, 917504 at 64 KiB, and **0** at the heap's own size and above. Both ends of
+//!   the sweep earn their rows — the far end is 0 where the near end was the whole heap.
+//! - **size** decides `size` and `currentAllocatedSize` after Metal's own rounding.
+//!
+//! The pair that is indistinguishable by construction is named rather than swept: a heap's
+//! `label` does not interact with any of the five, so the label case states one heap of each type
+//! and no more.
+//!
 //! # Why every case here is safe
 //!
 //! Nothing is encoded, dispatched or committed and no case reaches a queue: a heap is made, its
-//! getters are read, at most two buffers are placed in it, and the purgeable-state call is asked
-//! last of whatever asks it. The largest heap of the family is 1 MiB.
+//! getters are read, at most two buffers are placed in it, and the purgeable-state calls are the
+//! only thing asked of a heap the transition sweep made. The largest heap of the family is 1 MiB,
+//! and the widest table is the transition sweep's 36 of them — 36 MiB, well inside the project's
+//! ceiling.
 //!
 //! The hazards a heap descriptor carries are named in [`crate::heap_query::HeapSpec`]'s own guard —
 //! a sparse type, managed storage, a size of 0 — and this module's own tests hold every table to it with no
@@ -67,12 +106,12 @@
 
 use crate::case::{Abort, Case, Handle, Input, MetalSource, Side};
 use crate::heap_query::{
-    purgeable_word, HeapBufferSpec, HeapSpec, QueriedResource, CACHE_MODES, HAZARD_MODES,
-    LABEL_CHAIN, PURGEABLE_CHAIN,
+    purgeable_pairs, purgeable_word, HeapBufferSpec, HeapSpec, QueriedResource, CACHE_MODES,
+    HAZARD_MODES, LABEL_CHAIN,
 };
 use crate::texture_query::Storage;
 use crate::transcript::{Node, Observed, Sites, Value};
-use metal2vulkan_runtime::HeapType;
+use metal2vulkan_runtime::{HeapType, PurgeableState};
 
 /// The case names, as the report and the recordings spell them.
 pub const OWN_GETTERS: &str = "heap-own-getters";
@@ -81,19 +120,35 @@ pub const PLACED_BUFFERS: &str = "heap-placed-buffer-sizes";
 pub const PURGEABLE: &str = "heap-purgeable-states";
 pub const LABELS: &str = "heap-labels";
 
-/// The alignments the available-size sweep asks about: 1, the 256-byte placement grain either
-/// side, and up to a 64-KiB page.
+/// The alignments the available-size sweep asks about: every power of two that is a boundary of
+/// something, from the smallest to past the heap itself.
+///
+/// 1 is the least an alignment can be; 2 is the first that can round anything; 128, 256 and 257's
+/// neighbours sit either side of Metal's 256-byte placement grain; 4096, 16 KiB and 64 KiB are the
+/// page sizes a Metal heap is laid out in; `SIZE` is the alignment that equals the whole heap, and
+/// `SIZE << 1` is one larger than the heap can satisfy, which is the boundary on the far side.
+/// A sweep of representative values would miss both ends, and the far end is where a model that
+/// clamps differently from Metal's own allocator shows.
 ///
 /// Every one a power of two, which is what [`crate::heap_query`] says the sweep is kept inside: an
 /// alignment of 0 is a shape nothing in this tree says Metal takes, and any other non-power-of-two
 /// is one the runtime refuses `Invalid`.
-const ALIGNMENTS: [u64; 7] = [1, 2, 16, 128, 256, 4096, 1 << 16];
+const ALIGNMENTS: [u64; 10] = [1, 2, 16, 128, 256, 4096, 1 << 14, 1 << 16, SIZE, SIZE << 1];
 
 /// The storage modes a heap of this family takes.
 ///
 /// Two, not three: Metal's validation stops a managed heap, which
 /// [`HeapSpec::is_well_formed`](crate::heap_query::HeapSpec::is_well_formed) refuses outright.
 const BOTH_STORAGE: [Storage; 2] = [Storage::Shared, Storage::Private];
+
+/// The heap types every table of the family sweeps.
+///
+/// Two of `MTLHeapType`'s three. `Sparse` is the third and is not here: a sparse heap's size must
+/// be a multiple of the device's sparse tile size and its resources are made through a different
+/// call, so a row of it would be a different family rather than a deeper one, and
+/// [`HeapSpec::is_well_formed`](crate::heap_query::HeapSpec::is_well_formed) refuses it outright.
+/// [`crate::cases::sparse_heaps`] is where the suite asks about sparse memory.
+const HEAP_TYPES: [HeapType; 2] = [HeapType::Automatic, HeapType::Placement];
 
 /// The heap size every case of the family asks for: 1 MiB, as
 /// [`crate::cases::sparse_heaps`]' is, so a reader can put the two families' figures beside each
@@ -142,29 +197,26 @@ pub fn all() -> Vec<HeapFactsCase> {
     ]
 }
 
-/// Both heap types in both storage modes, then one storage mode across both CPU cache modes and
-/// all three hazard tracking modes.
+/// Every well-formed `MTLHeapDescriptor` this vocabulary can state: both heap types across both
+/// storage modes, both CPU cache modes and all three hazard tracking modes, as a full cross
+/// product — [`HEAP_TYPES`] x [`BOTH_STORAGE`] x [`CACHE_MODES`] x [`HAZARD_MODES`], 24 heaps.
 ///
-/// The second half is what makes the first half mean something: a table that only ever stated
-/// Metal's defaults would record one answer for `cpuCacheMode` and one for `hazardTrackingMode`,
-/// and a reading that ignored the descriptor entirely would look exactly the same.
+/// A cross product rather than one sweep per field, because the four interact: `resourceOptions`
+/// packs three of them into one word and Metal **resolves** the fourth, so a table that moved one
+/// field at a time could not tell a packing that drops a field in one combination from one that
+/// drops it everywhere. 24 descriptors is the whole space, not a selection, so there is no row to
+/// argue about.
 fn own_getters() -> HeapFactsCase {
     let mut heaps = Vec::new();
-    for heap_type in [HeapType::Automatic, HeapType::Placement] {
+    for heap_type in HEAP_TYPES {
         for storage in BOTH_STORAGE {
-            heaps.push(of_type(heap_type, SIZE, storage));
-        }
-    }
-    for heap_type in [HeapType::Automatic, HeapType::Placement] {
-        for cache in CACHE_MODES {
-            for hazard in HAZARD_MODES {
-                // One storage mode here, because the field under test is the other two: shared,
-                // so the CPU cache mode is a mode the memory could honestly have.
-                let heap = of_type(heap_type, SIZE, Storage::Shared)
-                    .cached(cache)
-                    .tracked(hazard);
-                if !heaps.contains(&heap) {
-                    heaps.push(heap);
+            for cache in CACHE_MODES {
+                for hazard in HAZARD_MODES {
+                    heaps.push(
+                        of_type(heap_type, SIZE, storage)
+                            .cached(cache)
+                            .tracked(hazard),
+                    );
                 }
             }
         }
@@ -180,7 +232,7 @@ fn own_getters() -> HeapFactsCase {
 /// each three times, so four heaps is twelve readings of seven alignments.
 fn available_sizes() -> HeapFactsCase {
     let mut heaps = Vec::new();
-    for heap_type in [HeapType::Automatic, HeapType::Placement] {
+    for heap_type in HEAP_TYPES {
         for storage in BOTH_STORAGE {
             heaps.push(of_type(heap_type, SIZE, storage));
         }
@@ -208,14 +260,15 @@ fn placed_buffers() -> HeapFactsCase {
     }
 }
 
-/// An automatic and a placement heap in both storage modes, for the purgeable chain.
+/// An automatic and a placement heap in both storage modes, each walked through **every** ordered
+/// transition between the three purgeable states ([`crate::heap_query::purgeable_pairs`]).
 ///
 /// The storage mode is in it because the runtime's model parts on it: emptying a shared heap may
 /// discard its bytes where emptying a private one does not, and whether the **answers** part too
 /// is what this records.
 fn purgeable_states() -> HeapFactsCase {
     let mut heaps = Vec::new();
-    for heap_type in [HeapType::Automatic, HeapType::Placement] {
+    for heap_type in HEAP_TYPES {
         for storage in BOTH_STORAGE {
             heaps.push(of_type(heap_type, SIZE, storage));
         }
@@ -328,8 +381,9 @@ impl Case for HeapFactsCase {
             }
             Ask::Purgeable => {
                 let mut out = b"setPurgeableState:".to_vec();
-                for state in PURGEABLE_CHAIN {
-                    out.extend(state.raw().to_le_bytes());
+                for (from, to) in purgeable_pairs() {
+                    out.extend(from.raw().to_le_bytes());
+                    out.extend(to.raw().to_le_bytes());
                 }
                 out
             }
@@ -350,6 +404,13 @@ impl Case for HeapFactsCase {
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
         for spec in &self.heaps {
+            // The transition sweep needs a heap of its own for every pair — a heap already put in
+            // one state cannot be the `from` of another — so it makes its heaps itself rather
+            // than reading the one heap the other asks share.
+            if matches!(self.ask, Ask::Purgeable) {
+                sites.push(transitions(side, spec));
+                continue;
+            }
             let mut node = Node::branch(spec.site(), Vec::new());
             // A heap the venue cannot make is recorded at its own site and the sweep goes on: the
             // other heaps' answers stay readable instead of being lost behind an abort.
@@ -374,10 +435,8 @@ impl Case for HeapFactsCase {
                 Ask::OwnGetters => {}
                 Ask::AvailableSizes => node = self.available(side, spec, heap, node),
                 Ask::PlacedBuffers => node = self.placed(side, heap, node),
-                // Last of everything this case asks of the heap, which is what
-                // `crate::heap_query` says the ordering is for: `Empty` lets Metal discard the
-                // heap's bytes.
-                Ask::Purgeable => node = purgeable(side, heap, node),
+                // Taken above: the transition sweep makes a heap of its own for every pair.
+                Ask::Purgeable => {}
                 Ask::Labels => node = labelled(side, heap, node),
             }
             sites.push(node);
@@ -477,17 +536,52 @@ fn available_sizes_at(side: &mut dyn Side, heap: Handle, round: &str) -> Node {
     node
 }
 
-/// The purgeable chain's three answers, each at its own site.
-fn purgeable(side: &mut dyn Side, heap: Handle, mut node: Node) -> Node {
-    for state in PURGEABLE_CHAIN {
-        let answered = match side.heap_purgeable_state(heap, state) {
-            Ok(was) => Value::ok(Value::Uint(was)),
-            Err(failure) => failure.recorded(),
+/// Every ordered transition between the three purgeable states, each on a heap of `spec` made for
+/// that pair alone.
+///
+/// Each pair records four answers, and only the last is a query of ours:
+///
+/// - `fresh`: `KeepCurrent`, which changes nothing, so this is the state Metal **made** the heap
+///   in — a fact no descriptor states;
+/// - `from`: the state before `from` was set, which is `fresh` again if Metal is consistent;
+/// - `to`: the state before `to` was set, which is what `from` **resolved** to. This is the
+///   transition's own answer, and for a pair whose two states differ it can never be the argument
+///   the call was handed;
+/// - `read-back`: `KeepCurrent` again, so the state `to` left behind is read rather than assumed.
+///
+/// `Empty` is in the sweep in both directions, which is why each pair gets its own heap: nothing
+/// is read through a heap after it has been emptied but these answers, and the heap is dropped
+/// with the pair.
+fn transitions(side: &mut dyn Side, spec: &HeapSpec) -> Node {
+    let mut node = Node::branch(spec.site(), Vec::new());
+    for (from, to) in purgeable_pairs() {
+        let at = format!(
+            "{}/{}-then-{}",
+            site::PURGEABLE,
+            purgeable_word(from),
+            purgeable_word(to)
+        );
+        let heap = match side.heap(spec) {
+            Ok(heap) => heap,
+            Err(failure) => {
+                node = node.with(Node::leaf(at, Observed::value(failure.recorded())));
+                continue;
+            }
         };
-        node = node.with(Node::leaf(
-            format!("{}/{}", site::PURGEABLE, purgeable_word(state)),
-            Observed::value(answered),
-        ));
+        let mut pair = Node::branch(at, Vec::new());
+        for (name, state) in [
+            ("fresh", PurgeableState::KeepCurrent),
+            ("from", from),
+            ("to", to),
+            ("read-back", PurgeableState::KeepCurrent),
+        ] {
+            let answered = match side.heap_purgeable_state(heap, state) {
+                Ok(was) => Value::ok(Value::Uint(was)),
+                Err(failure) => failure.recorded(),
+            };
+            pair = pair.with(Node::leaf(name, Observed::value(answered)));
+        }
+        node = node.with(pair);
     }
     node
 }
@@ -519,7 +613,7 @@ fn labelled(side: &mut dyn Side, heap: Handle, mut node: Node) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_query::{cache_word, hazard_word, heap_type_word};
+    use crate::heap_query::{cache_word, hazard_word, heap_type_word, PURGEABLE_STATES};
     use metal2vulkan_runtime::{CpuCacheMode, HazardTrackingMode};
     use std::collections::BTreeSet;
 
@@ -676,23 +770,106 @@ mod tests {
         );
     }
 
-    /// The purgeable chain reads a state back after it set it, which is the only thing that makes
-    /// its three answers a transition rule rather than three echoes.
+    /// The purgeable sweep holds **every** ordered pair of the three settable states, both
+    /// directions of each, and nothing else.
     ///
-    /// Verified to fail: a chain of `[Volatile, Volatile, Volatile]` fails here.
+    /// This is the depth claim: `MTLPurgeableState` has four values, the sweep sets the three that
+    /// are states, and `KeepCurrent` — the fourth — is the query every transition is read through.
+    /// A sweep that held one direction of a pair would pass a side whose answer to `Volatile`
+    /// after `Empty` is right and whose answer the other way round is not.
+    ///
+    /// Verified to fail: filtering `purgeable_pairs` to `from != to` fails here naming the three
+    /// missing pairs; keeping only pairs where `from.raw() < to.raw()` fails naming the other
+    /// direction of each.
     #[test]
-    fn the_purgeable_chain_asks_three_different_states_and_ends_in_a_query() {
-        let states: BTreeSet<u64> = PURGEABLE_CHAIN.iter().map(|state| state.raw()).collect();
-        assert_eq!(
-            states.len(),
-            PURGEABLE_CHAIN.len(),
-            "two calls of the chain hand the same state, so one of them reads nothing new"
+    fn the_purgeable_sweep_holds_every_ordered_pair_of_the_settable_states() {
+        let pairs: BTreeSet<(u64, u64)> = purgeable_pairs()
+            .into_iter()
+            .map(|(from, to)| (from.raw(), to.raw()))
+            .collect();
+        let mut missing = Vec::new();
+        for from in PURGEABLE_STATES {
+            for to in PURGEABLE_STATES {
+                if !pairs.contains(&(from.raw(), to.raw())) {
+                    missing.push(format!(
+                        "{}-then-{}",
+                        purgeable_word(from),
+                        purgeable_word(to)
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the sweep never asks these transitions, so nothing in the suite compares Metal's \
+             answer to them: {}",
+            missing.join(", ")
         );
         assert_eq!(
-            PURGEABLE_CHAIN.last().map(|state| purgeable_word(*state)),
-            Some("keep-current".to_owned()),
-            "the chain does not end in the query that changes nothing, so its last answer is not \
-             a reading of what the call before it did"
+            pairs.len(),
+            PURGEABLE_STATES.len() * PURGEABLE_STATES.len(),
+            "the sweep asks a pair twice, which costs a row and measures nothing new"
+        );
+        assert!(
+            !PURGEABLE_STATES.contains(&PurgeableState::KeepCurrent),
+            "`KeepCurrent` is the query every transition is read through, not a state a \
+             transition can go to"
+        );
+    }
+
+    /// The available-size sweep asks at both ends of what an alignment can be, not only in the
+    /// middle: 1, and an alignment larger than the whole heap.
+    ///
+    /// Verified to fail: dropping `SIZE << 1` from [`ALIGNMENTS`] fails here, as does dropping 1.
+    #[test]
+    fn the_alignment_sweep_reaches_both_boundaries() {
+        assert!(
+            ALIGNMENTS.contains(&1),
+            "no alignment of 1, the least one can be"
+        );
+        assert!(
+            ALIGNMENTS.iter().any(|alignment| *alignment > SIZE),
+            "no alignment larger than the heap, so nothing asks what Metal answers where the \
+             request cannot be satisfied at all"
+        );
+        assert!(
+            ALIGNMENTS.contains(&256),
+            "no alignment at Metal's placement grain"
+        );
+    }
+
+    /// The getter sweep is the **whole** cross product of the four descriptor fields the
+    /// vocabulary states, so no combination of them goes uncompared.
+    ///
+    /// Verified to fail: dropping `HAZARD_MODES`' last mode from [`own_getters`]' innermost loop
+    /// fails here with the count, and so does skipping one `(storage, cache)` pair.
+    #[test]
+    fn the_getter_sweep_is_the_whole_descriptor_space() {
+        let heaps: BTreeSet<String> = own_getters().heaps.iter().map(|heap| heap.site()).collect();
+        let mut missing = Vec::new();
+        for heap_type in HEAP_TYPES {
+            for storage in BOTH_STORAGE {
+                for cache in CACHE_MODES {
+                    for hazard in HAZARD_MODES {
+                        let heap = of_type(heap_type, SIZE, storage)
+                            .cached(cache)
+                            .tracked(hazard);
+                        if !heaps.contains(&heap.site()) {
+                            missing.push(heap.site());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these descriptors are never handed to Metal anywhere in the suite: {}",
+            missing.join(", ")
+        );
+        assert_eq!(
+            heaps.len(),
+            HEAP_TYPES.len() * BOTH_STORAGE.len() * CACHE_MODES.len() * HAZARD_MODES.len(),
+            "the table is not the cross product: a row is repeated or one is spelled twice"
         );
     }
 
