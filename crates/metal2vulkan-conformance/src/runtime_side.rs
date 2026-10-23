@@ -33,7 +33,10 @@ use crate::indirect_commands::{
     CommandsMade, ComputeCommandStep, EncodedCommand, IcbDescriptor, RenderCommandStep,
 };
 use crate::library_facts::{FunctionDescriptorSpec, LibraryFacts};
-use crate::mesh_descriptors::{ DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists, AWAY as MESH_AWAY, };
+use crate::mesh_descriptors::{
+    DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists,
+    AWAY as MESH_AWAY,
+};
 use crate::pipeline_facts::{ComputeStateFacts, ComputeStateSpec, RenderStateFacts};
 use crate::queue_slots::QueueSlots;
 use crate::render::{

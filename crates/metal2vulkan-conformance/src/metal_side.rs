@@ -38,7 +38,10 @@ use crate::indirect_commands::{
     CommandsMade, ComputeCommandStep, EncodedCommand, IcbDescriptor, RenderCommandStep,
 };
 use crate::library_facts::{FunctionDescriptorSpec, LibraryFacts};
-use crate::mesh_descriptors::{ DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists, AWAY as MESH_AWAY, };
+use crate::mesh_descriptors::{
+    DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists,
+    AWAY as MESH_AWAY,
+};
 use crate::pipeline_facts::{ComputeStateFacts, ComputeStateSpec, RenderStateFacts};
 use crate::queue_slots::QueueSlots;
 use crate::render::{
@@ -78,31 +81,12 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCompareFunction, MTLComputeCommandEncoder,
     MTLComputePipelineDescriptor, MTLComputePipelineReflection, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLCullMode, MTLDataType, MTLDepthClipMode,
-    MTLDepthStencilDescriptor,
-    MTLDepthStencilState,
-    MTLDevice,
-    MTLDispatchType,
-    MTLDynamicLibrary,
-    MTLEvent,
-    MTLFunction,
-    MTLFunctionConstant,
-    MTLFunctionConstantValues,
-    MTLFunctionDescriptor,
-    MTLFunctionOptions,
-    MTLHeap,
-    MTLHeapDescriptor,
-    MTLHeapType,
-    MTLIndexType,
-    MTLIndirectCommandBuffer,
-    MTLIndirectCommandBufferDescriptor,
-    MTLIndirectCommandType,
-    MTLIndirectComputeCommand,
-    MTLIndirectRenderCommand,
-    MTLLibrary,
-    MTLLinkedFunctions,
-    MTLLoadAction,
-    MTLMeshRenderPipelineDescriptor,
-    MTLMultisampleDepthResolveFilter,
+    MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLDispatchType, MTLDynamicLibrary,
+    MTLEvent, MTLFunction, MTLFunctionConstant, MTLFunctionConstantValues, MTLFunctionDescriptor,
+    MTLFunctionOptions, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLIndexType,
+    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
+    MTLIndirectComputeCommand, MTLIndirectRenderCommand, MTLLibrary, MTLLinkedFunctions,
+    MTLLoadAction, MTLMeshRenderPipelineDescriptor, MTLMultisampleDepthResolveFilter,
     MTLMultisampleStencilResolveFilter, MTLMutability, MTLOrigin, MTLPipelineBufferDescriptor,
     MTLPipelineBufferDescriptorArray, MTLPipelineOption, MTLPixelFormat, MTLPointerType,
     MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLRasterizationRateLayerDescriptor,
