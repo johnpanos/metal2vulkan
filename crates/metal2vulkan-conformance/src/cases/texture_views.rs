@@ -746,8 +746,8 @@ mod tests {
     /// A sweep of all-four-channel swizzles alone would pass a side that read one channel and
     /// filled the rest from it, which is why the one-channel half is asserted too.
     ///
-    /// Verified to fail: dropping `TextureSwizzle::Zero` from [`EVERY_SWIZZLE`] fails here naming
-    /// it; dropping [`parent_swizzles`]' second loop fails the per-channel half naming all six.
+    /// Verified to fail: emptying [`parent_swizzles`]' second loop, so every row states a swizzle
+    /// whose four channels agree, fails the per-channel half here naming all six values.
     #[test]
     fn the_inheritance_sweep_states_every_swizzle_value() {
         let swizzles = parent_swizzles();

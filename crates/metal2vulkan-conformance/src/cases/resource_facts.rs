@@ -885,9 +885,8 @@ mod tests {
     /// cache mode would compare `cpuCacheMode` and the low nibble of `resourceOptions` at one
     /// value, and a side that dropped the field entirely would pass.
     ///
-    /// Verified to fail: dropping the inner `HAZARD_MODES` loop from [`own_getters`] fails here
-    /// naming the eight missing combinations, and pinning its `cache` to `DefaultCache` fails
-    /// naming six.
+    /// Verified to fail: taking only the first of `CACHE_MODES` in [`own_getters`] fails here,
+    /// naming the six write-combined combinations it leaves out.
     #[test]
     fn the_getter_sweep_states_every_inherited_mode_combination() {
         let rows: BTreeSet<String> = own_getters().resources.iter().map(Row::site).collect();
@@ -918,8 +917,8 @@ mod tests {
     /// The transition sweep holds every ordered pair of the three settable purgeable states, in
     /// both directions, and reads each through the query that changes nothing.
     ///
-    /// Verified to fail: filtering `purgeable_pairs` to `from != to` fails here naming the three
-    /// same-state pairs it drops.
+    /// Verified to fail: keeping only the pairs where `from.raw() <= to.raw()` in
+    /// [`crate::heap_query::purgeable_pairs`] fails here, naming the three it drops.
     #[test]
     fn the_transition_sweep_holds_every_ordered_pair() {
         let pairs: BTreeSet<(u64, u64)> = purgeable_pairs()

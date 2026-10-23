@@ -778,9 +778,9 @@ mod tests {
     /// A sweep that held one direction of a pair would pass a side whose answer to `Volatile`
     /// after `Empty` is right and whose answer the other way round is not.
     ///
-    /// Verified to fail: filtering `purgeable_pairs` to `from != to` fails here naming the three
-    /// missing pairs; keeping only pairs where `from.raw() < to.raw()` fails naming the other
-    /// direction of each.
+    /// Verified to fail: keeping only the pairs where `from.raw() <= to.raw()` in
+    /// [`crate::heap_query::purgeable_pairs`] fails here, naming the three transitions it drops —
+    /// one direction of every pair whose two states differ.
     #[test]
     fn the_purgeable_sweep_holds_every_ordered_pair_of_the_settable_states() {
         let pairs: BTreeSet<(u64, u64)> = purgeable_pairs()
@@ -820,7 +820,8 @@ mod tests {
     /// The available-size sweep asks at both ends of what an alignment can be, not only in the
     /// middle: 1, and an alignment larger than the whole heap.
     ///
-    /// Verified to fail: dropping `SIZE << 1` from [`ALIGNMENTS`] fails here, as does dropping 1.
+    /// Verified to fail: dropping `SIZE << 1` from [`ALIGNMENTS`] fails here, naming the missing
+    /// far boundary.
     #[test]
     fn the_alignment_sweep_reaches_both_boundaries() {
         assert!(
@@ -841,8 +842,8 @@ mod tests {
     /// The getter sweep is the **whole** cross product of the four descriptor fields the
     /// vocabulary states, so no combination of them goes uncompared.
     ///
-    /// Verified to fail: dropping `HAZARD_MODES`' last mode from [`own_getters`]' innermost loop
-    /// fails here with the count, and so does skipping one `(storage, cache)` pair.
+    /// Verified to fail: taking only the first two of `HAZARD_MODES` in [`own_getters`]' innermost
+    /// loop fails here, naming the eight descriptors it leaves out.
     #[test]
     fn the_getter_sweep_is_the_whole_descriptor_space() {
         let heaps: BTreeSet<String> = own_getters().heaps.iter().map(|heap| heap.site()).collect();
