@@ -88,7 +88,9 @@ use metal2vulkan_runtime::{PurgeableState, SparsePageSize};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, ClassType};
-use objc2_foundation::{ NSArray, NSDictionary, NSError, NSObjectProtocol, NSRange, NSString, NSURL, };
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSObjectProtocol, NSRange, NSString, NSURL,
+};
 use objc2_metal::{
     MTLArgumentDescriptor, MTLArgumentEncoder, MTLArrayType, MTLAttribute, MTLAttributeFormat,
     MTLBarrierScope, MTLBinding, MTLBindingAccess, MTLBindingType, MTLBlendFactor,
