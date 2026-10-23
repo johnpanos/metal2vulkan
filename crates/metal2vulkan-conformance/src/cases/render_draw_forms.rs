@@ -706,7 +706,7 @@ fn point_rows() -> Vec<Row> {
             primitive: PrimitiveType::Point,
             shift: 1,
             form: Form::Plain {
-                first: at(0, 1 - 1),
+                first: at(0, 0),
                 count: 6,
             },
         },
