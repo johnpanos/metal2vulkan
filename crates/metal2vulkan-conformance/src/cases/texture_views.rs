@@ -40,7 +40,7 @@
 //! answered 0, 0 and no parent for everything would agree with a side that made no views at all.
 //! So every table is built so the recorded values are ones nothing else leaves:
 //!
-//! - **the relative getters are recorded non-zero somewhere.** [`tests`] asserts, with no device,
+//! - **the relative getters are recorded non-zero somewhere.** This module's own tests assert, with no device,
 //!   that every table holds a view whose first level or first slice is above 0, and that
 //!   `texture-view-parents` holds a view **of a view**. Without those rows the case would record
 //!   0 at every site, which is also what a side that ignored the ranges would answer;
@@ -58,7 +58,7 @@
 //!
 //! The one hazard a view creator carries is a range or a format Metal's validation stops, which
 //! ends its process. [`crate::texture_views::ViewRequest::is_well_formed`] decides that from the
-//! request's own shape and the parent's, [`tests`] holds every row of every table to it with no
+//! request's own shape and the parent's, this module's own tests hold every row of every table to it with no
 //! device, and the Metal side calls it in the one place that makes a view — so a row somebody adds
 //! to a recorded table by mistake is refused by the side rather than by a convention.
 //!

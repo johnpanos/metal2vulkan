@@ -19,7 +19,7 @@
 //!   what option word Metal packs a placed resource's modes into — which the runtime models as the
 //!   heap's own rather than the call's.
 //! - **`resource-aliasing`**: `isAliasable` before and after `makeAliasable`, with the heap's
-//!   `usedSize` either side, over one resource of each kind — and then, in [`TOGETHER`]'s own
+//!   `usedSize` either side, over one resource of each kind — and then, in `TOGETHER`'s own
 //!   sites, over **three buffers of one heap** with only the middle one made aliasable. The
 //!   runtime's `usedSize` leaves a buffer made aliasable **out** of the sum, and the three-in-one
 //!   shape is what makes that claim readable: a sum that lost the middle buffer's length and kept
@@ -42,7 +42,7 @@
 //! that **the sides cannot agree by construction**:
 //!
 //! - every table holds both a resource in a heap and a resource outside one, so `in_a_heap` is
-//!   recorded as true somewhere and false somewhere. [`tests`] asserts that with no device;
+//!   recorded as true somewhere and false somewhere. This module's own tests assert that with no device;
 //! - the placement rows state **three different offsets**, so `heapOffset` is three values and not
 //!   one, and a side that answered 0 always would differ at two sites;
 //! - the aliasing case reads the heap's `usedSize` both before and after `makeAliasable`, so a
@@ -60,7 +60,7 @@
 //!
 //! The hazards are the heap descriptor's, named in [`crate::heap_query::HeapSpec`]'s own guard, and
 //! the placement offsets': an offset that is not a multiple of 256, or a placement that runs past
-//! the heap, is one Metal's validation stops. [`tests`] holds every row to both with no device.
+//! the heap, is one Metal's validation stops. This module's own tests hold every row to both with no device.
 
 use crate::case::{Abort, Case, Handle, Input, MetalSource, Side};
 use crate::heap_query::{
@@ -103,7 +103,7 @@ pub enum Row {
     /// `newBufferWithLength:options:` of the device: a buffer in no heap.
     ///
     /// No storage mode: the suite's vocabulary makes a device buffer in one storage mode only
-    /// ([`Side::zeroed_buffer`](crate::case::Side::zeroed_buffer)), and a second one would be a
+    /// ([`Side::zeroed_buffer`]), and a second one would be a
     /// call of its own rather than a row of this table. `resourceOptions` still takes several
     /// values across the table, through the heaps and the textures, which is what the sweep needs.
     DeviceBuffer { length: u64 },
@@ -160,7 +160,7 @@ impl Row {
     /// One list, decided from the row's own shape. The shapes, each a failure of Metal's own
     /// validation and so a call that ends its process:
     ///
-    /// - a placement offset that is not a multiple of [`GRAIN`];
+    /// - a placement offset that is not a multiple of `GRAIN`;
     /// - a placement whose bytes run past the heap's end;
     /// - a buffer of length 0 from an **automatic** heap, which that call refuses in both APIs
     ///   (plain Metal answers nil; the runtime answers a typed `Nil`), so it is a refusal row
@@ -262,7 +262,7 @@ fn own_getters() -> ResourceFactsCase {
 
 /// One resource of each kind that can be made aliasable, each in a heap of its own.
 ///
-/// The claim that needs several resources in **one** heap is [`TOGETHER`]'s, emitted once per case
+/// The claim that needs several resources in **one** heap is `TOGETHER`'s, emitted once per case
 /// rather than per row: a row of this table makes its own heap, so its `usedSize` before and after
 /// is "the only buffer's length, then nothing" and says only that the length left the sum.
 fn aliasing() -> ResourceFactsCase {
@@ -448,7 +448,7 @@ impl Case for ResourceFactsCase {
     }
 }
 
-/// [`TOGETHER`]'s buffers in one automatic heap: the heap's figures, then the middle buffer made
+/// `TOGETHER`'s buffers in one automatic heap: the heap's figures, then the middle buffer made
 /// aliasable, then the heap's figures and every buffer's `isAliasable` again.
 ///
 /// This is the shape the `usedSize` claim needs. Nothing is encoded or committed: three buffers are
@@ -767,11 +767,11 @@ mod tests {
         );
     }
 
-    /// [`TOGETHER`] places more than one buffer in one heap and leaves at least one of them
+    /// `TOGETHER` places more than one buffer in one heap and leaves at least one of them
     /// **not** aliasable, which is what makes the `usedSize` claim readable: a sum that lost one
     /// buffer's length and kept the others is a different number from 0 and from the whole sum.
     ///
-    /// Verified to fail: a [`TOGETHER`] whose three buffers are all made aliasable fails here,
+    /// Verified to fail: a `TOGETHER` whose three buffers are all made aliasable fails here,
     /// naming the count.
     #[test]
     fn the_aliasing_case_leaves_a_buffer_of_one_heap_not_aliasable() {
