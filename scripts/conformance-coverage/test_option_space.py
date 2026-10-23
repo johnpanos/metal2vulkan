@@ -194,6 +194,14 @@ class InEffect(unittest.TestCase):
         row = axis(tree({"blends": text}), {"blends"})
         self.assertEqual(row["in_effect"], ["MTLThingBeta"])
 
+    def test_a_sweep_by_ordinal_states_nothing(self):
+        # The boundary of this column, kept visible: a case that hands the leg `0..n` reaches every
+        # value and names none, so the column reads zero and the document says it is a floor by
+        # exactly this. There is no sound textual reading of a computed ordinal, so the test holds
+        # the limit rather than a fix for it.
+        text = "fn go() { for raw in 0..6 { side.set_thing(raw); } }"
+        self.assertEqual(axis(tree({"sweep": text}), {"sweep"})["in_effect"], [])
+
     def test_a_comment_naming_a_value_is_not_in_effect(self):
         row = axis(tree({"blends": "// Thing::Beta is what Metal defaults to.\nfn go() {}"}), {"blends"})
         self.assertEqual(row["in_effect"], [])

@@ -520,6 +520,14 @@ def write_option_space(w, space) -> None:
         "instead."
     )
     w(
+        "- **A value a case states as a raw ordinal.** A case may hand the Metal leg an enum's "
+        "ordinal as a number — a sweep over `0..n` rather than over named variants — and no "
+        "reading of the text can say which value a computed number is. So *in effect*, and the "
+        "*stated* column of the hand-modelled table below, are floors by every sweep written that "
+        "way: a type they report short of its values may in fact be swept exhaustively, and the "
+        "case is what says so. Read the case before taking a row of the work list as work."
+    )
+    w(
         "- **Which case put a value in effect.** The unit is the case module, as it is for the "
         "items axis: a value named anywhere in a module whose cases include a Metal run counts for "
         "that module, even where one of its cases names it and the rest do not."
@@ -589,7 +597,10 @@ def write_option_space(w, space) -> None:
     w("")
     w(
         "The work list. A name here is a value of Metal's that no committed recording holds and no "
-        "case module states; it is not a claim that Metal accepts it on every device."
+        "case module states **by name**: it is not a claim that Metal accepts the value on every "
+        "device, and not a claim that no case reaches it, because a case that sweeps a type by "
+        "ordinal states none of its values here. Each row is a question for the case, not a "
+        "verdict on it."
     )
     w("")
     for row in sorted(rows, key=lambda r: (-len(r["missing"]), r["metal"])):
