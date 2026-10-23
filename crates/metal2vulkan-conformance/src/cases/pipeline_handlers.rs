@@ -16,12 +16,15 @@
 //!   slot, which both implementations refuse. The refusal leg is the half an asynchronous form can
 //!   get wrong on its own: a state delivered beside an error, an error with no state and no error,
 //!   or a handler that is simply never called.
-//! - **the reflection bit** — each of the five option-bearing forms is taken with
-//!   `MTLPipelineOptionNone` and with `MTLPipelineOptionBindingInfo`, which is what makes
-//!   `delivered-a-reflection` a site that **moves**: `false` for the first and `true` for the
-//!   second. The whole `MTLPipelineOption` mask, and its combinations, is
-//!   [`crate::cases::pipeline_options`]' sweep; here the bit is swept only far enough that the
-//!   reflection site is seen to be read rather than constant.
+//! - **the options value** — `newComputePipelineStateWithFunction:options:completionHandler:` is
+//!   taken with **all eight** combinations of the three bits Apple's header names
+//!   ([`crate::pipeline_options::MASKS`]' own value space), so the asynchronous path's reflection
+//!   rule is swept whole. `MTLPipelineOptionFailOnBinaryArchiveMiss` alone is the row that
+//!   matters: Metal fills the handler's reflection for it, which Apple's documentation for that
+//!   bit does not say, and reading only the two information bits answered nil there. The other
+//!   four option-bearing forms are taken with the bit clear and set, which is what makes
+//!   `delivered-a-reflection` a site that **moves** — `false` for the first and `true` for the
+//!   second — rather than a constant of the family.
 //!
 //! # Why the wrong-type function is the refusal, and not a number out of range
 //!
@@ -224,6 +227,39 @@ fn mesh_with(mesh: &'static str) -> MeshFunctions<'static> {
     }
 }
 
+/// Every `MTLPipelineOption` value the `newComputePipelineStateWithFunction:options:completionHandler:`
+/// rows sweep, with the case name each takes.
+///
+/// All eight combinations of the three bits Apple's header names, in
+/// [`crate::pipeline_options::MASKS`]' order, so the two families sweep the same value space and a
+/// row of one reads against the matching row of the other. The names are fixed strings rather than
+/// built from the mask, because a case's name is what a recording is keyed by.
+const COMPUTE_FUNCTION_MASKS: [(u64, &str); 8] = [
+    (0, "pipeline-handler-compute-function-options-none"),
+    (1, "pipeline-handler-compute-function-options-binding-info"),
+    (
+        2,
+        "pipeline-handler-compute-function-options-buffer-type-info",
+    ),
+    (
+        3,
+        "pipeline-handler-compute-function-options-binding-and-buffer-type",
+    ),
+    (
+        4,
+        "pipeline-handler-compute-function-options-fail-on-archive-miss",
+    ),
+    (
+        5,
+        "pipeline-handler-compute-function-options-binding-and-fail-on-miss",
+    ),
+    (
+        6,
+        "pipeline-handler-compute-function-options-buffer-type-and-fail-on-miss",
+    ),
+    (7, "pipeline-handler-compute-function-options-all-three"),
+];
+
 /// The case names one options value takes, one per option-bearing form.
 ///
 /// A struct of fixed strings rather than a name built at run time: a case's name is what a
@@ -231,7 +267,6 @@ fn mesh_with(mesh: &'static str) -> MeshFunctions<'static> {
 /// formatting.
 struct OptionNames {
     render: &'static str,
-    compute_function: &'static str,
     compute_descriptor: &'static str,
     tile: &'static str,
     mesh: &'static str,
@@ -240,7 +275,6 @@ struct OptionNames {
 /// The names of the rows taken with `MTLPipelineOptionNone`.
 const NONE_NAMES: OptionNames = OptionNames {
     render: "pipeline-handler-render-options-none",
-    compute_function: "pipeline-handler-compute-function-options-none",
     compute_descriptor: "pipeline-handler-compute-descriptor-options-none",
     tile: "pipeline-handler-tile-options-none",
     mesh: "pipeline-handler-mesh-options-none",
@@ -249,7 +283,6 @@ const NONE_NAMES: OptionNames = OptionNames {
 /// The names of the rows taken with `MTLPipelineOptionBindingInfo`.
 const BINDING_INFO_NAMES: OptionNames = OptionNames {
     render: "pipeline-handler-render-options-binding-info",
-    compute_function: "pipeline-handler-compute-function-options-binding-info",
     compute_descriptor: "pipeline-handler-compute-descriptor-options-binding-info",
     tile: "pipeline-handler-tile-options-binding-info",
     mesh: "pipeline-handler-mesh-options-binding-info",
@@ -299,12 +332,6 @@ pub fn all() -> Vec<PipelineHandlerCase> {
             described: Described::Render(drawing(), Some(options)),
         });
         cases.push(PipelineHandlerCase {
-            name: names.compute_function,
-            fixture: COMPUTE_FIXTURE,
-            entry: KERNEL,
-            described: Described::ComputeFunction(KERNEL, Some(options)),
-        });
-        cases.push(PipelineHandlerCase {
             name: names.compute_descriptor,
             fixture: COMPUTE_FIXTURE,
             entry: KERNEL,
@@ -324,6 +351,19 @@ pub fn all() -> Vec<PipelineHandlerCase> {
             fixture: MESH_FIXTURE,
             entry: MESH,
             described: Described::Mesh(mesh_with(MESH), options),
+        });
+    }
+    // **All eight `MTLPipelineOption` values on one form**, so the asynchronous path's reflection
+    // rule is swept whole and not only at the bit Apple's documentation describes.
+    // `MTLPipelineOptionFailOnBinaryArchiveMiss` alone is the row that matters: Metal fills the
+    // handler's reflection for it, which `pipeline_options` found through the synchronous call,
+    // and these rows are what hold the same rule through the block.
+    for (options, name) in COMPUTE_FUNCTION_MASKS {
+        cases.push(PipelineHandlerCase {
+            name,
+            fixture: COMPUTE_FIXTURE,
+            entry: KERNEL,
+            described: Described::ComputeFunction(KERNEL, Some(options)),
         });
     }
     // The refusal of each option-bearing form, with the reflection asked for: a refused creation
