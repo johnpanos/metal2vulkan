@@ -125,6 +125,15 @@ const SLICES: u32 = 2;
 /// read zero would be indistinguishable from one the copy never reached.
 const FILL: u8 = 0xc3;
 
+/// The notices **every** row of the family takes.
+///
+/// A sparse texture is emulated wherever the device offers no sparse residency of its own — which
+/// on this oracle's MoltenVK is every sparse texture — and the runtime announces that once per
+/// texture. It is a device gap, announced honestly, so each row declares it and then compares
+/// every number exactly; a venue with native sparse residency announces nothing and the
+/// declaration simply does not fire there.
+const EVERY_ROWS_NOTICES: [Degradation; 1] = [Degradation::EmulatedSparseTexture];
+
 /// A single-sampled 2D sparse texture of [`WIDTH`] by [`WIDTH`].
 fn plain() -> SparseTextureSpec {
     SparseTextureSpec::texture_2d(FORMAT, [WIDTH, WIDTH], LEVELS)
@@ -158,8 +167,9 @@ struct Row {
     case: &'static str,
     /// The program the row runs, built with no device at all so a guard can read it.
     program: fn() -> SparseMappingProgram,
-    /// The notices the row takes, each a degradation the runtime announces on the path the row
-    /// drives. Empty for every row but the indirect one.
+    /// The notices the row takes **beyond** [`EVERY_ROWS_NOTICES`], each a degradation the
+    /// runtime announces on the path this row alone drives. Empty for every row but the indirect
+    /// one.
     notices: &'static [Degradation],
 }
 
@@ -224,12 +234,14 @@ static MODES_AND_SIZES: Row = Row {
     },
 };
 
-/// **Every level a region can name**, from level 0 to one past the texture's own.
+/// **Every level inside the texture, and the tail.**
 ///
 /// Level 0, 1 and 2 hold 16, 4 and 1 tiles, so each raises `usedSize` by its own number. Level
 /// [`TAIL_LEVEL`] is `firstMipmapInTail`, where Metal maps the slice's **whole tail** however small
-/// the region, and a level past the texture's own maps nothing. Both of those are documented
-/// behaviour nothing in this tree had measured.
+/// the region — documented behaviour nothing in this tree had measured.
+///
+/// A level **past** the texture's own is [`A_LEVEL_PAST_THE_TEXTURES`], a row of its own, because
+/// our side refuses it and an abort there would leave every number below uncompared.
 static LEVELS_AND_THE_TAIL: Row = Row {
     case: "sparse-mapping-levels-and-the-tail",
     notices: &[],
@@ -250,13 +262,6 @@ static LEVELS_AND_THE_TAIL: Row = Row {
             TAIL_LEVEL,
             0,
         ));
-        // A level past the texture's own: nothing maps, and `usedSize` stays where it was.
-        steps.extend(update(
-            MappingMode::Map,
-            TileRect::one([0, 0]),
-            PAST_THE_LEVELS,
-            0,
-        ));
         // And unmapped in the same order, so every rise has a fall to read against.
         for level in [0, 1, 2] {
             steps.extend(update(
@@ -273,6 +278,30 @@ static LEVELS_AND_THE_TAIL: Row = Row {
             0,
         ));
         program(vec![plain()], Vec::new(), 0, steps)
+    },
+};
+
+/// **A level past the texture's own**, on its own, because the two oracles disagree about it.
+///
+/// Plain Metal takes the call and maps nothing: measured here, `usedSize` unchanged. Metal's own
+/// API validation layer stops it (`mipLevel(9) must be <= firstMipmapInTail(3)`), and our runtime
+/// refuses it typed, `Invalid(Sparse(Level { level: 9, levels: 9 }))`. Which of the two oracles the
+/// runtime should follow on a **direct** update is not this case's to decide — its own indirect
+/// path already follows plain Metal and maps nothing — so the row carries a known-gaps entry and
+/// the measurement stands in the suite rather than in somebody's notes.
+///
+/// It is one step and a commit, so the refusal costs no other number: that is why it is not a row
+/// of [`LEVELS_AND_THE_TAIL`].
+static A_LEVEL_PAST_THE_TEXTURES: Row = Row {
+    case: "sparse-mapping-a-level-past-the-textures",
+    notices: &[],
+    program: || {
+        program(
+            vec![plain()],
+            Vec::new(),
+            0,
+            update(MappingMode::Map, TileRect::one([0, 0]), PAST_THE_LEVELS, 0),
+        )
     },
 };
 
@@ -600,9 +629,10 @@ static MAPPED_TEXELS: Row = Row {
 
 /// Every row of the family, in the order the report lists them.
 #[cfg(test)]
-static EVERY_ROW: [&Row; 8] = [
+static EVERY_ROW: [&Row; 9] = [
     &MODES_AND_SIZES,
     &LEVELS_AND_THE_TAIL,
+    &A_LEVEL_PAST_THE_TEXTURES,
     &SLICES_OF_AN_ARRAY,
     &PLURAL_UPDATES,
     &INDIRECT_UPDATES,
@@ -630,9 +660,9 @@ impl Case for SparseMappings {
         // only declarations are the notices a row's own path announces, which the runtime must be
         // allowed to say; a notice a row does not declare reads as `UndeclaredNotice`, naming the
         // code and the case, which is the loud form.
-        self.row
-            .notices
+        EVERY_ROWS_NOTICES
             .iter()
+            .chain(self.row.notices)
             .map(|code| notice_allowance(code.code()))
             .collect()
     }
@@ -647,14 +677,19 @@ impl Case for SparseMappings {
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
         let program = (self.row.program)();
-        let mapped = crate::case::made(sites, "mapping", side.sparse_mapping(&program))?;
-        sites.push(mapped.node("mapping", &program.steps));
+        // The call's own site and the program's answer take **different** names: two siblings
+        // under one name are paired by whichever namesake the comparison reaches first, which is
+        // how a round reported six cases divergent having compared no byte of either side. The
+        // suite holds it for every recording (`tests::no_recorded_site_shares_its_name_with_a_
+        // sibling`), and it caught this family's first recordings.
+        let mapped = crate::case::made(sites, "sparse-mapping", side.sparse_mapping(&program))?;
+        sites.push(mapped.node("program", &program.steps));
         // A refused step stops the case here, after every step's own site is emitted: the numbers
         // a refused update did not change would otherwise read as divergences of their own, each a
         // row of the ledger for one bug.
         if let Some((at, failure)) = mapped.first_refusal() {
             return Err(Abort {
-                at: format!("mapping/step/{at}/{}", program.steps[at].call()),
+                at: format!("program/step/{at}/{}", program.steps[at].call()),
                 failure: failure.clone(),
             });
         }
@@ -680,6 +715,13 @@ pub fn modes_and_region_sizes() -> SparseMappings {
 pub fn levels_and_the_tail() -> SparseMappings {
     SparseMappings {
         row: &LEVELS_AND_THE_TAIL,
+    }
+}
+
+/// The case of a level past the texture's own, which our side refuses and plain Metal takes.
+pub fn a_level_past_the_textures() -> SparseMappings {
+    SparseMappings {
+        row: &A_LEVEL_PAST_THE_TEXTURES,
     }
 }
 
@@ -726,6 +768,7 @@ pub fn all() -> Vec<Box<dyn Case>> {
     vec![
         Box::new(modes_and_region_sizes()),
         Box::new(levels_and_the_tail()),
+        Box::new(a_level_past_the_textures()),
         Box::new(slices_of_an_array()),
         Box::new(plural_updates()),
         Box::new(indirect_updates()),
@@ -767,10 +810,11 @@ mod tests {
             // Only the indirect row declares anything, and only a notice: no value tolerance
             // appears anywhere in this family.
             let allowed = case.allowances();
-            let expects = match case.name() == INDIRECT_UPDATES.case {
-                true => INDIRECT_UPDATES.notices.len(),
-                false => 0,
-            };
+            let expects = EVERY_ROWS_NOTICES.len()
+                + match case.name() == INDIRECT_UPDATES.case {
+                    true => INDIRECT_UPDATES.notices.len(),
+                    false => 0,
+                };
             assert_eq!(allowed.len(), expects, "{}", case.name());
             for allowance in &allowed {
                 assert!(

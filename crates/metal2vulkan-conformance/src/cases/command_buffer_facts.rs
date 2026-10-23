@@ -45,10 +45,13 @@ use metal2vulkan_runtime::Degradation;
 pub const COMMAND_BUFFER_FACTS: &str = "command-buffer-facts";
 
 /// The notices the runtime can announce over the GPU times, and the whole of what this case takes.
-const GPU_TIME_NOTICES: [Degradation; 2] = [
-    Degradation::GpuTimesFromHost,
-    Degradation::UncalibratedGpuTimes,
-];
+///
+/// `UncalibratedGpuTimes` is **not** here, though the runtime can announce it: on this oracle it
+/// never fires, and a declaration that outlives its own reason keeps asserting that somebody
+/// examined a notice nobody has looked at since. A venue that does announce it reads as
+/// `UndeclaredNotice`, naming the code and the case, which is the loud form and the moment to look
+/// at it.
+const GPU_TIME_NOTICES: [Degradation; 1] = [Degradation::GpuTimesFromHost];
 
 /// A case over one command buffer's own answers.
 pub struct CommandBufferFactsCase {
@@ -110,7 +113,12 @@ impl Case for CommandBufferFactsCase {
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
-        let facts = made(sites, "facts", side.command_buffer_facts())?;
+        // The call's own site and the facts take **different** names: two siblings under one name
+        // are paired by whichever namesake the comparison reaches first, which is how a round
+        // reported six cases divergent having compared no byte of either side. The suite holds it
+        // for every recording (`tests::no_recorded_site_shares_its_name_with_a_sibling`), and it
+        // caught this case's first recording.
+        let facts = made(sites, "command-buffer", side.command_buffer_facts())?;
         sites.push(facts.node("facts"));
         Ok(())
     }
