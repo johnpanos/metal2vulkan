@@ -839,7 +839,7 @@ mod tests {
             by_answer.entry(answer).or_default().push(at);
         }
         let mut unexplained = Vec::new();
-        for (_, group) in &by_answer {
+        for group in by_answer.values() {
             if group.len() < 2 {
                 continue;
             }

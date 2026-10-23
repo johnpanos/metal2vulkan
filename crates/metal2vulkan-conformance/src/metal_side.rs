@@ -3946,7 +3946,7 @@ impl Side for MetalSide {
         let layers = request
             .layers
             .iter()
-            .map(|layer| layer_descriptor(layer))
+            .map(layer_descriptor)
             .collect::<Answer<Vec<_>>>()?;
         let descriptor = match request.form {
             // The two class methods that take their layers with them. Each is one call, so there
@@ -4090,7 +4090,7 @@ impl Side for MetalSide {
     fn rate_map_device_is_the_sides(&mut self, map: Handle) -> Answer<bool> {
         let map = self.held_rate_map(map)?;
         let device = map.device();
-        Ok(&*device as *const _ == &*self.device as *const _)
+        Ok(std::ptr::eq(&*device, &*self.device))
     }
 
     fn rate_map_facts(&mut self, map: Handle, layers: &[u64]) -> Answer<RateMapFacts> {

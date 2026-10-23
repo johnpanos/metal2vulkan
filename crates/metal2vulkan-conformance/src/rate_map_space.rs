@@ -13,7 +13,7 @@
 //!
 //! Metal leaves the compiled map to the device: a layer's samples "may be rounded up to the
 //! nearest supported value or granularity". Apple M3's rule is written down and measured in
-//! [`metal2vulkan::bind::rate_map`], and the two parts of it that place every probe point here
+//! `metal2vulkan::bind`'s rate-map module, and the two parts of it that place every probe point here
 //! are:
 //!
 //! - each sample `q` becomes `Q = max(min(q + 1/256, 1), 0.01)` — a **bias** then **two clamps**;
@@ -24,7 +24,7 @@
 //! interesting values of `q` are the ones **either side of a step**. A step sits where `Q` crosses
 //! `32/m` for an integer `m`, which is `q = 32/m - 1/256`; the two clamps put a step at
 //! `q = 1 - 1/256` and another at `q = 0.01 - 1/256`, below which every quality derives one
-//! answer. [`QUALITIES`] is that set: each clamp, each edge of a chosen set of `m`, the `f32`
+//! answer. [`qualities`] is that set: each clamp, each edge of a chosen set of `m`, the `f32`
 //! either side of each edge, and a uniform fill between them so the sweep is not only edges.
 //!
 //! **Two inputs deriving one answer is the measurement, not a failure.** Below `0.01 - 1/256`
@@ -115,7 +115,15 @@ pub const SWEEP_EXTENT: u32 = 256;
 /// `Q` of a quality sample: what Apple's compile clamps it to before it lays tiles. The sweep's own
 /// tables are chosen by this, and nothing is ever **compared** against it — Metal is the answer.
 pub fn biased(quality: f32) -> f32 {
-    (quality + BIAS).min(1.0).max(MIN_QUALITY)
+    let biased = quality + BIAS;
+    // A `NaN` sample reads 1, which is what Apple's compile does and what `f32::min` does by
+    // answering the side that is not `NaN`. `f32::clamp` answers `NaN` instead, so the rule is
+    // written out rather than left to it. No table here states a `NaN` — the sweep's own test
+    // holds every sample inside [0, 1] — and writing the rule faithfully costs one line.
+    if biased.is_nan() {
+        return 1.0;
+    }
+    biased.clamp(MIN_QUALITY, 1.0)
 }
 
 /// The screen pixels one tile of the granularity spans at quality `quality`: `⌊32 / Q⌋`, the step
@@ -182,11 +190,15 @@ pub const fn just_above(quality: f32) -> f32 {
     f32::from_bits(quality.to_bits() + 1)
 }
 
-/// How many `f32` steps the boundary searches walk before giving up. A boundary is one or two
+/// How many `f32` steps the boundary searches walk before giving up.
+///
+/// Public because [`step_over`], [`over_low_clamp`] and [`under_high_clamp`] all name it in their
+/// own contracts: each answers `None` where no quality within this many steps crosses its
+/// boundary. A boundary is one or two
 /// steps away in every case the tables use; the bound exists so a search cannot run away if a
 /// constant here is ever edited into nonsense, and `every_boundary_is_found` holds each table
 /// entry to having been found rather than defaulted.
-const BOUNDARY_WALK: u32 = 64;
+pub const BOUNDARY_WALK: u32 = 64;
 
 /// The edge of the tile rule's step at `m` screen pixels a tile: the quality whose biased value is
 /// exactly `32 / m`, which is the **top** of bucket `m`.
@@ -931,6 +943,11 @@ mod tests {
                 "a zero screen extent ends Metal's process in screen-to-physical"
             );
         }
-        assert!(SWEEP_EXTENT > 0);
+        for rung in EXTENT_LADDER {
+            assert!(
+                *rung > 0,
+                "a rung of the extent ladder is 0, where screen-to-physical ends Metal's process"
+            );
+        }
     }
 }
