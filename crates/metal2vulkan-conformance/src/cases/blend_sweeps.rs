@@ -104,9 +104,11 @@
 //!
 //! # What the sweep measured about Metal that nothing here knew before
 //!
-//! Metal's answer matches the written blend equation at **44,928 of 44,932** compared channels on
-//! this M3 Max, macOS 27.0.1. The four that do not are one fact, and it is the sort a sweep finds
-//! and a once-each suite cannot:
+//! The ten cases hold **177 blend states**, each over 64 pixels and four channels, so Metal's
+//! answer is held against the written blend equation at **45,312** compared channels; the counts
+//! are the subject of [`tests::the_sweep_is_the_size_its_prose_claims`] rather than of this
+//! sentence. **45,308 of them agree** on this M3 Max, macOS 27.0.1. The four that do not are one
+//! fact, and it is the sort a sweep finds and a once-each suite cannot:
 //!
 //! **`MTLBlendOperationSubtract` stores negative zero where both factored terms are zero.** The
 //! four leaves are `dc-1mdc-subtract` at the one pixel in each channel where the destination is
@@ -1561,6 +1563,44 @@ mod tests {
                 case.name()
             );
         }
+    }
+
+    /// The sweep is the size the module docs quote: 177 blend states over 64 pixels and four
+    /// channels, and each case holds the rows its own rule gives.
+    ///
+    /// A number in prose is a number that rots, so the prose quotes these and this holds them. The
+    /// per-case counts are each derived from the SDK table or from the shape of the sweep -- the
+    /// settable factors, the operations squared, the four-bit field twice over -- so a row that
+    /// quietly disappeared from a sweep fails here.
+    #[test]
+    fn the_sweep_is_the_size_its_prose_claims() {
+        let settable = factors(Family::Settable).len();
+        let second = factors(Family::SecondOutput).len();
+        let ops = operations().len();
+        let want: Vec<(&str, usize)> = vec![
+            ("blend-sweep-source-rgb", settable),
+            ("blend-sweep-destination-rgb", settable),
+            ("blend-sweep-source-alpha", settable),
+            ("blend-sweep-destination-alpha", settable),
+            ("blend-sweep-operations", operation_pairs().len() * ops),
+            ("blend-sweep-operation-pairs", ops * ops),
+            ("blend-sweep-write-masks", 2 * masks().len()),
+            ("blend-sweep-enabled", 3),
+            ("blend-sweep-blend-color", 10),
+            ("blend-sweep-second-source", 1 + 4 * second),
+        ];
+        let held: Vec<(&str, usize)> = all()
+            .iter()
+            .map(|case| (case.name(), case.variants().len()))
+            .collect();
+        assert_eq!(held, want);
+        let states: usize = held.iter().map(|(_, rows)| rows).sum();
+        assert_eq!(states, 177, "the family holds {states} blend states");
+        assert_eq!(states * PIXELS * 4, 45_312);
+        // And every state is compared over the whole level, which is what makes the channel count
+        // the comparison's own size rather than a multiplication in the prose.
+        assert_eq!(layout().extent(), LEVEL);
+        assert_eq!(LEVEL, PIXELS * 4 * 4);
     }
 
     /// Metal's `Subtract` stores negative zero where both factored terms are zero, and positive
