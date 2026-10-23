@@ -4513,15 +4513,23 @@ fn a_count_only_one_shape_moved_is_reported_as_well() {
 /// mention is not a correct use, so this is deliberately the weaker kind of guard — but it is
 /// mechanical, it needs no device, and a field the Metal side never names is a field it runs
 /// Metal's default for while a case states a value.
+///
+/// It reads `render_descriptor_from`, which is where the Metal side builds the descriptor:
+/// `render_pipeline` makes the state from it, and so does
+/// [`Side::pipeline_both_paths`](crate::case::Side::pipeline_both_paths), which hands one
+/// descriptor to a `completionHandler:` call and to its synchronous sibling. The guard follows
+/// the building rather than the creation, because that is where a field is set or forgotten.
 #[test]
 fn the_metal_side_mentions_every_pipeline_field() {
     let source = include_str!("metal_side.rs");
     let from = source
-        .find("fn render_pipeline(")
-        .expect("no render_pipeline in metal_side.rs");
+        .find("fn render_descriptor_from(")
+        .expect("no render_descriptor_from in metal_side.rs");
     let rest = &source[from..];
     // The method ends at the first `}` at one level of indentation, which closes it.
-    let to = rest.find("\n    }\n").expect("no end of render_pipeline");
+    let to = rest
+        .find("\n    }\n")
+        .expect("no end of render_descriptor_from");
     let body = &rest[..to];
     for field in [
         "depth_format",
@@ -4535,8 +4543,8 @@ fn the_metal_side_mentions_every_pipeline_field() {
     ] {
         assert!(
             body.contains(field),
-            "metal_side.rs's render_pipeline never mentions `{field}`, so it runs Metal's default \
-             where the case states a value"
+            "metal_side.rs's render_descriptor_from never mentions `{field}`, so it runs \
+             Metal's default where the case states a value"
         );
     }
 }
