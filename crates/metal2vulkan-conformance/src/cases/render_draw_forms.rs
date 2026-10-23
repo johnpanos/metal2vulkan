@@ -79,6 +79,7 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::{IndexType, PixelFormat, PrimitiveType};
+use metal2vulkan_runtime::Degradation;
 
 /// The target's format: four `uint`s a texel, which is the `uint4` the fragment function returns,
 /// stored as it is. The whole expectation is integer arithmetic.
@@ -122,6 +123,32 @@ const RUN_STRIDE: u64 = 16;
 /// sample or tile order, and within a draw Metal orders the primitives -- so the runs are expected
 /// to fold into one outcome, and asking for more makes the recording say so on evidence.
 const RUNS: u32 = 8;
+
+/// The notice the two cases that make an **indexed indirect** draw declare, and the lines case
+/// does not.
+///
+/// MoltenVK does not enable `robustBufferAccess2` and its driver is not measured to read index 0
+/// past the bound range, so an indexed indirect draw's index fetch is nothing Vulkan bounds: the
+/// GPU reads `indexCount` out of the argument buffer, and a count the index buffer cannot hold
+/// would read past it. The runtime therefore bounds the indices on the GPU **before the pass**
+/// (`metal2vulkan_runtime`'s `index_bounds.rs`) and announces the cost, which is work Metal does
+/// not do. The declaration loosens no value -- it says the announcement is this case's -- so the
+/// case still fails on any texel that moves.
+///
+/// Measured on an Apple M3 Max (macOS 27.0.1, build 26A434, MoltenVK, API 1.2): both cases
+/// announce `metal2vulkan-degrade-indirect-index-bounds-pass` once, and the runtime's own counts
+/// say which path fired -- `bounded_run_draws 1` and `cmd_draw_indexed_indirect 2`, the two
+/// indirect draws the degradation's own text says one becomes. Every texel of both cases, and
+/// every other field of their transcripts, compared exactly.
+///
+/// `render-draw-forms-lines` is the control, and it is a case rather than an argument: its
+/// indexed draw is the eight-argument direct form, so it reaches no bounds pass, moves neither
+/// count, declares nothing and replays **exact** on the same venue in the same run.
+fn bounds_pass_notice() -> Vec<Allowance> {
+    vec![crate::replay::notice_allowance(
+        Degradation::IndirectIndexBoundsPass.code(),
+    )]
+}
 
 /// Every case of the family, in the order the report lists them.
 pub fn all() -> Vec<Box<dyn Case>> {
@@ -791,10 +818,11 @@ impl Case for Points {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Nothing is loosened and no notice is declared. An `RGBA32Uint` texel is the `uint4` the
-        // fragment function returned: there is no conversion, no interpolation and no arithmetic of
-        // the shader's in the path, so every channel is an exact answer or it is a bug.
-        Vec::new()
+        // No value is loosened. An `RGBA32Uint` texel is the `uint4` the fragment function
+        // returned: there is no conversion, no interpolation and no arithmetic of the shader's in
+        // the path, so every channel is an exact answer or it is a bug. What is declared is the one
+        // notice this case's own indexed indirect draw provokes ([`bounds_pass_notice`]).
+        bounds_pass_notice()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -952,8 +980,9 @@ impl Case for Triangles {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Nothing loosened and no notice declared, for the reason the points case states.
-        Vec::new()
+        // No value loosened, for the reason the points case states, and the same one notice: this
+        // case makes an indexed indirect draw too ([`bounds_pass_notice`]).
+        bounds_pass_notice()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1114,6 +1143,7 @@ impl Case for Lines {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allowance::Justification;
     use crate::transcript::Transcript;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1736,6 +1766,21 @@ mod tests {
         assert_eq!(calls.len(), 8, "the family reaches {calls:?}");
     }
 
+    /// Whether `case` makes **no** indexed indirect draw, read off its own table rather than off
+    /// its name: a case that grew one would start announcing the bounds pass, and this is what
+    /// makes the declaration follow the draws.
+    fn line_rows_hold_no_indexed_indirect(case: &str) -> bool {
+        let rows = match case {
+            "render-draw-forms-points" => point_rows(),
+            "render-draw-forms-triangles" => triangle_rows(),
+            "render-draw-forms-lines" => line_rows(),
+            other => panic!("{other} is not a case of this family"),
+        };
+        !rows
+            .iter()
+            .any(|row| matches!(row.form, Form::IndexedIndirect { .. }))
+    }
+
     /// **Every case of the family names itself once**, and the names are the ones the recordings
     /// are keyed by.
     #[test]
@@ -1747,13 +1792,26 @@ mod tests {
         for case in all() {
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
-            // No case of the family loosens a value or declares a notice: every channel it reads is
-            // a `uint` the fragment function returned.
-            assert!(
-                case.allowances().is_empty(),
-                "{} declares something",
-                case.name()
-            );
+            // No case loosens a value: every channel it reads is a `uint` the fragment function
+            // returned. What a case declares is the one notice its **indexed indirect** draw
+            // provokes, and exactly the two cases that make one declare it -- which is the
+            // falsification of the declaration rather than a restatement of it, because the third
+            // case reaches the same code with every other draw form and announces nothing.
+            let declared = case.allowances();
+            let indirect = line_rows_hold_no_indexed_indirect(case.name());
+            match indirect {
+                true => assert!(declared.is_empty(), "{} declares something", case.name()),
+                false => {
+                    assert_eq!(declared.len(), 1, "{} declares one notice", case.name());
+                    assert_eq!(
+                        declared[0].justified_by,
+                        Justification::Degradation(
+                            Degradation::IndirectIndexBoundsPass.code().to_owned()
+                        ),
+                    );
+                    assert!(declared[0].path.starts_with("case/notices"));
+                }
+            }
             assert!(case.inputs().is_ok());
             assert!(case.shaders().is_ok());
         }
