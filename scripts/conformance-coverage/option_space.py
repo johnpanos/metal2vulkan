@@ -22,6 +22,24 @@ The numerator is two derived sets, which are different claims and are kept apart
 `compared` is their union. A value that only the suite's **shared** sources name (a default of the
 render vocabulary, say) is counted in neither: some case puts it to Metal, but which case is not a
 property of the text, so it is reported in its own column and is neither compared nor missing.
+
+# Why a value stated as a raw ordinal is not resolved, and must not be
+
+Both numerators read **names**. A case may instead hand the Metal leg an enum's ordinal as a
+number — a sweep over `0..n`, or a literal field — and such a value appears nowhere by name, so
+every column reads short of what the case does. That is stated as a limit in the document rather
+than worked around, because the obvious way to close it is unsound:
+
+the leg types some of these fields itself (`MTLPixelFormat(request.format as usize)` says that
+`format` holds a pixel format's ordinal), which invites reading every `format: <number>` in the
+suite as a pixel format. It is not one. `recording.rs` declares `format: u32` for the **recording
+format's version**, so `format: 1` there is version 1 and not `MTLPixelFormatA8Unorm`, and a rule
+keyed on the field's name would quietly credit the suite with a value nothing ever set. One
+vocabulary's word for a thing is not another's.
+
+So the floor stays a floor and says so. Closing it properly means a case stating its values by
+name, or a transcript site recording the enumerator beside the ordinal it already stores — not a
+cleverer reading of the text here.
 """
 
 import json
