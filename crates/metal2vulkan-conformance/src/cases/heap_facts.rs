@@ -85,7 +85,12 @@
 //!   is placed: after two placements the same heap answers 978944 up to an alignment of 4096,
 //!   966656 at 16 KiB, 917504 at 64 KiB, and **0** at the heap's own size and above. Both ends of
 //!   the sweep earn their rows — the far end is 0 where the near end was the whole heap.
-//! - **size** decides `size` and `currentAllocatedSize` after Metal's own rounding.
+//! - **size** decides `size` and `currentAllocatedSize` after Metal's own rounding, and the
+//!   rounding is the answer: measured at sizes either side of both page boundaries, a heap asked
+//!   for 1, 4095, 4096, 4097, 16383 or 16384 bytes is **16384** bytes, and one asked for 16385 is
+//!   32768. So Metal's grain here is 16 KiB and the 4 KiB boundary decides nothing — which only a
+//!   sweep that straddles both boundaries can say, and which a model rounding to 4096 would fail
+//!   at six of the seven rows.
 //!
 //! The pair that is indistinguishable by construction is named rather than swept: a heap's
 //! `label` does not interact with any of the five, so the label case states one heap of each type
@@ -150,6 +155,20 @@ const BOTH_STORAGE: [Storage; 2] = [Storage::Shared, Storage::Private];
 /// [`crate::cases::sparse_heaps`] is where the suite asks about sparse memory.
 const HEAP_TYPES: [HeapType; 2] = [HeapType::Automatic, HeapType::Placement];
 
+/// The sizes the getter sweep asks for, beside `SIZE`: a boundary rather than a representative at
+/// each of the page sizes a Metal heap is laid out in.
+///
+/// 1 is the least a heap can be, 4095/4096/4097 and 16383/16384/16385 sit either side of the two
+/// page sizes, and `SIZE` itself is the whole table's other rows. What the case records is `size`
+/// and `currentAllocatedSize` beside the number its descriptor asked for, so Metal's rounding is
+/// the answer and the asked-for number is beside it in the recording.
+///
+/// A size of 0 is not here: [`HeapSpec::is_well_formed`](crate::heap_query::HeapSpec::is_well_formed)
+/// refuses it, because a heap of no bytes is a call that answers nil rather than a reading of what
+/// Metal rounds. The device's maximum is not here either — nothing in this tree says what it is,
+/// and a heap near the device's memory would make the case depend on what else is running.
+const SIZES: [u64; 7] = [1, 4095, 4096, 4097, 16383, 16384, 16385];
+
 /// The heap size every case of the family asks for: 1 MiB, as
 /// [`crate::cases::sparse_heaps`]' is, so a reader can put the two families' figures beside each
 /// other.
@@ -206,6 +225,10 @@ pub fn all() -> Vec<HeapFactsCase> {
 /// field at a time could not tell a packing that drops a field in one combination from one that
 /// drops it everywhere. 24 descriptors is the whole space, not a selection, so there is no row to
 /// argue about.
+///
+/// The case's other table is [`SIZES`]: the same descriptor at sizes either side of the page
+/// boundaries, where `size` and `currentAllocatedSize` are Metal's rounding of a number the case
+/// states and so are the one pair of answers in the family that no mode can reach.
 fn own_getters() -> HeapFactsCase {
     let mut heaps = Vec::new();
     for heap_type in HEAP_TYPES {
@@ -219,6 +242,12 @@ fn own_getters() -> HeapFactsCase {
                     );
                 }
             }
+        }
+    }
+    for size in SIZES {
+        let heap = of_type(HeapType::Automatic, size, Storage::Shared);
+        if !heaps.contains(&heap) {
+            heaps.push(heap);
         }
     }
     HeapFactsCase {
@@ -867,10 +896,37 @@ mod tests {
             "these descriptors are never handed to Metal anywhere in the suite: {}",
             missing.join(", ")
         );
+        let modes = HEAP_TYPES.len() * BOTH_STORAGE.len() * CACHE_MODES.len() * HAZARD_MODES.len();
         assert_eq!(
             heaps.len(),
-            HEAP_TYPES.len() * BOTH_STORAGE.len() * CACHE_MODES.len() * HAZARD_MODES.len(),
-            "the table is not the cross product: a row is repeated or one is spelled twice"
+            modes + SIZES.len(),
+            "the table is not the cross product beside the size sweep: a row is repeated or one \
+             is spelled twice"
+        );
+    }
+
+    /// The getter sweep asks for a size either side of each page boundary, so `size` and
+    /// `currentAllocatedSize` are Metal's rounding and not the number the descriptor stated.
+    ///
+    /// Verified to fail: narrowing [`SIZES`] to `[4096, 16384]` fails here, naming both boundaries
+    /// it no longer straddles.
+    #[test]
+    fn the_size_sweep_straddles_the_page_boundaries() {
+        let asked: BTreeSet<u64> = SIZES.into_iter().collect();
+        let mut flat = Vec::new();
+        for page in [4096u64, 16384] {
+            if !asked.contains(&(page - 1)) || !asked.contains(&(page + 1)) {
+                flat.push(page);
+            }
+        }
+        assert!(
+            flat.is_empty(),
+            "these page boundaries are asked at one side only, so a side that rounded the wrong \
+             way would differ at no site: {flat:?}"
+        );
+        assert!(
+            asked.contains(&1),
+            "no heap of 1 byte, the least a heap can be asked for"
         );
     }
 

@@ -35,7 +35,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "24714e99802ae2172ab392f1ee8df855bff0ba8c5d36ec952dff2f7b5a76afa9"
+                          "hex": "536829ae56c64fd202e5bbbb608cd3c09ada6602066f276bf25266fc27810982"
                         }
                       }
                     },
@@ -2478,6 +2478,720 @@
                           "observed": {
                             "value": {
                               "uint": 545
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-1-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 1
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-4095-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 4095
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-4096-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 4096
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-4097-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 4097
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-16383-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 16383
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-16384-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 16384
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 16384
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
+                            }
+                          }
+                        },
+                        {
+                          "name": "label",
+                          "observed": {
+                            "value": "absent"
+                          }
+                        },
+                        {
+                          "name": "own_device",
+                          "observed": {
+                            "value": {
+                              "bool": true
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "automatic-16385-shared-default-cache-hazard-default",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "size-asked-for",
+                      "observed": {
+                        "value": {
+                          "uint": 16385
+                        }
+                      }
+                    },
+                    {
+                      "name": "fresh",
+                      "observed": {
+                        "value": "absent"
+                      },
+                      "children": [
+                        {
+                          "name": "type",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "size",
+                          "observed": {
+                            "value": {
+                              "uint": 32768
+                            }
+                          }
+                        },
+                        {
+                          "name": "used_size",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "current_allocated_size",
+                          "observed": {
+                            "value": {
+                              "uint": 32768
+                            }
+                          }
+                        },
+                        {
+                          "name": "storage_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "cpu_cache_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 0
+                            }
+                          }
+                        },
+                        {
+                          "name": "hazard_tracking_mode",
+                          "observed": {
+                            "value": {
+                              "uint": 1
+                            }
+                          }
+                        },
+                        {
+                          "name": "resource_options",
+                          "observed": {
+                            "value": {
+                              "uint": 256
                             }
                           }
                         },
