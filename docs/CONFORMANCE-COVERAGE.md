@@ -56,7 +56,7 @@ What this axis cannot see, measured rather than asserted:
 - **A value Metal answers as a bare ordinal.** A transcript holds a `uint`, and nothing in it says which enum the number belongs to, so only a site that records the enumerator's **name** is read. The *answered* column is a floor by every site that records an ordinal instead.
 - **A value a case states as a raw ordinal.** A case may hand the Metal leg an enum's ordinal as a number — a sweep over `0..n` rather than over named variants — and no reading of the text can say which value a computed number is. So *in effect*, and the *stated* column of the hand-modelled table below, are floors by every sweep written that way: a type they report short of its values may in fact be swept exhaustively, and the case is what says so. Read the case before taking a row of the work list as work.
 - **Which case put a value in effect.** The unit is the case module, as it is for the items axis: a value named anywhere in a module whose cases include a Metal run counts for that module, even where one of its cases names it and the rest do not.
-- **A value only the suite's shared sources name** — 6 of them. Some case puts it to Metal through the render or texture vocabulary, but which case is not a property of the text, so it is neither compared nor missing and has its own column.
+- **A value only the suite's shared sources name** — 4 of them. Some case puts it to Metal through the render or texture vocabulary, but which case is not a property of the text, so it is neither compared nor missing and has its own column.
 - **Combinations.** Every column here is per value. A type whose values are all compared says nothing about the pairs and triples of them, which is where most of the behaviour an implementation can get wrong lives.
 - **Metal's API validation is excluded.** Its complaints name enumerators, and the suite records that leg and never compares it, so reading it would count Apple's prose as a comparison. So are the cost and timing tables: a site name there is what was measured, not an answer that was compared.
 - **A `#[cfg(test)]` item is excluded.** One of the suite's unit tests names four blend factors to assert that no case uses them; counting those would have this report the opposite of what the code says.
@@ -65,11 +65,11 @@ What this axis cannot see, measured rather than asserted:
 |---|---|
 | Metal enums and option sets with a generated value list | 43 |
 | their values | 703 |
-| values compared | 336 |
-| share compared | 48% |
-| values only the suite's shared sources name | 6 |
-| values no source names and no recording holds | 361 |
-| types every value of which is compared | 11 |
+| values compared | 341 |
+| share compared | 49% |
+| values only the suite's shared sources name | 4 |
+| values no source names and no recording holds | 358 |
+| types every value of which is compared | 13 |
 | types no value of which is compared | 5 |
 
 The share is weakly informative on its own: `MTLPixelFormat`, `MTLDataType`, `MTLAttributeFormat`, `MTLVertexFormat` hold 506 of the 703 values between them, so an aggregate over types this uneven is mostly theirs. The per-type table is the one to read.
@@ -80,7 +80,7 @@ Deepest gap first, which is the order the work list reads in. *answered* and *in
 
 | Metal type | values | compared | answered | in effect | shared only | missing |
 |---|---|---|---|---|---|---|
-| `MTLPixelFormat` | 301 | 178 | 112 | 109 | 1 | 122 |
+| `MTLPixelFormat` | 301 | 179 | 112 | 110 | 0 | 122 |
 | `MTLDataType` | 97 | 15 | 10 | 9 | 0 | 82 |
 | `MTLAttributeFormat` | 54 | 1 | 0 | 1 | 0 | 53 |
 | `MTLVertexFormat` | 54 | 18 | 2 | 16 | 0 | 36 |
@@ -90,7 +90,6 @@ Deepest gap first, which is the order the work list reads in. *answered* and *in
 | `MTLFunctionType` | 7 | 3 | 3 | 0 | 0 | 4 |
 | `MTLStepFunction` | 9 | 5 | 0 | 5 | 0 | 4 |
 | `MTLFunctionOptions` | 5 | 2 | 1 | 2 | 0 | 3 |
-| `MTLPrimitiveType` | 5 | 2 | 0 | 2 | 0 | 3 |
 | `MTLReadWriteTextureTier` | 3 | 0 | 0 | 0 | 0 | 3 |
 | `MTLSamplerMipFilter` | 3 | 0 | 0 | 0 | 0 | 3 |
 | `MTLSamplerReductionMode` | 3 | 0 | 0 | 0 | 0 | 3 |
@@ -111,11 +110,12 @@ Deepest gap first, which is the order the work list reads in. *answered* and *in
 | `MTLSamplerMinMagFilter` | 3 | 2 | 0 | 2 | 0 | 1 |
 | `MTLTessellationControlPointIndexType` | 3 | 2 | 2 | 0 | 0 | 1 |
 | `MTLDispatchType` | 2 | 0 | 0 | 0 | 2 | 0 |
-| `MTLIndexType` | 2 | 1 | 0 | 1 | 1 | 0 |
 | `MTLBindingAccess` | 3 | 3 | 3 | 0 | 0 | 0 |
 | `MTLCullMode` | 3 | 3 | 0 | 3 | 0 | 0 |
 | `MTLDepthClipMode` | 2 | 2 | 0 | 2 | 0 | 0 |
+| `MTLIndexType` | 2 | 2 | 0 | 2 | 0 | 0 |
 | `MTLMutability` | 3 | 3 | 3 | 0 | 0 | 0 |
+| `MTLPrimitiveType` | 5 | 5 | 0 | 5 | 0 | 0 |
 | `MTLRenderStages` | 5 | 5 | 0 | 5 | 0 | 0 |
 | `MTLSamplerAddressMode` | 6 | 6 | 0 | 6 | 0 | 0 |
 | `MTLTessellationFactorFormat` | 1 | 1 | 1 | 0 | 0 | 0 |
@@ -138,7 +138,6 @@ The work list. A name here is a value of Metal's that no committed recording hol
 - **`MTLFunctionType`**, 4 of 7: `MTLFunctionTypeVisible`, `MTLFunctionTypeIntersection`, `MTLFunctionTypeMesh`, `MTLFunctionTypeObject`
 - **`MTLStepFunction`**, 4 of 9: `MTLStepFunctionPerVertex`, `MTLStepFunctionPerInstance`, `MTLStepFunctionPerPatch`, `MTLStepFunctionPerPatchControlPoint`
 - **`MTLFunctionOptions`**, 3 of 5: `MTLFunctionOptionCompileToBinary`, `MTLFunctionOptionFailOnBinaryArchiveMiss`, `MTLFunctionOptionPipelineIndependent`
-- **`MTLPrimitiveType`**, 3 of 5: `MTLPrimitiveTypeLine`, `MTLPrimitiveTypeLineStrip`, `MTLPrimitiveTypeTriangleStrip`
 - **`MTLReadWriteTextureTier`**, 3 of 3: `MTLReadWriteTextureTierNone`, `MTLReadWriteTextureTier1`, `MTLReadWriteTextureTier2`
 - **`MTLSamplerMipFilter`**, 3 of 3: `MTLSamplerMipFilterNotMipmapped`, `MTLSamplerMipFilterNearest`, `MTLSamplerMipFilterLinear`
 - **`MTLSamplerReductionMode`**, 3 of 3: `MTLSamplerReductionModeWeightedAverage`, `MTLSamplerReductionModeMinimum`, `MTLSamplerReductionModeMaximum`
@@ -162,9 +161,7 @@ The work list. A name here is a value of Metal's that no committed recording hol
 And the values only the suite's shared sources name, which some case reaches and this cannot attribute:
 
 - **`MTLDispatchType`**: `MTLDispatchTypeSerial`, `MTLDispatchTypeConcurrent`
-- **`MTLIndexType`**: `MTLIndexTypeUInt32`
 - **`MTLIndirectCommandType`**: `MTLIndirectCommandTypeDrawMeshThreads`
-- **`MTLPixelFormat`**: `MTLPixelFormatRGBA32Uint`
 - **`MTLSamplerBorderColor`**: `MTLSamplerBorderColorTransparentBlack`
 
 ### Metal types with no generated value list
@@ -176,15 +173,15 @@ These 17 are what that shape finds, and the list is a floor: a type the tree mod
 | Metal type | the tree's type | declared | stated by a recorded case | shared only |
 |---|---|---|---|---|
 | `MTLBlitOption` | `BlitOption` | 4 | 0 | 4 |
-| `MTLCPUCacheMode` | `CpuCacheMode` | 2 | 0 | 0 |
+| `MTLCPUCacheMode` | `CpuCacheMode` | 2 | 1 | 1 |
 | `MTLCommandBufferStatus` | `CommandBufferStatus` | 6 | 0 | 6 |
-| `MTLHazardTrackingMode` | `HazardTrackingMode` | 3 | 0 | 0 |
-| `MTLHeapType` | `HeapType` | 3 | 0 | 2 |
+| `MTLHazardTrackingMode` | `HazardTrackingMode` | 3 | 1 | 2 |
+| `MTLHeapType` | `HeapType` | 3 | 2 | 1 |
 | `MTLLoadAction` | `LoadAction` | 3 | 2 | 1 |
 | `MTLMultisampleDepthResolveFilter` | `MultisampleDepthResolveFilter` | 3 | 0 | 1 |
 | `MTLMultisampleStencilResolveFilter` | `MultisampleStencilResolveFilter` | 2 | 0 | 1 |
 | `MTLPipelineOption` | `PipelineOption` | — a bit set | 0 | 0 |
-| `MTLPurgeableState` | `PurgeableState` | 4 | 0 | 0 |
+| `MTLPurgeableState` | `PurgeableState` | 4 | 1 | 3 |
 | `MTLResourceOptions` | `ResourceOptions` | — a bit set | 0 | 0 |
 | `MTLSparsePageSize` | `SparsePageSize` | 3 | 3 | 0 |
 | `MTLSparseTextureRegionAlignmentMode` | `SparseTextureRegionAlignmentMode` | 2 | 0 | 2 |
