@@ -779,8 +779,10 @@ def write(data) -> str:
         w("")
         w(
             "The Metal leg sends these selectors to a receiver this typed, and "
-            "`scripts/metal-coverage/coverage.tsv` holds no row for the item. Either the map is "
-            "short of the SDK or the name is spelled differently there; both are worth a look."
+            "`scripts/metal-coverage/coverage.tsv` holds no row for the item. Either the selector "
+            "is `NSObject`'s, which `objc2-metal` generates on every class it binds and no Metal "
+            "header declares, or the map is short of the SDK, or the name is spelled differently "
+            "there; the last two are worth a look."
         )
         w("")
         w("| receiver | selector |")
