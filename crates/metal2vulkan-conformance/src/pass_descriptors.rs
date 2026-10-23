@@ -226,6 +226,12 @@ impl Reads {
 /// Raw values and not this suite's enumerations: the whole of what an action means is its ordinal,
 /// the runtime's own `LoadAction::from_raw` is what turns one into its value, and a sweep that
 /// named each value would state a vocabulary beside the two the sides already have.
+///
+/// The sweeps state only the values and bits Metal **defines**. An undefined store-action option
+/// bit is not swept because the runtime refuses one by design — `StoreActionOptions::from_raw`
+/// answers a typed error rather than casting — so a row stating bit 1 would compare our refusal
+/// against whatever Metal's setter stored, which is a refusal case and a different question from
+/// this family's. What Metal does with such a bit is unmeasured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Actions {
     /// `loadAction`: `MTLLoadAction`'s raw value, 0 to 2.

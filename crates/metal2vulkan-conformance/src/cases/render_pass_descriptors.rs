@@ -4,9 +4,8 @@
 //! `MTLRenderPassAttachmentDescriptor` at six of twelve, every one of them by a render family
 //! **handing the descriptor to an encoder**. Nothing read one back, so the array length, the
 //! imageblock sample length, the threadgroup memory length, the rate map, the sample-position
-//! getter, the class's own constructor, the six index fields of every attachment and the
-//! colour-array setter were reached by nothing at all — and the fields that *were* reached were
-//! reached at one value each.
+//! getter, the six index fields of every attachment and the colour-array setter were reached by
+//! nothing at all — and the fields that *were* reached were reached at one value each.
 //!
 //! [`crate::pass_descriptors`] holds the vocabulary, the sweeps and the argument about what each
 //! shape can catch. This module is the cases.
@@ -33,7 +32,9 @@
 //! - `pass-attachment-actions`, 18 rows: the load action, the store action and the store action
 //!   options, **36 of 36 triples** — every `MTLLoadAction` against every `MTLStoreAction` against
 //!   both options, exhaustive, because each row states three attachments at three places of the
-//!   space ([`crate::pass_descriptors::action_rows`]). Load 3/3, store 6/6, options 2/2.
+//!   space ([`crate::pass_descriptors::action_rows`]). Load 3/3, store 6/6, options 2/2 of the
+//!   values Metal defines — the mask's undefined bits are not swept, for the reason
+//!   [`crate::pass_descriptors::Actions`] gives.
 //! - `pass-attachment-filters`, 6 rows: 6 of 6 pairs. Depth filter 3/3, stencil filter 2/2.
 //! - `pass-attachment-indices`, 8 rows: the six index fields at 0, 1, 2, 7, 8, the last 32-bit
 //!   index, the first value past 32 bits and the last `NSUInteger`. A 64-bit space, so the ratio is
