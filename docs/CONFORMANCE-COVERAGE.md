@@ -27,10 +27,10 @@ Its limits, measured rather than asserted:
 | | |
 |---|---|
 | implemented Metal items | 958 |
-| of those, exercised by the suite's Metal leg | 631 |
-| of those, not exercised | 327 |
+| of those, exercised by the suite's Metal leg | 630 |
+| of those, not exercised | 328 |
 | share exercised | 66% |
-| of those exercised, no case reaching it loosens anything | 496 |
+| of those exercised, no case reaching it loosens anything | 495 |
 | of those exercised, a case reaching it loosens some site | 135 |
 | case modules | 110 |
 | committed recordings | 846 |
@@ -203,8 +203,8 @@ Every container with an implemented item, by how much of it the suite reaches.
 | `MTLComputeCommandEncoder` | 36 | 23 | 13 | `argument_encoders`, `astc_textures`, `blit_encoder_commands`, `border_swizzles`… |
 | the header's free functions | 12 | 0 | 12 |  |
 | `MTLIndirectRenderCommand` | 23 | 12 | 11 | `indirect_commands`, `mesh_commands` |
+| `MTLRasterizationRateLayerDescriptor` | 10 | 0 | 10 |  |
 | `MTLComputePipelineState` | 15 | 6 | 9 | `compute_threadgroups`, `pipeline_facts` |
-| `MTLRasterizationRateLayerDescriptor` | 10 | 1 | 9 | `rate_map_sweeps`, `rate_maps` |
 | `MTLSamplerDescriptor` | 16 | 7 | 9 | `argument_encoders`, `border_swizzles`, `chroma_pairs`, `compute_encoder_commands`… |
 | `MTLBinaryArchive` | 7 | 0 | 7 |  |
 | `MTLRenderPipelineState` | 15 | 8 | 7 | `pipeline_facts`, `tile_threadgroups` |
@@ -305,7 +305,7 @@ A container is one Objective-C type; the SDK header it sits in is the family of 
 | `MTLArgument.h` | 77 | 46 | 31 |
 | `MTLDevice.h` | 73 | 44 | 29 |
 | `MTLRenderPipeline.h` | 114 | 90 | 24 |
-| `MTLRasterizationRate.h` | 37 | 17 | 20 |
+| `MTLRasterizationRate.h` | 37 | 16 | 21 |
 | `MTLComputeCommandEncoder.h` | 36 | 23 | 13 |
 | `MTLIndirectCommandEncoder.h` | 35 | 22 | 13 |
 | `MTLComputePipeline.h` | 34 | 22 | 12 |
@@ -358,6 +358,7 @@ An implemented container no case's Metal leg touches. These are the families of 
 | `MTLFunctionHandle` | 3 | `MTLFunctionHandle.h` |
 | `MTLFunctionReflection` | 3 | `MTLLibrary.h` |
 | `MTLObjectPayloadBinding` | 3 | `MTLArgument.h` |
+| `MTLRasterizationRateLayerDescriptor` | 10 | `MTLRasterizationRate.h` |
 | `MTLRasterizationRateSampleArray` | 3 | `MTLRasterizationRate.h` |
 | `MTLRenderPipelineFunctionsDescriptor` | 4 | `MTLRenderPipeline.h` |
 | `MTLSharedEventListener` | 2 | `MTLEvent.h` |
@@ -365,7 +366,7 @@ An implemented container no case's Metal leg touches. These are the families of 
 | `MTLVisibleFunctionTable` | 4 | `MTLVisibleFunctionTable.h` |
 | `MTLVisibleFunctionTableDescriptor` | 3 | `MTLVisibleFunctionTable.h` |
 
-17 containers, 77 implemented items.
+18 containers, 87 implemented items.
 
 ## The suite's shape
 
@@ -469,8 +470,8 @@ Each case module: the cases it holds, the `Side` methods it calls, and how many 
 | `pixel_samplers` | 16 | 16 | every field | 31 |
 | `pvrtc_cpu_order` | 6 | 6 | every field | 41 |
 | `pvrtc_rows` | 8 | 8 | every field | 41 |
-| `rate_map_sweeps` | 8 | 8 | every field | 21 |
-| `rate_maps` | 2 | 2 | every field | 16 |
+| `rate_map_sweeps` | 8 | 8 | every field | 20 |
+| `rate_maps` | 2 | 2 | every field | 15 |
 | `render_chains` | 3 | 3 | every field | 87 |
 | `render_depth_stencil_state` | 3 | 3 | every field | 94 |
 | `render_draw_forms` | 4 | 4 | every field | 83 |
@@ -1264,7 +1265,7 @@ One row per implemented item of the SDK, in the coverage map's order. *exercised
 |---|---|---|---|
 | `MTLRasterizationRateLayerDescriptor` | no | — | — |
 | `initWithSampleCount:` | no | — | — |
-| `initWithSampleCount:horizontal:vertical:` | yes | `rate_map_sweeps`, `rate_maps` | 10 |
+| `initWithSampleCount:horizontal:vertical:` | no | — | — |
 | `sampleCount` | no | — | — |
 | `maxSampleCount` | no | — | — |
 | `horizontalSampleStorage` | no | — | — |
@@ -1979,6 +1980,7 @@ An item the Metal leg calls that no case module was found to reach: either a `Si
 | `MTLIndirectComputeCommand` `setImageblockWidth:height:` | implemented |
 | `MTLIndirectRenderCommand` `setObjectThreadgroupMemoryLength:atIndex:` | implemented |
 | `MTLIndirectRenderCommand` `setVertexBuffer:offset:attributeStride:atIndex:` | implemented |
+| `MTLRasterizationRateLayerDescriptor` `initWithSampleCount:horizontal:vertical:` | implemented |
 | `MTLTextureDescriptor` `textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:` | implemented |
 
 ## Called, not in the coverage map
