@@ -34,9 +34,9 @@
 //!
 //! `MTLFunctionDescriptor` has no getters a case can usefully read back off the descriptor: what
 //! it is *for* is the function it makes. So its three settable facts are compared through that
-//! function — `name` through [`FunctionFacts::name`], `constantValues` through the specialized
+//! function — `name` through [`crate::function_facts::FunctionFacts::name`], `constantValues` through the specialized
 //! attribute lists and the empty constants dictionary, and `options` through
-//! [`FunctionFacts::options`], which every case made by name answers `MTLFunctionOptionNone` for.
+//! [`crate::function_facts::FunctionFacts::options`], which every case made by name answers `MTLFunctionOptionNone` for.
 //! A descriptor whose options a side dropped reads as a different `options` field rather than as
 //! nothing.
 
