@@ -152,7 +152,12 @@ fn bounds_pass_notice() -> Vec<Allowance> {
 
 /// Every case of the family, in the order the report lists them.
 pub fn all() -> Vec<Box<dyn Case>> {
-    vec![Box::new(Points), Box::new(Triangles), Box::new(Lines)]
+    vec![
+        Box::new(Points),
+        Box::new(Triangles),
+        Box::new(Lines),
+        Box::new(Empty),
+    ]
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1140,6 +1145,161 @@ impl Case for Lines {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// render-draw-forms-empty
+
+/// A draw of **no vertices and no indices** through every selector that can take one, between two
+/// draws that write.
+///
+/// The documented boundary of every count these selectors carry. Plain Metal draws nothing for a
+/// draw of no vertices, indices or instances (`metal2vulkan_runtime`'s `render.rs` module docs,
+/// measured on an M4), which is a **defined** answer rather than an undefined one: the band stays
+/// the pass's clear. So it compares exactly, which is the whole reason the boundary is worth a case.
+///
+/// A target that is all clear would prove nothing, so marks 1 and 10 write the first and last rows
+/// through the shortest selector there is: the pass ran, a draw of this pipeline over these
+/// bindings does write, and the eight draws between them wrote nothing. Mark 9's indirect draw
+/// names a **real** run of three indices into row 9, and its arguments say `indexCount` 0 -- so row
+/// 9 staying clear is a reading of the count rather than of an empty buffer.
+///
+/// **What this case does not sweep, and why.** An `instanceCount` of 0 is the other half of the
+/// boundary and is not here: plain Metal draws nothing for it too, but Metal's own API validation
+/// layer **stops** it (the same module docs, the probe case `zero_instances`), so the suite's
+/// validated oracle would record an abort of its child rather than a fact. Pairing the two is a
+/// `rate_maps`-shaped case that declares a plain-against-validated disagreement, and whether the
+/// suite should hold one here is a decision above this family.
+const EMPTY_SIZE: [u32; 2] = POINT_SIZE;
+
+/// A draw of no vertices or no indices through every selector that can take one.
+pub struct Empty;
+
+/// The empty case's ten draws: two that write, and eight of no vertices or no indices between them.
+fn empty_rows() -> Vec<Row> {
+    let at = |column: u32, row: u32| row * EMPTY_SIZE[0] + column;
+    let point = |mark: u32, form: Form| Row {
+        mark,
+        primitive: PrimitiveType::Point,
+        shift: 1,
+        form,
+    };
+    vec![
+        // The positive control ahead of the empty draws.
+        point(
+            1,
+            Form::Plain {
+                first: at(0, 0),
+                count: 6,
+            },
+        ),
+        point(
+            2,
+            Form::Plain {
+                first: at(0, 2),
+                count: 0,
+            },
+        ),
+        point(
+            3,
+            Form::Instanced {
+                first: at(0, 3),
+                count: 0,
+                instances: 3,
+            },
+        ),
+        point(
+            4,
+            Form::Based {
+                first: at(0, 4),
+                count: 0,
+                instances: 2,
+            },
+        ),
+        // An indirect draw whose `vertexCount` is 0 and whose `vertexStart` names row 5.
+        point(
+            5,
+            Form::Indirect {
+                arguments: [0, 1, at(0, 5), 0],
+            },
+        ),
+        point(
+            6,
+            Form::IndexedPlain {
+                index_type: IndexType::UInt16,
+                indices: Vec::new(),
+            },
+        ),
+        point(
+            7,
+            Form::IndexedInstanced {
+                index_type: IndexType::UInt32,
+                indices: Vec::new(),
+                instances: 2,
+            },
+        ),
+        point(
+            8,
+            Form::IndexedBased {
+                index_type: IndexType::UInt16,
+                indices: Vec::new(),
+                instances: 1,
+                base_vertex: at(0, 8) as i32,
+                base_instance: 4,
+            },
+        ),
+        // The run is three real indices into row 9 and the arguments say `indexCount` 0, so row 9
+        // staying clear reads the count rather than an empty buffer.
+        point(
+            9,
+            Form::IndexedIndirect {
+                index_type: IndexType::UInt16,
+                indices: vec![at(0, 9), at(2, 9), at(4, 9)],
+                arguments: [0, 1, 0, 0, 0],
+            },
+        ),
+        // The positive control after them.
+        point(
+            10,
+            Form::Plain {
+                first: at(0, 15),
+                count: 6,
+            },
+        ),
+    ]
+}
+
+impl Case for Empty {
+    fn name(&self) -> &'static str {
+        "render-draw-forms-empty"
+    }
+
+    fn metal_source(&self) -> MetalSource {
+        MetalSource::Run
+    }
+
+    fn record_runs(&self) -> u32 {
+        RUNS
+    }
+
+    fn allowances(&self) -> Vec<Allowance> {
+        // This case makes an indexed indirect draw, so it declares the same one notice the points
+        // and triangles cases do ([`bounds_pass_notice`]) -- the runtime bounds the indices before
+        // the pass whatever the count turns out to be. No value is loosened.
+        bounds_pass_notice()
+    }
+
+    fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
+        shader_refs()
+    }
+
+    fn inputs(&self) -> Result<Vec<Input>, String> {
+        case_inputs(&empty_rows(), &point_positions(), EMPTY_SIZE)
+    }
+
+    fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
+        drawn(side, sites, &empty_rows(), &point_positions(), EMPTY_SIZE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,6 +1501,7 @@ mod tests {
             (point_rows(), point_positions(), POINT_SIZE),
             (triangle_rows(), triangle_positions(), TRIANGLE_SIZE),
             (line_rows(), line_positions(), LINE_SIZE),
+            (empty_rows(), point_positions(), EMPTY_SIZE),
         ] {
             for row in &rows {
                 for vid in vertices(&row.form) {
@@ -1735,6 +1896,64 @@ mod tests {
         }
     }
 
+    /// **Metal's recorded empty-draw target holds the two rows that write and nothing else.**
+    ///
+    /// The two controls are what makes this readable: a target of all clear would pass with a pass
+    /// that never ran, and this one fails unless rows 0 and 15 hold their draws' own pixels.
+    #[test]
+    fn metal_drew_nothing_for_every_empty_form() {
+        let Some(bytes) = recorded(Empty.name(), EMPTY_SIZE) else {
+            println!("render-draw-forms-empty: no recording in the tree yet");
+            return;
+        };
+        let rows = empty_rows();
+        let writing: Vec<&Row> = rows
+            .iter()
+            .filter(|row| !vertices(&row.form).is_empty())
+            .collect();
+        assert_eq!(writing.len(), 2, "the case holds two draws that write");
+        let positions = point_positions();
+        let mut want: BTreeMap<(u32, u32), Texel> = BTreeMap::new();
+        for row in &writing {
+            for vid in vertices(&row.form) {
+                let at = positions[vid as usize];
+                want.insert(
+                    (at[0] as u32, at[1] as u32),
+                    Texel {
+                        mark: row.mark,
+                        vid,
+                        iid: 0,
+                        base: 0,
+                    },
+                );
+            }
+        }
+        // The two controls are on the first and the last row, so an empty draw that wrote anywhere
+        // between them is caught.
+        assert_eq!(
+            want.keys().map(|(_, y)| *y).collect::<BTreeSet<u32>>(),
+            BTreeSet::from([0, EMPTY_SIZE[1] - 1])
+        );
+        let mut differ = Vec::new();
+        for y in 0..EMPTY_SIZE[1] {
+            for x in 0..EMPTY_SIZE[0] {
+                let got = texel(&bytes, x, y, EMPTY_SIZE);
+                let expected = want.get(&(x, y)).copied().unwrap_or(CLEAR);
+                if got != expected {
+                    differ.push(format!("({x}, {y}): Metal {got:?}, want {expected:?}"));
+                }
+            }
+        }
+        for line in differ.iter().take(20) {
+            println!("EMPTY-DIFFERS: {line}");
+        }
+        assert!(
+            differ.is_empty(),
+            "{} texel(s) are not what two writing draws and eight empty ones say",
+            differ.len()
+        );
+    }
+
     /// **The family reaches every value of `MTLPrimitiveType` and both of `MTLIndexType`**, which
     /// is the whole of what it set out to sweep, and the ratio is stated here rather than in prose.
     #[test]
@@ -1742,7 +1961,7 @@ mod tests {
         let mut primitives = BTreeSet::new();
         let mut index_types = BTreeSet::new();
         let mut calls = BTreeSet::new();
-        for rows in [point_rows(), triangle_rows(), line_rows()] {
+        for rows in [point_rows(), triangle_rows(), line_rows(), empty_rows()] {
             for row in rows {
                 primitives.insert(row.primitive.as_raw());
                 let step = row.form.step(row.primitive, Handle(0), Handle(1), 0);
@@ -1774,6 +1993,7 @@ mod tests {
             "render-draw-forms-points" => point_rows(),
             "render-draw-forms-triangles" => triangle_rows(),
             "render-draw-forms-lines" => line_rows(),
+            "render-draw-forms-empty" => empty_rows(),
             other => panic!("{other} is not a case of this family"),
         };
         !rows
@@ -1784,11 +2004,11 @@ mod tests {
     /// **Every case of the family names itself once**, and the names are the ones the recordings
     /// are keyed by.
     #[test]
-    fn the_family_names_three_cases_apart() {
+    fn the_family_names_four_cases_apart() {
         let names: Vec<&str> = all().iter().map(|case| case.name()).collect();
         let distinct: BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(distinct.len(), names.len(), "two cases share a name");
-        assert_eq!(names.len(), 3);
+        assert_eq!(names.len(), 4);
         for case in all() {
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
