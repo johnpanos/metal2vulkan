@@ -102,6 +102,27 @@
 //! Each of those is a fact about Metal that the recording **measures** rather than one the suite
 //! asserts: the model says they agree, and the recorded texels say the model is Metal's.
 //!
+//! # What the sweep measured about Metal that nothing here knew before
+//!
+//! Metal's answer matches the written blend equation at **44,928 of 44,932** compared channels on
+//! this M3 Max, macOS 27.0.1. The four that do not are one fact, and it is the sort a sweep finds
+//! and a once-each suite cannot:
+//!
+//! **`MTLBlendOperationSubtract` stores negative zero where both factored terms are zero.** The
+//! four leaves are `dc-1mdc-subtract` at the one pixel in each channel where the destination is
+//! zero, which makes `destinationColor * source` and `(1 - destinationColor) * destination` both
+//! zero. IEEE subtraction gives `+0` for those operands, and so does every neighbour of the
+//! measurement: `Add` and `ReverseSubtract` over the same two terms store `+0`, and `Subtract`
+//! itself stores `+0` at the leaves of the same site where its two terms are equal and **non**-zero.
+//! So the condition is exactly "both terms zero" and nothing wider, which is why
+//! [`tests::metals_subtract_stores_a_negative_zero_where_both_terms_are_zero`] holds the boundary
+//! as well as the fact. What the blend unit does to arrive there is not something this suite can
+//! see, and it does not guess.
+//!
+//! It is a bit a Metal program can read -- a sign test, or a division -- so the model states it and
+//! no site is loosened for it. A device that stores `+0` there is divergent from Metal, and that is
+//! the honest verdict rather than a rounding to wave through.
+//!
 //! # Nothing here can fault a GPU
 //!
 //! Single-sampled 8 by 8 targets of the case's own memory, one full-screen triangle a pass, no
@@ -399,6 +420,16 @@ fn model(variant: &Variant, pixel: usize) -> [f32; 4] {
                 let from_destination = d * factored(destination_factor);
                 match op {
                     O::Add => from_source + from_destination,
+                    // Measured, not derived: where **both** factored terms are zero, Metal's
+                    // `Subtract` stores negative zero. Its sibling operations over the same two
+                    // operands store positive zero, and so does `Subtract` where the two terms are
+                    // equal and non-zero -- which IEEE subtraction would give in every one of those
+                    // cases, so this is the one place the blend unit is not it. The four leaves of
+                    // this family that show it, and the many that pin the boundary around them, are
+                    // `tests::metals_subtract_stores_a_negative_zero_where_both_terms_are_zero`'s
+                    // subject; the mechanism behind it is not something the suite can see, and the
+                    // suite does not guess at one.
+                    O::Subtract if from_source == 0.0 && from_destination == 0.0 => -0.0,
                     O::Subtract => from_source - from_destination,
                     O::ReverseSubtract => from_destination - from_source,
                     O::Min => s.min(d),
@@ -1201,6 +1232,19 @@ mod tests {
     fn the_write_mask_sweep_is_the_whole_four_bit_field() {
         let bits = channel_bits();
         assert_eq!(bits.len(), 4, "the field is not four bits: {bits:?}");
+        // The order matters beyond this test: `model` reads `channel_bits()[channel]` to decide
+        // whether channel `channel` of a texel is written, so the table's order and the texel's
+        // channel order must be the same one. A reorder upstream fails here rather than masking the
+        // wrong channel in every row of the sweep.
+        assert_eq!(
+            bits.iter().map(|(_, name)| *name).collect::<Vec<&str>>(),
+            vec![
+                "MTLColorWriteMaskRed",
+                "MTLColorWriteMaskGreen",
+                "MTLColorWriteMaskBlue",
+                "MTLColorWriteMaskAlpha",
+            ]
+        );
         let swept = masks();
         assert_eq!(swept.len(), 16);
         let raws: BTreeSet<u32> = swept.iter().map(|(mask, _)| mask.as_raw()).collect();
@@ -1508,6 +1552,102 @@ mod tests {
                 rows.len(),
                 "{}: two rows fingerprint alike",
                 case.name()
+            );
+        }
+    }
+
+    /// Metal's `Subtract` stores negative zero where both factored terms are zero, and positive
+    /// zero everywhere else a zero comes out — including under `Subtract` itself where the two
+    /// terms are equal and non-zero.
+    ///
+    /// Read straight off the recording, not off the model, so the model's one measured exception
+    /// cannot be the thing that proves itself. The boundary is what makes the exception a fact
+    /// rather than a fudge: in the **same site**, under the **same operation**, a leaf whose two
+    /// terms are equal and non-zero stores `+0` and a leaf whose two terms are both zero stores
+    /// `-0`, so nothing wider than "both terms zero" is being claimed. `Add`, `ReverseSubtract`,
+    /// `Min` and `Max` over the same two zero operands store `+0`, which is the other half.
+    #[test]
+    fn metals_subtract_stores_a_negative_zero_where_both_terms_are_zero() {
+        use metal2vulkan_runtime::MetalLevel;
+        let case = all()
+            .into_iter()
+            .find(|case| case.sweep == Sweep::Operations)
+            .expect("the family holds an operations case");
+        let Ok(recording) = crate::recording::read(case.name()) else {
+            return;
+        };
+        let answer = recording.answer(MetalLevel::NEWEST).unwrap();
+        let taken = answer.deterministic().expect("one outcome");
+        let blended = taken.root.child("blended").expect("the blended site");
+        let held = layout();
+        let read = |site: &str, pixel: usize, channel: usize| -> f32 {
+            let node = blended
+                .child(site)
+                .unwrap_or_else(|| panic!("no {site} site"));
+            let Value::Bytes(bytes) = &node.observed.value else {
+                panic!("{site} holds no bytes");
+            };
+            let at = held.at(0, pixel as u32, channel as u32);
+            f32::from_bits(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+        };
+        // `dc-1mdc` factors the source by the destination and the destination by its complement, so
+        // both terms are zero exactly where the destination channel is zero.
+        let mut both_zero = Vec::new();
+        let mut equal_and_not_zero = Vec::new();
+        for pixel in 0..PIXELS {
+            for channel in 0..4usize {
+                let d = destination(pixel)[channel];
+                let s = SOURCE[channel];
+                let from_source = s * d;
+                let from_destination = d * (1.0 - d);
+                if from_source == 0.0 && from_destination == 0.0 {
+                    both_zero.push((pixel, channel));
+                } else if from_source == from_destination {
+                    equal_and_not_zero.push((pixel, channel));
+                }
+            }
+        }
+        assert_eq!(
+            both_zero.len(),
+            4,
+            "the destination sweep reaches zero in {} leaves, not four: {both_zero:?}",
+            both_zero.len()
+        );
+        assert!(
+            !equal_and_not_zero.is_empty(),
+            "no leaf of dc-1mdc has two equal non-zero terms, so the boundary is untested"
+        );
+        for (pixel, channel) in &both_zero {
+            assert_eq!(
+                read("dc-1mdc-subtract", *pixel, *channel).to_bits(),
+                (-0.0f32).to_bits(),
+                "dc-1mdc-subtract pixel {pixel} channel {channel}: both terms are zero, so Metal \
+                 stores negative zero"
+            );
+            // `Add` and `ReverseSubtract` are the other two operations over these same two zero
+            // terms, and both store positive zero. `Min` and `Max` are not about the terms at all
+            // -- they read no factor, which the collapse table already holds -- so they store the
+            // smaller and the larger of the source and the destination and have no zero here to
+            // sign.
+            for other in ["dc-1mdc-add", "dc-1mdc-reverse-subtract"] {
+                assert_eq!(
+                    read(other, *pixel, *channel).to_bits(),
+                    0.0f32.to_bits(),
+                    "{other} pixel {pixel} channel {channel}: only Subtract signs its zero"
+                );
+            }
+            assert_eq!(
+                read("dc-1mdc-max", *pixel, *channel),
+                SOURCE[*channel].max(destination(*pixel)[*channel]),
+                "dc-1mdc-max pixel {pixel} channel {channel}"
+            );
+        }
+        for (pixel, channel) in &equal_and_not_zero {
+            assert_eq!(
+                read("dc-1mdc-subtract", *pixel, *channel).to_bits(),
+                0.0f32.to_bits(),
+                "dc-1mdc-subtract pixel {pixel} channel {channel}: the two terms are equal and \
+                 non-zero, so the zero is positive and the exception is only about zero terms"
             );
         }
     }
