@@ -29,6 +29,19 @@
 //! decide inside a case, so this family covers the formats whose texels are Metal's own bytes and
 //! says so.
 //!
+//! **What the family can tell apart, and what it cannot.** The compared value is bytes moved by
+//! `replace_region` and read back by `get_bytes`, so what the format decides here is the texel's
+//! size — which sets the extent, the pitch and the padding the layout compares — and whether Metal
+//! makes a texture of the format at all. Two formats of the same texel bytes that Metal both makes
+//! and copies verbatim are **indistinguishable by construction** in this family: the written
+//! pattern is seeded by the format's own ordinal (`TextureRoundTrip::written`), so their rows
+//! hold different bytes and compare the same behaviour. Measured, not reasoned: with the runtime
+//! leg patched to make every `RGB10A2Uint` texture as `RGB10A2Unorm` instead, this family's
+//! `texture-round-trip-91` still read `exact` on an Apple M3 Max, while the same patch to
+//! `R16Unorm` — a different texel size — diverged at 128 bytes. A format's *numeric* behaviour is
+//! another family's question: `norm_storage_writes` sweeps the normalized packings, and
+//! `shared_exponent_storage` `RGB9E5Float`'s word.
+//!
 //! Nothing here reaches the GPU: a texture is created and the host copies bytes into and out of it.
 
 use crate::case::{Abort, Case, Input, MetalSource, Side, TextureRole, TextureSpec};
