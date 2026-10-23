@@ -26,9 +26,9 @@ Its limits, measured rather than asserted:
 
 | | |
 |---|---|
-| implemented Metal items | 958 |
+| implemented Metal items | 957 |
 | of those, exercised by the suite's Metal leg | 663 |
-| of those, not exercised | 295 |
+| of those, not exercised | 294 |
 | share exercised | 69% |
 | of those exercised, no case reaching it loosens anything | 520 |
 | of those exercised, a case reaching it loosens some site | 143 |
@@ -195,8 +195,8 @@ Every container with an implemented item, by how much of it the suite reaches.
 | `MTLComputeCommandEncoder` | 36 | 23 | 13 | `argument_encoders`, `astc_textures`, `blit_encoder_commands`, `border_swizzles`… |
 | the header's free functions | 12 | 0 | 12 |  |
 | `MTLIndirectRenderCommand` | 23 | 12 | 11 | `indirect_commands`, `mesh_commands` |
-| `MTLRasterizationRateLayerDescriptor` | 10 | 0 | 10 |  |
 | `MTLComputePipelineState` | 15 | 6 | 9 | `compute_threadgroups`, `pipeline_facts`, `pipeline_handlers` |
+| `MTLRasterizationRateLayerDescriptor` | 9 | 0 | 9 |  |
 | `MTLRenderPipelineState` | 15 | 8 | 7 | `pipeline_facts`, `pipeline_handlers`, `tile_threadgroups` |
 | `MTLTextureDescriptor` | 19 | 13 | 6 | `argument_encoders`, `astc_textures`, `blend_sweeps`, `blit_encoder_commands`… |
 | `MTLRasterizationRateMapDescriptor` | 10 | 5 | 5 | `rate_map_sweeps`, `rate_maps` |
@@ -295,8 +295,8 @@ A container is one Objective-C type; the SDK header it sits in is the family of 
 |---|---|---|---|
 | `MTLRenderCommandEncoder.h` | 119 | 64 | 55 |
 | `MTLArgument.h` | 77 | 46 | 31 |
-| `MTLRasterizationRate.h` | 37 | 16 | 21 |
 | `MTLRenderPipeline.h` | 114 | 93 | 21 |
+| `MTLRasterizationRate.h` | 36 | 16 | 20 |
 | `MTLDevice.h` | 73 | 55 | 18 |
 | `MTLComputeCommandEncoder.h` | 36 | 23 | 13 |
 | `MTLIndirectCommandEncoder.h` | 35 | 22 | 13 |
@@ -347,14 +347,14 @@ An implemented container no case's Metal leg touches. These are the families of 
 | `MTLFunctionHandle` | 3 | `MTLFunctionHandle.h` |
 | `MTLFunctionReflection` | 3 | `MTLLibrary.h` |
 | `MTLObjectPayloadBinding` | 3 | `MTLArgument.h` |
-| `MTLRasterizationRateLayerDescriptor` | 10 | `MTLRasterizationRate.h` |
+| `MTLRasterizationRateLayerDescriptor` | 9 | `MTLRasterizationRate.h` |
 | `MTLRasterizationRateSampleArray` | 3 | `MTLRasterizationRate.h` |
 | `MTLSharedEventListener` | 2 | `MTLEvent.h` |
 | `MTLType` | 2 | `MTLArgument.h` |
 | `MTLVisibleFunctionTable` | 4 | `MTLVisibleFunctionTable.h` |
 | `MTLVisibleFunctionTableDescriptor` | 3 | `MTLVisibleFunctionTable.h` |
 
-14 containers, 69 implemented items.
+14 containers, 68 implemented items.
 
 ## The suite's shape
 
@@ -1268,7 +1268,6 @@ One row per implemented item of the SDK, in the coverage map's order. *exercised
 | `verticalSampleStorage` | no | — | — |
 | `horizontal` | no | — | — |
 | `vertical` | no | — | — |
-| `MTLRasterizationRateLayerDescriptor` | no | — | — |
 
 ### `MTLRasterizationRateMap`
 

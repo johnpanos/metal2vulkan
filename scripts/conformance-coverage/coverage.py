@@ -652,7 +652,16 @@ def write(data) -> str:
     """The document's text."""
     rows, index, api, leg = data["rows"], data["index"], data["api"], data["leg"]
     families, records, by_item = data["families"], data["records"], data["by_item"]
-    implemented = [row for row in rows if row["status"] == "I"]
+    # One row per `(container, name)`, not one per row of the map: it holds
+    # `MTLRasterizationRateLayerDescriptor` twice, once as a class and once as a category on it,
+    # and every other number here is a set of those keys. Counting the rows instead states a
+    # denominator the numerator cannot reach, and `item_index` resolves a call to the later row
+    # anyway, so the deduplication matches what the resolution already does.
+    implemented = list(
+        {
+            (row["container"], row["name"]): row for row in rows if row["status"] == "I"
+        }.values()
+    )
     keys = {(row["container"], row["name"]) for row in implemented}
     exercised = {key for key in by_item if key in keys}
     cases_of = defaultdict(list)
