@@ -50,11 +50,9 @@ use crate::pass_descriptors::{
     ASSIGNED_COLOR, DEPTH_AT, MUTATED_AFTER, READ_COLORS as PASS_COLORS, STENCIL_AT, SWEPT_COLOR,
 };
 use crate::pipeline_facts::{ComputeStateFacts, ComputeStateSpec, RenderStateFacts};
-use crate::pipeline_handlers::{
-    BothPaths, Delivered, Form as PipelineForm, Handled, StateFacts,
-    IMAGEBLOCK as HANDLER_IMAGEBLOCK, WAIT as HANDLER_WAIT,
-};
+use crate::pipeline_handlers::{ BothPaths, Delivered, Form as PipelineForm, Handled, StateFacts, IMAGEBLOCK as HANDLER_IMAGEBLOCK, WAIT as HANDLER_WAIT, };
 use crate::pipeline_option_reflection::UnderOptions;
+use crate::pipeline_options::{OptionOutcome, FRAGMENT_STAGE, KERNEL_STAGE, VERTEX_STAGE};
 use crate::queue_slots::QueueSlots;
 use crate::render::{
     Dispatch, RenderPass, RenderPipelineSpec, RenderStep, RenderWork, StageFunction, StepResource,
@@ -88,9 +86,7 @@ use metal2vulkan_runtime::{PurgeableState, SparsePageSize};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, ClassType};
-use objc2_foundation::{
-    NSArray, NSDictionary, NSError, NSObjectProtocol, NSRange, NSString, NSURL,
-};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSObjectProtocol, NSRange, NSString, NSUInteger, NSURL};
 use objc2_metal::{
     MTLArgumentDescriptor, MTLArgumentEncoder, MTLArrayType, MTLAttribute, MTLAttributeFormat,
     MTLBarrierScope, MTLBinding, MTLBindingAccess, MTLBindingType, MTLBlendFactor,
@@ -3018,6 +3014,130 @@ impl Side for MetalSide {
             refused: false,
             bindings: found,
         })
+    }
+
+    fn compute_pipeline_under_options(
+        &mut self,
+        library: Handle,
+        entry: &str,
+        options: u64,
+    ) -> Answer<OptionOutcome> {
+        let library = self
+            .libraries
+            .get(library.0 as usize)
+            .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+        let function = library
+            .newFunctionWithName(&NSString::from_str(entry))
+            .ok_or_else(|| Failure::named("NoSuchFunction", entry.to_owned()))?;
+        let mut reflection = None;
+        // SAFETY: the function is of this library, and `reflection` is this call's own
+        // out-parameter. The option is the case's own raw value, which Metal accepts whole: it
+        // reads the bits it defines and keeps the rest.
+        let state = unsafe {
+            self.device
+                .newComputePipelineStateWithFunction_options_reflection_error(
+                    &function,
+                    MTLPipelineOption(options as NSUInteger),
+                    Some(&mut reflection),
+                )
+        }
+        .map_err(|error| {
+            Failure::named(
+                "NewComputePipelineState",
+                error.localizedDescription().to_string(),
+            )
+        })?;
+        let outcome = match reflection {
+            // Declared, not inferred: the coverage derivation types a receiver from what bound
+            // it, and an `Option` the creation filled in through an out-parameter names no type.
+            Some(reflection) => {
+                let reflection: Retained<MTLComputePipelineReflection> = reflection;
+                let bindings = reflection.bindings();
+                let mut found = Vec::new();
+                for binding in &bindings {
+                    found.push(metal_binding(&binding)?);
+                }
+                OptionOutcome {
+                    reflected: true,
+                    stages: vec![(KERNEL_STAGE, Some(found))],
+                }
+            }
+            None => OptionOutcome::without_reflection(&[KERNEL_STAGE]),
+        };
+        // The state is kept so it outlives the reflection its creation answered.
+        keep(&mut self.pipelines, state);
+        Ok(outcome)
+    }
+
+    fn render_pipeline_under_options(
+        &mut self,
+        library: Handle,
+        vertex: &str,
+        fragment: &str,
+        attachment: PixelFormat,
+        options: u64,
+    ) -> Answer<OptionOutcome> {
+        let library = self
+            .libraries
+            .get(library.0 as usize)
+            .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+        let function = |name: &str| -> Answer<Retained<ProtocolObject<dyn MTLFunction>>> {
+            library
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| Failure::named("NewFunctionWithName", name.to_owned()))
+        };
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        let (vertex, fragment) = (function(vertex)?, function(fragment)?);
+        descriptor.setVertexFunction(Some(&vertex));
+        descriptor.setFragmentFunction(Some(&fragment));
+        let attachments = descriptor.colorAttachments();
+        // SAFETY: attachment 0 is inside the fixed-size array every descriptor holds.
+        let first = unsafe { attachments.objectAtIndexedSubscript(0) };
+        first.setPixelFormat(MTLPixelFormat(attachment.as_raw() as usize));
+        let mut reflection = None;
+        let state = self
+            .device
+            .newRenderPipelineStateWithDescriptor_options_reflection_error(
+                &descriptor,
+                MTLPipelineOption(options as NSUInteger),
+                Some(&mut reflection),
+            )
+            .map_err(|error| {
+                Failure::named(
+                    "NewRenderPipelineState",
+                    error.localizedDescription().to_string(),
+                )
+            })?;
+        let outcome = match reflection {
+            Some(reflection) => {
+                let reflection: Retained<MTLRenderPipelineReflection> = reflection;
+                let mut stages = Vec::new();
+                for (stage, bindings) in [
+                    (VERTEX_STAGE, reflection.vertexBindings()),
+                    (FRAGMENT_STAGE, reflection.fragmentBindings()),
+                ] {
+                    let mut found = Vec::new();
+                    for binding in &bindings {
+                        found.push(metal_binding(&binding)?);
+                    }
+                    stages.push((stage, Some(found)));
+                }
+                OptionOutcome {
+                    reflected: true,
+                    stages,
+                }
+            }
+            None => OptionOutcome::without_reflection(&[VERTEX_STAGE, FRAGMENT_STAGE]),
+        };
+        // The state is kept so it outlives the reflection its creation answered.
+        keep(
+            &mut self.render_pipelines,
+            RenderPipeline {
+                state,
+                reflection: None,
+            },
+        );
+        Ok(outcome)
     }
 
     fn compute_pipeline_with_descriptor(
