@@ -200,7 +200,11 @@ fn stencil_filter_name(raw: u64) -> Result<&'static str, String> {
     )
 }
 
-/// The site row `load`/`store` of the action sweep is emitted at: both SDK enumerators.
+/// The site a row of the action sweep is emitted at: the two SDK enumerators **colour
+/// attachment 0** carries, which is the row's own unrotated triple (`Row::rotated`: the swept
+/// colour takes the row, the depth attachment `rotated(1)` and the stencil attachment
+/// `rotated(2)`). Naming the attachment the row is *about* is what keeps the site the selector it
+/// reads; the other two attachments' values are in the same row's compared facts.
 fn action_site(load: u64, store: u64) -> String {
     match (load_action_name(load), store_action_name(store)) {
         (Ok(load), Ok(store)) => format!("{load}/{store}"),
@@ -208,7 +212,13 @@ fn action_site(load: u64, store: u64) -> String {
     }
 }
 
-/// The site row `depth`/`stencil` of the filter sweep is emitted at: both SDK enumerators.
+/// The site a row of the filter sweep is emitted at: the SDK enumerator the **depth** attachment
+/// carries and the one the **stencil** attachment carries.
+///
+/// A resolve filter is only ever on those two attachments, and they read `rotated(1)` and
+/// `rotated(2)` of the row rather than the row itself, so the caller passes the rotated values. The
+/// row's own unrotated depth filter is on no attachment at all, and a site named after it would
+/// name a value nothing in the row reads.
 fn filter_site(depth: u64, stencil: u64) -> String {
     match (depth_filter_name(depth), stencil_filter_name(stencil)) {
         (Ok(depth), Ok(stencil)) => format!("{depth}/{stencil}"),
@@ -329,7 +339,7 @@ impl Sweep {
                 .into_iter()
                 .map(|row| {
                     (
-                        filter_site(row.filters.depth, row.filters.stencil),
+                        filter_site(row.rotated(1).filters.depth, row.rotated(2).filters.stencil),
                         PassSpec::new(Shape::Defaults, Reads::Attachments).at(row),
                     )
                 })
@@ -638,7 +648,7 @@ mod tests {
         assert_eq!(actions.len(), action_rows().len(), "{actions:?}");
         let filters: BTreeSet<String> = filter_rows()
             .into_iter()
-            .map(|row| filter_site(row.filters.depth, row.filters.stencil))
+            .map(|row| filter_site(row.rotated(1).filters.depth, row.rotated(2).filters.stencil))
             .collect();
         assert_eq!(filters.len(), filter_rows().len(), "{filters:?}");
         // Every site carries both enumerators rather than falling back to the ordinals.

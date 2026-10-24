@@ -35,687 +35,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "50412fc22ddb947511869bbc3a7e14a2680c0e37fe92ab7771fe876d14e5c88b"
-                        }
-                      }
-                    }
-                  ]
-                },
-                {
-                  "name": "MTLMultisampleDepthResolveFilterSample0/MTLMultisampleStencilResolveFilterSample0",
-                  "observed": {
-                    "value": "absent"
-                  },
-                  "children": [
-                    {
-                      "name": "color_attachments",
-                      "observed": {
-                        "value": {
-                          "list": [
-                            {
-                              "fields": {
-                                "depth_plane": {
-                                  "uint": 0
-                                },
-                                "has_resolve_texture": {
-                                  "bool": false
-                                },
-                                "has_texture": {
-                                  "bool": false
-                                },
-                                "level": {
-                                  "uint": 0
-                                },
-                                "load_action": {
-                                  "uint": 0
-                                },
-                                "resolve_depth_plane": {
-                                  "uint": 0
-                                },
-                                "resolve_level": {
-                                  "uint": 0
-                                },
-                                "resolve_slice": {
-                                  "uint": 0
-                                },
-                                "slice": {
-                                  "uint": 0
-                                },
-                                "store_action": {
-                                  "uint": 1
-                                },
-                                "store_action_options": {
-                                  "uint": 0
-                                }
-                              }
-                            },
-                            {
-                              "fields": {
-                                "depth_plane": {
-                                  "uint": 0
-                                },
-                                "has_resolve_texture": {
-                                  "bool": false
-                                },
-                                "has_texture": {
-                                  "bool": false
-                                },
-                                "level": {
-                                  "uint": 0
-                                },
-                                "load_action": {
-                                  "uint": 0
-                                },
-                                "resolve_depth_plane": {
-                                  "uint": 0
-                                },
-                                "resolve_level": {
-                                  "uint": 0
-                                },
-                                "resolve_slice": {
-                                  "uint": 0
-                                },
-                                "slice": {
-                                  "uint": 0
-                                },
-                                "store_action": {
-                                  "uint": 1
-                                },
-                                "store_action_options": {
-                                  "uint": 0
-                                }
-                              }
-                            },
-                            {
-                              "fields": {
-                                "depth_plane": {
-                                  "uint": 0
-                                },
-                                "has_resolve_texture": {
-                                  "bool": false
-                                },
-                                "has_texture": {
-                                  "bool": false
-                                },
-                                "level": {
-                                  "uint": 0
-                                },
-                                "load_action": {
-                                  "uint": 0
-                                },
-                                "resolve_depth_plane": {
-                                  "uint": 0
-                                },
-                                "resolve_level": {
-                                  "uint": 0
-                                },
-                                "resolve_slice": {
-                                  "uint": 0
-                                },
-                                "slice": {
-                                  "uint": 0
-                                },
-                                "store_action": {
-                                  "uint": 1
-                                },
-                                "store_action_options": {
-                                  "uint": 0
-                                }
-                              }
-                            }
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "name": "color_clears",
-                      "observed": {
-                        "value": {
-                          "list": [
-                            {
-                              "list": [
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 4607182418800017408,
-                                    "width": "double"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "list": [
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 4607182418800017408,
-                                    "width": "double"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "list": [
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 4607182418800017408,
-                                    "width": "double"
-                                  }
-                                }
-                              ]
-                            }
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "name": "depth_attachment",
-                      "observed": {
-                        "value": {
-                          "fields": {
-                            "depth_plane": {
-                              "uint": 7
-                            },
-                            "has_resolve_texture": {
-                              "bool": false
-                            },
-                            "has_texture": {
-                              "bool": false
-                            },
-                            "level": {
-                              "uint": 7
-                            },
-                            "load_action": {
-                              "uint": 1
-                            },
-                            "resolve_depth_plane": {
-                              "uint": 7
-                            },
-                            "resolve_level": {
-                              "uint": 7
-                            },
-                            "resolve_slice": {
-                              "uint": 7
-                            },
-                            "slice": {
-                              "uint": 7
-                            },
-                            "store_action": {
-                              "uint": 2
-                            },
-                            "store_action_options": {
-                              "uint": 1
-                            }
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "name": "clear_depth",
-                      "observed": {
-                        "value": {
-                          "float": {
-                            "bits": 4611686018427387904,
-                            "width": "double"
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "name": "depth_resolve_filter",
-                      "observed": {
-                        "value": {
-                          "uint": 1
-                        }
-                      }
-                    },
-                    {
-                      "name": "stencil_attachment",
-                      "observed": {
-                        "value": {
-                          "fields": {
-                            "depth_plane": {
-                              "uint": 14
-                            },
-                            "has_resolve_texture": {
-                              "bool": false
-                            },
-                            "has_texture": {
-                              "bool": false
-                            },
-                            "level": {
-                              "uint": 14
-                            },
-                            "load_action": {
-                              "uint": 2
-                            },
-                            "resolve_depth_plane": {
-                              "uint": 14
-                            },
-                            "resolve_level": {
-                              "uint": 14
-                            },
-                            "resolve_slice": {
-                              "uint": 14
-                            },
-                            "slice": {
-                              "uint": 14
-                            },
-                            "store_action": {
-                              "uint": 3
-                            },
-                            "store_action_options": {
-                              "uint": 0
-                            }
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "name": "clear_stencil",
-                      "observed": {
-                        "value": {
-                          "uint": 2
-                        }
-                      }
-                    },
-                    {
-                      "name": "stencil_resolve_filter",
-                      "observed": {
-                        "value": {
-                          "uint": 0
-                        }
-                      }
-                    }
-                  ]
-                },
-                {
-                  "name": "MTLMultisampleDepthResolveFilterSample0/MTLMultisampleStencilResolveFilterDepthResolvedSample",
-                  "observed": {
-                    "value": "absent"
-                  },
-                  "children": [
-                    {
-                      "name": "color_attachments",
-                      "observed": {
-                        "value": {
-                          "list": [
-                            {
-                              "fields": {
-                                "depth_plane": {
-                                  "uint": 0
-                                },
-                                "has_resolve_texture": {
-                                  "bool": false
-                                },
-                                "has_texture": {
-                                  "bool": false
-                                },
-                                "level": {
-                                  "uint": 0
-                                },
-                                "load_action": {
-                                  "uint": 0
-                                },
-                                "resolve_depth_plane": {
-                                  "uint": 0
-                                },
-                                "resolve_level": {
-                                  "uint": 0
-                                },
-                                "resolve_slice": {
-                                  "uint": 0
-                                },
-                                "slice": {
-                                  "uint": 0
-                                },
-                                "store_action": {
-                                  "uint": 1
-                                },
-                                "store_action_options": {
-                                  "uint": 0
-                                }
-                              }
-                            },
-                            {
-                              "fields": {
-                                "depth_plane": {
-                                  "uint": 0
-                                },
-                                "has_resolve_texture": {
-                                  "bool": false
-                                },
-                                "has_texture": {
-                                  "bool": false
-                                },
-                                "level": {
-                                  "uint": 0
-                                },
-                                "load_action": {
-                                  "uint": 0
-                                },
-                                "resolve_depth_plane": {
-                                  "uint": 0
-                                },
-                                "resolve_level": {
-                                  "uint": 0
-                                },
-                                "resolve_slice": {
-                                  "uint": 0
-                                },
-                                "slice": {
-                                  "uint": 0
-                                },
-                                "store_action": {
-                                  "uint": 1
-                                },
-                                "store_action_options": {
-                                  "uint": 0
-                                }
-                              }
-                            },
-                            {
-                              "fields": {
-                                "depth_plane": {
-                                  "uint": 0
-                                },
-                                "has_resolve_texture": {
-                                  "bool": false
-                                },
-                                "has_texture": {
-                                  "bool": false
-                                },
-                                "level": {
-                                  "uint": 0
-                                },
-                                "load_action": {
-                                  "uint": 0
-                                },
-                                "resolve_depth_plane": {
-                                  "uint": 0
-                                },
-                                "resolve_level": {
-                                  "uint": 0
-                                },
-                                "resolve_slice": {
-                                  "uint": 0
-                                },
-                                "slice": {
-                                  "uint": 0
-                                },
-                                "store_action": {
-                                  "uint": 1
-                                },
-                                "store_action_options": {
-                                  "uint": 0
-                                }
-                              }
-                            }
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "name": "color_clears",
-                      "observed": {
-                        "value": {
-                          "list": [
-                            {
-                              "list": [
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 4607182418800017408,
-                                    "width": "double"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "list": [
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 4607182418800017408,
-                                    "width": "double"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "list": [
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 0,
-                                    "width": "double"
-                                  }
-                                },
-                                {
-                                  "float": {
-                                    "bits": 4607182418800017408,
-                                    "width": "double"
-                                  }
-                                }
-                              ]
-                            }
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "name": "depth_attachment",
-                      "observed": {
-                        "value": {
-                          "fields": {
-                            "depth_plane": {
-                              "uint": 7
-                            },
-                            "has_resolve_texture": {
-                              "bool": false
-                            },
-                            "has_texture": {
-                              "bool": false
-                            },
-                            "level": {
-                              "uint": 7
-                            },
-                            "load_action": {
-                              "uint": 1
-                            },
-                            "resolve_depth_plane": {
-                              "uint": 7
-                            },
-                            "resolve_level": {
-                              "uint": 7
-                            },
-                            "resolve_slice": {
-                              "uint": 7
-                            },
-                            "slice": {
-                              "uint": 7
-                            },
-                            "store_action": {
-                              "uint": 2
-                            },
-                            "store_action_options": {
-                              "uint": 1
-                            }
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "name": "clear_depth",
-                      "observed": {
-                        "value": {
-                          "float": {
-                            "bits": 4611686018427387904,
-                            "width": "double"
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "name": "depth_resolve_filter",
-                      "observed": {
-                        "value": {
-                          "uint": 1
-                        }
-                      }
-                    },
-                    {
-                      "name": "stencil_attachment",
-                      "observed": {
-                        "value": {
-                          "fields": {
-                            "depth_plane": {
-                              "uint": 14
-                            },
-                            "has_resolve_texture": {
-                              "bool": false
-                            },
-                            "has_texture": {
-                              "bool": false
-                            },
-                            "level": {
-                              "uint": 14
-                            },
-                            "load_action": {
-                              "uint": 2
-                            },
-                            "resolve_depth_plane": {
-                              "uint": 14
-                            },
-                            "resolve_level": {
-                              "uint": 14
-                            },
-                            "resolve_slice": {
-                              "uint": 14
-                            },
-                            "slice": {
-                              "uint": 14
-                            },
-                            "store_action": {
-                              "uint": 3
-                            },
-                            "store_action_options": {
-                              "uint": 0
-                            }
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "name": "clear_stencil",
-                      "observed": {
-                        "value": {
-                          "uint": 2
-                        }
-                      }
-                    },
-                    {
-                      "name": "stencil_resolve_filter",
-                      "observed": {
-                        "value": {
-                          "uint": 1
+                          "hex": "8ba55609292fd312b9b9709abc0eb335df50c21024249daf07a1e7bb5d1f41a4"
                         }
                       }
                     }
@@ -997,7 +317,7 @@
                       "name": "depth_resolve_filter",
                       "observed": {
                         "value": {
-                          "uint": 2
+                          "uint": 1
                         }
                       }
                     },
@@ -1337,7 +657,7 @@
                       "name": "depth_resolve_filter",
                       "observed": {
                         "value": {
-                          "uint": 2
+                          "uint": 1
                         }
                       }
                     },
@@ -1677,7 +997,7 @@
                       "name": "depth_resolve_filter",
                       "observed": {
                         "value": {
-                          "uint": 0
+                          "uint": 2
                         }
                       }
                     },
@@ -1743,6 +1063,686 @@
                 },
                 {
                   "name": "MTLMultisampleDepthResolveFilterMax/MTLMultisampleStencilResolveFilterDepthResolvedSample",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "color_attachments",
+                      "observed": {
+                        "value": {
+                          "list": [
+                            {
+                              "fields": {
+                                "depth_plane": {
+                                  "uint": 0
+                                },
+                                "has_resolve_texture": {
+                                  "bool": false
+                                },
+                                "has_texture": {
+                                  "bool": false
+                                },
+                                "level": {
+                                  "uint": 0
+                                },
+                                "load_action": {
+                                  "uint": 0
+                                },
+                                "resolve_depth_plane": {
+                                  "uint": 0
+                                },
+                                "resolve_level": {
+                                  "uint": 0
+                                },
+                                "resolve_slice": {
+                                  "uint": 0
+                                },
+                                "slice": {
+                                  "uint": 0
+                                },
+                                "store_action": {
+                                  "uint": 1
+                                },
+                                "store_action_options": {
+                                  "uint": 0
+                                }
+                              }
+                            },
+                            {
+                              "fields": {
+                                "depth_plane": {
+                                  "uint": 0
+                                },
+                                "has_resolve_texture": {
+                                  "bool": false
+                                },
+                                "has_texture": {
+                                  "bool": false
+                                },
+                                "level": {
+                                  "uint": 0
+                                },
+                                "load_action": {
+                                  "uint": 0
+                                },
+                                "resolve_depth_plane": {
+                                  "uint": 0
+                                },
+                                "resolve_level": {
+                                  "uint": 0
+                                },
+                                "resolve_slice": {
+                                  "uint": 0
+                                },
+                                "slice": {
+                                  "uint": 0
+                                },
+                                "store_action": {
+                                  "uint": 1
+                                },
+                                "store_action_options": {
+                                  "uint": 0
+                                }
+                              }
+                            },
+                            {
+                              "fields": {
+                                "depth_plane": {
+                                  "uint": 0
+                                },
+                                "has_resolve_texture": {
+                                  "bool": false
+                                },
+                                "has_texture": {
+                                  "bool": false
+                                },
+                                "level": {
+                                  "uint": 0
+                                },
+                                "load_action": {
+                                  "uint": 0
+                                },
+                                "resolve_depth_plane": {
+                                  "uint": 0
+                                },
+                                "resolve_level": {
+                                  "uint": 0
+                                },
+                                "resolve_slice": {
+                                  "uint": 0
+                                },
+                                "slice": {
+                                  "uint": 0
+                                },
+                                "store_action": {
+                                  "uint": 1
+                                },
+                                "store_action_options": {
+                                  "uint": 0
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "name": "color_clears",
+                      "observed": {
+                        "value": {
+                          "list": [
+                            {
+                              "list": [
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 4607182418800017408,
+                                    "width": "double"
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "list": [
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 4607182418800017408,
+                                    "width": "double"
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "list": [
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 4607182418800017408,
+                                    "width": "double"
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "name": "depth_attachment",
+                      "observed": {
+                        "value": {
+                          "fields": {
+                            "depth_plane": {
+                              "uint": 7
+                            },
+                            "has_resolve_texture": {
+                              "bool": false
+                            },
+                            "has_texture": {
+                              "bool": false
+                            },
+                            "level": {
+                              "uint": 7
+                            },
+                            "load_action": {
+                              "uint": 1
+                            },
+                            "resolve_depth_plane": {
+                              "uint": 7
+                            },
+                            "resolve_level": {
+                              "uint": 7
+                            },
+                            "resolve_slice": {
+                              "uint": 7
+                            },
+                            "slice": {
+                              "uint": 7
+                            },
+                            "store_action": {
+                              "uint": 2
+                            },
+                            "store_action_options": {
+                              "uint": 1
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "clear_depth",
+                      "observed": {
+                        "value": {
+                          "float": {
+                            "bits": 4611686018427387904,
+                            "width": "double"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "depth_resolve_filter",
+                      "observed": {
+                        "value": {
+                          "uint": 2
+                        }
+                      }
+                    },
+                    {
+                      "name": "stencil_attachment",
+                      "observed": {
+                        "value": {
+                          "fields": {
+                            "depth_plane": {
+                              "uint": 14
+                            },
+                            "has_resolve_texture": {
+                              "bool": false
+                            },
+                            "has_texture": {
+                              "bool": false
+                            },
+                            "level": {
+                              "uint": 14
+                            },
+                            "load_action": {
+                              "uint": 2
+                            },
+                            "resolve_depth_plane": {
+                              "uint": 14
+                            },
+                            "resolve_level": {
+                              "uint": 14
+                            },
+                            "resolve_slice": {
+                              "uint": 14
+                            },
+                            "slice": {
+                              "uint": 14
+                            },
+                            "store_action": {
+                              "uint": 3
+                            },
+                            "store_action_options": {
+                              "uint": 0
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "clear_stencil",
+                      "observed": {
+                        "value": {
+                          "uint": 2
+                        }
+                      }
+                    },
+                    {
+                      "name": "stencil_resolve_filter",
+                      "observed": {
+                        "value": {
+                          "uint": 1
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "MTLMultisampleDepthResolveFilterSample0/MTLMultisampleStencilResolveFilterSample0",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "color_attachments",
+                      "observed": {
+                        "value": {
+                          "list": [
+                            {
+                              "fields": {
+                                "depth_plane": {
+                                  "uint": 0
+                                },
+                                "has_resolve_texture": {
+                                  "bool": false
+                                },
+                                "has_texture": {
+                                  "bool": false
+                                },
+                                "level": {
+                                  "uint": 0
+                                },
+                                "load_action": {
+                                  "uint": 0
+                                },
+                                "resolve_depth_plane": {
+                                  "uint": 0
+                                },
+                                "resolve_level": {
+                                  "uint": 0
+                                },
+                                "resolve_slice": {
+                                  "uint": 0
+                                },
+                                "slice": {
+                                  "uint": 0
+                                },
+                                "store_action": {
+                                  "uint": 1
+                                },
+                                "store_action_options": {
+                                  "uint": 0
+                                }
+                              }
+                            },
+                            {
+                              "fields": {
+                                "depth_plane": {
+                                  "uint": 0
+                                },
+                                "has_resolve_texture": {
+                                  "bool": false
+                                },
+                                "has_texture": {
+                                  "bool": false
+                                },
+                                "level": {
+                                  "uint": 0
+                                },
+                                "load_action": {
+                                  "uint": 0
+                                },
+                                "resolve_depth_plane": {
+                                  "uint": 0
+                                },
+                                "resolve_level": {
+                                  "uint": 0
+                                },
+                                "resolve_slice": {
+                                  "uint": 0
+                                },
+                                "slice": {
+                                  "uint": 0
+                                },
+                                "store_action": {
+                                  "uint": 1
+                                },
+                                "store_action_options": {
+                                  "uint": 0
+                                }
+                              }
+                            },
+                            {
+                              "fields": {
+                                "depth_plane": {
+                                  "uint": 0
+                                },
+                                "has_resolve_texture": {
+                                  "bool": false
+                                },
+                                "has_texture": {
+                                  "bool": false
+                                },
+                                "level": {
+                                  "uint": 0
+                                },
+                                "load_action": {
+                                  "uint": 0
+                                },
+                                "resolve_depth_plane": {
+                                  "uint": 0
+                                },
+                                "resolve_level": {
+                                  "uint": 0
+                                },
+                                "resolve_slice": {
+                                  "uint": 0
+                                },
+                                "slice": {
+                                  "uint": 0
+                                },
+                                "store_action": {
+                                  "uint": 1
+                                },
+                                "store_action_options": {
+                                  "uint": 0
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "name": "color_clears",
+                      "observed": {
+                        "value": {
+                          "list": [
+                            {
+                              "list": [
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 4607182418800017408,
+                                    "width": "double"
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "list": [
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 4607182418800017408,
+                                    "width": "double"
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "list": [
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 0,
+                                    "width": "double"
+                                  }
+                                },
+                                {
+                                  "float": {
+                                    "bits": 4607182418800017408,
+                                    "width": "double"
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "name": "depth_attachment",
+                      "observed": {
+                        "value": {
+                          "fields": {
+                            "depth_plane": {
+                              "uint": 7
+                            },
+                            "has_resolve_texture": {
+                              "bool": false
+                            },
+                            "has_texture": {
+                              "bool": false
+                            },
+                            "level": {
+                              "uint": 7
+                            },
+                            "load_action": {
+                              "uint": 1
+                            },
+                            "resolve_depth_plane": {
+                              "uint": 7
+                            },
+                            "resolve_level": {
+                              "uint": 7
+                            },
+                            "resolve_slice": {
+                              "uint": 7
+                            },
+                            "slice": {
+                              "uint": 7
+                            },
+                            "store_action": {
+                              "uint": 2
+                            },
+                            "store_action_options": {
+                              "uint": 1
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "clear_depth",
+                      "observed": {
+                        "value": {
+                          "float": {
+                            "bits": 4611686018427387904,
+                            "width": "double"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "depth_resolve_filter",
+                      "observed": {
+                        "value": {
+                          "uint": 0
+                        }
+                      }
+                    },
+                    {
+                      "name": "stencil_attachment",
+                      "observed": {
+                        "value": {
+                          "fields": {
+                            "depth_plane": {
+                              "uint": 14
+                            },
+                            "has_resolve_texture": {
+                              "bool": false
+                            },
+                            "has_texture": {
+                              "bool": false
+                            },
+                            "level": {
+                              "uint": 14
+                            },
+                            "load_action": {
+                              "uint": 2
+                            },
+                            "resolve_depth_plane": {
+                              "uint": 14
+                            },
+                            "resolve_level": {
+                              "uint": 14
+                            },
+                            "resolve_slice": {
+                              "uint": 14
+                            },
+                            "slice": {
+                              "uint": 14
+                            },
+                            "store_action": {
+                              "uint": 3
+                            },
+                            "store_action_options": {
+                              "uint": 0
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "clear_stencil",
+                      "observed": {
+                        "value": {
+                          "uint": 2
+                        }
+                      }
+                    },
+                    {
+                      "name": "stencil_resolve_filter",
+                      "observed": {
+                        "value": {
+                          "uint": 0
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "MTLMultisampleDepthResolveFilterSample0/MTLMultisampleStencilResolveFilterDepthResolvedSample",
                   "observed": {
                     "value": "absent"
                   },
