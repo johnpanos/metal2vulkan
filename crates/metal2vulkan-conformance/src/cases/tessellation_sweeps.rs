@@ -1350,12 +1350,11 @@ fn read_coarse_marks(
     )
 }
 
-/// `bytes` as little-endian words.
+/// `bytes` as little-endian words, the trailing bytes of a length that is not a multiple of four
+/// left out.
 fn to_words(bytes: &[u8]) -> Vec<u32> {
-    bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect()
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().copied().map(u32::from_le_bytes).collect()
 }
 
 /// The two texts of `fixture` a case fingerprints.
@@ -1417,9 +1416,9 @@ mod tests {
 
     /// The cells the mark region `bytes` holds a nonzero word at.
     fn marked(bytes: &[u8]) -> usize {
-        bytes
-            .chunks_exact(4)
-            .filter(|word| word.iter().any(|byte| *byte != 0))
+        to_words(bytes)
+            .into_iter()
+            .filter(|word| *word != 0)
             .count()
     }
 
@@ -1683,8 +1682,11 @@ mod tests {
         // a coarse draw can mark is `8 * 65 + 8`. The compared prefix is one word longer than that,
         // so no mark the draw could make lies outside it.
         assert_eq!(COARSE_WORDS, 8 * AXIS + 9);
-        assert!(COARSE_WORDS <= MARK_WORDS);
         assert_eq!(COARSE_WORDS - 1, 8 * AXIS + 8);
+        // The prefix is inside the mark grid, so a coarse leg reads marks and never a stored
+        // coordinate. Both are constants, so the check belongs in a const block: clippy refuses a
+        // runtime assertion whose value the compiler already knows.
+        const { assert!(COARSE_WORDS <= MARK_WORDS) };
     }
 
     #[test]
