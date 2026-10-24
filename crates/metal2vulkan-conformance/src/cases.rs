@@ -85,6 +85,7 @@ pub mod extended_range_two_planes;
 pub mod extended_swizzles;
 pub mod fetch_ordered;
 pub mod format_copies;
+pub mod fragment_imageblock_reflection;
 pub mod frame_chains;
 pub mod fresh_contents;
 pub mod function_bindings;
@@ -238,6 +239,9 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     for case in tile_pipeline_reflection::all() {
+        cases.push(Box::new(case));
+    }
+    for case in fragment_imageblock_reflection::all() {
         cases.push(Box::new(case));
     }
     for case in mesh_pipeline_reflection::all() {
