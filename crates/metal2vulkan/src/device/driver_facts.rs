@@ -751,6 +751,17 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
         DriverId::INTEL_OPEN_SOURCE_MESA,
         (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
     ),
+    // Turnip (Mesa 26.2.0-devel, driverVersion 26.1.99, with the Darwin KMD) on the Adreno 630 of the OnePlus 6T (fajita,
+    // UniXNU): the device's 8-bit linear filter, taken by the owner of that port; checked against the exact filter on the render
+    // server's own frames (no channel more than one code apart), not by the deviation probe.
+    Measured {
+        fact: DriverDeviation::Unorm8LinearFilter,
+        driver: DriverId::MESA_TURNIP,
+        vendor: Some(QUALCOMM_VENDOR_ID),
+        device: Some(QUALCOMM_ADRENO_630),
+        first: mesa(26, 1, 99),
+        last: mesa(26, 2, 0),
+    },
     Measured {
         fact: DriverDeviation::Unorm8LinearFilter,
         driver: DriverId::MESA_LLVMPIPE,
@@ -809,6 +820,12 @@ const fn nvidia_61571(fact: DriverDeviation, device: u32) -> Measured<DriverDevi
 
 /// AMD's `vendorID`.
 const AMD_VENDOR_ID: u32 = 0x1002;
+
+/// Qualcomm's `vendorID`.
+const QUALCOMM_VENDOR_ID: u32 = 0x5143;
+
+/// The `deviceID` Turnip reports for the Adreno 630 (its chip id, 6.3.0.2).
+pub(crate) const QUALCOMM_ADRENO_630: u32 = 0x0603_0002;
 
 /// The `deviceID` of the Radeon 780M it was measured under, Phoenix's (the committed capture
 /// `amd-780m-radv`); Hawk Point's 0x1900 is the same GPU, so it takes these rows too
