@@ -60,6 +60,10 @@ pub struct DevicePolicy {
     /// runtime's shadow of them, copied in before each use. The runtime's choice alone: no
     /// emitted code changes.
     pub padded_reads: PaddedReadsPolicy,
+    /// Whether a uniform view's loads read the low four bits of the bind offset's residual from
+    /// a specialization constant (`SpecKey::SlotOffsetLow`), so the driver knows each load's place
+    /// in its 16-byte vector, or from the push field with the rest (the default).
+    pub uniform_offset: UniformOffsetPolicy,
 }
 
 impl DevicePolicy {
@@ -84,6 +88,7 @@ impl DevicePolicy {
         rounding_order: RoundingOrderPolicy::Native,
         half_blend: HalfBlendPolicy::Device,
         padded_reads: PaddedReadsPolicy::Alias,
+        uniform_offset: UniformOffsetPolicy::Pushed,
     };
 
     /// This policy with Metal's answer wherever the choices offer it: its maths functions,
@@ -315,6 +320,24 @@ pub enum RoundingOrderPolicy {
 /// returns, each factor (`1 - x` and the blend color's `half` included), each product and the sum
 /// rounded to `half`, nearest even (EV FLT-hb2-m3); a device's own blend adds in its arithmetic and
 /// rounds once.
+/// Where a uniform view's load reads the residual of its slot's bind offset: wholly from the push
+/// field (the default), or its low four bits (the bind offset modulo 16) from a specialization
+/// constant, so that a pipeline is made per class of bind offset modulo 16 a draw binds (at most
+/// four, as a constant buffer's offset is a multiple of 4) and the driver places each load in its
+/// vector. On the Adreno 630 that halves the registers of CoreAnimation's blurs (fajita census:
+/// 657 -> 420 over its fragment functions, waves +12%) at about 3% more instructions a fragment;
+/// a speed choice to measure, not taken by default.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum UniformOffsetPolicy {
+    /// The residual from the push field alone (the default).
+    #[default]
+    Pushed,
+    /// The residual's low four bits from `SpecKey::SlotOffsetLow`.
+    Specialized,
+}
+
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

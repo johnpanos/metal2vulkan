@@ -341,6 +341,7 @@ fn descriptor_bases_are_sixteen_aligned_on_every_profile() {
         length_class: length_class(4096),
         attribute_stride: None,
         offset_alignment: 4,
+        offset_low: 0,
     };
     for (stem, p) in committed_profiles().expect("profiles") {
         let limits = &p.fields().limits;

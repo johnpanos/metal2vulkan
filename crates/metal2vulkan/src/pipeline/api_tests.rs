@@ -948,6 +948,7 @@ mod bind_serde_round_trips {
                 device_address: false,
                 length_class: 20,
                 offset_alignment: 2,
+                offset_low: 0,
             },
         );
         shape.samplers.insert(

@@ -694,6 +694,9 @@ pub struct AccessPlan {
     /// Device-address accesses are contained (robust buffer access does not cover them, so only
     /// `Containment::UnsafeOff` turns this off).
     pub psb_contained: bool,
+    /// A uniform view's load reads its residual's low bits from `SpecKey::SlotOffsetLow`
+    /// (`DevicePolicy::uniform_offset`).
+    pub uniform_offset_specialized: bool,
     /// The arenas the function uses.
     pub local: local::LocalPlan,
     /// The function's index extensions ([`index`]): planned before any instruction is selected
@@ -1491,6 +1494,8 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     cx.families.access.pulled = sourced;
     cx.families.access.slots = lowering;
     cx.families.access.psb_contained = p.fields().containment != Containment::UnsafeOff;
+    cx.families.access.uniform_offset_specialized =
+        p.fields().uniform_offset == crate::device::policy::UniformOffsetPolicy::Specialized;
     Ok(slots)
 }
 

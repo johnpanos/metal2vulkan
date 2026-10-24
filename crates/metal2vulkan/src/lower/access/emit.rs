@@ -277,8 +277,9 @@ pub(super) fn prepare(
     let residual = cx.push_field(fb, PushField::SlotBindOffset(choice.slot))?;
     // A uniform view's residual takes its low four bits from `SpecKey::SlotOffsetLow`: each load's
     // place in its 16-byte vector is then a constant to the driver.
+    let specialized = cx.plan.families.access.uniform_offset_specialized;
     let residual = match view.kind {
-        ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. } => {
+        ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. } if specialized => {
             let u32_ = fb.module().ty(crate::spirv::ir::Type::Int {
                 width: 32,
                 signed: false,
@@ -293,7 +294,7 @@ pub(super) fn prepare(
             let high = u32_op(fb, BinOp::BitwiseAnd, residual, mask)?;
             u32_op(fb, BinOp::BitwiseOr, high, low)?
         }
-        ViewKind::Storage => residual,
+        _ => residual,
     };
     let off = u32_op(fb, BinOp::IAdd, residual, m)?;
     let inb = match (t.check, view.kind) {

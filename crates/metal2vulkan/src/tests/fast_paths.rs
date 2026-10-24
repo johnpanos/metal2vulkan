@@ -70,6 +70,8 @@ fn choices() -> Vec<Choice> {
         half_blend: _,
         // The runtime's: whether a texture over padded rows that only reads aliases them.
         padded_reads: _,
+        // Where a uniform load reads its offset's low bits: the same answers, a speed choice.
+        uniform_offset: _,
     } = p;
     vec![
         choice!(p.framebuffer_fetch: FramebufferFetchPolicy { RequireOrdered, AcceptUnordered }),
