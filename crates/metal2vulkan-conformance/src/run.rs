@@ -784,3 +784,97 @@ fn record_one_time(
         .sort_by(|one, two| (one.leg, &one.venue).cmp(&(two.leg, &two.venue)));
     crate::recording::write(&recording)
 }
+
+/// The suite's integrity property, on a device: **every case reads the same verdict alone as it
+/// reads inside a selection.**
+///
+/// This is the whole-run form of what `device::tests` and
+/// `tests::a_notice_one_case_provoked_does_not_excuse_the_nexts_difference` hold piece by piece.
+/// Those two are deterministic and need no device; this one runs the real legs, so it catches any
+/// other state the suite carries from case to case — the device, its queue, its pools, its shader
+/// cache, a lazily-built fixture — wherever that state reaches a verdict.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod every_case_reads_the_same_verdict_alone {
+    use super::{replay_on_under, Policy, Venues};
+    use crate::allowance::Justification;
+    use crate::case::Case;
+
+    const VENUE: Venues = if cfg!(m2v_gpu) {
+        Venues::Gpu
+    } else {
+        Venues::Cpu
+    };
+
+    /// How many of the notice-sensitive cases the guard takes. A bound, because each case is
+    /// replayed twice and the alone leg opens a device apiece: the property is a property of the
+    /// machinery, so a sample of the family that can express it is the whole evidence, and the
+    /// deterministic tests cover the mechanism exhaustively.
+    const TAKE: usize = 8;
+
+    /// The cases whose verdict a notice can move: the ones that cite a degrade notice to justify
+    /// something. Selected by shape rather than by name, so a case added to the family joins the
+    /// guard and a case whose notice is fixed leaves it.
+    fn notice_sensitive() -> Vec<Box<dyn Case>> {
+        crate::cases::all()
+            .into_iter()
+            .filter(|case| {
+                case.allowances().iter().any(|allowance| {
+                    matches!(allowance.justified_by, Justification::Degradation(_))
+                })
+            })
+            .take(TAKE)
+            .collect()
+    }
+
+    #[test]
+    fn a_cases_verdict_is_the_same_alone_as_in_a_selection() {
+        let selection = notice_sensitive();
+        assert!(
+            !selection.is_empty(),
+            "no case cites a degrade notice, so the guard has nothing to hold"
+        );
+
+        let together = replay_on_under(VENUE, Policy::Exact, &selection).unwrap();
+        let mut announced_anywhere = 0usize;
+        for row in together.rows() {
+            announced_anywhere += row.ours.announced_notices().len();
+        }
+
+        for case in &selection {
+            let alone = replay_on_under(VENUE, Policy::Exact, std::slice::from_ref(case)).unwrap();
+            let alone_row = alone
+                .rows()
+                .iter()
+                .find(|row| row.case == case.name())
+                .unwrap_or_else(|| panic!("{} replayed alone gave no row", case.name()));
+            let in_set_row = together
+                .rows()
+                .iter()
+                .find(|row| row.case == case.name())
+                .unwrap_or_else(|| panic!("{} in the selection gave no row", case.name()));
+            assert_eq!(
+                alone_row.verdict,
+                in_set_row.verdict,
+                "{} read one verdict alone and another inside a selection of {}",
+                case.name(),
+                selection.len()
+            );
+        }
+
+        // A guard that holds a property nothing on this venue exercises has to say so, rather than
+        // reading as evidence. The verdicts above are still held either way.
+        if announced_anywhere == 0 {
+            println!(
+                "no case of the selection announced a degrade notice on this venue, so the \
+                 notice half of the property was not exercised here"
+            );
+        } else {
+            println!("{announced_anywhere} notice(s) announced across the selection");
+        }
+        assert_eq!(
+            together.unattributed(),
+            &[],
+            "the selection announced notices no case's scope was open for"
+        );
+    }
+}
