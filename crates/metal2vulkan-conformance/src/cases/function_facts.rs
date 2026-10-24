@@ -129,6 +129,15 @@ pub fn all() -> Vec<FunctionFactsCase> {
             entry: "rt6_resolve_white",
             constants: plain,
         },
+        // A visible function, which a pipeline places in a visible-function table rather than
+        // running as a stage. `functionType` is again the subject, and the shape is the third kind
+        // of entry point this family had no row for: not a stage, not a mesh stage, a callee.
+        FunctionFactsCase {
+            name: "function-facts-visible",
+            fixture: "visible_table_functions",
+            entry: "table_add",
+            constants: plain,
+        },
         // An object function of a mesh pipeline. `functionType` is the subject: `MTLFunctionType`
         // has seven values and the three above were every one the suite reached, so the two a mesh
         // pipeline's own stages carry were compared nowhere. An object function also answers nil
