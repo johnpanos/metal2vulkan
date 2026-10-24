@@ -19,7 +19,7 @@
 //!
 //! # Two sweeps
 //!
-//! **`MTLPipelineOption`, 8 of 8.** [`MASKS`](crate::pipeline_option_reflection::MASKS) is the
+//! **`MTLPipelineOption`, 8 of 8.** [`crate::pipeline_option_reflection::MASKS`] is the
 //! whole of Apple's option word, and each case runs the mesh creation under every one of its eight
 //! values — the same table [`crate::cases::pipeline_option_reflection`] sweeps for the compute
 //! creation and [`crate::cases::tile_pipeline_reflection`] for the tile one, read rather than

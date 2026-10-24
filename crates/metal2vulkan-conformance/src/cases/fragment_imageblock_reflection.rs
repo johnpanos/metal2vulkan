@@ -20,7 +20,7 @@
 //! # The sweep: `MTLPipelineOption`, 8 of 8
 //!
 //! The eight defined values, from
-//! [`MASKS`](crate::pipeline_option_reflection::MASKS), the table
+//! [`crate::pipeline_option_reflection::MASKS`], the table
 //! [`crate::cases::pipeline_option_reflection`] and the two new render families all read rather
 //! than copy.
 //!

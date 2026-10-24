@@ -18,7 +18,7 @@
 //!
 //! # The sweep: `MTLPipelineOption`, 8 of 8
 //!
-//! [`MASKS`](crate::pipeline_option_reflection::MASKS) is the whole of Apple's option word — the
+//! [`crate::pipeline_option_reflection::MASKS`] is the whole of Apple's option word — the
 //! three bits its header names, in all eight combinations — and each case of this family runs the
 //! tile creation under every one of them. It is the same table
 //! [`crate::cases::pipeline_option_reflection`] sweeps for the compute creation, read rather than
