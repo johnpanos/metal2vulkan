@@ -1944,7 +1944,10 @@ mod tests {
              vacuously: {seen:?}"
         );
         // And no two inputs are the same input: one below, one equal, one above, in each sweep.
-        assert!(DEPTH_INPUTS[0] < STORED_DEPTH && DEPTH_INPUTS[2] > STORED_DEPTH);
+        // The depths are constants, so their order is a compile-time fact and is stated as one.
+        const {
+            assert!(DEPTH_INPUTS[0] < STORED_DEPTH && DEPTH_INPUTS[2] > STORED_DEPTH);
+        }
         assert_eq!(DEPTH_INPUTS[1], STORED_DEPTH);
         assert!(STENCIL_INPUTS[0] < STORED_STENCIL && STENCIL_INPUTS[2] > STORED_STENCIL);
         assert_eq!(STENCIL_INPUTS[1], STORED_STENCIL);
