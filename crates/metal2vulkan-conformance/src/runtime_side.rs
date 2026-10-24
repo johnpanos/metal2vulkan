@@ -4050,6 +4050,54 @@ impl Side for RuntimeSide<'_> {
                 ComputeStep::Bytes { bytes, index } => encoder
                     .set_bytes(bytes, *index)
                     .map_err(Failure::from_error),
+                ComputeStep::BufferWithStride {
+                    buffer: handle,
+                    offset,
+                    stride,
+                    index,
+                } => buffer(*handle).and_then(|held| {
+                    encoder
+                        .set_buffer_with_stride(Some(held), *offset, *stride, *index)
+                        .map_err(Failure::from_error)
+                }),
+                ComputeStep::BuffersWithStrides {
+                    buffers: named,
+                    first,
+                } => named
+                    .iter()
+                    .map(|(handle, _, _)| buffer(*handle).map(Some))
+                    .collect::<Answer<Vec<Option<&Buffer>>>>()
+                    .and_then(|held| {
+                        let offsets: Vec<u64> = named.iter().map(|(_, at, _)| *at).collect();
+                        let strides: Vec<u64> = named.iter().map(|(_, _, by)| *by).collect();
+                        encoder
+                            .set_buffers_with_strides(&held, &offsets, &strides, *first)
+                            .map_err(Failure::from_error)
+                    }),
+                ComputeStep::BufferOffsetWithStride {
+                    offset,
+                    stride,
+                    index,
+                } => encoder
+                    .set_buffer_offset_with_stride(*offset, *stride, *index)
+                    .map_err(Failure::from_error),
+                ComputeStep::BytesWithStride {
+                    bytes,
+                    stride,
+                    index,
+                } => encoder
+                    .set_bytes_with_stride(bytes, *stride, *index)
+                    .map_err(Failure::from_error),
+                ComputeStep::StageInRegion { origin, size } => encoder
+                    .set_stage_in_region(Region::new_3d(
+                        origin[0].into(),
+                        origin[1].into(),
+                        origin[2].into(),
+                        size[0].into(),
+                        size[1].into(),
+                        size[2].into(),
+                    ))
+                    .map_err(Failure::from_error),
                 ComputeStep::Texture {
                     texture: handle,
                     index,
@@ -4343,6 +4391,50 @@ impl Side for RuntimeSide<'_> {
                         .execute_commands_in_buffer(icb, *first..*first + *count)
                         .map_err(Failure::from_error)?;
                     encoder.end_encoding().map_err(Failure::from_error)
+                }),
+                RenderWork::ResetCommands {
+                    commands,
+                    first,
+                    count,
+                } => pools.indirect(*commands).and_then(|icb| {
+                    let mut blit = command_buffer
+                        .blit_command_encoder()
+                        .map_err(Failure::from_error)?;
+                    blit.reset_commands_in_buffer(icb, *first..*first + *count)
+                        .map_err(Failure::from_error)?;
+                    blit.end_encoding().map_err(Failure::from_error)
+                }),
+                RenderWork::CopyCommands {
+                    from,
+                    first,
+                    count,
+                    into,
+                    into_index,
+                } => pools.indirect(*from).and_then(|source| {
+                    let destination = pools.indirect(*into)?;
+                    let mut blit = command_buffer
+                        .blit_command_encoder()
+                        .map_err(Failure::from_error)?;
+                    blit.copy_indirect_command_buffer(
+                        source,
+                        *first..*first + *count,
+                        destination,
+                        *into_index,
+                    )
+                    .map_err(Failure::from_error)?;
+                    blit.end_encoding().map_err(Failure::from_error)
+                }),
+                RenderWork::OptimizeCommands {
+                    commands,
+                    first,
+                    count,
+                } => pools.indirect(*commands).and_then(|icb| {
+                    let mut blit = command_buffer
+                        .blit_command_encoder()
+                        .map_err(Failure::from_error)?;
+                    blit.optimize_indirect_command_buffer(icb, *first..*first + *count)
+                        .map_err(Failure::from_error)?;
+                    blit.end_encoding().map_err(Failure::from_error)
                 }),
             };
             refused.push(answered.err());

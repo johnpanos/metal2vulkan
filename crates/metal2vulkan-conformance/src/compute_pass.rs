@@ -82,6 +82,17 @@ pub const USAGE_WRITE: u64 = 1 << 1;
 /// `MTLBarrierScopeBuffers`.
 pub const SCOPE_BUFFERS: u64 = 1 << 0;
 
+/// `MTLBarrierScopeTextures`.
+pub const SCOPE_TEXTURES: u64 = 1 << 1;
+
+/// `MTLAttributeStrideStatic`: the `attributeStride` argument that sets **no** per-bind stride, so
+/// the index is read as the plain setters leave it.
+///
+/// It is one of the four values the stride setters are documented to treat apart — 0, a stride of
+/// its own, this one, and a stride past 32 bits, which Metal takes modulo `2^32` — and it is the
+/// only one of them that is a named constant rather than a number.
+pub const ATTRIBUTE_STRIDE_STATIC: u64 = u64::MAX;
+
 /// One command a case encodes into a compute pass, in the order it lists them.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComputeStep {
@@ -105,6 +116,44 @@ pub enum ComputeStep {
     /// `setBytes:length:atIndex:`: a binding whose bytes the call copies, with no buffer of the
     /// case's own behind it.
     Bytes { bytes: Vec<u8>, index: u32 },
+    /// `setBuffer:offset:attributeStride:atIndex:`: the buffer bound with the per-bind stride a
+    /// `[[stage_in]]` layout of `MTLBufferLayoutStrideDynamic` reads its elements at.
+    ///
+    /// Only such a layout reads the stride at all, so a case over this binds a pipeline whose
+    /// stage-input descriptor states one; against a layout of a fixed stride the four stride
+    /// setters are the plain setters with one more argument that reaches nothing.
+    BufferWithStride {
+        buffer: Handle,
+        offset: u64,
+        stride: u64,
+        index: u32,
+    },
+    /// `setBuffers:offsets:attributeStrides:withRange:`: the plural form of
+    /// [`ComputeStep::BufferWithStride`], each buffer with its own offset and stride.
+    BuffersWithStrides {
+        buffers: Vec<(Handle, u64, u64)>,
+        first: u32,
+    },
+    /// `setBufferOffset:attributeStride:atIndex:`: a new offset **and** a new stride for the
+    /// buffer already bound at that index, which is only legal once one is.
+    ///
+    /// [`ATTRIBUTE_STRIDE_STATIC`] here *clears* the index's stride rather than leaving it, which
+    /// is the one place a case can tell that value from a stride of 0 by what it replaced.
+    BufferOffsetWithStride {
+        offset: u64,
+        stride: u64,
+        index: u32,
+    },
+    /// `setBytes:length:attributeStride:atIndex:`: [`ComputeStep::Bytes`] with the per-bind stride
+    /// a dynamic-stride layout reads the copied bytes at.
+    BytesWithStride {
+        bytes: Vec<u8>,
+        stride: u64,
+        index: u32,
+    },
+    /// `setStageInRegion:`: the region a `[[stage_in]]` fetch's elements are taken from and
+    /// clamped to, which Metal requires of every dispatch whose kernel has a stage input.
+    StageInRegion { origin: [u32; 3], size: [u32; 3] },
     /// `setTexture:atIndex:`.
     Texture { texture: Handle, index: u32 },
     /// `setTextures:withRange:`: several textures in one call, from `first`.
@@ -163,6 +212,11 @@ impl ComputeStep {
             ComputeStep::BufferOffset { .. } => "setBufferOffset",
             ComputeStep::Buffers { .. } => "setBuffers",
             ComputeStep::Bytes { .. } => "setBytes",
+            ComputeStep::BufferWithStride { .. } => "setBufferWithAttributeStride",
+            ComputeStep::BuffersWithStrides { .. } => "setBuffersWithAttributeStrides",
+            ComputeStep::BufferOffsetWithStride { .. } => "setBufferOffsetWithAttributeStride",
+            ComputeStep::BytesWithStride { .. } => "setBytesWithAttributeStride",
+            ComputeStep::StageInRegion { .. } => "setStageInRegion",
             ComputeStep::Texture { .. } => "setTexture",
             ComputeStep::Textures { .. } => "setTextures",
             ComputeStep::Sampler { .. } => "setSamplerState",
@@ -208,6 +262,46 @@ impl ComputeStep {
             ComputeStep::Bytes { bytes, index } => {
                 words.extend(bytes);
                 words.extend(index.to_le_bytes());
+            }
+            ComputeStep::BufferWithStride {
+                offset,
+                stride,
+                index,
+                ..
+            } => {
+                words.extend(offset.to_le_bytes());
+                words.extend(stride.to_le_bytes());
+                words.extend(index.to_le_bytes());
+            }
+            ComputeStep::BuffersWithStrides { buffers, first } => {
+                words.extend(first.to_le_bytes());
+                for (_, offset, stride) in buffers {
+                    words.extend(offset.to_le_bytes());
+                    words.extend(stride.to_le_bytes());
+                }
+            }
+            ComputeStep::BufferOffsetWithStride {
+                offset,
+                stride,
+                index,
+            } => {
+                words.extend(offset.to_le_bytes());
+                words.extend(stride.to_le_bytes());
+                words.extend(index.to_le_bytes());
+            }
+            ComputeStep::BytesWithStride {
+                bytes,
+                stride,
+                index,
+            } => {
+                words.extend(bytes);
+                words.extend(stride.to_le_bytes());
+                words.extend(index.to_le_bytes());
+            }
+            ComputeStep::StageInRegion { origin, size } => {
+                for axis in origin.iter().chain(size) {
+                    words.extend(axis.to_le_bytes());
+                }
             }
             ComputeStep::Texture { index, .. } | ComputeStep::Sampler { index, .. } => {
                 words.extend(index.to_le_bytes());
@@ -423,7 +517,31 @@ mod tests {
                 bytes: vec![1, 2, 3],
                 index: 1,
             },
-            ComputeStep::Bytes { .. } => ComputeStep::Texture {
+            ComputeStep::Bytes { .. } => ComputeStep::BufferWithStride {
+                buffer: handle(),
+                offset: 0,
+                stride: 4,
+                index: 1,
+            },
+            ComputeStep::BufferWithStride { .. } => ComputeStep::BuffersWithStrides {
+                buffers: vec![(handle(), 0, 8)],
+                first: 1,
+            },
+            ComputeStep::BuffersWithStrides { .. } => ComputeStep::BufferOffsetWithStride {
+                offset: 4,
+                stride: ATTRIBUTE_STRIDE_STATIC,
+                index: 1,
+            },
+            ComputeStep::BufferOffsetWithStride { .. } => ComputeStep::BytesWithStride {
+                bytes: vec![4, 5, 6],
+                stride: 1 << 32,
+                index: 1,
+            },
+            ComputeStep::BytesWithStride { .. } => ComputeStep::StageInRegion {
+                origin: [0, 0, 0],
+                size: [8, 1, 1],
+            },
+            ComputeStep::StageInRegion { .. } => ComputeStep::Texture {
                 texture: handle(),
                 index: 0,
             },
