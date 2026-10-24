@@ -14,7 +14,7 @@ Columns:
   - `none`: no public API path: malformed or non-Metal input, Apple-private calls, or a cap no valid program of ordinary size meets;
   - `?`: not assessed yet.
 
-Generated at `c5177fd06`.
+Generated at `e0f6c94a0`.
 
 ## Totals
 
@@ -405,7 +405,7 @@ Each refusal's sites, with the function that builds it.
 - `feature::PrivateMemory`: `crates/metal2vulkan/src/lower/select.rs:1171 (function_storage)`
 - `feature::SparseTextures`: `crates/metal2vulkan-runtime/src/sparse/texture.rs:60 (sparse_refusal)`; `crates/metal2vulkan-runtime/src/sparse/texture.rs:65 (sparse_refusal)`
 - `feature::TimelineSemaphores`: `crates/metal2vulkan-runtime/src/device/create.rs:1115 (timeline_difference)`
-- `feature::Reflection`: `crates/metal2vulkan-runtime/src/pipeline/texture_access.rs:131 (at)`; `crates/metal2vulkan/src/bind/argument_buffer.rs:626 (unmeasured)`; `crates/metal2vulkan/src/reflection/derive.rs:178 (specialized_reads)`; `crates/metal2vulkan/src/reflection/derive.rs:212 (read_attributes)`; `crates/metal2vulkan/src/reflection/derive.rs:239 (gap_at)`; `crates/metal2vulkan/src/reflection/function.rs:172 (unmeasured)`; `crates/metal2vulkan/src/reflection/function.rs:366 (attribute)`; `crates/metal2vulkan/src/reflection/function.rs:437 (module_constants)`; `crates/metal2vulkan/src/reflection/linked.rs:125 (function)`; `crates/metal2vulkan/src/reflection/mod.rs:254 (stage)`
+- `feature::Reflection`: `crates/metal2vulkan-runtime/src/pipeline/texture_access.rs:131 (at)`; `crates/metal2vulkan/src/bind/argument_buffer.rs:626 (unmeasured)`; `crates/metal2vulkan/src/reflection/derive.rs:182 (specialized_reads)`; `crates/metal2vulkan/src/reflection/derive.rs:216 (read_attributes)`; `crates/metal2vulkan/src/reflection/derive.rs:243 (gap_at)`; `crates/metal2vulkan/src/reflection/function.rs:172 (unmeasured)`; `crates/metal2vulkan/src/reflection/function.rs:366 (attribute)`; `crates/metal2vulkan/src/reflection/function.rs:437 (module_constants)`; `crates/metal2vulkan/src/reflection/linked.rs:125 (function)`; `crates/metal2vulkan/src/reflection/mod.rs:254 (stage)`
 - `feature::HeapTextureTiling`: `crates/metal2vulkan-runtime/src/texture/heap.rs:632 (tiling_refusal)`
 - `feature::ViewportDepthRange`: `crates/metal2vulkan-runtime/src/render_state.rs:1230 (depth_ranges_refused)`
 - `feature::UndeclaredTextureUsage`: `crates/metal2vulkan-runtime/src/binding_view.rs:141 (binding_view)`; `crates/metal2vulkan-runtime/src/texture/usage_shadow.rs:72 (refused)`
