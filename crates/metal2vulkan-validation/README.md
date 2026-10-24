@@ -29,6 +29,7 @@ as tightly packed selected regions, not backend-specific row-pitched storage.
 | `corpus-moltenvk` | The same through MoltenVK (macOS) |
 | `corpus-draw-ab` | Draw logged fragment functions through the runtime and compare two builds |
 | `command-replay` | Run a recorded stretch of Metal commands through the runtime |
+| `pipeline-census` | Make a manifest's pipeline states and report translator time and driver shader statistics |
 | `format-scout` | Drive every Metal pixel format through the runtime, one use at a time |
 
 Each command's `--help` lists its options.

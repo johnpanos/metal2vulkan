@@ -291,6 +291,12 @@ re-record on that venue.
   compared, and fails the comparison unless named in `--expected-skips`.
 - `command-replay` runs one recorded stretch of Metal commands through the runtime from a manifest
   that names every object and byte.
+- `pipeline-census` makes every function and pipeline state of a `command-replay` manifest, one at a
+  time, and reports per state the translator's time, the SPIR-V words of its first pipeline and
+  the driver's per-shader statistics (Mesa ir3's instruction, nop and ALU-category counts).
+  `scripts/pipeline-census/` holds the Adreno 630 host wrapper (`a630-host`, Turnip over the
+  UniXNU host kernel stack), a converter from the NativeMetal frontend's pipeline journal
+  (`journal_manifest.py`) and a two-run comparison (`compare.py`).
 - `format-scout` drives every Metal pixel format through the runtime's public API, one use at a
   time, and records what each use did.
 

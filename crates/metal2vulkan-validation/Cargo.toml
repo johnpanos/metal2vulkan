@@ -80,6 +80,11 @@ path = "src/bin/command-replay.rs"
 test = false
 
 [[bin]]
+name = "pipeline-census"
+path = "src/bin/pipeline-census.rs"
+test = false
+
+[[bin]]
 name = "corpus-harvest"
 path = "src/bin/corpus-harvest.rs"
 
