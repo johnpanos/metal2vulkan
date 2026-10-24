@@ -1159,6 +1159,8 @@ pub(crate) struct PipelineFields {
     /// The label the creation's options carry, which is where the runtime takes
     /// `MTLRenderPipelineDescriptor.label` from rather than from the descriptor itself.
     pub label: Option<String>,
+    /// The tessellation fields, where the case states them.
+    pub tessellation: Option<metal2vulkan::pipeline::TessellationDescriptor>,
 }
 
 /// [`PipelineFields`] of `spec`: `Err` where the spec names a colour attachment past the eight a
@@ -1181,7 +1183,24 @@ pub(crate) fn pipeline_fields(spec: &RenderPipelineSpec<'_>) -> Answer<PipelineF
         vertex_descriptor: spec.vertex_layout.as_ref().map(vertex_descriptor),
         support_indirect_command_buffers: spec.support_indirect_command_buffers,
         label: spec.label.map(str::to_owned),
+        tessellation: spec.tessellation.as_ref().map(tessellation_descriptor),
     })
+}
+
+/// The runtime's `TessellationDescriptor` for `state`: every field the case names, since the
+/// vocabulary is Metal's own and there is no second spelling to keep in step.
+fn tessellation_descriptor(
+    state: &crate::render::TessellationState,
+) -> metal2vulkan::pipeline::TessellationDescriptor {
+    let mut descriptor = metal2vulkan::pipeline::TessellationDescriptor::default();
+    descriptor.max_tessellation_factor = state.max_factor;
+    descriptor.partition_mode = state.partition;
+    descriptor.factor_format = state.factor_format;
+    descriptor.factor_step_function = state.factor_step;
+    descriptor.output_winding_order = state.winding;
+    descriptor.control_point_index_type = state.control_point_index_type;
+    descriptor.factor_scale_enabled = state.factor_scale_enabled;
+    descriptor
 }
 
 /// The runtime's vertex descriptor for `layout`: the same attribute indices, buffer indices and
@@ -6050,6 +6069,7 @@ impl RuntimeSide<'_> {
         descriptor.rasterization_enabled = apart.rasterization_enabled;
         descriptor.vertex_descriptor = apart.vertex_descriptor;
         descriptor.support_indirect_command_buffers = apart.support_indirect_command_buffers;
+        descriptor.tessellation = apart.tessellation;
         let mut options = PipelineOptions::default();
         options.label = apart.label;
         Ok((descriptor, options))
@@ -6977,6 +6997,64 @@ fn encode_pass(command_buffer: &CommandBuffer, pass: &RenderPass, pools: &Pools)
                 let over = heap_range(&heap, held)?;
                 encoder
                     .use_heaps(&over, *stages)
+                    .map_err(Failure::from_error)?;
+            }
+            RenderStep::TessellationFactorBuffer {
+                buffer: held,
+                offset,
+                instance_stride,
+            } => {
+                let factors = held.map(&buffer).transpose()?;
+                encoder
+                    .set_tessellation_factor_buffer(factors, *offset, *instance_stride)
+                    .map_err(Failure::from_error)?;
+            }
+            RenderStep::DrawPatches {
+                control_points,
+                first,
+                count,
+                patch_indices,
+                patch_index_offset,
+                instances,
+                base_instance,
+            } => {
+                let indices = patch_indices.map(&buffer).transpose()?;
+                encoder
+                    .draw_patches(
+                        *control_points,
+                        *first,
+                        *count,
+                        indices,
+                        *patch_index_offset,
+                        *instances,
+                        *base_instance,
+                    )
+                    .map_err(Failure::from_error)?;
+            }
+            RenderStep::DrawIndexedPatches {
+                control_points,
+                first,
+                count,
+                patch_indices,
+                patch_index_offset,
+                control_point_indices,
+                control_point_index_offset,
+                instances,
+                base_instance,
+            } => {
+                let indices = patch_indices.map(&buffer).transpose()?;
+                encoder
+                    .draw_indexed_patches(
+                        *control_points,
+                        *first,
+                        *count,
+                        indices,
+                        *patch_index_offset,
+                        buffer(*control_point_indices)?,
+                        *control_point_index_offset,
+                        *instances,
+                        *base_instance,
+                    )
                     .map_err(Failure::from_error)?;
             }
         }

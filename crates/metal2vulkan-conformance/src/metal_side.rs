@@ -7282,6 +7282,34 @@ impl MetalSide {
         descriptor.setRasterSampleCount(spec.samples as usize);
         descriptor.setRasterizationEnabled(spec.rasterization);
         descriptor.setSupportIndirectCommandBuffers(spec.support_indirect_command_buffers);
+        // Every tessellation field, and only where the case states them: a pipeline that names no
+        // tessellation state leaves Metal's own defaults alone, which is what every other family's
+        // pipeline has always been made with.
+        if let Some(state) = &spec.tessellation {
+            // SAFETY: each value is an enumerator of the SDK's own table or, for the factor, a
+            // count the case keeps inside `MTLDevice`'s documented 1..=64, and the descriptor is
+            // this call's own. The three setters `objc2` marks unsafe take a raw `NSUInteger`.
+            unsafe {
+                descriptor.setMaxTessellationFactor(state.max_factor as usize);
+                descriptor.setTessellationPartitionMode(MTLTessellationPartitionMode(
+                    state.partition.as_raw() as usize,
+                ));
+                descriptor.setTessellationControlPointIndexType(
+                    MTLTessellationControlPointIndexType(
+                        state.control_point_index_type.as_raw() as usize
+                    ),
+                );
+            }
+            descriptor.setTessellationFactorFormat(MTLTessellationFactorFormat(
+                state.factor_format.as_raw() as usize,
+            ));
+            descriptor.setTessellationFactorStepFunction(MTLTessellationFactorStepFunction(
+                state.factor_step.as_raw() as usize,
+            ));
+            descriptor
+                .setTessellationOutputWindingOrder(MTLWinding(state.winding.as_raw() as usize));
+            descriptor.setTessellationFactorScaleEnabled(state.factor_scale_enabled);
+        }
         if let Some(layout) = &spec.vertex_layout {
             descriptor.setVertexDescriptor(Some(&vertex_descriptor(layout)));
         }
@@ -8457,6 +8485,76 @@ impl MetalSide {
                         at,
                         count,
                         MTLRenderStages(stages.as_raw() as usize),
+                    );
+                }
+            }
+            RenderStep::TessellationFactorBuffer {
+                buffer,
+                offset,
+                instance_stride,
+            } => {
+                let held = buffer.map(|handle| self.held(handle)).transpose()?;
+                // SAFETY: the buffer is one of this side's own, and the case states a range inside
+                // it; a nil buffer is Metal's own "no factors bound" and takes no range.
+                unsafe {
+                    encoder.setTessellationFactorBuffer_offset_instanceStride(
+                        held,
+                        *offset as usize,
+                        *instance_stride as usize,
+                    );
+                }
+            }
+            RenderStep::DrawPatches {
+                control_points,
+                first,
+                count,
+                patch_indices,
+                patch_index_offset,
+                instances,
+                base_instance,
+            } => {
+                let indices = patch_indices.map(|handle| self.held(handle)).transpose()?;
+                // SAFETY: the patch index buffer is one of this side's own and the case states a
+                // range inside it; the factor buffer the draw reads was bound by a step before it.
+                unsafe {
+                    encoder.drawPatches_patchStart_patchCount_patchIndexBuffer_patchIndexBufferOffset_instanceCount_baseInstance(
+                        *control_points as usize,
+                        *first as usize,
+                        *count as usize,
+                        indices,
+                        *patch_index_offset as usize,
+                        *instances as usize,
+                        *base_instance as usize,
+                    );
+                }
+            }
+            RenderStep::DrawIndexedPatches {
+                control_points,
+                first,
+                count,
+                patch_indices,
+                patch_index_offset,
+                control_point_indices,
+                control_point_index_offset,
+                instances,
+                base_instance,
+            } => {
+                let indices = patch_indices.map(|handle| self.held(handle)).transpose()?;
+                let control = self.held(*control_point_indices)?;
+                // SAFETY: both index buffers are this side's own, and the case states a range
+                // inside each: `(first + count) · control_points` control-point indices from the
+                // control-point offset, which is what Metal reads.
+                unsafe {
+                    encoder.drawIndexedPatches_patchStart_patchCount_patchIndexBuffer_patchIndexBufferOffset_controlPointIndexBuffer_controlPointIndexBufferOffset_instanceCount_baseInstance(
+                        *control_points as usize,
+                        *first as usize,
+                        *count as usize,
+                        indices,
+                        *patch_index_offset as usize,
+                        control,
+                        *control_point_index_offset as usize,
+                        *instances as usize,
+                        *base_instance as usize,
                     );
                 }
             }

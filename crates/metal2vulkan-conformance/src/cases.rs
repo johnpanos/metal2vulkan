@@ -152,6 +152,7 @@ pub mod srgb_fetch;
 pub mod stage_in_regions;
 pub mod surface_fills;
 pub mod swizzled_storage;
+pub mod tessellation_sweeps;
 pub mod texel_swizzles;
 pub mod texture_accesses;
 pub mod texture_buffer_fills;
@@ -287,6 +288,19 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     for case in vertex_formats::all() {
+        cases.push(Box::new(case));
+    }
+    let (partitions, factors, steps, patches) = tessellation_sweeps::all();
+    for case in partitions {
+        cases.push(Box::new(case));
+    }
+    for case in factors {
+        cases.push(Box::new(case));
+    }
+    for case in steps {
+        cases.push(Box::new(case));
+    }
+    for case in patches {
         cases.push(Box::new(case));
     }
     for case in attribute_formats::all() {
