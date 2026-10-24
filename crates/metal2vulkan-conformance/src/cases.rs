@@ -167,6 +167,7 @@ pub mod two_plane_heap_blits;
 pub mod two_plane_samples;
 pub mod vertex_formats;
 pub mod visibility;
+pub mod visible_tables;
 pub mod wide_points;
 pub mod ycbcr_minify;
 pub mod ycbcr_textures;
@@ -210,6 +211,9 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     for case in pipeline_options::all() {
+        cases.push(Box::new(case));
+    }
+    for case in visible_tables::all() {
         cases.push(Box::new(case));
     }
     for case in pipeline_functions::all() {
