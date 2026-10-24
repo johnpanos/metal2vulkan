@@ -21,7 +21,28 @@
 //! the control: it is pinned to level 0 by the fixture's own text, so a row where the runtime
 //! column parts from it is a row where the clamp moved the level, and a row where the two agree is
 //! one where it did not. That is the whole non-vacuity question, answered inside the recorded
-//! bytes, and `tests::the_clamps_reach_a_level_the_case_never_named` holds it there.
+//! bytes by `tests::the_recorded_clamps_moved_the_level` and
+//! `tests::the_three_mip_filters_are_not_one_answer`.
+//!
+//! **What the three filters answered**, as lane 0 (texel `(0, 0)`, whose levels hold 1, 1001 and
+//! 2001):
+//!
+//! | `lodMinClamp` | NotMipmapped | Nearest | Linear |
+//! |---|---|---|---|
+//! | 0 | 1 | 1 | 1 |
+//! | 0.25 | 1 | 1 | 251 |
+//! | 0.5 | 1 | 1 | 501 |
+//! | 1 | 1 | 1001 | 1001 |
+//! | 1.5 | 1 | 1001 | 1501 |
+//! | 2 | 1 | 2001 | 2001 |
+//! | 3 | 1 | 2001 | 2001 |
+//! | `FLT_MAX` | 1 | 2001 | 2001 |
+//!
+//! Three readings worth naming, because none of them is a rule anybody wrote down here:
+//! **`NotMipmapped` ignores `lodMinClamp` outright** — all eight rows read the level the kernel
+//! named; **`Nearest` picks `ceil(clamp + 0.5) - 1`**, so 0.5 still reads level 0 and 1.5 reads
+//! level 1; and **`Linear` blends exactly**, 251 being three quarters of level 0 and a quarter of
+//! level 1 to the bit. Past the last level every filter holds at level 2, `FLT_MAX` included.
 //!
 //! The runtime sampler's two filters are both **nearest** in this family, deliberately. With an
 //! explicit level Metal's choice between the minifying and the magnifying filter is a second
@@ -34,10 +55,29 @@
 //! constexpr column is again the control: a mode that is not `Repeat` parts from it at every `r`
 //! outside `[0, 1]`. All six `MTLSamplerAddressMode` values are rows.
 //!
-//! The border colour here is **opaque white**, and that is load-bearing rather than decorative.
-//! `ClampToZero` reads transparent black whatever the border colour, while `ClampToBorderColor`
-//! reads the border colour, so with the default transparent black the two modes would be two rows
-//! that cannot differ — the sweep comparing nothing twice. Opaque white tells them apart.
+//! The border colour here is **opaque white**, and it was chosen to tell `ClampToZero` from
+//! `ClampToBorderColor`. **It does not, and the recording is why:** on this oracle both modes read
+//! `1.0`, the opaque-white border's red, not `0.0`. Metal reads the border colour on a
+//! clamp-to-zero axis as well, which is what the runtime's own `sampler.rs` already says it
+//! measured, so **no border colour can part those two values** and they are indistinguishable
+//! here by construction. The opaque-white border stays, because it is what makes that a measured
+//! fact rather than an untested assumption: with the default transparent black both modes would
+//! read 0 and a reader could not tell a border from a zero.
+//!
+//! **What the six modes answered**, at `s = t = 0.375` (texel `(1, 1)` of a slice, so a slice `z`
+//! reads `6 + 16 z`) with the border reading `1`:
+//!
+//! | `r` | edge | mirror-clamp | repeat | mirror-repeat | zero | border |
+//! |---|---|---|---|---|---|---|
+//! | `1.0` | 54 | 54 | 6 | 54 | 1 | 1 |
+//! | `1.25` | 54 | 54 | 22 | 38 | 1 | 1 |
+//! | `-2.3` | 6 | 54 | 38 | 22 | 1 | 1 |
+//! | `3.7` | 54 | 54 | 38 | 22 | 1 | 1 |
+//!
+//! Five distinct answers of six modes, every lane inside `[0, 1)` agreeing as the control
+//! requires. The lane one unit in the last place **below** `+0.0` reads slice 0 under every mode
+//! rather than the border, which is `float`'s own subnormal boundary showing through and the same
+//! behaviour `nearest_positions` measured on the `s` axis.
 //!
 //! **`compare`** — `rrp_mirror_clamp`'s `rrp_mc_compare` takes five `sample_compare`s of a
 //! `depth2d<float>` through the runtime sampler, at one texel offset each. One case per
@@ -57,6 +97,12 @@
 //! case still earns its place: it pins the agreement, so an implementation that *did* apply a
 //! minimum reduction here would diverge from Metal and be caught.
 //!
+//! **It is the one family here that cannot be falsified, and that is the finding.** Dropping
+//! `reduction_mode` from our leg's descriptor and replaying leaves the case `exact`, because
+//! neither Metal nor the runtime applies the mode on this device. So as a *comparison of
+//! behaviour on this oracle* these three rows compare nothing, and they are not claimed to: what
+//! they hold is the agreement, for a venue where one side might not.
+//!
 //! # What is not here, and why
 //!
 //! - **`lodMaxClamp`** cannot be given a distinguishing value by any kernel in the tree. Every
@@ -67,7 +113,8 @@
 //!   refuses it. Closing this needs one kernel that takes its level from a buffer.
 //! - **`maxAnisotropy`** needs a footprint with an aspect ratio, which needs a gradient or a
 //!   fragment's derivatives; at an explicit level there is none, so every value inside Metal's
-//!   1-to-16 range reads alike.
+//!   1-to-16 range reads alike. Outside 1 to 16 is what Metal's validation refuses, so that stays
+//!   out too.
 //! - **`lodAverage`** is a fragment-stage fact — whether the level is averaged over the quad — and
 //!   no fragment function in the tree samples through a runtime sampler.
 //!
@@ -83,18 +130,21 @@
 //! `reduction` families sample at is inside its texture; the `r-address` family's coordinates
 //! reach outside on purpose, which is what an address mode is for.
 
+use crate::allowance::Allowance;
 use crate::case::{
     call, made, Abort, Bindings, Case, Failure, Handle, Input, MetalSource, SamplerSpec, Side,
     TextureRole, TextureSpec,
 };
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
+use crate::replay::notice_allowance;
 use crate::texture::{TextureRequest, Upload};
 use crate::transcript::{ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value};
 use metal2vulkan::metal::{
     CompareFunction, PixelFormat, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter,
     SamplerMipFilter, SamplerReductionMode, TextureType, TextureUsage,
 };
+use metal2vulkan_runtime::Degradation;
 
 /// The fixture whose slot kernels sample through the runtime sampler at `[[sampler(0)]]` beside a
 /// constexpr sampler of their own.
@@ -226,6 +276,24 @@ fn centres() -> Vec<[f32; 2]> {
         .collect()
 }
 
+/// The coordinates the `cubic` family samples at: a quarter of a texel past each texel's lower
+/// corner, so the footprint is never centred on a texel.
+///
+/// A cubic filter weights sixteen texels, and at a texel centre a symmetric kernel can collapse to
+/// the texel itself; a quarter off-centre is where the sixteen weights differ and the filter's own
+/// shape shows.
+fn quarters() -> Vec<[f32; 2]> {
+    (0..SIDE)
+        .flat_map(|y| (0..SIDE).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            [
+                (x as f32 + 0.25) / SIDE as f32,
+                (y as f32 + 0.25) / SIDE as f32,
+            ]
+        })
+        .collect()
+}
+
 /// The coordinate buffer of a 2D slot family.
 fn coords_2d(at: &[[f32; 2]]) -> Vec<u8> {
     at.iter()
@@ -267,6 +335,41 @@ fn texture_3d<'a>(uploads: &'a [Upload<'a>]) -> TextureRequest<'a> {
         over: None,
         uploads,
     }
+}
+
+/// The four-channel 3D texture the `border` family samples, whose every channel comes from the
+/// texture or from the border, so all three border colours are distinguishable.
+///
+/// `R32Float` cannot tell them apart: Metal fills a one-channel format's sample as
+/// `(r, 0, 0, 1)`, so transparent black and opaque black both read `0` in the one channel there
+/// is. A four-channel format reads `(0, 0, 0, 0)`, `(0, 0, 0, 1)` and `(1, 1, 1, 1)`.
+fn bytes_3d_rgba() -> Vec<u8> {
+    (0..DEPTH)
+        .flat_map(|z| (0..SIDE).flat_map(move |y| (0..SIDE).map(move |x| (x, y, z))))
+        .flat_map(|(x, y, z)| {
+            [
+                (16 + 16 * x) as u8,
+                (16 + 16 * y) as u8,
+                (16 + 16 * z) as u8,
+                128,
+            ]
+        })
+        .collect()
+}
+
+/// The `border` family's 3D texture, loaded with `uploads`.
+fn texture_3d_rgba<'a>(uploads: &'a [Upload<'a>]) -> TextureRequest<'a> {
+    let mut request = texture_3d(uploads);
+    request.format = PixelFormat::RGBA8Unorm.as_raw();
+    request
+}
+
+/// The `border` family's one upload, whose pitches are its four bytes a texel.
+fn upload_3d_rgba(bytes: &[u8]) -> Upload<'_> {
+    let mut upload = upload_3d(bytes);
+    upload.row_pitch = SIDE * 4;
+    upload.image_pitch = SIDE * SIDE * 4;
+    upload
 }
 
 /// The 3D texture's one upload.
@@ -443,6 +546,11 @@ enum Family {
     Compare(CompareFunction),
     /// Three rows, one an `MTLSamplerReductionMode`.
     Reduction,
+    /// Six rows: each `MTLSamplerBorderColor` on each of the two address modes that read a
+    /// border.
+    Border,
+    /// One row: a `Cubic` min and mag filter, the third value of `MTLSamplerMinMagFilter`.
+    Cubic,
 }
 
 /// Every `MTLSamplerAddressMode`, which the `r-address` family's rows are.
@@ -459,6 +567,21 @@ const MODES: [(&str, SamplerAddressMode); 6] = [
         "clamp-to-border-color",
         SamplerAddressMode::ClampToBorderColor,
     ),
+];
+
+/// Every `MTLSamplerBorderColor`, spelled out one value a row rather than imported in a brace
+/// list, which is how the option-space axis reads a value as put to Metal.
+const BORDERS: [(&str, SamplerBorderColor); 3] = [
+    ("transparent-black", SamplerBorderColor::TransparentBlack),
+    ("opaque-black", SamplerBorderColor::OpaqueBlack),
+    ("opaque-white", SamplerBorderColor::OpaqueWhite),
+];
+
+/// The two address modes that read a border on this oracle: `ClampToBorderColor`, which is for it,
+/// and `ClampToZero`, which the recordings show reads it too.
+const BORDER_MODES: [(&str, SamplerAddressMode); 2] = [
+    ("zero", SamplerAddressMode::ClampToZero),
+    ("border", SamplerAddressMode::ClampToBorderColor),
 ];
 
 /// Every `MTLSamplerReductionMode`, which the `reduction` family's rows are.
@@ -497,6 +620,14 @@ pub fn all() -> Vec<SamplerFiltering> {
             name: "sampler-reduction-modes",
             family: Family::Reduction,
         },
+        SamplerFiltering {
+            name: "sampler-border-colours",
+            family: Family::Border,
+        },
+        SamplerFiltering {
+            name: "sampler-cubic-filter",
+            family: Family::Cubic,
+        },
     ];
     for (name, function) in COMPARE_FUNCTIONS {
         cases.push(SamplerFiltering {
@@ -526,11 +657,11 @@ impl SamplerFiltering {
     /// The fixture and entry point the case runs.
     fn fixture(&self) -> Fixture {
         match self.family {
-            Family::Mip(_) | Family::Reduction => Fixture {
+            Family::Mip(_) | Family::Reduction | Family::Cubic => Fixture {
                 name: SLOTS,
                 entry: SLOT_2D,
             },
-            Family::RAddress => Fixture {
+            Family::RAddress | Family::Border => Fixture {
                 name: SLOTS,
                 entry: SLOT_3D,
             },
@@ -571,6 +702,22 @@ impl SamplerFiltering {
                     (name.to_owned(), spec)
                 })
                 .collect(),
+            Family::Border => BORDER_MODES
+                .iter()
+                .flat_map(|&(mode_name, mode)| {
+                    BORDERS.iter().map(move |&(colour, border)| {
+                        let mut spec = SamplerSpec::new()
+                            .bordered(border)
+                            .addressed(SamplerAddressMode::Repeat);
+                        spec.r_address_mode = mode;
+                        (format!("{mode_name}-{colour}"), spec)
+                    })
+                })
+                .collect(),
+            Family::Cubic => vec![(
+                "cubic".to_owned(),
+                SamplerSpec::filtered(SamplerMinMagFilter::Cubic),
+            )],
         }
     }
 
@@ -578,7 +725,8 @@ impl SamplerFiltering {
     fn lanes(&self) -> (u32, Vec<u8>) {
         match self.family {
             Family::Mip(_) => (SIDE * SIDE, coords_2d(&centres())),
-            Family::RAddress => (rs().len() as u32, coords_3d()),
+            Family::Cubic => (SIDE * SIDE, coords_2d(&quarters())),
+            Family::RAddress | Family::Border => (rs().len() as u32, coords_3d()),
             Family::Compare(_) => (compare_lanes().len() as u32, coords_compare()),
             Family::Reduction => (GROUP, coords_2d(&corners())),
         }
@@ -612,6 +760,12 @@ impl SamplerFiltering {
                 .map(|(level, bytes)| Input::bytes(format!("texture:level-{level}"), bytes))
                 .collect(),
             Family::RAddress => vec![Input::bytes("texture:3d", &bytes_3d())],
+            Family::Border => vec![Input::bytes("texture:3d-rgba", &bytes_3d_rgba())],
+            Family::Cubic => chain_bytes()
+                .iter()
+                .enumerate()
+                .map(|(level, bytes)| Input::bytes(format!("texture:level-{level}"), bytes))
+                .collect(),
             Family::Compare(_) => vec![Input::bytes("texture:depth", &depth_bytes())],
         }
     }
@@ -619,7 +773,7 @@ impl SamplerFiltering {
     /// The texture the case makes, on `side`.
     fn texture(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<Handle, Abort> {
         match self.family {
-            Family::Mip(_) | Family::Reduction => {
+            Family::Mip(_) | Family::Reduction | Family::Cubic => {
                 let chain = chain_bytes();
                 let uploads = chain_uploads(&chain);
                 made(sites, "texture", side.texture(&mipped_2d(&uploads)))
@@ -628,6 +782,11 @@ impl SamplerFiltering {
                 let bytes = bytes_3d();
                 let uploads = [upload_3d(&bytes)];
                 made(sites, "texture", side.texture(&texture_3d(&uploads)))
+            }
+            Family::Border => {
+                let bytes = bytes_3d_rgba();
+                let uploads = [upload_3d_rgba(&bytes)];
+                made(sites, "texture", side.texture(&texture_3d_rgba(&uploads)))
             }
             Family::Compare(_) => {
                 let spec = TextureSpec::new(
@@ -675,6 +834,24 @@ impl Case for SamplerFiltering {
             });
         }
         Ok(shaders)
+    }
+
+    fn allowances(&self) -> Vec<Allowance> {
+        // Metal announces nothing, so a notice of ours is a difference at the notices site. One
+        // family here provokes one: a `Cubic` min and mag filter, which no device's own sampler
+        // has, so the runtime emulates Metal's bicubic footprint and announces that its arithmetic
+        // is its own (`bicubic-filter-arithmetic`).
+        //
+        // It is a **declaration and loosens nothing**: measured on the M3 Max, every one of the
+        // sixteen samples of `sampler-cubic-filter` compares with Metal bit for bit, and the
+        // notices site is the whole of the difference. The other families provoke no notice and
+        // declare none, so a notice any of them starts announcing reads as divergent at once.
+        match self.family {
+            Family::Cubic => vec![notice_allowance(
+                Degradation::BicubicFilterArithmetic.code(),
+            )],
+            _ => Vec::new(),
+        }
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -972,6 +1149,46 @@ mod tests {
         );
     }
 
+    /// **The non-vacuity evidence for `borderColor`.** The three colours are three answers on a
+    /// four-channel format, and whether the two border-reading address modes agree is recorded
+    /// rather than assumed.
+    #[test]
+    fn the_three_border_colours_are_three_answers() {
+        let case = all()
+            .into_iter()
+            .find(|case| matches!(case.family, Family::Border))
+            .expect("the border case");
+        let mut answers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for (row, _) in case.rows() {
+            let Some(outcomes) = recorded(case.name(), &row) else {
+                println!("{}: no recording in the tree yet", case.name());
+                return;
+            };
+            answers.insert(row, outcomes[0].clone());
+        }
+        assert_eq!(answers.len(), BORDERS.len() * BORDER_MODES.len());
+        for (mode, _) in BORDER_MODES {
+            let colours: BTreeSet<&Vec<u8>> = BORDERS
+                .iter()
+                .filter_map(|(colour, _)| answers.get(&format!("{mode}-{colour}")))
+                .collect();
+            println!("{mode}: {} distinct answers of 3 colours", colours.len());
+            assert!(
+                colours.len() > 1,
+                "{mode}: every border colour read the same bytes"
+            );
+        }
+        let mut alike = Vec::new();
+        for (colour, _) in BORDERS {
+            let zero = answers.get(&format!("zero-{colour}"));
+            let border = answers.get(&format!("border-{colour}"));
+            if zero == border {
+                alike.push(colour);
+            }
+        }
+        println!("clamp-to-zero reads the same as clamp-to-border-color at {alike:?}");
+    }
+
     /// **The `reductionMode` rows are one answer, and that is the measurement.**
     ///
     /// `supportsSamplerReductionMode` is false on this oracle, so Metal reduces a linear
@@ -1048,9 +1265,8 @@ mod tests {
                 case.name()
             );
             let per_lane = match case.family {
-                Family::Compare(_) => 16,
-                Family::RAddress => 16,
-                _ => 8,
+                Family::Compare(_) | Family::RAddress | Family::Border => 16,
+                Family::Mip(_) | Family::Reduction | Family::Cubic => 8,
             };
             assert_eq!(
                 coords.len(),
