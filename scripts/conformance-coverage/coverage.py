@@ -601,9 +601,18 @@ def write_option_space(w, space) -> None:
     w("A value is **compared** where either of two things holds, which are different claims:")
     w("")
     w(
-        "- **answered** — the enumerator's name is in a committed recording's transcript of an "
-        "answer Metal **ran**. Metal named the value back at a site the comparison reads, so the "
-        "value is in the compared text itself."
+        "- **answered** — the enumerator's name is in what a site of a committed recording "
+        "**observed**, in an answer Metal **ran**. Metal named the value back at a site the "
+        "comparison reads, so the value is in the compared text itself."
+    )
+    site = sum(len(row["at_a_site"]) for row in rows)
+    w(
+        f"- **at a site** — the enumerator's name is a committed recording's site **name**, and "
+        f"not in anything that site observed: {site} of them. The comparison pairs sites by name, "
+        "so the value is in the compared text and the case did put it to Metal — but the name is "
+        "the **case's** label for the site, so it is no evidence that Metal said the value. This "
+        "was folded into *answered* and overstated it badly: 105 of the 172 values that column "
+        "held were a case's own spelling of a pixel format in a site name."
     )
     w(
         "- **in effect** — a case module's own text names the value, and that module has at least "
@@ -692,17 +701,20 @@ def write_option_space(w, space) -> None:
     )
     w("")
     w(
-        "Deepest gap first, which is the order the work list reads in. *answered* and *in effect* "
-        "overlap; *compared* is their union."
+        "Deepest gap first, which is the order the work list reads in. *answered*, *at a site* "
+        "and *in effect* overlap; *compared* is their union."
     )
     w("")
-    w("| Metal type | values | compared | answered | in effect | shared only | missing |")
-    w("|---|---|---|---|---|---|---|")
+    w(
+        "| Metal type | values | compared | answered | at a site | in effect | shared only | "
+        "missing |"
+    )
+    w("|---|---|---|---|---|---|---|---|")
     for row in sorted(rows, key=lambda r: (-len(r["missing"]), -len(r["shared"]), r["metal"])):
         w(
             f"| `{row['metal']}` | {len(row['values'])} | {len(row['compared'])} | "
-            f"{len(row['answered'])} | {len(row['in_effect'])} | {len(row['shared'])} | "
-            f"{len(row['missing'])} |"
+            f"{len(row['answered'])} | {len(row['at_a_site'])} | {len(row['in_effect'])} | "
+            f"{len(row['shared'])} | {len(row['missing'])} |"
         )
     w("")
     unreadable = [row for row in rows if row["named_no_value"]]

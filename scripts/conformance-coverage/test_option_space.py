@@ -271,13 +271,18 @@ class Answered(unittest.TestCase):
         self.assertEqual(row["answered"], [])
 
     def test_a_compound_site_name_is_split_into_its_tokens(self):
+        # The tokenising is what this is about, and it still holds. The column is `at_a_site` and
+        # not `answered`: a site's name is the case's label, so a value found there is in the
+        # compared text without Metal having named it back. See `AtASite`.
         data = recording("one", "MTLThingGamma")
         data["answers"][0]["outcomes"][0]["transcript"]["root"] = {
             "name": "MTLThingZeta/TextureBuffer/64x1x1",
             "observed": {"value": "absent"},
         }
         row = axis(tree({}, recordings=(data,)), set())
-        self.assertEqual(row["answered"], ["MTLThingZeta"])
+        self.assertEqual(row["at_a_site"], ["MTLThingZeta"])
+        self.assertEqual(row["answered"], [])
+        self.assertIn("MTLThingZeta", row["compared"])
 
 
 class SharedOnly(unittest.TestCase):
@@ -391,6 +396,78 @@ impl Thingy {
         )
         found = option_space.inventory(root, set())
         self.assertEqual([row["metal"] for row in found["by_hand"]], [])
+
+
+def site_named(case: str, value: str) -> dict:
+    """A recording of `case` whose transcript holds `value` as a site's **name**, observing nothing.
+
+    The shape 105 values of `MTLPixelFormat` are in across the committed recordings: a case labels
+    the site it asks about with the enumerator, and the site's own answer is a number.
+    """
+    node = {
+        "name": "case",
+        "children": [{"name": value, "observed": {"value": {"uint": 7}}}],
+    }
+    return {
+        "format": 1,
+        "case": case,
+        "suite_version": 1,
+        "answers": [
+            {
+                "provenance": option_space.RAN,
+                "runs": 1,
+                "outcomes": [{"runs": 1, "transcript": {"root": node}}],
+            }
+        ],
+    }
+
+
+class AtASite(unittest.TestCase):
+    """A value in a site's **name** is not Metal naming it back, and was counted as if it were.
+
+    The comparison pairs sites by name, so such a value is in the compared text and the case did
+    put it to Metal. But the name is the case's own label, so it is no evidence Metal said the
+    value -- and folding it into *answered* made that column read 172 where Metal's own
+    observations held 67.
+    """
+
+    def test_a_value_only_in_a_site_name_is_at_a_site_and_not_answered(self):
+        root = tree({"blends": "fn go() {}\n"}, recordings=(site_named("b-one", "MTLThingBeta"),))
+        row = axis(root, {"blends"})
+        self.assertEqual(row["at_a_site"], ["MTLThingBeta"])
+        self.assertEqual(row["answered"], [])
+        # Still compared: the value is in the text the comparison reads.
+        self.assertEqual(row["compared"], ["MTLThingBeta"])
+        self.assertEqual(row["missing"], [n for n in row["values"] if n != "MTLThingBeta"])
+
+    def test_a_value_a_site_observed_is_answered(self):
+        root = tree({"blends": "fn go() {}\n"}, recordings=(recording("b-one", "MTLThingBeta"),))
+        row = axis(root, {"blends"})
+        self.assertEqual(row["answered"], ["MTLThingBeta"])
+        self.assertEqual(row["at_a_site"], [])
+
+    def test_a_value_both_observed_and_named_is_answered_only(self):
+        # The two columns never hold one value twice: what Metal observed is answered, whatever
+        # else spells it.
+        root = tree(
+            {"blends": "fn go() {}\n"},
+            recordings=(
+                recording("b-one", "MTLThingBeta"),
+                site_named("b-two", "MTLThingBeta"),
+            ),
+        )
+        row = axis(root, {"blends"})
+        self.assertEqual(row["answered"], ["MTLThingBeta"])
+        self.assertEqual(row["at_a_site"], [])
+
+    def test_a_carried_answers_site_name_is_not_read(self):
+        # The same gate the rest of `answered` applies: a carried answer ran no Metal.
+        held = site_named("b-one", "MTLThingBeta")
+        held["answers"][0]["provenance"] = "carried"
+        root = tree({"blends": "fn go() {}\n"}, recordings=(held,))
+        row = axis(root, {"blends"})
+        self.assertEqual(row["at_a_site"], [])
+        self.assertEqual(row["answered"], [])
 
 
 class BracedUse(unittest.TestCase):

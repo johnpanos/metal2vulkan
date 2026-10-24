@@ -58,7 +58,8 @@ The denominator is generated, never written here: `crates/metal2vulkan/src/metal
 
 A value is **compared** where either of two things holds, which are different claims:
 
-- **answered** — the enumerator's name is in a committed recording's transcript of an answer Metal **ran**. Metal named the value back at a site the comparison reads, so the value is in the compared text itself.
+- **answered** — the enumerator's name is in what a site of a committed recording **observed**, in an answer Metal **ran**. Metal named the value back at a site the comparison reads, so the value is in the compared text itself.
+- **at a site** — the enumerator's name is a committed recording's site **name**, and not in anything that site observed: 105 of them. The comparison pairs sites by name, so the value is in the compared text and the case did put it to Metal — but the name is the **case's** label for the site, so it is no evidence that Metal said the value. This was folded into *answered* and overstated it badly: 105 of the 172 values that column held were a case's own spelling of a pixel format in a site name.
 - **in effect** — a case module's own text names the value, and that module has at least one case whose recording is a Metal run. Metal's recorded answer was taken with the value in effect, so what is compared is Metal's behaviour **under** it, even where no site reads it back. A blend factor is this and not the first: what the recording holds is the texels Metal blended with it.
 
 What this axis cannot see, measured rather than asserted:
@@ -87,69 +88,69 @@ The share is weakly informative on its own: `MTLPixelFormat`, `MTLDataType`, `MT
 
 ### Depth by type
 
-Deepest gap first, which is the order the work list reads in. *answered* and *in effect* overlap; *compared* is their union.
+Deepest gap first, which is the order the work list reads in. *answered*, *at a site* and *in effect* overlap; *compared* is their union.
 
-| Metal type | values | compared | answered | in effect | shared only | missing |
-|---|---|---|---|---|---|---|
-| `MTLPixelFormat` | 301 | 219 | 112 | 151 | 0 | 82 |
-| `MTLAttributeFormat` | 54 | 1 | 0 | 1 | 0 | 53 |
-| `MTLVertexFormat` | 54 | 18 | 2 | 16 | 0 | 36 |
-| `MTLDataType` | 97 | 75 | 74 | 9 | 0 | 22 |
-| `MTLBindingType` | 12 | 6 | 6 | 0 | 0 | 6 |
-| `MTLFunctionType` | 7 | 3 | 3 | 0 | 0 | 4 |
-| `MTLStepFunction` | 9 | 5 | 0 | 5 | 0 | 4 |
-| `MTLFunctionOptions` | 5 | 2 | 1 | 2 | 0 | 3 |
-| `MTLReadWriteTextureTier` | 3 | 0 | 0 | 0 | 0 | 3 |
-| `MTLStencilOperation` | 8 | 5 | 0 | 5 | 0 | 3 |
-| `MTLTextureUsage` | 9 | 6 | 0 | 6 | 0 | 3 |
-| `MTLPipelineOption` | 4 | 0 | 0 | 0 | 2 | 2 |
-| `MTLIndirectCommandType` | 8 | 5 | 0 | 5 | 1 | 2 |
-| `MTLMultisampleDepthResolveFilter` | 3 | 0 | 0 | 0 | 1 | 2 |
-| `MTLArgumentBuffersTier` | 2 | 0 | 0 | 0 | 0 | 2 |
-| `MTLBarrierScope` | 3 | 1 | 0 | 1 | 0 | 2 |
-| `MTLPrimitiveTopologyClass` | 4 | 2 | 2 | 0 | 0 | 2 |
-| `MTLStoreAction` | 6 | 4 | 0 | 4 | 0 | 2 |
-| `MTLTessellationFactorStepFunction` | 4 | 2 | 2 | 0 | 0 | 2 |
-| `MTLTessellationPartitionMode` | 4 | 2 | 2 | 0 | 0 | 2 |
-| `MTLVertexStepFunction` | 5 | 3 | 2 | 2 | 0 | 2 |
-| `MTLStorageMode` | 4 | 0 | 0 | 0 | 3 | 1 |
-| `MTLMultisampleStencilResolveFilter` | 2 | 0 | 0 | 0 | 1 | 1 |
-| `MTLColorWriteMask` | 7 | 6 | 0 | 6 | 0 | 1 |
-| `MTLPatchType` | 3 | 2 | 2 | 0 | 0 | 1 |
-| `MTLResourceUsage` | 3 | 2 | 0 | 2 | 0 | 1 |
-| `MTLTessellationControlPointIndexType` | 3 | 2 | 2 | 0 | 0 | 1 |
-| `MTLCommandBufferStatus` | 6 | 0 | 0 | 0 | 6 | 0 |
-| `MTLBlitOption` | 4 | 0 | 0 | 0 | 4 | 0 |
-| `MTLPurgeableState` | 4 | 1 | 0 | 1 | 3 | 0 |
-| `MTLDispatchType` | 2 | 0 | 0 | 0 | 2 | 0 |
-| `MTLHazardTrackingMode` | 3 | 1 | 0 | 1 | 2 | 0 |
-| `MTLSparseTextureRegionAlignmentMode` | 2 | 0 | 0 | 0 | 2 | 0 |
-| `MTLCPUCacheMode` | 2 | 1 | 0 | 1 | 1 | 0 |
-| `MTLHeapType` | 3 | 2 | 0 | 2 | 1 | 0 |
-| `MTLLoadAction` | 3 | 2 | 0 | 2 | 1 | 0 |
-| `MTLBindingAccess` | 3 | 3 | 3 | 0 | 0 | 0 |
-| `MTLBlendFactor` | 20 | 20 | 10 | 20 | 0 | 0 |
-| `MTLBlendOperation` | 6 | 6 | 5 | 6 | 0 | 0 |
-| `MTLCompareFunction` | 8 | 8 | 0 | 8 | 0 | 0 |
-| `MTLCullMode` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLDepthClipMode` | 2 | 2 | 0 | 2 | 0 | 0 |
-| `MTLIndexType` | 2 | 2 | 0 | 2 | 0 | 0 |
-| `MTLMutability` | 3 | 3 | 3 | 0 | 0 | 0 |
-| `MTLPrimitiveType` | 5 | 5 | 0 | 5 | 0 | 0 |
-| `MTLRenderStages` | 5 | 5 | 0 | 5 | 0 | 0 |
-| `MTLSamplerAddressMode` | 6 | 6 | 0 | 6 | 0 | 0 |
-| `MTLSamplerBorderColor` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLSamplerMinMagFilter` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLSamplerMipFilter` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLSamplerReductionMode` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLSparsePageSize` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLStoreActionOptions` | 2 | 2 | 0 | 2 | 0 | 0 |
-| `MTLTessellationFactorFormat` | 1 | 1 | 1 | 0 | 0 | 0 |
-| `MTLTextureSwizzle` | 6 | 6 | 0 | 6 | 0 | 0 |
-| `MTLTextureType` | 10 | 10 | 7 | 10 | 0 | 0 |
-| `MTLTriangleFillMode` | 2 | 2 | 0 | 2 | 0 | 0 |
-| `MTLVisibilityResultMode` | 3 | 3 | 0 | 3 | 0 | 0 |
-| `MTLWinding` | 2 | 2 | 2 | 2 | 0 | 0 |
+| Metal type | values | compared | answered | at a site | in effect | shared only | missing |
+|---|---|---|---|---|---|---|---|
+| `MTLPixelFormat` | 301 | 219 | 7 | 105 | 151 | 0 | 82 |
+| `MTLAttributeFormat` | 54 | 1 | 0 | 0 | 1 | 0 | 53 |
+| `MTLVertexFormat` | 54 | 18 | 2 | 0 | 16 | 0 | 36 |
+| `MTLDataType` | 97 | 75 | 74 | 0 | 9 | 0 | 22 |
+| `MTLBindingType` | 12 | 6 | 6 | 0 | 0 | 0 | 6 |
+| `MTLFunctionType` | 7 | 3 | 3 | 0 | 0 | 0 | 4 |
+| `MTLStepFunction` | 9 | 5 | 0 | 0 | 5 | 0 | 4 |
+| `MTLFunctionOptions` | 5 | 2 | 1 | 0 | 2 | 0 | 3 |
+| `MTLReadWriteTextureTier` | 3 | 0 | 0 | 0 | 0 | 0 | 3 |
+| `MTLStencilOperation` | 8 | 5 | 0 | 0 | 5 | 0 | 3 |
+| `MTLTextureUsage` | 9 | 6 | 0 | 0 | 6 | 0 | 3 |
+| `MTLPipelineOption` | 4 | 0 | 0 | 0 | 0 | 2 | 2 |
+| `MTLIndirectCommandType` | 8 | 5 | 0 | 0 | 5 | 1 | 2 |
+| `MTLMultisampleDepthResolveFilter` | 3 | 0 | 0 | 0 | 0 | 1 | 2 |
+| `MTLArgumentBuffersTier` | 2 | 0 | 0 | 0 | 0 | 0 | 2 |
+| `MTLBarrierScope` | 3 | 1 | 0 | 0 | 1 | 0 | 2 |
+| `MTLPrimitiveTopologyClass` | 4 | 2 | 2 | 0 | 0 | 0 | 2 |
+| `MTLStoreAction` | 6 | 4 | 0 | 0 | 4 | 0 | 2 |
+| `MTLTessellationFactorStepFunction` | 4 | 2 | 2 | 0 | 0 | 0 | 2 |
+| `MTLTessellationPartitionMode` | 4 | 2 | 2 | 0 | 0 | 0 | 2 |
+| `MTLVertexStepFunction` | 5 | 3 | 2 | 0 | 2 | 0 | 2 |
+| `MTLStorageMode` | 4 | 0 | 0 | 0 | 0 | 3 | 1 |
+| `MTLMultisampleStencilResolveFilter` | 2 | 0 | 0 | 0 | 0 | 1 | 1 |
+| `MTLColorWriteMask` | 7 | 6 | 0 | 0 | 6 | 0 | 1 |
+| `MTLPatchType` | 3 | 2 | 2 | 0 | 0 | 0 | 1 |
+| `MTLResourceUsage` | 3 | 2 | 0 | 0 | 2 | 0 | 1 |
+| `MTLTessellationControlPointIndexType` | 3 | 2 | 2 | 0 | 0 | 0 | 1 |
+| `MTLCommandBufferStatus` | 6 | 0 | 0 | 0 | 0 | 6 | 0 |
+| `MTLBlitOption` | 4 | 0 | 0 | 0 | 0 | 4 | 0 |
+| `MTLPurgeableState` | 4 | 1 | 0 | 0 | 1 | 3 | 0 |
+| `MTLDispatchType` | 2 | 0 | 0 | 0 | 0 | 2 | 0 |
+| `MTLHazardTrackingMode` | 3 | 1 | 0 | 0 | 1 | 2 | 0 |
+| `MTLSparseTextureRegionAlignmentMode` | 2 | 0 | 0 | 0 | 0 | 2 | 0 |
+| `MTLCPUCacheMode` | 2 | 1 | 0 | 0 | 1 | 1 | 0 |
+| `MTLHeapType` | 3 | 2 | 0 | 0 | 2 | 1 | 0 |
+| `MTLLoadAction` | 3 | 2 | 0 | 0 | 2 | 1 | 0 |
+| `MTLBindingAccess` | 3 | 3 | 3 | 0 | 0 | 0 | 0 |
+| `MTLBlendFactor` | 20 | 20 | 10 | 0 | 20 | 0 | 0 |
+| `MTLBlendOperation` | 6 | 6 | 5 | 0 | 6 | 0 | 0 |
+| `MTLCompareFunction` | 8 | 8 | 0 | 0 | 8 | 0 | 0 |
+| `MTLCullMode` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLDepthClipMode` | 2 | 2 | 0 | 0 | 2 | 0 | 0 |
+| `MTLIndexType` | 2 | 2 | 0 | 0 | 2 | 0 | 0 |
+| `MTLMutability` | 3 | 3 | 3 | 0 | 0 | 0 | 0 |
+| `MTLPrimitiveType` | 5 | 5 | 0 | 0 | 5 | 0 | 0 |
+| `MTLRenderStages` | 5 | 5 | 0 | 0 | 5 | 0 | 0 |
+| `MTLSamplerAddressMode` | 6 | 6 | 0 | 0 | 6 | 0 | 0 |
+| `MTLSamplerBorderColor` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLSamplerMinMagFilter` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLSamplerMipFilter` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLSamplerReductionMode` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLSparsePageSize` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLStoreActionOptions` | 2 | 2 | 0 | 0 | 2 | 0 | 0 |
+| `MTLTessellationFactorFormat` | 1 | 1 | 1 | 0 | 0 | 0 | 0 |
+| `MTLTextureSwizzle` | 6 | 6 | 0 | 0 | 6 | 0 | 0 |
+| `MTLTextureType` | 10 | 10 | 7 | 0 | 10 | 0 | 0 |
+| `MTLTriangleFillMode` | 2 | 2 | 0 | 0 | 2 | 0 | 0 |
+| `MTLVisibilityResultMode` | 3 | 3 | 0 | 0 | 3 | 0 | 0 |
+| `MTLWinding` | 2 | 2 | 2 | 0 | 2 | 0 | 0 |
 
 ### Types a case is about, whose values this axis cannot read
 

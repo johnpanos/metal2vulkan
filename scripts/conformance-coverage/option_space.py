@@ -406,8 +406,41 @@ def _tokens(value, key: str | None, out: list[str]) -> None:
             _tokens(held, key, out)
 
 
-def answered(root: Path, types: dict[str, Type]) -> dict[tuple[str, str], set[str]]:
+def _site_and_observed(node, named: list[str], observed: list[str]) -> None:
+    """A transcript's tokens, split by where they came from: a site's **name**, or what it observed.
+
+    The split is the whole point. A node's name is the **case's** label for a site, chosen by
+    whoever wrote the case; what the node observed is Metal's answer. Reading them into one bag
+    credited a value to Metal because a case had spelled the enumerator in its own site name --
+    105 values of `MTLPixelFormat` across the committed recordings, which was 105 of the 172 the
+    *answered* column held.
+    """
+    if not isinstance(node, dict):
+        return
+    name = node.get("name")
+    if isinstance(name, str):
+        named.extend(re.findall(r"[A-Za-z0-9_]+", name))
+    _tokens(node.get("observed"), None, observed)
+    for child in node.get("children") or []:
+        _site_and_observed(child, named, observed)
+
+
+def answered(
+    root: Path, types: dict[str, Type]
+) -> tuple[dict[tuple[str, str], set[str]], dict[tuple[str, str], set[str]]]:
     """The values a committed recording's compared transcript holds, by the cases holding them.
+
+    Two dicts, because they are two claims of different strength and were one number:
+
+    - **answered**: the value is in what a site **observed**, which is Metal's own answer. This is
+      the strong claim the document makes for the column -- Metal named the value back at a site
+      the comparison reads.
+    - **at a site**: the value is in a site's **name**. The comparison does read those names, and
+      pairs sites by them, so the value is in the compared text and the case did put it to Metal.
+      But it is the case's label and not Metal's answer, so it is no evidence that Metal **said**
+      the value, and folding it into the first overstated what the recording holds.
+
+    Both are inside *compared*, so no total moves; what moves is which column carries them.
 
     Only `answers[].outcomes[].transcript` is read. An answer's `validated` leg is Metal's API
     validation, which the suite records and **never compares**, and its complaints name
@@ -422,18 +455,30 @@ def answered(root: Path, types: dict[str, Type]) -> dict[tuple[str, str], set[st
         for name, canonical in held.aliases.items():
             of_name.setdefault(name, (held.metal, canonical))
     out: dict[tuple[str, str], set[str]] = {}
+    at_a_site: dict[tuple[str, str], set[str]] = {}
     for path in sorted((root / "crates/metal2vulkan-conformance/recordings").glob("*.json")):
         data = json.loads(path.read_text())
-        found: list[str] = []
+        named: list[str] = []
+        observed: list[str] = []
         for answer in data.get("answers", []):
             if answer.get("provenance") != RAN:
                 continue
             for outcome in answer.get("outcomes", []):
-                _tokens(outcome.get("transcript"), None, found)
-        for token in set(found):
+                _site_and_observed(
+                    (outcome.get("transcript") or {}).get("root"), named, observed
+                )
+        for token in set(observed):
             if token in of_name:
                 out.setdefault(of_name[token], set()).add(data["case"])
-    return out
+        for token in set(named):
+            if token in of_name and of_name[token] not in out:
+                at_a_site.setdefault(of_name[token], set()).add(data["case"])
+    # A value Metal observed somewhere is answered, whatever else spells it, so the two columns
+    # never hold the same value twice.
+    for key in list(at_a_site):
+        if key in out:
+            del at_a_site[key]
+    return out, at_a_site
 
 
 #: A Rust item the tree declares to be one Metal enum or option set: a doc comment naming the
@@ -516,13 +561,13 @@ def inventory(root: Path, ran: set[str]) -> dict:
     for metal, rust, names in hand:
         held[metal] = Type(metal, rust, "by hand", [(name, name) for name in names])
     effect, shared, about = stated(root, held, ran)
-    read_back = answered(root, types)
+    read_back, at_a_site = answered(root, types)
     rows = []
     for metal, held in sorted(types.items()):
         compared, only_shared, missing = [], [], []
         for name in held.names:
             key = (metal, name)
-            if key in read_back or key in effect:
+            if key in read_back or key in at_a_site or key in effect:
                 compared.append(name)
             elif key in shared:
                 only_shared.append(name)
@@ -536,6 +581,10 @@ def inventory(root: Path, ran: set[str]) -> dict:
                 "values": held.names,
                 "compared": compared,
                 "answered": [n for n in held.names if (metal, n) in read_back],
+                # In a site's **name** rather than in what it observed: the case's label for the
+                # site, which the comparison does pair by, so the value is in the compared text --
+                # but it is not Metal saying the value, which is what *answered* claims.
+                "at_a_site": [n for n in held.names if (metal, n) in at_a_site],
                 "in_effect": [n for n in held.names if (metal, n) in effect],
                 "shared": only_shared,
                 "missing": missing,
@@ -564,5 +613,6 @@ def inventory(root: Path, ran: set[str]) -> dict:
         "rows": rows,
         "by_hand": hand_rows,
         "answered": read_back,
+        "at_a_site": at_a_site,
         "in_effect": effect,
     }
