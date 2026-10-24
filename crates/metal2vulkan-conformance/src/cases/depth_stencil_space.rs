@@ -106,7 +106,7 @@ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{
     ColorWriteMask, CompareFunction, PixelFormat, PrimitiveType, StencilOperation,
 };
-use metal2vulkan_runtime::StoreAction;
+use metal2vulkan_runtime::{Degradation, StoreAction};
 
 // ------------------------------------------------------------------------------------------------
 // The geometry every case here shares
@@ -1585,9 +1585,15 @@ const MATRIX_ROW: u32 = 3;
 /// textures**, which is the shape Metal takes (a `Depth32Float` beside a `Stencil8`, of identical
 /// dimensions, which its validation requires) and which a Vulkan subpass has no counterpart for:
 /// the runtime renders such a pass into a scratch image of the combined format and copies each
-/// aspect in and out. Single-sampled aspects copy through a staging buffer, bit for bit, so the
-/// case is held to exact answers and declares no notice. Nothing else in the suite compares that
-/// path against Metal.
+/// aspect in and out. Nothing else in the suite compares that path against Metal.
+///
+/// Measured on an Apple M3 Max (macOS 27.0.1, MoltenVK): **every value the case reads is Metal's
+/// own**, and the one difference is that our side announces
+/// `metal2vulkan-degrade-separate-depth-stencil`, which the case therefore names. That notice is a
+/// `Performance` degradation -- Metal's answer at a cost Metal does not pay, the two copies a
+/// single-sampled aspect takes through a staging buffer -- so the values stay exact and nothing but
+/// the notice site is loosened. The allowance fails the case if the notice stops firing, so it
+/// cannot outlive its reason.
 pub struct DepthSlot;
 
 impl DepthSlot {
@@ -1806,9 +1812,13 @@ impl Case for DepthSlot {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Nothing loosened. The separate-texture path copies a single-sampled aspect through a
-        // staging buffer, bit for bit, so it owes Metal's own bytes with nothing announced.
-        Vec::new()
+        // Only the notice set is loosened. A pass whose depth and stencil attachments are two
+        // textures renders through a scratch image of the combined format, which the runtime
+        // announces; it is a `Performance` degradation, so it buys the copies and not the answer,
+        // and every texel and every stencil byte of this case still compares exactly.
+        vec![crate::replay::notice_allowance(
+            Degradation::SeparateDepthStencil.code(),
+        )]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -2285,9 +2295,24 @@ mod tests {
         for case in all() {
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
-            assert!(case.allowances().is_empty());
             assert!(case.inputs().is_ok());
+            // Five of the six loosen nothing at all: a texel is white or the clear and a stencil
+            // byte is a stencil byte, both of which the attachments hold exactly. The sixth names
+            // one notice and no value tolerance, because the path it is the only case to take is
+            // announced.
+            let allowed = case.allowances();
+            match case.name() == DepthSlot.name() {
+                true => assert_eq!(allowed.len(), 1, "{}", case.name()),
+                false => assert!(allowed.is_empty(), "{}", case.name()),
+            }
         }
+        // The one notice the family names is a cost rather than a near-equivalent, which is what
+        // makes loosening the notice site alone honest: a `Precision` degradation would owe a value
+        // tolerance beside it.
+        assert_eq!(
+            Degradation::SeparateDepthStencil.category(),
+            metal2vulkan_runtime::DegradationCategory::Performance
+        );
         // The six programs between them attach every combination the family needs: depth alone,
         // stencil alone, and the two together as separate textures.
         let shapes: BTreeSet<(Option<u32>, bool)> = programs()
