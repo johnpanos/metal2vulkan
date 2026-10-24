@@ -22,12 +22,13 @@
 //! nothing else. Widening it to 53 formats would multiply those 28 rows by a field they have
 //! nothing to do with, and would still need another fixture, because `stage_in_regions.metal`
 //! declares no float, half or integer-vector attribute to decode into. The fixture that does is
-//! `kernel_stage_in`, whose `stage_in_fetch` declares one attribute of each class and reports
+//! `kernel_stage_in`, whose `stage_in_fetch_wide` declares one attribute of each class and reports
 //! every one as raw bits, which is exactly this family's question and none of that one's.
 //!
 //! # The five declared attributes, and what each can read
 //!
-//! `stage_in_fetch`'s `[[stage_in]]` holds `float4 f`, `uint4 u`, `int i`, `half2 h` and `int4 v`,
+//! `stage_in_fetch_wide`'s `[[stage_in]]` holds `float4 f`, `uint4 u`, `int i`, `half2 h` and
+//! `int4 v`,
 //! so the descriptor — not the source — chooses each one's format. A format reaches the shader only
 //! through an attribute whose declared type admits it, which splits the field by **numeric class**:
 //!
@@ -117,7 +118,13 @@ use metal2vulkan::metal::{AttributeFormat, StepFunction};
 const FIXTURE: &str = "kernel_stage_in";
 
 /// The entry point: one attribute of each class, each reported as raw bits.
-const ENTRY: &str = "stage_in_fetch";
+///
+/// `stage_in_fetch_wide` and not `stage_in_fetch`, which is the same four attributes without the
+/// `int4`. The two exist apart because `stage_in_fetch`'s four are the contract a dozen of the
+/// translator's own stage-input tests state their descriptors against, and a fifth attribute the
+/// kernel declares and those descriptors do not describe is an invalid descriptor to every one of
+/// them. So the wide declaration is its own entry point in the same fixture.
+const ENTRY: &str = "stage_in_fetch_wide";
 
 /// The Metal buffer index every attribute's layout reads.
 const SOURCE: u32 = 1;
@@ -150,7 +157,8 @@ const OUTPUT_BYTES: usize = 832;
 
 // ---- The four declared attributes --------------------------------------------------------------
 
-/// One of the five `[[stage_in]]` attributes `stage_in_fetch` declares, by what it is declared as.
+/// One of the five `[[stage_in]]` attributes `stage_in_fetch_wide` declares, by what it is
+/// declared as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Declared {
     /// `float4 f [[attribute(0)]]`.

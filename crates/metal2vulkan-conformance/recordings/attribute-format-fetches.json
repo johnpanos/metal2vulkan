@@ -5,13 +5,13 @@
   "shaders": [
     {
       "fixture": "kernel_stage_in.ll",
-      "entry": "stage_in_fetch",
-      "source_sha256": "554c1ca4719b1e9220daa8e55d0c0cace6212e33f4f760b181a86ba3b03824e2"
+      "entry": "stage_in_fetch_wide",
+      "source_sha256": "7e7482a0b2a896a40b42502585a32b25a7621ea24a8fe2f4a931f534df7900d2"
     },
     {
       "fixture": "kernel_stage_in.air.ll",
-      "entry": "stage_in_fetch",
-      "source_sha256": "e4d2ad764a4aa7357297556cb2bcef1e88cd79d335176d83cee3494ecaff2236"
+      "entry": "stage_in_fetch_wide",
+      "source_sha256": "68a480d877a187bd21e45a352579dd7f7e4e6183e0467a8aea4ad6475811966f"
     }
   ],
   "answers": [
@@ -47,7 +47,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "554c1ca4719b1e9220daa8e55d0c0cace6212e33f4f760b181a86ba3b03824e2"
+                          "hex": "7e7482a0b2a896a40b42502585a32b25a7621ea24a8fe2f4a931f534df7900d2"
                         }
                       }
                     },
@@ -57,7 +57,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "e4d2ad764a4aa7357297556cb2bcef1e88cd79d335176d83cee3494ecaff2236"
+                          "hex": "68a480d877a187bd21e45a352579dd7f7e4e6183e0467a8aea4ad6475811966f"
                         }
                       }
                     },
@@ -87,7 +87,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "67e580c6706ce07751ce9688e0b9bc8caf695de7805959f82d58c248fdab4e77"
+                          "hex": "f80c24a1eaddc8ba3f32c7719b44b7acceca91a10d412a796c9859f93347bf21"
                         }
                       }
                     },
@@ -97,7 +97,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "0af5c8bf147b64a46fd211e91e9afc357571861edc8327fa3f374486e453e9bb"
+                          "hex": "77004a02edce0660825a4c3967677b3acec0231e5a25e45fbc5cd1aa66f0df69"
                         }
                       }
                     },
@@ -107,7 +107,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "3351f84a1d4463aa22014c20848a53a40073061ff95250666337f6c9c01ab789"
+                          "hex": "3d8daba8af8da477da7a9624d7469eca629b9fd60cd8aed5e3fb72a093706740"
                         }
                       }
                     },
@@ -117,7 +117,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "2df1d815093b87418e7df46616c946052289179e725432c2d9e1d9388b0aa4b5"
+                          "hex": "6dd295415daed3b9cb51d164769fabb5e319732b45a83312ab33cbc3870cc1e8"
                         }
                       }
                     },
@@ -127,7 +127,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "d23a1895dc8ca689bba56cce8232ca1a02f147f2f94392b9b2ecf0d561374185"
+                          "hex": "8cbe33bea7c838dc4a8015ea74cfec22f4f141ae5d59d8ce2cc65a25d105d540"
                         }
                       }
                     },
@@ -137,7 +137,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "c5168a079ea7a5d8de71c85d30fdfff43d4b2610e6e423e338c52cfe7726fb2d"
+                          "hex": "60f3577c3c0f424c975d356e033c1ba4e913d2da367adbc2c59ec6194bf63e55"
                         }
                       }
                     },
@@ -147,7 +147,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "adb0708c2eec6b9ef21c6d59b0180df0c385865f6881a8f1e0381aceb9cbf1e6"
+                          "hex": "d72124d70e55e8bc67ae4e39c4e74cb6f274de088321dcf573ccc6289d855d8e"
                         }
                       }
                     },
@@ -157,7 +157,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "3df497d8530750459fdbc89b707309ce1e960f0c6c02f91f23c94346cf9642a7"
+                          "hex": "1418f6f5b957e3fab00c282abec7155a1a14ac97dbcbfe469c0b45fca017182f"
                         }
                       }
                     },
@@ -167,7 +167,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "82fc46d12666bd9ba66e74ff08087bf55433e7fe5021eafc1d0add89bf52c009"
+                          "hex": "85be19b96bfb1b1414f56b085c9591d600feb0c9bc11d31139ecd638d3cd1ac4"
                         }
                       }
                     },
@@ -177,7 +177,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "c9119c746fef1317a6de3c315ff43ced558ca4d918464e4a6351ce789d0fb3e0"
+                          "hex": "866cf7183515ff3b36ae242c8c51727c1919c4244f7a43c360378b2e6d4a194d"
                         }
                       }
                     },
@@ -187,7 +187,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "ead271e15174a2328eeaa346141efdc1eabfc99d8d587df20c4615deaed9602b"
+                          "hex": "65e348da5e0db3ad46ac4bee13decf6f61f728cb506d852885adee51dbc084a6"
                         }
                       }
                     },
@@ -197,7 +197,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "77ad090d3978c89be9134cfeb53cf77bc38a90872f49dce0f093f7980c3f74f9"
+                          "hex": "cbfa98befc46b09a3c0aa646a3a2e1dd7428f414c327322f85e303e3274635c1"
                         }
                       }
                     },
@@ -207,7 +207,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "21252df8fa8cb7c0cbd919b1ae652d00a7d50c7d69b8ab450c1f1df6f61644e0"
+                          "hex": "17392a27b4e60ad8989875668f95fe9f71e1f0dc92e810d15540e872b9130a3c"
                         }
                       }
                     },
@@ -217,7 +217,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "17c78aecc9afce4834fc1b7b57d37016d238899afa3e8074a7ae95e7bc60597d"
+                          "hex": "07296450587675b04c85389cc0c6a91ad66615a15c517126207553bcdf2c4f78"
                         }
                       }
                     },
@@ -227,7 +227,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "693076380f506dcfc47572ae95091decde4811dc916c422b0969eea00f522cca"
+                          "hex": "0f05687353db358812d12831698c600c40827c4e0b7482f1d324eb0501e473a4"
                         }
                       }
                     },
@@ -237,7 +237,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "2d3686fb19058c1ad7bac0bd808eb8a1d2c9d930602972c772a1878f9a9b06fc"
+                          "hex": "8afd6e4d5c7a470bb93498497dc3149b2d003c1dfbc2406400a6975ff37a534c"
                         }
                       }
                     },
@@ -247,7 +247,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "19f60ccd38a51a29e619fa2a4939fc4c5e6e9be2419b6d4330e35d7adf6f2dc2"
+                          "hex": "ef3aa068b4d349f178368f937441ccd8dd250714c22b30fa39369361c3d3d983"
                         }
                       }
                     },
@@ -257,7 +257,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "273223c18c5ce8f60cb864cf30d431ca7ba31078ed470928b994ab21b226bf7f"
+                          "hex": "c0c62ee70f25655cc7119bee5462f0b77508d276cd8d0e96901af7a06918850a"
                         }
                       }
                     },
@@ -267,7 +267,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "1e96c195105dd7eaaa54352407d848fa8ac2640f27a20739c8aecd6fc2ca9075"
+                          "hex": "70011344b57189dfc939c290adba7931f209cfdf2b28ab147e50b06019ad0c35"
                         }
                       }
                     },
@@ -277,7 +277,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "89938b72b8696ef34ad4551c7226e0e20049a0722477ed12018c8cc6793ae5d3"
+                          "hex": "b3950fb982c54cc74c7a7dd018b5bd8cefb587142e001f70faf01f06ce2f646f"
                         }
                       }
                     },
@@ -287,7 +287,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "8bcf54306974502f4fefc9f0484a98d4299fbbdf38cb4d7bffe8e5a3fa486cdf"
+                          "hex": "5210207facdc3a42f4ec263b80632c459f3a7ba20e3360625b83f672b793b7a9"
                         }
                       }
                     },
@@ -297,7 +297,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "d719a46f9f40593d6f40ae3cb308c6706dd5103a3b2386dca93707f2073d026c"
+                          "hex": "3904bf77436dfa30c29f78ab062ae16f853b111091c450df5eee8a5ea3201d97"
                         }
                       }
                     },
@@ -307,7 +307,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "7fc66375fefadaa2e8222c61574ab149dd4ad6d5a2ac146d1ab6c5dfcb8a4ef7"
+                          "hex": "4659430419bab81e47921cdfbde5ea3ab03ebd3ebea66c5a20ed493ec629079b"
                         }
                       }
                     },
@@ -317,7 +317,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "69f70930442f437d11c9b3fdee12d633eee7455eb9535dc6ac4607928c5921f1"
+                          "hex": "4b80db5862b76ff4236a02a1c02de25c1eee62fd8e0224cc2c3daee9f4887128"
                         }
                       }
                     },
@@ -327,7 +327,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "380a7caee37240b1a1a82e8966f36d16ecb20a99c080760ca568b7037b088407"
+                          "hex": "99882e985a86068ce0467c92a4299f6e3ee0bee3716dee60b4c291b374e60fa5"
                         }
                       }
                     },
@@ -337,7 +337,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "e61de3426a09dd4554f6a7f3052993201e17347903ff66fdb46ac40d9d449199"
+                          "hex": "f14ec1c4f8589de0bbe2c30bfbb2aa680ea275b825e9e9d0f499227b92785af9"
                         }
                       }
                     },
@@ -347,7 +347,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "33487340e6ad21dd477f7d941542d00ebdd83f8652e29cd1fe06faa168f492fc"
+                          "hex": "8361950fd14e67498f7b3ac4a5d9c3fe4af66de99fe672e1dcc6b91b1c6da7db"
                         }
                       }
                     },
@@ -357,7 +357,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "6cce8c1288201bccc3ae1a8d10b013dbab89349428574ef28086ac5893545e66"
+                          "hex": "3ba54e0740c2f19dfd7265fa3867fa4ad4eab3426f2cbe79497143eeba0cfcfd"
                         }
                       }
                     },
@@ -367,7 +367,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "8155a77993a620eeb7a06b02de28b22a38a7e0268f235bb1c310b597d243493d"
+                          "hex": "40eabe01ab37f7cb9acfdf4bd1a1639c5b1be6a835690f25ef955390d861daae"
                         }
                       }
                     }

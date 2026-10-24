@@ -5,13 +5,13 @@
   "shaders": [
     {
       "fixture": "kernel_stage_in.ll",
-      "entry": "stage_in_fetch",
-      "source_sha256": "554c1ca4719b1e9220daa8e55d0c0cace6212e33f4f760b181a86ba3b03824e2"
+      "entry": "stage_in_fetch_wide",
+      "source_sha256": "7e7482a0b2a896a40b42502585a32b25a7621ea24a8fe2f4a931f534df7900d2"
     },
     {
       "fixture": "kernel_stage_in.air.ll",
-      "entry": "stage_in_fetch",
-      "source_sha256": "e4d2ad764a4aa7357297556cb2bcef1e88cd79d335176d83cee3494ecaff2236"
+      "entry": "stage_in_fetch_wide",
+      "source_sha256": "68a480d877a187bd21e45a352579dd7f7e4e6183e0467a8aea4ad6475811966f"
     }
   ],
   "answers": [
@@ -47,7 +47,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "554c1ca4719b1e9220daa8e55d0c0cace6212e33f4f760b181a86ba3b03824e2"
+                          "hex": "7e7482a0b2a896a40b42502585a32b25a7621ea24a8fe2f4a931f534df7900d2"
                         }
                       }
                     },
@@ -57,7 +57,7 @@
                         "value": "absent",
                         "digest": {
                           "kind": "sha256",
-                          "hex": "e4d2ad764a4aa7357297556cb2bcef1e88cd79d335176d83cee3494ecaff2236"
+                          "hex": "68a480d877a187bd21e45a352579dd7f7e4e6183e0467a8aea4ad6475811966f"
                         }
                       }
                     },
