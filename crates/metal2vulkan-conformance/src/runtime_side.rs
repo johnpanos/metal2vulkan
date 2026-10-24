@@ -3973,6 +3973,12 @@ impl Side for RuntimeSide<'_> {
         let textures: Vec<Texture> = self.textures.clone();
         let samplers: Vec<SamplerState> = self.samplers.clone();
         let states: Vec<ComputePipelineState> = self.pipelines.clone();
+        let held_heaps: Vec<Heap> = self.heaps.clone();
+        let heap = |handle: Handle| -> Answer<&Heap> {
+            held_heaps
+                .get(handle.0 as usize)
+                .ok_or_else(|| Failure::named("NoSuchHandle", format!("heap {}", handle.0)))
+        };
         let buffer = |handle: Handle| -> Answer<&Buffer> {
             buffers
                 .get(handle.0 as usize)
@@ -4185,6 +4191,13 @@ impl Side for RuntimeSide<'_> {
                             .use_resources(&held, resource_usage(*usage)?)
                             .map_err(Failure::from_error)
                     }),
+                ComputeStep::UseHeap { heap: handle } => heap(*handle)
+                    .and_then(|held| encoder.use_heap(held).map_err(Failure::from_error)),
+                ComputeStep::UseHeaps { heaps: named } => named
+                    .iter()
+                    .map(|handle| heap(*handle))
+                    .collect::<Answer<Vec<&Heap>>>()
+                    .and_then(|held| encoder.use_heaps(&held).map_err(Failure::from_error)),
                 ComputeStep::BarrierScope { scope } => barrier_scope(*scope).map(|scope| {
                     encoder.memory_barrier_with_scope(scope);
                 }),

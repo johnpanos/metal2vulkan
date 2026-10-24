@@ -186,6 +186,16 @@ pub enum ComputeStep {
         resources: Vec<PassResource>,
         usage: u64,
     },
+    /// `useHeap:`: every resource of the heap is resident for this encoder's dispatches.
+    ///
+    /// A bound slot is resident without being declared, so this changes nothing a case reading its
+    /// own bindings can observe; what a case over it holds is that a dispatch through a
+    /// heap-placed buffer answers Metal's own words with the heap declared. The observable a
+    /// declaration *would* have is a resource reached off-slot, which is undefined behaviour on a
+    /// shared GPU and no case here probes.
+    UseHeap { heap: Handle },
+    /// `useHeaps:count:`: the plural form of [`ComputeStep::UseHeap`].
+    UseHeaps { heaps: Vec<Handle> },
     /// `memoryBarrierWithScope:`: the earlier dispatches' writes to that scope are visible to the
     /// later ones.
     BarrierScope { scope: u64 },
@@ -226,6 +236,8 @@ impl ComputeStep {
             ComputeStep::ThreadgroupMemory { .. } => "setThreadgroupMemoryLength",
             ComputeStep::UseResource { .. } => "useResource",
             ComputeStep::UseResources { .. } => "useResources",
+            ComputeStep::UseHeap { .. } => "useHeap",
+            ComputeStep::UseHeaps { .. } => "useHeaps",
             ComputeStep::BarrierScope { .. } => "memoryBarrierWithScope",
             ComputeStep::BarrierResources { .. } => "memoryBarrierWithResources",
             ComputeStep::DispatchThreadgroups { .. } => "dispatchThreadgroups",
@@ -339,6 +351,12 @@ impl ComputeStep {
             ComputeStep::UseResources { resources, usage } => {
                 words.extend(usage.to_le_bytes());
                 words.extend((resources.len() as u32).to_le_bytes());
+            }
+            // A heap a step names is fingerprinted by the case through its own descriptor, so
+            // only the count of them is here, as for the plural resource declaration.
+            ComputeStep::UseHeap { .. } => {}
+            ComputeStep::UseHeaps { heaps } => {
+                words.extend((heaps.len() as u32).to_le_bytes());
             }
             ComputeStep::BarrierScope { scope } => words.extend(scope.to_le_bytes()),
             ComputeStep::BarrierResources { resources } => {
@@ -579,7 +597,11 @@ mod tests {
                 resources: vec![PassResource::Texture(handle())],
                 usage: USAGE_READ,
             },
-            ComputeStep::UseResources { .. } => ComputeStep::BarrierScope {
+            ComputeStep::UseResources { .. } => ComputeStep::UseHeap { heap: handle() },
+            ComputeStep::UseHeap { .. } => ComputeStep::UseHeaps {
+                heaps: vec![handle()],
+            },
+            ComputeStep::UseHeaps { .. } => ComputeStep::BarrierScope {
                 scope: SCOPE_BUFFERS,
             },
             ComputeStep::BarrierScope { .. } => ComputeStep::BarrierResources {

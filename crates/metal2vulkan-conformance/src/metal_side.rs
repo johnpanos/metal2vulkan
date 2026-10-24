@@ -9073,6 +9073,19 @@ impl MetalSide {
                     );
                 }
             }
+            ComputeStep::UseHeap { heap } => {
+                let held = self.held_heap(*heap)?;
+                encoder.useHeap(held);
+            }
+            ComputeStep::UseHeaps { heaps } => {
+                let held = self.heap_range(heaps)?;
+                let pointers: Vec<std::ptr::NonNull<ProtocolObject<dyn MTLHeap>>> = held
+                    .iter()
+                    .map(|one| std::ptr::NonNull::from(&**one))
+                    .collect();
+                // SAFETY: the array holds `count` pointers and each heap outlives the call.
+                unsafe { encoder.useHeaps_count(array_head(&pointers)?, pointers.len()) };
+            }
             ComputeStep::BarrierScope { scope } => {
                 encoder.memoryBarrierWithScope(MTLBarrierScope(*scope as usize));
             }
