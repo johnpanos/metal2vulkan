@@ -109,6 +109,7 @@ pub mod mesh_barriers;
 pub mod mesh_commands;
 pub mod mesh_draws;
 pub mod mesh_pipeline_descriptors;
+pub mod mesh_pipeline_reflection;
 pub mod nearest_positions;
 pub mod norm_storage_writes;
 pub mod pass_bytes;
@@ -157,6 +158,7 @@ pub mod texture_fills;
 pub mod texture_views;
 pub mod textures;
 pub mod tile_pipeline_descriptors;
+pub mod tile_pipeline_reflection;
 pub mod tile_threadgroups;
 pub mod two_plane_copies;
 pub mod two_plane_heap_blits;
@@ -233,6 +235,12 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     for case in mesh_pipeline_descriptors::all() {
+        cases.push(Box::new(case));
+    }
+    for case in tile_pipeline_reflection::all() {
+        cases.push(Box::new(case));
+    }
+    for case in mesh_pipeline_reflection::all() {
         cases.push(Box::new(case));
     }
     for case in render_pass_descriptors::all() {
