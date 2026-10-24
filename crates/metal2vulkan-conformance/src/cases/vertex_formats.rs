@@ -79,10 +79,36 @@
 //!   `MTLVertexStepFunctionConstant`, whose fetch no fixed-function vertex input can express, so
 //!   the shader pulls it. The decoding must not depend on which path fetched it, and
 //!   `tests::the_two_step_functions_recorded_the_same_values` holds that.
+//! - **`vertex-format-instance-step`** — every swept format under
+//!   `MTLVertexStepFunctionPerInstance`, drawn as **one** instance of twelve vertices, so the step
+//!   fetches element 0 for every one of them. That is the whole of what this fixture can observe of
+//!   the instance step, and `tests::the_instance_step_fetched_one_element_for_every_vertex` holds
+//!   it: the answer is twelve copies of what the per-vertex step answered at row 0, which tells it
+//!   apart from the per-vertex step (whose twelve rows differ from each other) and not from the
+//!   constant step.
 //!
 //! Format against attribute width and format against step are the two pairings that can change a
 //! decode; the three of them together are not taken, because a step function cannot reach the
 //! narrowing a width does.
+//!
+//! # The step functions this family does not set, and why
+//!
+//! - **`MTLVertexStepFunctionPerInstance`'s step rate** is not observable here. One instance
+//!   fetches element `0 / rate` whatever the rate is, and separating two rates needs two instances
+//!   with destinations of their own — which needs a fixture declaring `[[instance_id]]`, and no
+//!   committed one does. The case sets rate 1 and claims nothing about any other.
+//! - **`MTLVertexStepFunctionPerPatch` and `PerPatchControlPoint`** are tessellation's: they need a
+//!   post-tessellation vertex function, a patch control-point buffer and a tessellation factor
+//!   buffer, which is a family of its own rather than a row of this one. Named here because no case
+//!   in the suite sets either, so the two values are uncompared.
+//! - **`MTLStepFunctionPerVertex`, `PerInstance`, `PerPatch` and `PerPatchControlPoint`** — the
+//!   vertex and tessellation steps of `MTLStageInputOutputDescriptor`, the compute descriptor —
+//!   are **not set by any case and must not be**. A vertex or tessellation step in a compute layout
+//!   is an invalid descriptor, and Metal's compute pipeline creation stops at an **assertion** for
+//!   one (`metal2vulkan::lower::stage_io::stage_in`'s module docs record the measurement). An
+//!   assertion ends the process, so a case that set one could not report anything and would take
+//!   the run down with it. Those four values are therefore uncomparable rather than uncompared, and
+//!   that is a property of Metal's API and not a gap of the suite's.
 //!
 //! # What the three cases separate, measured
 //!
@@ -225,6 +251,9 @@ enum Sweep {
     Half4,
     /// Every swept format into the `float4` attribute under Metal's constant step.
     Constant,
+    /// Every swept format into the `float4` attribute under Metal's instance step, drawn as one
+    /// instance of [`ROWS`] vertices.
+    PerInstance,
 }
 
 impl Sweep {
@@ -240,6 +269,7 @@ impl Sweep {
     fn step(self) -> VertexStepFunction {
         match self {
             Sweep::Constant => VertexStepFunction::Constant,
+            Sweep::PerInstance => VertexStepFunction::PerInstance,
             _ => VertexStepFunction::PerVertex,
         }
     }
@@ -266,6 +296,10 @@ pub fn all() -> Vec<VertexFormats> {
             name: "vertex-format-constant-step",
             sweep: Sweep::Constant,
         },
+        VertexFormats {
+            name: "vertex-format-instance-step",
+            sweep: Sweep::PerInstance,
+        },
     ]
 }
 
@@ -287,6 +321,15 @@ impl VertexFormats {
     fn layouts(&self) -> [VertexBufferLayout; 1] {
         [match self.sweep.step() {
             VertexStepFunction::Constant => VertexBufferLayout::constant(1, stride()),
+            VertexStepFunction::PerInstance => VertexBufferLayout {
+                index: 1,
+                stride: stride(),
+                step: VertexStepFunction::PerInstance,
+                // The rate is not observable through this fixture, which has no `[[instance_id]]`:
+                // one instance fetches element `0 / rate` whatever the rate is. 1 is the plain
+                // value; the module docs say what a rate sweep would need.
+                rate: 1,
+            },
             _ => VertexBufferLayout::per_vertex(1, stride()),
         }]
     }
@@ -1067,6 +1110,61 @@ mod tests {
         sign | ((exponent + 127 - 15) << 23) | (mantissa << 13)
     }
 
+    /// The instance step fetched element 0 for every vertex: its answer is `ROWS` copies of what
+    /// the per-vertex step answered at its row 0.
+    ///
+    /// Non-vacuous against the per-vertex step, whose twelve rows differ from each other, so an
+    /// implementation that stepped per vertex where Metal steps per instance fails here. It says
+    /// nothing against the **constant** step, which fetches the same element too: separating those
+    /// two needs the instance index in the answer, and the module docs say what that would take.
+    #[test]
+    fn the_instance_step_fetched_one_element_for_every_vertex() {
+        let cases = all();
+        let (per_vertex, per_instance) = (&cases[0], &cases[3]);
+        assert_eq!(per_instance.sweep, Sweep::PerInstance);
+        let mut compared = 0usize;
+        let mut differ = Vec::new();
+        let mut varying = 0usize;
+        for format in formats() {
+            let (Some(one), Some(other)) =
+                (recorded(per_vertex, format), recorded(per_instance, format))
+            else {
+                continue;
+            };
+            compared += 1;
+            // The per-vertex answer varies across its rows, which is what makes the claim below a
+            // claim rather than two constants agreeing.
+            if one.iter().any(|held| *held != one[0]) {
+                varying += 1;
+            }
+            for (row, held) in other.iter().enumerate() {
+                if *held != one[0] {
+                    differ.push(format!(
+                        "{} row {row}: instance step {held:08x?}, per-vertex row 0 {:08x?}",
+                        format.name(),
+                        one[0]
+                    ));
+                }
+            }
+        }
+        if compared == 0 {
+            println!("no recording of both step functions in the tree yet");
+            return;
+        }
+        for line in differ.iter().take(20) {
+            println!("INSTANCE-STEP-DIFFERS: {line}");
+        }
+        assert!(
+            differ.is_empty(),
+            "{} reading(s) over {compared} format(s) are not the per-vertex step's first row",
+            differ.len()
+        );
+        assert!(
+            varying > 0,
+            "no format's per-vertex answer varies across its rows, so the claim compares nothing"
+        );
+    }
+
     /// The constant step answered what the per-vertex step answered, format for format.
     ///
     /// One fetch is fixed-function vertex input on a device that has it and the other no
@@ -1075,6 +1173,7 @@ mod tests {
     fn the_two_step_functions_recorded_the_same_values() {
         let cases = all();
         let (per_vertex, constant) = (&cases[0], &cases[2]);
+        assert_eq!(constant.sweep, Sweep::Constant);
         let mut compared = 0usize;
         let mut differ = Vec::new();
         for format in formats() {
