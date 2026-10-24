@@ -592,9 +592,10 @@ def write_option_space(w, space) -> None:
     w(
         "The denominator is generated, never written here: "
         "`crates/metal2vulkan/src/metal/generated.rs` and the front end's hold every enumerator "
-        "name and ordinal `scripts/regen-metal-enums/` extracts from the SDK's Metal headers. A "
-        "Metal type this tree models by hand instead has **no denominator here** and is listed "
-        "apart, below."
+        "name and ordinal `scripts/regen-metal-enums/` extracts from the SDK's Metal headers, and "
+        "`scripts/conformance-coverage/metal_enumerators.tsv` holds the same for the Metal types "
+        "this tree declares by hand instead, which have no generated Rust. A Metal type neither "
+        "covers has **no denominator here** and is listed apart, below."
     )
     w("")
     w("A value is **compared** where either of two things holds, which are different claims:")
@@ -694,6 +695,38 @@ def write_option_space(w, space) -> None:
             f"{len(row['missing'])} |"
         )
     w("")
+    unreadable = [row for row in rows if row["named_no_value"]]
+    if unreadable:
+        w("### Types a case is about, whose values this axis cannot read")
+        w("")
+        w(
+            "The raw-ordinal limit above as a work list rather than a sentence. Each row is a type "
+            "whose name a recorded case module uses and **none of whose values that module states "
+            "by name**: a sweep written `for bits in 0..8` reads exactly this way, and so does a "
+            "module that only mentions the type in passing. So a row is a question for the case, "
+            "never a verdict on it -- the module may put every value of the type to Metal, and "
+            "this axis would still count none of them."
+        )
+        w("")
+        w(
+            "It names the type and the module, and no value: which value a computed number is is "
+            "not a property of the text, and a rule that answered it would be inventing the "
+            "answer. Closing a row means the case stating its values by name, or a transcript site "
+            "recording the enumerator beside the ordinal it already stores."
+        )
+        w("")
+        w("| Metal type | values | compared | modules naming it that state no value |")
+        w("|---|---|---|---|")
+        for row in sorted(
+            unreadable, key=lambda r: (len(r["compared"]), -len(r["values"]), r["metal"])
+        ):
+            modules = ", ".join(f"`{m}`" for m in row["named_no_value"])
+            w(
+                f"| `{row['metal']}` | {len(row['values'])} | {len(row['compared'])} | "
+                f"{modules} |"
+            )
+        w("")
+
     w("### The values not compared")
     w("")
     w(
@@ -724,19 +757,26 @@ def write_option_space(w, space) -> None:
     w("")
     w(
         "These the tree models by hand: a Rust item whose own doc comment opens by naming a Metal "
-        "type, and whose shape is a closed enum or a newtype over one integer. "
-        "`regen-metal-enums` holds no value list for them, so **this axis has no denominator "
-        "here**, and *declared* is our own sources' variant count rather than the SDK's — a "
-        "newtype option set declares none. There is no *answered* column either: a recording names "
-        "a value by its Metal enumerator, and for these types this has no list of those names to "
-        "match against. Giving one a denominator means appending its Metal name to "
-        "`scripts/regen-metal-enums/`'s `ENUMS` or `OPTIONS` and regenerating."
+        "type, and whose shape is a closed enum or a newtype over one integer. The tree declares "
+        "them itself because the compile-and-plan layer never reads them, and that stays — but a "
+        "declaration measured against itself is no measurement, so "
+        "`scripts/regen-metal-enums/`'s `TABLE_ONLY` list generates "
+        "`scripts/conformance-coverage/metal_enumerators.tsv`, the SDK's own values for them, and "
+        "every type it covers is in the per-type table above with a real denominator. What is left "
+        "here is what the table does not cover."
     )
     w("")
     w(
-        f"These {len(space['by_hand'])} are what that shape finds, and the list is a floor: a type "
-        "the tree models without saying so on the item lands in neither table, and so is nowhere "
-        "in this axis at all."
+        "For a row here **this axis has no denominator**: *declared* is our own sources' variant "
+        "count rather than the SDK's — a newtype option set declares none — and there is no "
+        "*answered* column, because a recording names a value by its Metal enumerator and this has "
+        "no list of those names to match against."
+    )
+    w("")
+    w(
+        f"{len(space['by_hand'])} are left, and the list is a floor: a type the tree models "
+        "without saying so on the item lands in neither table, and so is nowhere in this axis at "
+        "all."
     )
     w("")
     w("| Metal type | the tree's type | declared | stated by a recorded case | shared only |")

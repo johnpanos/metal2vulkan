@@ -54,7 +54,7 @@ A tolerance names a **site of a transcript**, not an item, so the last two rows 
 
 The axis above counts a Metal **item** as exercised where one call of it ran. A selector that takes an enum therefore counts whatever value reached it, so that axis says nothing about how much of an enum the suite ever put to Metal. This one does, over the values themselves.
 
-The denominator is generated, never written here: `crates/metal2vulkan/src/metal/generated.rs` and the front end's hold every enumerator name and ordinal `scripts/regen-metal-enums/` extracts from the SDK's Metal headers. A Metal type this tree models by hand instead has **no denominator here** and is listed apart, below.
+The denominator is generated, never written here: `crates/metal2vulkan/src/metal/generated.rs` and the front end's hold every enumerator name and ordinal `scripts/regen-metal-enums/` extracts from the SDK's Metal headers, and `scripts/conformance-coverage/metal_enumerators.tsv` holds the same for the Metal types this tree declares by hand instead, which have no generated Rust. A Metal type neither covers has **no denominator here** and is listed apart, below.
 
 A value is **compared** where either of two things holds, which are different claims:
 
@@ -66,23 +66,23 @@ What this axis cannot see, measured rather than asserted:
 - **A value Metal answers as a bare ordinal.** A transcript holds a `uint`, and nothing in it says which enum the number belongs to, so only a site that records the enumerator's **name** is read. The *answered* column is a floor by every site that records an ordinal instead.
 - **A value a case states as a raw ordinal.** A case may hand the Metal leg an enum's ordinal as a number — a sweep over `0..n` rather than over named variants — and no reading of the text can say which value a computed number is. So *in effect*, and the *stated* column of the hand-modelled table below, are floors by every sweep written that way: a type they report short of its values may in fact be swept exhaustively, and the case is what says so. Read the case before taking a row of the work list as work.
 - **Which case put a value in effect.** The unit is the case module, as it is for the items axis: a value named anywhere in a module whose cases include a Metal run counts for that module, even where one of its cases names it and the rest do not.
-- **A value only the suite's shared sources name** — 3 of them. Some case puts it to Metal through the render or texture vocabulary, but which case is not a property of the text, so it is neither compared nor missing and has its own column.
+- **A value only the suite's shared sources name** — 30 of them. Some case puts it to Metal through the render or texture vocabulary, but which case is not a property of the text, so it is neither compared nor missing and has its own column.
 - **Combinations.** Every column here is per value. A type whose values are all compared says nothing about the pairs and triples of them, which is where most of the behaviour an implementation can get wrong lives.
 - **Metal's API validation is excluded.** Its complaints name enumerators, and the suite records that leg and never compares it, so reading it would count Apple's prose as a comparison. So are the cost and timing tables: a site name there is what was measured, not an answer that was compared.
 - **A `#[cfg(test)]` item is excluded.** One of the suite's unit tests names four blend factors to assert that no case uses them; counting those would have this report the opposite of what the code says.
 
 | | |
 |---|---|
-| Metal enums and option sets with a generated value list | 43 |
-| their values | 703 |
-| values compared | 463 |
-| share compared | 66% |
-| values only the suite's shared sources name | 3 |
-| values no source names and no recording holds | 237 |
-| types every value of which is compared | 20 |
-| types no value of which is compared | 3 |
+| Metal enums and option sets with a generated value list | 59 |
+| their values | 757 |
+| values compared | 482 |
+| share compared | 64% |
+| values only the suite's shared sources name | 30 |
+| values no source names and no recording holds | 245 |
+| types every value of which is compared | 23 |
+| types no value of which is compared | 10 |
 
-The share is weakly informative on its own: `MTLPixelFormat`, `MTLDataType`, `MTLAttributeFormat`, `MTLVertexFormat` hold 506 of the 703 values between them, so an aggregate over types this uneven is mostly theirs. The per-type table is the one to read.
+The share is weakly informative on its own: `MTLPixelFormat`, `MTLDataType`, `MTLAttributeFormat`, `MTLVertexFormat` hold 506 of the 757 values between them, so an aggregate over types this uneven is mostly theirs. The per-type table is the one to read.
 
 ### Depth by type
 
@@ -101,18 +101,31 @@ Deepest gap first, which is the order the work list reads in. *answered* and *in
 | `MTLReadWriteTextureTier` | 3 | 0 | 0 | 0 | 0 | 3 |
 | `MTLStencilOperation` | 8 | 5 | 0 | 5 | 0 | 3 |
 | `MTLTextureUsage` | 9 | 6 | 0 | 6 | 0 | 3 |
+| `MTLPipelineOption` | 4 | 0 | 0 | 0 | 2 | 2 |
 | `MTLIndirectCommandType` | 8 | 5 | 0 | 5 | 1 | 2 |
+| `MTLMultisampleDepthResolveFilter` | 3 | 0 | 0 | 0 | 1 | 2 |
 | `MTLArgumentBuffersTier` | 2 | 0 | 0 | 0 | 0 | 2 |
 | `MTLBarrierScope` | 3 | 1 | 0 | 1 | 0 | 2 |
 | `MTLPrimitiveTopologyClass` | 4 | 2 | 2 | 0 | 0 | 2 |
+| `MTLStoreAction` | 6 | 4 | 0 | 4 | 0 | 2 |
 | `MTLTessellationFactorStepFunction` | 4 | 2 | 2 | 0 | 0 | 2 |
 | `MTLTessellationPartitionMode` | 4 | 2 | 2 | 0 | 0 | 2 |
 | `MTLVertexStepFunction` | 5 | 3 | 2 | 2 | 0 | 2 |
+| `MTLStorageMode` | 4 | 0 | 0 | 0 | 3 | 1 |
+| `MTLMultisampleStencilResolveFilter` | 2 | 0 | 0 | 0 | 1 | 1 |
 | `MTLColorWriteMask` | 7 | 6 | 0 | 6 | 0 | 1 |
 | `MTLPatchType` | 3 | 2 | 2 | 0 | 0 | 1 |
 | `MTLResourceUsage` | 3 | 2 | 0 | 2 | 0 | 1 |
 | `MTLTessellationControlPointIndexType` | 3 | 2 | 2 | 0 | 0 | 1 |
+| `MTLCommandBufferStatus` | 6 | 0 | 0 | 0 | 6 | 0 |
+| `MTLBlitOption` | 4 | 0 | 0 | 0 | 4 | 0 |
+| `MTLPurgeableState` | 4 | 1 | 0 | 1 | 3 | 0 |
 | `MTLDispatchType` | 2 | 0 | 0 | 0 | 2 | 0 |
+| `MTLHazardTrackingMode` | 3 | 1 | 0 | 1 | 2 | 0 |
+| `MTLSparseTextureRegionAlignmentMode` | 2 | 0 | 0 | 0 | 2 | 0 |
+| `MTLCPUCacheMode` | 2 | 1 | 0 | 1 | 1 | 0 |
+| `MTLHeapType` | 3 | 2 | 0 | 2 | 1 | 0 |
+| `MTLLoadAction` | 3 | 2 | 0 | 2 | 1 | 0 |
 | `MTLBindingAccess` | 3 | 3 | 3 | 0 | 0 | 0 |
 | `MTLBlendFactor` | 20 | 20 | 10 | 20 | 0 | 0 |
 | `MTLBlendOperation` | 6 | 6 | 5 | 6 | 0 | 0 |
@@ -128,11 +141,29 @@ Deepest gap first, which is the order the work list reads in. *answered* and *in
 | `MTLSamplerMinMagFilter` | 3 | 3 | 0 | 3 | 0 | 0 |
 | `MTLSamplerMipFilter` | 3 | 3 | 0 | 3 | 0 | 0 |
 | `MTLSamplerReductionMode` | 3 | 3 | 0 | 3 | 0 | 0 |
+| `MTLSparsePageSize` | 3 | 3 | 0 | 3 | 0 | 0 |
+| `MTLStoreActionOptions` | 2 | 2 | 0 | 2 | 0 | 0 |
 | `MTLTessellationFactorFormat` | 1 | 1 | 1 | 0 | 0 | 0 |
 | `MTLTextureSwizzle` | 6 | 6 | 0 | 6 | 0 | 0 |
 | `MTLTextureType` | 10 | 10 | 7 | 10 | 0 | 0 |
 | `MTLTriangleFillMode` | 2 | 2 | 0 | 2 | 0 | 0 |
+| `MTLVisibilityResultMode` | 3 | 3 | 0 | 3 | 0 | 0 |
 | `MTLWinding` | 2 | 2 | 2 | 2 | 0 | 0 |
+
+### Types a case is about, whose values this axis cannot read
+
+The raw-ordinal limit above as a work list rather than a sentence. Each row is a type whose name a recorded case module uses and **none of whose values that module states by name**: a sweep written `for bits in 0..8` reads exactly this way, and so does a module that only mentions the type in passing. So a row is a question for the case, never a verdict on it -- the module may put every value of the type to Metal, and this axis would still count none of them.
+
+It names the type and the module, and no value: which value a computed number is is not a property of the text, and a rule that answered it would be inventing the answer. Closing a row means the case stating its values by name, or a transcript site recording the enumerator beside the ordinal it already stores.
+
+| Metal type | values | compared | modules naming it that state no value |
+|---|---|---|---|
+| `MTLBarrierScope` | 3 | 1 | `compute_encoder_commands`, `mesh_barriers` |
+| `MTLLoadAction` | 3 | 2 | `srgb_fetch` |
+| `MTLBindingAccess` | 3 | 3 | `texture_accesses` |
+| `MTLSamplerBorderColor` | 3 | 3 | `border_swizzles` |
+| `MTLSamplerAddressMode` | 6 | 6 | `border_swizzles` |
+| `MTLTextureSwizzle` | 6 | 6 | `border_swizzles`, `texel_swizzles` |
 
 ### The values not compared
 
@@ -152,45 +183,48 @@ The work list. A name here is a value of Metal's that no committed recording hol
 - **`MTLArgumentBuffersTier`**, 2 of 2: `MTLArgumentBuffersTier1`, `MTLArgumentBuffersTier2`
 - **`MTLBarrierScope`**, 2 of 3: `MTLBarrierScopeBuffers`, `MTLBarrierScopeRenderTargets`
 - **`MTLIndirectCommandType`**, 2 of 8: `MTLIndirectCommandTypeDrawPatches`, `MTLIndirectCommandTypeDrawIndexedPatches`
+- **`MTLMultisampleDepthResolveFilter`**, 2 of 3: `MTLMultisampleDepthResolveFilterMin`, `MTLMultisampleDepthResolveFilterMax`
+- **`MTLPipelineOption`**, 2 of 4: `MTLPipelineOptionBufferTypeInfo`, `MTLPipelineOptionFailOnBinaryArchiveMiss`
 - **`MTLPrimitiveTopologyClass`**, 2 of 4: `MTLPrimitiveTopologyClassPoint`, `MTLPrimitiveTopologyClassLine`
+- **`MTLStoreAction`**, 2 of 6: `MTLStoreActionUnknown`, `MTLStoreActionCustomSampleDepthStore`
 - **`MTLTessellationFactorStepFunction`**, 2 of 4: `MTLTessellationFactorStepFunctionPerPatch`, `MTLTessellationFactorStepFunctionPerInstance`
 - **`MTLTessellationPartitionMode`**, 2 of 4: `MTLTessellationPartitionModeInteger`, `MTLTessellationPartitionModeFractionalEven`
 - **`MTLVertexStepFunction`**, 2 of 5: `MTLVertexStepFunctionPerPatch`, `MTLVertexStepFunctionPerPatchControlPoint`
 - **`MTLColorWriteMask`**, 1 of 7: `MTLColorWriteMaskUnspecialized`
+- **`MTLMultisampleStencilResolveFilter`**, 1 of 2: `MTLMultisampleStencilResolveFilterDepthResolvedSample`
 - **`MTLPatchType`**, 1 of 3: `MTLPatchTypeQuad`
 - **`MTLResourceUsage`**, 1 of 3: `MTLResourceUsageSample`
+- **`MTLStorageMode`**, 1 of 4: `MTLStorageModeMemoryless`
 - **`MTLTessellationControlPointIndexType`**, 1 of 3: `MTLTessellationControlPointIndexTypeUInt16`
 
 And the values only the suite's shared sources name, which some case reaches and this cannot attribute:
 
+- **`MTLBlitOption`**: `MTLBlitOptionNone`, `MTLBlitOptionDepthFromDepthStencil`, `MTLBlitOptionStencilFromDepthStencil`, `MTLBlitOptionRowLinearPVRTC`
+- **`MTLCPUCacheMode`**: `MTLCPUCacheModeWriteCombined`
+- **`MTLCommandBufferStatus`**: `MTLCommandBufferStatusNotEnqueued`, `MTLCommandBufferStatusEnqueued`, `MTLCommandBufferStatusCommitted`, `MTLCommandBufferStatusScheduled`, `MTLCommandBufferStatusCompleted`, `MTLCommandBufferStatusError`
 - **`MTLDispatchType`**: `MTLDispatchTypeSerial`, `MTLDispatchTypeConcurrent`
+- **`MTLHazardTrackingMode`**: `MTLHazardTrackingModeUntracked`, `MTLHazardTrackingModeTracked`
+- **`MTLHeapType`**: `MTLHeapTypeSparse`
 - **`MTLIndirectCommandType`**: `MTLIndirectCommandTypeDrawMeshThreads`
+- **`MTLLoadAction`**: `MTLLoadActionDontCare`
+- **`MTLMultisampleDepthResolveFilter`**: `MTLMultisampleDepthResolveFilterSample0`
+- **`MTLMultisampleStencilResolveFilter`**: `MTLMultisampleStencilResolveFilterSample0`
+- **`MTLPipelineOption`**: `MTLPipelineOptionNone`, `MTLPipelineOptionArgumentInfo`
+- **`MTLPurgeableState`**: `MTLPurgeableStateNonVolatile`, `MTLPurgeableStateVolatile`, `MTLPurgeableStateEmpty`
+- **`MTLSparseTextureRegionAlignmentMode`**: `MTLSparseTextureRegionAlignmentModeOutward`, `MTLSparseTextureRegionAlignmentModeInward`
+- **`MTLStorageMode`**: `MTLStorageModeShared`, `MTLStorageModeManaged`, `MTLStorageModePrivate`
 
 ### Metal types with no generated value list
 
-These the tree models by hand: a Rust item whose own doc comment opens by naming a Metal type, and whose shape is a closed enum or a newtype over one integer. `regen-metal-enums` holds no value list for them, so **this axis has no denominator here**, and *declared* is our own sources' variant count rather than the SDK's — a newtype option set declares none. There is no *answered* column either: a recording names a value by its Metal enumerator, and for these types this has no list of those names to match against. Giving one a denominator means appending its Metal name to `scripts/regen-metal-enums/`'s `ENUMS` or `OPTIONS` and regenerating.
+These the tree models by hand: a Rust item whose own doc comment opens by naming a Metal type, and whose shape is a closed enum or a newtype over one integer. The tree declares them itself because the compile-and-plan layer never reads them, and that stays — but a declaration measured against itself is no measurement, so `scripts/regen-metal-enums/`'s `TABLE_ONLY` list generates `scripts/conformance-coverage/metal_enumerators.tsv`, the SDK's own values for them, and every type it covers is in the per-type table above with a real denominator. What is left here is what the table does not cover.
 
-These 17 are what that shape finds, and the list is a floor: a type the tree models without saying so on the item lands in neither table, and so is nowhere in this axis at all.
+For a row here **this axis has no denominator**: *declared* is our own sources' variant count rather than the SDK's — a newtype option set declares none — and there is no *answered* column, because a recording names a value by its Metal enumerator and this has no list of those names to match against.
+
+1 are left, and the list is a floor: a type the tree models without saying so on the item lands in neither table, and so is nowhere in this axis at all.
 
 | Metal type | the tree's type | declared | stated by a recorded case | shared only |
 |---|---|---|---|---|
-| `MTLBlitOption` | `BlitOption` | 4 | 0 | 4 |
-| `MTLCPUCacheMode` | `CpuCacheMode` | 2 | 1 | 1 |
-| `MTLCommandBufferStatus` | `CommandBufferStatus` | 6 | 0 | 6 |
-| `MTLHazardTrackingMode` | `HazardTrackingMode` | 3 | 1 | 2 |
-| `MTLHeapType` | `HeapType` | 3 | 2 | 1 |
-| `MTLLoadAction` | `LoadAction` | 3 | 2 | 1 |
-| `MTLMultisampleDepthResolveFilter` | `MultisampleDepthResolveFilter` | 3 | 0 | 1 |
-| `MTLMultisampleStencilResolveFilter` | `MultisampleStencilResolveFilter` | 2 | 0 | 1 |
-| `MTLPipelineOption` | `PipelineOption` | — a bit set | 0 | 0 |
-| `MTLPurgeableState` | `PurgeableState` | 4 | 1 | 3 |
 | `MTLResourceOptions` | `ResourceOptions` | — a bit set | 0 | 0 |
-| `MTLSparsePageSize` | `SparsePageSize` | 3 | 3 | 0 |
-| `MTLSparseTextureRegionAlignmentMode` | `SparseTextureRegionAlignmentMode` | 2 | 0 | 2 |
-| `MTLStorageMode` | `StorageMode` | 4 | 0 | 3 |
-| `MTLStoreAction` | `StoreAction` | 6 | 4 | 0 |
-| `MTLStoreActionOptions` | `StoreActionOptions` | — a bit set | 0 | 0 |
-| `MTLVisibilityResultMode` | `VisibilityResultMode` | 3 | 3 | 0 |
 
 ## By container
 
