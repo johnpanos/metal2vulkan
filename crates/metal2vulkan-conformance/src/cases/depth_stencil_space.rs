@@ -80,11 +80,11 @@
 //! # Bounds
 //!
 //! Every value list is the generated table's (`CompareFunction::ALL`, `StencilOperation::ALL`),
-//! held by [`tests::the_swept_lists_are_the_generated_tables`], so a value Apple adds to either
-//! enum fails this module rather than quietly lowering its ratio. The masks and the stored stencils
-//! are bounded by the attachment: a `Stencil8` holds 8 bits, so 0, 0xff and the one-bit drops are
-//! the whole of the mask's end behaviour, and 0, 128 and 255 are the ends and the middle of the
-//! stored value's range. No device query bounds any of it — Metal states no limit on a
+//! held by the module's own `the_swept_lists_are_the_generated_tables`, so a value Apple adds to
+//! either enum fails this module rather than quietly lowering its ratio. The masks and the stored
+//! stencils are bounded by the attachment: a `Stencil8` holds 8 bits, so 0, 0xff and the one-bit
+//! drops are the whole of the mask's end behaviour, and 0, 128 and 255 are the ends and the middle
+//! of the stored value's range. No device query bounds any of it — Metal states no limit on a
 //! depth/stencil descriptor's fields, and `MTLDevice` answers none.
 //!
 //! Nothing here can fault a GPU: one pass a case, at most sixty-one draws of three vertices over a
@@ -2679,8 +2679,8 @@ mod tests {
             // operation (`Zero`) fires; where it is the front face it keeps the front reference and
             // steps up.
             if forward_up { 0 } else { up },
-            // The per-face read masks under a reference one bit from the stored value: the whole-byte
-            // face fails and zeroes, the masked face passes and steps down.
+            // The per-face read masks under a reference one bit from the stored value: the
+            // whole-byte face fails and zeroes, the masked face passes and steps down.
             if forward_up { 0 } else { down },
             if forward_up { down } else { 0 },
         ]
