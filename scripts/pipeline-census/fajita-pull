@@ -11,7 +11,10 @@ into OUT/manifest.json. Then:
 
     scripts/pipeline-census/a630-host --manifest OUT/manifest.json --out OUT/census
 
-The phone side: `NGPU_CAPTURE=1` in /private/var/ngpu/gpu-env, then the render server restarted
+With a frame capture (NGPU_CAPTURE_FRAMES) it also pulls frames.jsonl and its blobs and builds
+OUT/<process>/frames.json for command-replay (frames_manifest.py).
+
+The phone side: `NGPU_CAPTURE=1` (and `NGPU_CAPTURE_FRAMES=N`, `NGPU_CAPTURE_SKIP=K`) in /private/var/ngpu/gpu-env, then the render server restarted
 (`ngpu-metal killall backboardd`) so its device opens with the variable set. Everything pulled is
 the render server's (Apple's shaders): it stays under the gitignored .cache/."""
 import argparse
@@ -64,6 +67,22 @@ for d in dirs:
             continue
         if 'file' in r and 'library' in r:
             pull(d + '/' + r['file'], os.path.join(leaf, r['file']))
+    # The frame capture (NGPU_CAPTURE_FRAMES): its records and every blob they name.
+    if pull(d + '/frames.jsonl', os.path.join(leaf, 'frames.jsonl')):
+        blobs = set()
+        for line in open(os.path.join(leaf, 'frames.jsonl'), errors='replace'):
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get('file'):
+                blobs.add(r['file'])
+            blobs.update(u['file'] for u in r.get('uploads', []))
+        for b in sorted(blobs):
+            if not os.path.exists(os.path.join(leaf, b)):
+                pull(d + '/' + b, os.path.join(leaf, b))
+        subprocess.run([sys.executable, '-I', os.path.join(here, 'frames_manifest.py'), leaf, '--out',
+                        os.path.join(leaf, 'frames.json')], check=False)
 if not local_dirs:
     sys.exit('no capture pulled')
 subprocess.run([sys.executable, '-I', os.path.join(here, 'capture_manifest.py'), *local_dirs, '--out',
