@@ -393,6 +393,47 @@ impl Thingy {
         self.assertEqual([row["metal"] for row in found["by_hand"]], [])
 
 
+class BracedUse(unittest.TestCase):
+    """`use Type::{A, B};` names those values, which only `Head::Tail` reading missed entirely.
+
+    `border_swizzles` sweeps all three `MTLSamplerBorderColor` values in nine samplers through a
+    braced `use` and then writes the variants bare, naming `SamplerBorderColor::` nowhere. The
+    axis read 1 of 3 and the document said so while the sweep was complete.
+    """
+
+    def test_a_braced_use_names_every_variant_it_imports(self):
+        root = tree({"blends": "use Thing::{Alpha, Gamma};\nlet pair = [Alpha, Gamma];\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], ["MTLThingAlpha", "MTLThingGamma"])
+
+    def test_a_renamed_import_names_the_value_imported_not_the_local_name(self):
+        root = tree({"blends": "use Thing::{Beta as B};\nlet x = [B, B];\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], ["MTLThingBeta"])
+
+    def test_the_objc2_spelling_of_a_braced_use_is_read(self):
+        root = tree({"blends": "use MTLThing::{Delta, Epsilon};\nlet x = [Delta, Epsilon];\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], ["MTLThingDelta", "MTLThingEpsilon"])
+
+    def test_a_qualified_path_resolves_to_its_last_segment(self):
+        root = tree({"blends": "use metal2vulkan::metal::Thing::{Zeta};\nlet x = Zeta;\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], ["MTLThingZeta"])
+
+    def test_a_braced_use_of_something_else_names_no_value(self):
+        # The direction this could go wrong in: a brace list of names that are not the type's
+        # values, and a type name that is not a Metal type at all.
+        root = tree({"blends": "use Thing::{Omega};\nuse Other::{Alpha, Beta};\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], [])
+
+    def test_a_bare_name_with_no_use_names_nothing(self):
+        # The unsound reading this deliberately does not take: a module that writes `Alpha` and
+        # imports nothing has not said which type's value it means.
+        root = tree({"blends": "let x = [Alpha, Beta, Gamma];\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], [])
+
+    def test_a_braced_use_in_a_comment_names_nothing(self):
+        root = tree({"blends": "// use Thing::{Alpha, Beta};\nfn go() {}\n"})
+        self.assertEqual(axis(root, {"blends"})["in_effect"], [])
+
+
 class Table(unittest.TestCase):
     """The generated enumerator table is the denominator for a type the tree declares by hand.
 

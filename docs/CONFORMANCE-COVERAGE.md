@@ -64,6 +64,7 @@ A value is **compared** where either of two things holds, which are different cl
 What this axis cannot see, measured rather than asserted:
 
 - **A value Metal answers as a bare ordinal.** A transcript holds a `uint`, and nothing in it says which enum the number belongs to, so only a site that records the enumerator's **name** is read. The *answered* column is a floor by every site that records an ordinal instead.
+- **A spelling of a value this derivation does not read.** Both numerators read names, and a name written in a shape the reading does not cover is counted nowhere. This has gone wrong twice and was each time found by someone checking a count against the code: a braced `use SamplerBorderColor::{..}` followed by bare variants read as **1 of 3** where the case swept all three, and before it `use BlendFactor as F` lost a third of a module's blend factors. The spellings now read are a variant beside its type, the `objc2` spelling, a renaming `use`, and a braced `use`. A fourth would be invisible the same way, so these counts are a floor by exactly that unknown.
 - **A value a case states as a raw ordinal.** A case may hand the Metal leg an enum's ordinal as a number — a sweep over `0..n` rather than over named variants — and no reading of the text can say which value a computed number is. So *in effect*, and the *stated* column of the hand-modelled table below, are floors by every sweep written that way: a type they report short of its values may in fact be swept exhaustively, and the case is what says so. Read the case before taking a row of the work list as work.
 - **Which case put a value in effect.** The unit is the case module, as it is for the items axis: a value named anywhere in a module whose cases include a Metal run counts for that module, even where one of its cases names it and the rest do not.
 - **A value only the suite's shared sources name** — 30 of them. Some case puts it to Metal through the render or texture vocabulary, but which case is not a property of the text, so it is neither compared nor missing and has its own column.
@@ -161,9 +162,6 @@ It names the type and the module, and no value: which value a computed number is
 | `MTLBarrierScope` | 3 | 1 | `compute_encoder_commands`, `mesh_barriers` |
 | `MTLLoadAction` | 3 | 2 | `srgb_fetch` |
 | `MTLBindingAccess` | 3 | 3 | `texture_accesses` |
-| `MTLSamplerBorderColor` | 3 | 3 | `border_swizzles` |
-| `MTLSamplerAddressMode` | 6 | 6 | `border_swizzles` |
-| `MTLTextureSwizzle` | 6 | 6 | `border_swizzles`, `texel_swizzles` |
 
 ### The values not compared
 

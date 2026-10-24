@@ -622,6 +622,16 @@ def write_option_space(w, space) -> None:
         "instead."
     )
     w(
+        "- **A spelling of a value this derivation does not read.** Both numerators read names, "
+        "and a name written in a shape the reading does not cover is counted nowhere. This has "
+        "gone wrong twice and was each time found by someone checking a count against the code: a "
+        "braced `use SamplerBorderColor::{..}` followed by bare variants read as **1 of 3** where "
+        "the case swept all three, and before it `use BlendFactor as F` lost a third of a "
+        "module's blend factors. The spellings now read are a variant beside its type, the "
+        "`objc2` spelling, a renaming `use`, and a braced `use`. A fourth would be invisible the "
+        "same way, so these counts are a floor by exactly that unknown."
+    )
+    w(
         "- **A value a case states as a raw ordinal.** A case may hand the Metal leg an enum's "
         "ordinal as a number — a sweep over `0..n` rather than over named variants — and no "
         "reading of the text can say which value a computed number is. So *in effect*, and the "

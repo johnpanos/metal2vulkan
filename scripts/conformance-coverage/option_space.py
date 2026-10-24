@@ -23,6 +23,28 @@ The numerator is two derived sets, which are different claims and are kept apart
 render vocabulary, say) is counted in neither: some case puts it to Metal, but which case is not a
 property of the text, so it is reported in its own column and is neither compared nor missing.
 
+# What the floor is made of
+
+Every column here is a floor, and the honest thing is to say what of rather than only that it is
+one. Two things, and as far as has been measured no third:
+
+1. **A value a case states as a raw ordinal**, which the next section is about. Measured where it
+   can be: the document lists each type a recorded module names and states no value of by name,
+   which is how a sweep over `0..n` reads, so the floor has a work list and not just a warning.
+2. **A spelling of a value that `_stated_in` does not read.** This is the one that has gone wrong
+   twice. A braced `use` was invisible until it was read — `border_swizzles` swept all three
+   `MTLSamplerBorderColor` values and the axis said 1 of 3 — and before it `use BlendFactor as F`
+   lost a third of a module's blend factors. Each was found by someone checking a count against
+   the code, not by this file. Every spelling now read is listed on `_stated_in`, and
+   `_resolved` is the one rule all of them go through; a spelling not in that list is counted
+   nowhere, and that is where the next one will be.
+
+What is **not** part of the floor, because it is measured: the generated denominator (every type
+`regen-metal-enums` covers, by `ENUMS`, `OPTIONS` or `TABLE_ONLY`), the `#[cfg(test)]` exclusion,
+Metal's validation leg, and which case put a value in effect. A type the tree models by hand and
+says so nowhere on the item is outside both tables and so outside the axis, which the document
+states where it lists them.
+
 # Why a value stated as a raw ordinal is not resolved, and must not be
 
 Both numerators read **names**. A case may instead hand the Metal leg an enum's ordinal as a
@@ -235,19 +257,60 @@ def without_tests(text: str) -> str:
     return "".join(out)
 
 
-def _stated_in(text: str, by_rust: dict[str, Type], by_metal: dict[str, Type]):
-    """The `(Metal type, value)` pairs `text` names, in either of the two spellings it uses.
+def _resolved(held: Type, tail: str, metal_spelling: bool) -> set[tuple[str, str]]:
+    """The values of `held` that the variant name `tail` names, by every spelling of one value.
 
-    The suite names a Metal value two ways, and both have to be read:
+    One reading of the rule, so every place that resolves a name uses the same one: a variant name
+    beside its type, a variant name brought in bare by a `use`, and the `objc2` spelling are the
+    same question asked of different text.
+
+    Three ways a name reaches a value, and no fourth:
+
+    - the Rust name the generated table gives it, which is what `BlendFactor::SourceAlpha` names;
+    - the type's name and the variant's spelled back together, where that concatenation is an
+      enumerator the table holds. `objc2` names a variant with its type's prefix dropped, so
+      `MTLStorageMode::Private` is `MTLStorageModePrivate` — and the same rule reads our own
+      spelling of a type we model unlike the SDK, `BlitOption::None` against `MTLBlitOptionNone`,
+      because we make a closed enum of what the SDK makes an `NS_OPTIONS`. Never by assuming the
+      rule held: the value credited is the one whose enumerator is exactly the concatenation, and
+      nothing is credited where the table holds no such name.
+    - a hand-modelled type with no table has no SDK enumerator list at all, so our own variant
+      name is the only name there is.
+    """
+    out: set[tuple[str, str]] = set()
+    for rust, value in held.values:
+        if rust == tail:
+            out.add((held.metal, value))
+    found = held.value_named(held.metal + tail)
+    if found is not None:
+        out.add((held.metal, found))
+    elif metal_spelling and held.kind == "by hand" and tail in held.names:
+        out.add((held.metal, tail))
+    return out
+
+
+def _stated_in(text: str, by_rust: dict[str, Type], by_metal: dict[str, Type]):
+    """The `(Metal type, value)` pairs `text` names, in every spelling the suite uses.
+
+    The suite names a Metal value three ways, and all three have to be read:
 
     - through the tree's own type, `BlendFactor::SourceAlpha` — and `rotated_targets.rs` writes
       `use BlendFactor as F;` and then every factor as `F::SourceAlpha`, so a derivation reading
       only `BlendFactor::` spellings reports a third of that module's blend factors as never
       exercised;
     - through `objc2-metal`'s own enum, `MTLStorageMode::Private`, which the Metal leg writes
-      directly. `objc2` names a variant with its type's prefix dropped, so the enumerator is the
-      two spelled back together, and it counts only where that concatenation is a name the
-      generated table holds — never by assuming the rule held.
+      directly;
+    - through a **braced `use`**, `use SamplerBorderColor::{OpaqueBlack, OpaqueWhite,
+      TransparentBlack};`, after which the module writes the variants bare and names
+      `SamplerBorderColor::` nowhere. `border_swizzles` sweeps all three border colours in nine
+      samplers that way and this read **1 of 3** until the `use` was read too.
+
+    A `use` is taken as the module naming the value, and the bare name is not looked for
+    afterwards. That is sound here and nowhere else: an import nothing uses is a warning, warnings
+    are errors in this tree, so a variant in a `use` is one the text goes on to use. Looking for
+    the bare name instead would be the unsound reading — `border_swizzles` imports
+    `TextureSwizzle::Alpha as A`, and crediting a type's value for every `A` in a module is how a
+    derivation invents coverage.
     """
     alias: dict[str, str] = {}
     for found in re.finditer(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)\b", text):
@@ -258,30 +321,26 @@ def _stated_in(text: str, by_rust: dict[str, Type], by_metal: dict[str, Type]):
         head, tail = found.group(1), found.group(2)
         held = by_rust.get(alias.get(head, head))
         if held is not None:
-            for rust, value in held.values:
-                if rust == tail:
-                    out.add((held.metal, value))
-            # The tree's own variant name spelled against the SDK's enumerator, which is the same
-            # concatenation rule the `objc2` spelling below uses, applied to our type's name
-            # rather than Metal's. It is what reads `BlitOption::None`: we model `MTLBlitOption`
-            # as a closed enum with `None` and `DepthFromDepthStencil`, while the SDK makes it an
-            # `NS_OPTIONS` whose derived names are `NONE` and `DEPTH_FROM_DEPTH_STENCIL`, so the
-            # variant pairs with no Rust name in the table and only the enumerator joins them.
-            # Never a guess: the value credited is the one whose enumerator is exactly the
-            # concatenation, and no value is credited where it is not a name the table holds.
-            found_value = held.value_named(held.metal + tail)
-            if found_value is not None:
-                out.add((held.metal, found_value))
+            out |= _resolved(held, tail, False)
         held = by_metal.get(head)
-        if held is None:
-            continue
-        found_value = held.value_named(head + tail)
-        if found_value is not None:
-            out.add((held.metal, found_value))
-        elif held.kind == "by hand" and tail in held.names:
-            # A hand-modelled type has no SDK enumerator list, so our own variant name is the only
-            # name there is; `objc2` spells the same value the same way after the prefix.
-            out.add((held.metal, tail))
+        if held is not None:
+            out |= _resolved(held, tail, True)
+    # The braced form, which the loop above cannot see: after `::` comes `{` and not a name. The
+    # path may be qualified (`metal2vulkan::metal::TextureSwizzle::{..}`), so the type is its last
+    # segment, and each item may be renamed, in which case what names the value is the name
+    # imported and not the local one.
+    for found in re.finditer(r"\buse\s+([A-Za-z_][\w:]*?)\s*::\s*\{([^{}]*)\}", text):
+        head = found.group(1).split("::")[-1].strip()
+        for held, metal_spelling in (
+            (by_rust.get(alias.get(head, head)), False),
+            (by_metal.get(head), True),
+        ):
+            if held is None:
+                continue
+            for item in found.group(2).split(","):
+                imported = item.split(" as ")[0].strip()
+                if imported:
+                    out |= _resolved(held, imported, metal_spelling)
     return out
 
 
