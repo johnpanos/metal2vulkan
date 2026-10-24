@@ -128,6 +128,7 @@ fn shape(samples: u32, colors: &[Option<Format>], depth: bool, storage: &[u32]) 
         fetch_inputs: false,
         no_inputs: Vec::new(),
         storage: storage.to_vec(),
+        idle: Vec::new(),
         view_mask: 0,
         locations: Vec::new(),
     }

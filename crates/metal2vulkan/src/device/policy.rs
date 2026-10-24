@@ -64,6 +64,11 @@ pub struct DevicePolicy {
     /// a specialization constant (`SpecKey::SlotOffsetLow`), so the driver knows each load's place
     /// in its 16-byte vector, or from the push field with the rest (the default).
     pub uniform_offset: UniformOffsetPolicy,
+    /// Whether a render pass's color attachment that neither loads nor stores (`DontCare` both
+    /// ways, no resolve) stays out of the draws' subpass until a draw writes or fetches it
+    /// ([`IdleColorsPolicy::LeftOut`]), or is in it from the start (the default). The runtime's
+    /// choice alone: no emitted code changes.
+    pub idle_colors: IdleColorsPolicy,
 }
 
 impl DevicePolicy {
@@ -89,6 +94,7 @@ impl DevicePolicy {
         half_blend: HalfBlendPolicy::Device,
         padded_reads: PaddedReadsPolicy::Alias,
         uniform_offset: UniformOffsetPolicy::Pushed,
+        idle_colors: IdleColorsPolicy::Kept,
     };
 
     /// This policy with Metal's answer wherever the choices offer it: its maths functions,
@@ -327,6 +333,25 @@ pub enum RoundingOrderPolicy {
 /// vector. On the Adreno 630 that halves the registers of CoreAnimation's blurs (fajita census:
 /// 657 -> 420 over its fragment functions, waves +12%) at about 3% more instructions a fragment;
 /// a speed choice to measure, not taken by default.
+/// Where a render pass's idle color attachment stands: one that neither loads nor stores
+/// (`DontCare` both ways, without a resolve), which CoreAnimation's every pass has as its second
+/// color (written by its pipelines with an empty write mask in most passes). Left out, such a
+/// color is `VK_ATTACHMENT_UNUSED` in the draws' subpass until the pass's first draw that writes
+/// it (a write mask or a blend) or fetches it, which records into an instance that has it: a tiled
+/// renderer then holds no tile memory for it in a pass that never uses it (Turnip's GMEM: twice
+/// the pixels per bin for two 8-bit colors). The same texels are written either way; a speed
+/// choice to measure, not taken by default.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IdleColorsPolicy {
+    /// Every color attachment in the draws' subpass from the pass's start (the default).
+    #[default]
+    Kept,
+    /// An idle color out of the subpass until a draw writes or fetches it.
+    LeftOut,
+}
+
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

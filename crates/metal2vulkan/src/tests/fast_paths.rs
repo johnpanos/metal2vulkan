@@ -72,6 +72,8 @@ fn choices() -> Vec<Choice> {
         padded_reads: _,
         // Where a uniform load reads its offset's low bits: the same answers, a speed choice.
         uniform_offset: _,
+        // The runtime's: whether an idle color attachment waits out of the subpass.
+        idle_colors: _,
     } = p;
     vec![
         choice!(p.framebuffer_fetch: FramebufferFetchPolicy { RequireOrdered, AcceptUnordered }),

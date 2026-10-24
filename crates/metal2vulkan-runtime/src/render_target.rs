@@ -153,6 +153,10 @@ pub(super) struct PassShape {
     /// attachments its pipelines read and write as storage images in the pixel interlock
     /// (`framebuffer_fetch.rs`), but for the [`anchor`](PassShape::anchor).
     pub(super) storage: Vec<u32>,
+    /// The color indices, ascending, the draws' subpass leaves out (`VK_ATTACHMENT_UNUSED`) as
+    /// idle (`DevicePolicy::idle_colors`): neither loaded nor stored, and written and fetched by
+    /// no draw of the instance; their descriptions stay, `DONT_CARE` both ways.
+    pub(super) idle: Vec<u32>,
     /// Every subpass's view mask: the views of the instance's amplified draws, 0 without
     /// multiview (the module docs).
     pub(super) view_mask: u32,
@@ -194,6 +198,7 @@ impl PassShape {
             fetch_inputs: layout.fetch_inputs,
             no_inputs,
             storage: Vec::new(),
+            idle: Vec::new(),
             view_mask: 0,
             locations: Vec::new(),
         })
@@ -205,6 +210,11 @@ impl PassShape {
             storage,
             ..self.clone()
         }
+    }
+
+    /// This shape with `idle` (ascending) left out of the draws' subpass.
+    pub(super) fn with_idle(self, idle: Vec<u32>) -> PassShape {
+        PassShape { idle, ..self }
     }
 
     /// This shape with every subpass of `view_mask`.
@@ -236,6 +246,7 @@ impl PassShape {
         index.is_some_and(|index| {
             self.colors.get(index as usize).is_some_and(Option::is_some)
                 && !self.storage.contains(&index)
+                && !self.idle.contains(&index)
         })
     }
 
@@ -942,6 +953,7 @@ pub(super) fn later_resolve(
         fetch_inputs: false,
         no_inputs: Vec::new(),
         storage: Vec::new(),
+        idle: Vec::new(),
         view_mask: 0,
         locations: Vec::new(),
     };
@@ -986,6 +998,7 @@ pub(super) fn reach_pass(
         fetch_inputs: false,
         no_inputs: Vec::new(),
         storage: Vec::new(),
+        idle: Vec::new(),
         view_mask: 0,
         locations: Vec::new(),
     };
@@ -1110,7 +1123,9 @@ fn create(
         let reference = add(&mut attachments, *format, shape.samples, ops);
         // A storage attachment keeps its description, but no subpass uses it unless it is the
         // sample planes' anchor (the module docs).
-        if shape.storage.contains(&(index as u32)) && anchor != Some(index as u32) {
+        if (shape.storage.contains(&(index as u32)) && anchor != Some(index as u32))
+            || shape.idle.contains(&(index as u32))
+        {
             references.push(unused);
         } else {
             references.push(reference);

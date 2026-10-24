@@ -67,8 +67,8 @@ pub(crate) use mechanism::mechanism;
 pub use metal::{MetalDeviceProperties, SimdSupport, StageSimd};
 pub use policy::{
     ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-    NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
-    UniformOffsetPolicy, Unorm8LinearFilterPolicy,
+    IdleColorsPolicy, NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy,
+    TexelConversionPolicy, UniformOffsetPolicy, Unorm8LinearFilterPolicy,
 };
 pub(crate) use profile::whole_point_size;
 pub use profile::{DeviceProfile, SpirvValidation};

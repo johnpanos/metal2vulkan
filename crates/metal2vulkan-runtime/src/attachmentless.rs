@@ -62,6 +62,7 @@ pub(super) fn shape(samples: u32, view_mask: u32) -> PassShape {
         fetch_inputs: false,
         no_inputs: Vec::new(),
         storage: Vec::new(),
+        idle: Vec::new(),
         view_mask,
         locations: Vec::new(),
     }

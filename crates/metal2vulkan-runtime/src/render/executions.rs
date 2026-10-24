@@ -2021,6 +2021,7 @@ impl RenderExecution {
             },
             layout,
             passes: vec![(snapshot.shape.clone(), Arc::clone(&snapshot.compatible))],
+            idle: Vec::new(),
             render_target_array_length: snapshot.render_target_array_length,
             state: snapshot.state.clone(),
             pipeline: None,

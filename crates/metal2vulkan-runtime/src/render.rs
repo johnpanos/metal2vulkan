@@ -946,6 +946,10 @@ pub struct RenderCommandEncoder {
     layout: PassLayout,
     /// The compatible pass of each shape the encoder's instances took.
     passes: Vec<(PassShape, Arc<RenderPassObject>)>,
+    /// The pass's idle colors no draw has written or fetched yet, ascending
+    /// (`DevicePolicy::idle_colors`, `PassShape::idle`): the current instance's subpass leaves
+    /// them out; a draw that writes or fetches one records into an instance that has it.
+    idle: Vec<u32>,
     /// The descriptor's `renderTargetArrayLength`: 0 (Metal's default), 1, or the layers of a
     /// layered pass (`PassLayout::layers`).
     render_target_array_length: u32,
@@ -1276,7 +1280,8 @@ impl CommandBuffer {
             _ => layout.layers,
         };
         let rate_map = RateMappedPass::of(CALL, descriptor, &layout)?;
-        let shape = PassShape::of(&layout)?;
+        let idle = idle_colors(device, &layout);
+        let shape = PassShape::of(&layout)?.with_idle(idle.clone());
         let compatible = render_target::shared_compatible_pass(device, &shape)?;
         if again.is_none() {
             if let Some(problem) = self.state().refusal() {
@@ -1329,6 +1334,7 @@ impl CommandBuffer {
             visibility: Visibility::new(layout.visibility.clone()),
             layout,
             passes: vec![(shape, compatible)],
+            idle,
             pipeline: None,
             routed: None,
             vertex: ArgumentTable::default(),
@@ -4413,6 +4419,16 @@ impl RenderCommandEncoder {
         )
     }
 
+    /// The idle colors an instance of the draws' subpass `locations` leaves out: none for a routed
+    /// subpass, whose references name colors by location (`PassShape::locations`), nor for one
+    /// that leaves colors out as storage images.
+    fn idle_in(&self, locations: &[Option<u32>]) -> Vec<u32> {
+        match locations.is_empty() {
+            true => self.idle.clone(),
+            false => Vec::new(),
+        }
+    }
+
     /// Whether a draw that reads and writes the colors `storage` (ascending) in the interlocked
     /// storage form, and writes the colors of the mask `written` (`GraphicsState::color_outputs`),
     /// records in the current instance as far as those colors go: the instance leaves out each of
@@ -4586,6 +4602,7 @@ impl RenderCommandEncoder {
         let images = standing.iter().any(|s| !matches!(s, Standing::Planes(..)));
         if !images
             && self.current.shape.storage == storage
+            && self.current.shape.idle == self.idle_in(locations)
             && self.current.shape.locations == locations
             && Reformat::same(&self.current.reformats, reformats)
             && self.current.shadow == shadow
@@ -4672,6 +4689,7 @@ impl RenderCommandEncoder {
         let layout = stood.as_ref().unwrap_or(&self.layout);
         let mut shape = PassShape::of(layout)?
             .with_storage(storage.to_vec())
+            .with_idle(self.idle_in(locations))
             .with_view_mask(views.view_mask)
             .with_locations(locations.to_vec());
         for reformat in reformats {
@@ -6145,6 +6163,22 @@ impl RenderCommandEncoder {
         fetched.dedup();
         if self.layout.fetch_inputs {
             self.inputs_read.extend(fetched.iter().copied());
+        }
+        // An idle color the draw writes (a write mask or a blend) or fetches joins the subpass
+        // from the draw's instance on (`DevicePolicy::idle_colors`).
+        if !self.idle.is_empty() {
+            let writes = |index: u32| {
+                graphics
+                    .color_attachments
+                    .get(index as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|a| !a.write_mask.is_empty() || a.blend.is_some())
+            };
+            self.idle.retain(|&index| {
+                !writes(index)
+                    && !fetched.contains(&index)
+                    && storage.iter().all(|s| s.color_index != index)
+            });
         }
         // A draw that reads and writes some of the instance's interlocked colors and writes none
         // of the others records in it, as one that reads them all would.
@@ -8535,4 +8569,26 @@ mod tests {
             );
         }
     }
+}
+
+/// The colors of `layout` an encoder leaves out of its draws' subpass until a draw writes or
+/// fetches them, under `DevicePolicy::idle_colors`: each that loads `DontCare`, stores
+/// `DontCare` as the descriptor states it, and resolves nowhere. None under the default policy.
+fn idle_colors(device: &crate::Device, layout: &PassLayout) -> Vec<u32> {
+    let policy = device.compile_device().policy().idle_colors;
+    if policy != metal2vulkan::device::IdleColorsPolicy::LeftOut {
+        return Vec::new();
+    }
+    (0u32..)
+        .zip(&layout.colors)
+        .filter_map(|(index, color)| {
+            let color = color.as_ref()?;
+            let idle = color.load == LoadAction::DontCare
+                && color.store == StoreAction::DontCare
+                && !color.late_store
+                && color.resolve.is_none()
+                && color.copied_resolve.is_none();
+            idle.then_some(index)
+        })
+        .collect()
 }

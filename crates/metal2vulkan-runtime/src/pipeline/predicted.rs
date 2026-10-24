@@ -195,7 +195,34 @@ impl GraphicsState {
             storage.sort_unstable();
             storage.dedup();
         }
+        // Under `DevicePolicy::idle_colors`, a pass whose color neither loads nor stores leaves it
+        // out until a draw writes or fetches it: predicted for each color the state writes nothing
+        // to (no write mask, no blend) and fetches not.
+        let idle = match self.device().compile_device().policy().idle_colors {
+            metal2vulkan::device::IdleColorsPolicy::LeftOut => (0u32..)
+                .zip(&colors)
+                .filter(|(index, format)| {
+                    let writes = graphics
+                        .color_attachments
+                        .get(*index as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|a| !a.write_mask.is_empty() || a.blend.is_some());
+                    let fetches = graphics
+                        .input_attachments
+                        .iter()
+                        .any(|a| a.color_index == *index)
+                        || graphics
+                            .storage_attachments
+                            .iter()
+                            .any(|a| a.color_index == *index);
+                    format.is_some() && !writes && !fetches
+                })
+                .map(|(index, _)| index)
+                .collect(),
+            _ => Vec::new(),
+        };
         let pass = PassShape {
+            idle,
             color_resolves: vec![None; colors.len()],
             colors,
             depth_stencil,
