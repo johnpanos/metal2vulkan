@@ -106,18 +106,6 @@ for d in dirs:
     if not pull(d + '/capture.jsonl', os.path.join(leaf, 'capture.jsonl')):
         continue
     local_dirs.append(leaf)
-    for line in open(os.path.join(leaf, 'capture.jsonl'), errors='replace'):
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if 'file' in r and 'library' in r:
-            if r['library'] in have:
-                shutil.copyfile(have[r['library']], os.path.join(leaf, r['file']))
-                print('have %s (%s)' % (r['file'], os.path.basename(have[r['library']])))
-            else:
-                print('library %s: %d bytes' % (r['file'], r.get('bytes', 0)))
-                pull(d + '/' + r['file'], os.path.join(leaf, r['file']))
     # The frame capture (NGPU_CAPTURE_FRAMES): its records and every blob they name.
     if pull(d + '/frames.jsonl', os.path.join(leaf, 'frames.jsonl')):
         blobs = set()
@@ -134,6 +122,25 @@ for d in dirs:
                 pull(d + '/' + b, os.path.join(leaf, b))
         subprocess.run([sys.executable, '-I', os.path.join(here, 'frames_manifest.py'), leaf, '--out',
                         os.path.join(leaf, 'frames.json')], check=False)
+    # Only the libraries a captured function names (an unused one is pulled for nothing: session-101654's 2.3 MB
+    # library timed out twice before the frames were reached), after the frames.
+    records = []
+    for line in open(os.path.join(leaf, 'capture.jsonl'), errors='replace'):
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    used = {r.get('library') for r in records if 'function' in r and 'name' in r}
+    for r in records:
+        if 'file' in r and 'library' in r:
+            if r['library'] not in used:
+                print('skip %s: no captured function names it' % r['file'])
+            elif r['library'] in have:
+                shutil.copyfile(have[r['library']], os.path.join(leaf, r['file']))
+                print('have %s (%s)' % (r['file'], os.path.basename(have[r['library']])))
+            else:
+                print('library %s: %d bytes' % (r['file'], r.get('bytes', 0)))
+                pull(d + '/' + r['file'], os.path.join(leaf, r['file']))
 if not local_dirs:
     sys.exit('no capture pulled')
 subprocess.run([sys.executable, '-I', os.path.join(here, 'capture_manifest.py'), *local_dirs, '--out',
