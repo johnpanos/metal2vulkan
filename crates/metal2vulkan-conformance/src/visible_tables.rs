@@ -382,7 +382,7 @@ fn folded<T, N: Fn() -> T, H: Fn(F) -> T, F>(
 
 impl Asked {
     /// The answer of a side whose call gives `Option` and whose `Error::Nil` is Metal's nil
-    /// ([`folded`]).
+    /// (the `folded` helper below is the one place the rule lives).
     pub fn of(answer: Result<Option<HandleFacts>, metal2vulkan_runtime::Error>) -> Self {
         folded(answer, || Asked::Nil, Asked::Handle, Asked::Refused)
     }
@@ -444,7 +444,7 @@ pub enum Made {
 
 impl Made {
     /// The answer of a side whose creation gives a `Result` and whose `Error::Nil` is Metal's nil,
-    /// folded as [`Asked::of`] folds a handle's ([`folded`]).
+    /// folded as [`Asked::of`] folds a handle's, through the same `folded` helper.
     pub fn of(answer: Result<Option<TableFacts>, metal2vulkan_runtime::Error>) -> Self {
         folded(answer, || Made::Nil, Made::Table, Made::Refused)
     }
