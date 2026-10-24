@@ -120,28 +120,49 @@ fn every_committed_profile_is_within_itself() {
     }
 }
 
-/// What V8 measured with the layer: `vk12-floor` on SwiftShader states four features SwiftShader
-/// lacks. The product's view names each of them.
+/// A profile that states features a device lacks is named member by member: the floor with four
+/// optional features SwiftShader lacks (`shaderInt16`, 8- and 16-bit storage access, and formatless
+/// storage-image reads) names each of them on SwiftShader.
 #[test]
 fn a_profile_beyond_the_device_is_named_member_by_member() {
-    let floor = read_at(&committed("vk12-floor"), AT_1_2);
-    let swiftshader = read_at(&committed("swiftshader"), AT_1_2);
-    let gaps = exceeds(&floor, &swiftshader);
-    for feature in [
+    let lacked = [
         VkFeature::ShaderInt16,
         VkFeature::StorageBuffer8BitAccess,
         VkFeature::StorageBuffer16BitAccess,
         VkFeature::ShaderStorageImageReadWithoutFormat,
-    ] {
+    ];
+    let mut beyond = read_at(&committed("vk12-floor"), AT_1_2);
+    beyond.features.extend(lacked);
+    let swiftshader = read_at(&committed("swiftshader"), AT_1_2);
+    let gaps = exceeds(&beyond, &swiftshader);
+    for feature in lacked {
         assert!(
             gaps.contains(&format!("feature {feature:?}")),
             "{feature:?}: {gaps:?}"
         );
     }
     // The committed x86 lavapipe has more than the floor; the reverse does not hold.
+    let floor = read_at(&committed("vk12-floor"), AT_1_2);
     let lavapipe = read_at(&committed("lavapipe"), AT_1_2);
     assert!(exceeds(&floor, &lavapipe).is_empty());
     assert!(!exceeds(&lavapipe, &floor).is_empty());
+}
+
+/// The floor is Vulkan 1.2 core, which every Vulkan 1.2 device has: Intel's Iris Xe on ANV, which
+/// reads no storage image without its format, takes it as the other Linux venue captures do.
+#[test]
+fn every_device_capture_takes_the_floor() {
+    let floor = read_at(&committed("vk12-floor"), AT_1_2);
+    for stem in [
+        "intel-irisxe-rplp-anv",
+        "intel-uhd770-rpls-anv",
+        "amd-780m-radv",
+        "nvidia-rtx5080-laptop",
+        "gate-lavapipe",
+    ] {
+        let device = read_at(&committed(stem), AT_1_2);
+        assert_eq!(exceeds(&floor, &device), Vec::<String>::new(), "{stem}");
+    }
 }
 
 #[test]
@@ -387,6 +408,7 @@ fn a_restricted_context_runs_only_on_a_device_that_has_and_reports_its_profile()
             metal2vulkan::device::DriverWorkaround::ClippedTrianglesSplitPixelFragments,
             metal2vulkan::device::DriverWorkaround::MeshIndexComponentStoresMisplaced,
             metal2vulkan::device::DriverWorkaround::ClippedCoverageNotMetals,
+            metal2vulkan::device::DriverWorkaround::TessellatorNotMetals,
         ]
     );
     let mut swiftshader_native = native.clone();
@@ -399,15 +421,21 @@ fn a_restricted_context_runs_only_on_a_device_that_has_and_reports_its_profile()
         [
             metal2vulkan::device::DriverWorkaround::BufferAtomicsUncontained,
             metal2vulkan::device::DriverWorkaround::ClippedCoverageNotMetals,
+            metal2vulkan::device::DriverWorkaround::TessellatorNotMetals,
         ]
     );
     assert!(matches!(
         check(&native, &tools[..1], &queried),
         Err(RestrictionError::Inactive { .. })
     ));
+    // SwiftShader takes the floor (Vulkan 1.2's required features and minimum limits); a device
+    // short of one of its limits does not.
     let swiftshader = read_at(&committed("swiftshader"), AT_1_2);
+    assert_eq!(check_within(&restriction, &swiftshader, AT_1_2), Ok(()));
+    let mut short = swiftshader;
+    short.limits.max_bound_descriptor_sets = 3;
     assert!(matches!(
-        check_within(&restriction, &swiftshader, AT_1_2),
+        check_within(&restriction, &short, AT_1_2),
         Err(RestrictionError::Exceeds { .. })
     ));
     let mut renamed = queried.clone();
@@ -791,7 +819,7 @@ fn a_run_on_the_m4_at_the_m3_max_venue_stops_on_its_name_alone() {
 /// requirements document omits what its profile does not require; the layer then reports the
 /// device's own value for a member it omits (of a structure the context queries) and a feature it
 /// omits as absent, where the product reads the version's guarantee (or none) and a feature the
-/// version requires as present. EV COV-legs2-nvidia ran the RTX 5080 restricted to
+/// version requires as present. Our probe ran the RTX 5080 restricted to
 /// `lunarg-desktop-baseline-2023` as extracted (none of its stated members beyond the device): the
 /// context refused all four runs, in exactly these six members. The document lists
 /// `VK_EXT_subgroup_size_control` and `VK_EXT_vertex_attribute_divisor` but states none of their
@@ -1125,8 +1153,8 @@ fn layer_report(restriction: &ProfileRestriction, capture: &Value, minor: u32) -
     device.insert("features".into(), Value::Object(omitted_features));
     device.insert("properties".into(), Value::Object(omitted_properties));
     // The layer keeps one block's entry of a format, the last of the profile's blocks that states
-    // it, where the product's reader takes the union of every block's flags (EV COV-roadmap-cpu:
-    // `roadmap-2022`'s storage-only conditional entries replaced its required ones).
+    // it, where the product's reader takes the union of every block's flags (`roadmap-2022`'s
+    // storage-only conditional entries replaced its required ones).
     let mut formats = serde_json::Map::new();
     for block in profile_blocks(&document) {
         for (format, entry) in block["formats"].as_object().into_iter().flatten() {
@@ -1178,9 +1206,9 @@ fn presented(
 /// own version (the context a restricted run of it opens): modelled from each venue's capture, the
 /// layer's report of it passes the restricted context's check. The model is the evidence's: for
 /// `lunarg-desktop-baseline-2023` as extracted it gives exactly the six members the RTX 5080's
-/// context reported (EV COV-legs2-nvidia), and the completed one matched on RADV, ANV, and the RTX
-/// 5080 (EVs COV-lunarg-*). `roadmap-2022` as extracted omits the core members the product reads
-/// that the layer then reports at each device's value; completed, it omits none.
+/// context reported, and the completed one matched on RADV, ANV, and the RTX 5080. `roadmap-2022`
+/// as extracted omits the core members the product reads that the layer then reports at each
+/// device's value; completed, it omits none.
 #[test]
 fn a_completed_requirements_document_presents_as_the_product_reads_it_on_every_venue() {
     let venues = crate::c3::Venues::load(&crate::c3::Venues::committed_path()).unwrap();

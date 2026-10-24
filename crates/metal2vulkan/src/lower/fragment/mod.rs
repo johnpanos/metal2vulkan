@@ -44,6 +44,11 @@
 //!   a `Private u32` before it calls the body, and the body reads that copy
 //!   (`stage_io::coverage_in`). SPIRV-Cross (MoltenVK) declares the input a scalar in the entry
 //!   but passes it to a function as an array, which Metal refuses.
+//! - **Snapshot reads** (`snapshot`): a function compiled to read textures through snapshots
+//!   (`LoweringInputs::snapshot_textures`) opens with an ordered pixel interlock's critical section
+//!   in which, in the draw that takes the snapshot, each non-helper fragment copies its pixel's
+//!   texel, and that draw returns after it; in the draw that reads it, each read of the slot reads
+//!   the snapshot, and a helper reads 0. The body runs outside the critical section.
 //! - Refused: the `uint2` overloads of `map_screen_to_physical_coordinates` and its inverse
 //!   (canon compiles the `float2` ones to the rate map's decoder; no reading of the
 //!   physical-to-screen `uint2` one is established).
@@ -56,7 +61,9 @@ pub(crate) mod fetch;
 mod imageblock;
 mod input_blend;
 mod rog;
+mod snapshot;
 mod stencil;
+mod word_input;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,8 +101,9 @@ pub(crate) use depth_test::{
 };
 pub use discard::DiscardForm;
 pub(crate) use fetch::{
-    blends_half_in_shader, compiled_write_mask, extended_range_blend, half4_output,
-    half_blend_attachment, interlock_orders, kept_channels, storage_form, ColorUse, StorageSamples,
+    blends_half_in_shader, compiled_write_mask, extended_range_blend, half_blend_attachment,
+    half_float_format, half_output, inputs_order, interlock_orders, kept_channels, storage_form,
+    ColorUse, StorageSamples,
 };
 pub use fetch::{
     select_output as select_storage_output, select_second_output as select_storage_second_output,
@@ -104,8 +112,12 @@ pub use fetch::{
 pub use imageblock::{select_output as select_imageblock_output, ImageblockPlan};
 pub(crate) use input_blend::texel as input_blend_texel;
 pub use input_blend::{select_second_output as select_input_second_output, InputBlend};
+#[cfg(test)]
+pub(crate) use snapshot::{decode as snapshot_decode, encode as snapshot_encode};
+pub(crate) use snapshot::{prepare as snapshot_prepare, read as snapshot_read};
 pub(crate) use stencil::{face_word, SHADOW_FORMAT};
 pub use stencil::{select_output as select_stencil_output, ShadowStencil};
+pub(crate) use word_input::merge as word_input_merge;
 
 fn not_lowered() -> Error {
     Unsupported::not_implemented(Feature::Lowering(LowerFamily::Fragment)).into()
@@ -183,6 +195,10 @@ pub struct FragmentPlan {
     /// The extended-range attachments whose blend the function computes over their input
     /// attachments, on a device that orders fetch through them (`input_blend`), by index.
     pub input_blends: BTreeMap<u32, InputBlend>,
+    /// The word attachments whose word the function merges into the texel's over their input
+    /// attachments, on a device that orders fetch through them (`word_input`), by index: the bits
+    /// of the fields each write keeps from the texel.
+    pub word_merges: BTreeMap<u32, u32>,
     /// The stage interface's `FragCoord` object, which gives the pixel of the storage form and
     /// of the shader-side stencil.
     pub fetch_coord: Option<usize>,
@@ -209,6 +225,10 @@ pub struct FragmentPlan {
     /// The function returns a `[[depth(...)]]` output (`StageIoPlan::depth_clamp`). Inside an
     /// interlocked body each return records a positive NaN depth as discarded.
     pub depth_output: bool,
+    /// The texture slots the function reads through a snapshot (`snapshot`,
+    /// `LoweringInputs::snapshot_textures`), by Metal index, each with its snapshot's form.
+    /// Filled by [`finish`].
+    pub snapshot: BTreeMap<u32, crate::pipeline::sym::SnapshotForm>,
 }
 
 impl FragmentPlan {
@@ -227,7 +247,7 @@ impl FragmentPlan {
     /// sites, or for a helper query where no site demotes.
     fn reads_helper_input(&self) -> bool {
         (self.predicated() && !self.quad_exits.is_empty())
-            || (self.helper_queries && !self.demotes())
+            || ((self.helper_queries || !self.snapshot.is_empty()) && !self.demotes())
     }
 
     /// The function declares `discarded`: a predicated site, inside an interlocked body a
@@ -328,6 +348,7 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
         } else {
             None
         };
+    let snapshot = snapshot::finish(cx, interlock.is_some(), looped)?;
     let sites: Vec<InstId> = cx.families.fragment.discards.keys().copied().collect();
     let discard::DiscardPlan {
         forms,
@@ -383,6 +404,7 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
         ))
         .saturating_add(stencil::words(cx, rets))
         .saturating_add(input_blend::words(cx, returns(cx)))
+        .saturating_add(word_input::words(cx, returns(cx)))
         .saturating_add(depth_test::words(cx, rets))
         .saturating_add(killing_rets.saturating_mul(RETURN_KILL_WORDS))
         .saturating_add((quad_exits.len() as u64).saturating_mul(QUAD_EXIT_WORDS))
@@ -400,6 +422,7 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
     fp.guarded = guarded;
     fp.terminate_invocation = terminate;
     fp.interlock = interlock;
+    fp.snapshot = snapshot;
     Ok(())
 }
 
@@ -431,6 +454,8 @@ pub struct Declared {
     /// The `Private u32` copy of the `SampleMask` input's word, which the entry stores before it
     /// calls the body it wraps, and the body reads for every read of the input.
     pub coverage_copy: Option<GlobalId>,
+    /// The snapshots the function reads textures through, and the helper's copy.
+    pub snapshot: snapshot::Declared,
 }
 
 /// Declare the fragment family's module-scope objects and modes: the discard predicate, the
@@ -442,7 +467,7 @@ pub fn declare(
 ) -> BResult<Declared> {
     let fp = &plan.families.fragment;
     let mut d = Declared::default();
-    if let Some(m) = fp.interlock {
+    if let Some(m) = fp.interlock.or(snapshot::mode(&fp.snapshot)) {
         modes.push(m);
     }
     // The storage form's writes are Metal's under early tests.
@@ -464,7 +489,7 @@ pub fn declare(
     d.attachments = color::declare(
         mb,
         &fp.colors,
-        (&fp.fetch, &fp.input_blends),
+        (&fp.fetch, &fp.input_blends, &fp.word_merges),
         fp.fetch_sample.is_some(),
     )?;
     for (&color, sc) in &fp.fetch {
@@ -478,6 +503,7 @@ pub fn declare(
     d.depth_stand_in = depth_test::declare(mb, fp.depth_test.as_ref())?;
     d.stencil_stand_in = depth_test::declare_stencil(mb, fp.depth_test.as_ref())?;
     d.loop_sample = coverage::declare(mb, plan)?;
+    d.snapshot = snapshot::declare(mb, &fp.snapshot)?;
     if wraps_body(fp) && sample_mask_input(plan).is_some() {
         let u32_ = mb.ty(SType::Int {
             width: 32,
@@ -563,6 +589,7 @@ pub fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error
 pub fn plan_entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     fetch::plan(cx)?;
     input_blend::plan(cx)?;
+    word_input::plan(cx)?;
     coverage::plan(cx)
 }
 
@@ -579,10 +606,31 @@ pub fn writes_through_storage(cx: &SelectCx<'_>, color: u32) -> bool {
 }
 
 /// Whether the function writes color attachment `color` in the storage form under Metal's
-/// 16-bit float blend of a `half4` output, which the shader computes
-/// (`DevicePolicy::half_blend`): the attachment stores Metal's value.
+/// 16-bit float or 8-bit unorm blend, which the shader computes, and that blend is Metal's
+/// exactly: the attachment stores Metal's value.
 pub fn blends_half_in_storage(cx: &SelectCx<'_>, color: u32) -> bool {
+    fetch::blends_in_shader(cx, color, true)
+}
+
+/// Whether the function writes (or reads) color attachment `color` in the storage form, which the
+/// pipeline's color attachments do not hold.
+pub fn written_in_storage(cx: &SelectCx<'_>, color: u32) -> bool {
+    cx.families.fragment.fetch.contains_key(&color)
+}
+
+/// Whether the function writes color attachment `color` in the storage form under Metal's
+/// 16-bit float blend, which the shader computes, exactly or not: the write stores a `half` in
+/// every channel, whose conversion by the device is exact.
+pub fn blends_sixteen_in_storage(cx: &SelectCx<'_>, color: u32) -> bool {
     fetch::blends_half(cx, color)
+}
+
+/// Whether the function writes color attachment `color` in the storage form under a blend the
+/// shader computes of a format held directly (Metal's 16-bit float or 8-bit unorm blend), exactly
+/// or not: the write stores the value the blend gives, which no conversion of the device's
+/// changes (an 8-bit unorm channel's code is rounded by Metal's rule in the shader).
+pub fn blends_in_storage(cx: &SelectCx<'_>, color: u32) -> bool {
+    fetch::blends_in_shader(cx, color, false)
 }
 
 /// Whether the function's second (index-1) output to `color` is the second source of the
@@ -633,11 +681,13 @@ pub fn writes_outside_interface(cx: &SelectCx<'_>) -> bool {
         || fp.stencil.is_some()
 }
 
-/// The work before the body, in the function's first block: read the imageblock input, and place
-/// the fragment's tile in the pass's tile memory.
+/// The work before the body, in the function's first block: read the imageblock input, place the
+/// fragment's tile in the pass's tile memory, and copy the textures read through snapshots
+/// (`snapshot`).
 pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
     imageblock::emit_entry(cx, fb)?;
-    crate::lower::access::tile_memory::emit_entry(cx, fb)
+    crate::lower::access::tile_memory::emit_entry(cx, fb)?;
+    snapshot::emit_entry(cx, fb)
 }
 
 /// The value of parameter `b` in its lowered representation, read by an instruction or a

@@ -219,8 +219,15 @@ pub enum Inst {
         offset: Value,
         count: Value,
     },
-    /// A conversion; the target type is the result's type.
-    Convert { op: ConvOp, a: Value },
+    /// A conversion; the target type is the result's type. `contract` is
+    /// [`Contraction::Forbidden`] only on an `FConvert`: a conversion decorated `NoContraction`,
+    /// which the device may not remove or merge with another operation (without it Vulkan assumes
+    /// `AllowTransform`, under which `f32 -> f16 -> f32` may become `f32` alone).
+    Convert {
+        op: ConvOp,
+        a: Value,
+        contract: Contraction,
+    },
     // ---- Composites (builder/ops/composite.rs) ----
     /// `OpCompositeConstruct`.
     CompositeConstruct { parts: Box<[Value]> },
@@ -397,6 +404,10 @@ pub enum Inst {
     IsHelperInvocation,
     /// `OpSetMeshOutputsEXT`: the vertices and primitives a mesh workgroup outputs.
     SetMeshOutputs { vertices: Value, primitives: Value },
+    /// `OpEmitVertex`: a geometry entry emits a vertex of its output values.
+    EmitVertex,
+    /// `OpEndPrimitive`: a geometry entry ends its output primitive.
+    EndPrimitive,
     // ---- Ray queries (builder/ops/ray.rs) ----
     /// A `SPV_KHR_ray_query` instruction.
     RayQuery(RayQueryInst),
@@ -572,7 +583,9 @@ impl Inst {
             | Inst::DemoteToHelperInvocation
             | Inst::IsHelperInvocation
             | Inst::ControlBarrier { .. }
-            | Inst::MemoryBarrier { .. } => {}
+            | Inst::MemoryBarrier { .. }
+            | Inst::EmitVertex
+            | Inst::EndPrimitive => {}
             Inst::SetMeshOutputs {
                 vertices,
                 primitives,
@@ -799,7 +812,9 @@ impl Inst {
             | Inst::DemoteToHelperInvocation
             | Inst::IsHelperInvocation
             | Inst::ControlBarrier { .. }
-            | Inst::MemoryBarrier { .. } => {}
+            | Inst::MemoryBarrier { .. }
+            | Inst::EmitVertex
+            | Inst::EndPrimitive => {}
             Inst::SetMeshOutputs {
                 vertices,
                 primitives,
@@ -1003,7 +1018,9 @@ impl Inst {
             | Inst::EndInterlock
             | Inst::DemoteToHelperInvocation
             | Inst::IsHelperInvocation
-            | Inst::SetMeshOutputs { .. } => {}
+            | Inst::SetMeshOutputs { .. }
+            | Inst::EmitVertex
+            | Inst::EndPrimitive => {}
         }
     }
 
@@ -1024,6 +1041,7 @@ impl Inst {
             } => Some(ModelNeed::Fragment),
             Inst::BeginInterlock | Inst::EndInterlock => Some(ModelNeed::Interlock),
             Inst::SetMeshOutputs { .. } => Some(ModelNeed::Mesh),
+            Inst::EmitVertex | Inst::EndPrimitive => Some(ModelNeed::Geometry),
             Inst::AtomicLoad { scope, .. }
             | Inst::AtomicStore { scope, .. }
             | Inst::Atomic { scope, .. }
@@ -1241,6 +1259,9 @@ pub enum ExecModel {
     TaskEXT,
     /// A mesh function (`SPV_EXT_mesh_shader`).
     MeshEXT,
+    /// The pass-through geometry stage link synthesizes for a fragment function that reads
+    /// `[[barycentric_coord]]` on a device without `fragmentShaderBarycentric`.
+    Geometry,
 }
 
 impl ExecModel {
@@ -1275,6 +1296,16 @@ pub enum ExecMode {
     SignedZeroInfNanPreserve {
         width: u8,
     },
+    /// `DenormPreserve` (`SPV_KHR_float_controls`): denormal results and operands of this float
+    /// width are kept.
+    DenormPreserve {
+        width: u8,
+    },
+    /// `RoundingModeRTE` (`SPV_KHR_float_controls`): float operations and conversions of this
+    /// width round to nearest even.
+    RoundingModeRte {
+        width: u8,
+    },
     SubgroupUniformControlFlow,
     MaximallyReconverges,
     /// `RequireFullQuadsKHR` (`SPV_KHR_quad_control`, fragment only): every quad starts with its
@@ -1306,6 +1337,20 @@ pub enum ExecMode {
     OutputLines,
     /// Triangles (`OutputTrianglesEXT`).
     OutputTriangles,
+    // ---- Geometry ----
+    /// A geometry entry's input primitive: points (`InputPoints`). Its triangles are
+    /// [`ExecMode::Triangles`] and its output points [`ExecMode::OutputPoints`].
+    InputPoints,
+    /// Lines (`InputLines`).
+    InputLines,
+    /// A geometry entry's output primitive: line strips (`OutputLineStrip`).
+    OutputLineStrip,
+    /// Triangle strips (`OutputTriangleStrip`).
+    OutputTriangleStrip,
+    /// A geometry entry's invocations per input primitive (`Invocations`).
+    Invocations {
+        n: u32,
+    },
 }
 
 impl ExecMode {

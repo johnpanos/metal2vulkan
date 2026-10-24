@@ -211,7 +211,7 @@ impl Forwarding {
 /// every function to one inlined at each call, the GPU's compiler compiles a routine once per call,
 /// and `DontInline` states that the calls should stay calls. Elsewhere the control is left out:
 /// NVIDIA's driver honours it at a measured cost (a routine-heavy kernel ran 8.1 times as long with
-/// it on the RTX 3090, EV UNM-gt2-nv3090), and Mesa's inline every function whatever it states.
+/// it on the RTX 3090), and Mesa's inline every function whatever it states.
 fn states_dont_inline(p: &DeviceProfile) -> bool {
     p.fields()
         .workarounds
@@ -1375,6 +1375,7 @@ impl Ser<'_> {
             ExecModel::TessellationControl => crate::spv::ExecutionModel::TessellationControl,
             ExecModel::TaskEXT => crate::spv::ExecutionModel::TaskEXT,
             ExecModel::MeshEXT => crate::spv::ExecutionModel::MeshEXT,
+            ExecModel::Geometry => crate::spv::ExecutionModel::Geometry,
         };
         let f = self.ids.func(e.func)?;
         let mut ops = vec![model as u32, f];
@@ -1415,6 +1416,10 @@ impl Ser<'_> {
             ExecMode::SignedZeroInfNanPreserve { width } => {
                 plain(w, M::SignedZeroInfNanPreserve, &[u32::from(width)])
             }
+            ExecMode::DenormPreserve { width } => plain(w, M::DenormPreserve, &[u32::from(width)]),
+            ExecMode::RoundingModeRte { width } => {
+                plain(w, M::RoundingModeRTE, &[u32::from(width)])
+            }
             ExecMode::SubgroupUniformControlFlow => plain(w, M::SubgroupUniformControlFlowKHR, &[]),
             ExecMode::MaximallyReconverges => plain(w, M::MaximallyReconvergesKHR, &[]),
             ExecMode::RequireFullQuads => plain(w, M::RequireFullQuadsKHR, &[]),
@@ -1430,6 +1435,11 @@ impl Ser<'_> {
             ExecMode::OutputPoints => plain(w, M::OutputPoints, &[]),
             ExecMode::OutputLines => plain(w, M::OutputLinesEXT, &[]),
             ExecMode::OutputTriangles => plain(w, M::OutputTrianglesEXT, &[]),
+            ExecMode::InputPoints => plain(w, M::InputPoints, &[]),
+            ExecMode::InputLines => plain(w, M::InputLines, &[]),
+            ExecMode::OutputLineStrip => plain(w, M::OutputLineStrip, &[]),
+            ExecMode::OutputTriangleStrip => plain(w, M::OutputTriangleStrip, &[]),
+            ExecMode::Invocations { n } => plain(w, M::Invocations, &[n]),
         }
     }
 
@@ -1528,7 +1538,8 @@ impl Ser<'_> {
                                 (
                                     ExecModel::Vertex
                                         | ExecModel::TessellationEvaluation
-                                        | ExecModel::MeshEXT,
+                                        | ExecModel::MeshEXT
+                                        | ExecModel::Geometry,
                                     IoDir::Output
                                 ) | (ExecModel::Fragment, IoDir::Input)
                             );
@@ -1638,6 +1649,10 @@ impl Ser<'_> {
                         ..
                     }
                     | Inst::Glsl {
+                        contract: Contraction::Forbidden,
+                        ..
+                    }
+                    | Inst::Convert {
                         contract: Contraction::Forbidden,
                         ..
                     } = &n.inst
@@ -2217,7 +2232,7 @@ impl Ser<'_> {
                 &with(head()?, &[v(*base)?, v(*offset)?, v(*count)?]),
             ),
             Inst::Fma { a, b, c } => w.inst(Op::FmaKHR, &with(head()?, &[v(*a)?, v(*b)?, v(*c)?])),
-            Inst::Convert { op, a } => w.inst(op.to_spirv(), &with(head()?, &[v(*a)?])),
+            Inst::Convert { op, a, .. } => w.inst(op.to_spirv(), &with(head()?, &[v(*a)?])),
             Inst::CompositeConstruct { parts } => {
                 let mut ops = head()?;
                 for p in parts.iter() {
@@ -2504,6 +2519,8 @@ impl Ser<'_> {
                 vertices,
                 primitives,
             } => w.inst(Op::SetMeshOutputsEXT, &[v(*vertices)?, v(*primitives)?]),
+            Inst::EmitVertex => w.inst(Op::EmitVertex, &[]),
+            Inst::EndPrimitive => w.inst(Op::EndPrimitive, &[]),
             Inst::RayQuery(op) => {
                 let o = match op {
                     RayQueryInst::Initialize { .. } | RayQueryInst::Confirm { .. } => {

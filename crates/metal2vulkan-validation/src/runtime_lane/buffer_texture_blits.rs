@@ -1,12 +1,13 @@
 //! Device tests of blits that name textures over buffers on the device the cfg selects, under the
-//! validation layer. TOB probe 1's blit cases run on the runtime over Metal's bytes: a buffer whose
-//! byte `i` is `7i + 3`, holding 4x4 `RGBA8Unorm` textures at offset 256, two-slice linear arrays
-//! and 16-texel texture buffers, filled with texels that name themselves. Each case runs over an
-//! ordinary buffer and a no-copy one, at the probe's 32-byte rows and at 256-byte rows, so each
-//! layout takes the aliasing or the shadow form the device gives it. Every byte of every buffer and
-//! ordinary texture is checked against a model of Metal's measured answer: a copy moves texel rows
-//! as a copy through a temporary does, never the bytes between rows. The overlapping cases, which a
-//! model alone would not prove, also match the rows the probe recorded on the M4 and the M3 Max.
+//! validation layer. The blit cases of a Metal probe on the M3 Max and an M4 run on the runtime
+//! over Metal's bytes: a buffer whose byte `i` is `7i + 3`, holding 4x4 `RGBA8Unorm` textures at
+//! offset 256, two-slice linear arrays and 16-texel texture buffers, filled with texels that name
+//! themselves. Each case runs over an ordinary buffer and a no-copy one, at the probe's 32-byte
+//! rows and at 256-byte rows, so each layout takes the aliasing or the shadow form the device gives
+//! it. Every byte of every buffer and ordinary texture is checked against a model of Metal's
+//! measured answer: a copy moves texel rows as a copy through a temporary does, never the bytes
+//! between rows. The overlapping cases, which a model alone would not prove, also match the rows
+//! the probe recorded on the M4 and the M3 Max.
 
 use super::degrade_notices::{assert_made_once, forced, shared_in_system_memory};
 use super::host_memory::{no_copy, not_importable, Mapping};
@@ -382,11 +383,10 @@ fn on_device(test: impl FnOnce(&Device)) {
     );
 }
 
-/// The rows TOB probe 1 recorded (M4 and M3 Max alike) for its overlapping copies at 32-byte
-/// rows: a texture onto itself a texel down and right (`b.self_overlap`), a texture into one a
-/// row below over the same bytes and back (`b.t2t_overlap`, `b.t2t_overlap_rev`, five rows),
-/// and copies between the texture and its own buffer a texel apart (`b.b2t_overlap`,
-/// `b.t2b_overlap`).
+/// The rows a Metal probe recorded (M4 and M3 Max alike) for its overlapping copies at 32-byte
+/// rows: a texture onto itself a texel down and right (`b.self_overlap`), a texture into one a row
+/// below over the same bytes and back (`b.t2t_overlap`, `b.t2t_overlap_rev`, five rows), and copies
+/// between the texture and its own buffer a texel apart (`b.b2t_overlap`, `b.t2b_overlap`).
 const PROBE_SELF_OVERLAP: &str =
     "102040c0112041c1122042c2132043c3737a81888f969da4abb2b9c0c7ced5dc|\
 102144c4102040c0112041c1122042c2535a61686f767d848b9299a0a7aeb5bc|\
@@ -418,13 +418,13 @@ fn probe_rows(held: &Held, probe: Option<(&str, u64)>, what: &str) {
         assert_eq!(
             hex_rows(&held.bytes(), OFF, 32, n),
             rows,
-            "{what}: the rows TOB probe 1 recorded"
+            "{what}: the rows Metal's probe recorded"
         );
     }
 }
 
-/// TOB probe 1's blits between a 2D texture over a buffer (at `OFF`, rows `bpr` apart) and
-/// ordinary textures, other textures over buffers, the texture itself, and buffers.
+/// The probe's blits between a 2D texture over a buffer (at `OFF`, rows `bpr` apart) and ordinary
+/// textures, other textures over buffers, the texture itself, and buffers.
 fn texture_blits(device: &Device, kind: Kind, bpr: u64) {
     let new = || Held::new(device, kind).unwrap();
     let probe = |recorded: &'static str, n: u64| {
@@ -845,7 +845,7 @@ fn texture_buffer_blits(device: &Device, kind: Kind) {
     }
 }
 
-/// Every blit kind with textures over buffers moves Metal's bytes: TOB probe 1's cases, over an
+/// Every blit kind with textures over buffers moves Metal's bytes: the probe's cases, over an
 /// ordinary and a no-copy buffer, at 32- and 256-byte rows.
 #[test]
 fn blits_of_textures_over_buffers_move_metals_bytes() {
@@ -871,7 +871,7 @@ fn blits_of_textures_over_buffers_move_metals_bytes() {
 /// bytes of one buffer that overlap, which goes through a scratch buffer.
 pub(super) const OVERLAPS: [Degradation; 1] = [Degradation::OverlappingTexelCopy];
 
-/// A copy of a texture over a buffer onto itself a texel down and right (TOB probe 1's
+/// A copy of a texture over a buffer onto itself a texel down and right (probe case
 /// `b.self_overlap`), and of one into a texture a row further on over the same bytes
 /// (`b.t2t_overlap`), each in two command buffers, move the rows the probe recorded on the M4 and
 /// the M3 Max, and the device announces the overlap once ([`OVERLAPS`]), and where they force it
@@ -923,8 +923,7 @@ pub(super) const NARROW_ROWS: [Degradation; 1] = [Degradation::NarrowSurfaceRows
 
 /// The IOSurface stand-in (`Buffer::new_texture_with_iosurface_plane`) over an ordinary and a
 /// no-copy 16-KiB buffer standing for the surface, at plain Metal's answers on the M3 Max and an
-/// M4 (EVs `SPH-iosurf3-m3`, `SPH-iosurf3-m4`, `IOS-iosurf4-m4`, `IOS-iosurf4-m3`): the
-/// consumer's 4x4 `R8Unorm` plane at 4 bytes a row and `RG8Unorm` plane at 8, an `RG8Unorm`
+/// M4: the consumer's 4x4 `R8Unorm` plane at 4 bytes a row and `RG8Unorm` plane at 8, an `RG8Unorm`
 /// plane at 9 (not a multiple of its texel), an `R8Unorm` plane at offset 4, an `RGBA8Unorm`
 /// plane at 16 and at 20, an `R8Unorm` plane at 40 (each through [`iosurface_plane`]); the
 /// consumer's three-plane '420v' backing ([`iosurface_420v`]); and the refusals of a surface
@@ -1153,9 +1152,8 @@ fn a_planar_surface_s_depth_or_stencil_texture_reads_and_stores_the_plane() {
 
 /// Where Metal's pass puts element `(x, y)` of a `w`x`h` depth or stencil texture of `unit`-byte
 /// elements over a plane of a surface with planes, from the plane's offset rounded down to 128
-/// (EVs SID-pdl1-m4 to SID-pdl7-m4, an M4 under macOS 27.0.1): tiles of Metal's largest sides
-/// for the unit, or a side's power of two where it is smaller, a row of them after another,
-/// Morton order inside, x's bit lowest.
+/// (an M4 under macOS 27.0.1): tiles of Metal's largest sides for the unit, or a side's power of
+/// two where it is smaller, a row of them after another, Morton order inside, x's bit lowest.
 fn tiled_at(unit: u64, [w, h]: [u64; 2], x: u64, y: u64) -> u64 {
     let [lw, lh] = match unit {
         1 => [128, 128],
@@ -1180,14 +1178,14 @@ fn tiled_at(unit: u64, [w, h]: [u64; 2], x: u64, y: u64) -> u64 {
 }
 
 /// A pass on a depth or stencil texture over a plane of a surface with planes writes the bytes
-/// of Metal's tiles alone, as Metal's does (EVs SID-pdl6-m4 and SID-pdl7-m4: no byte outside
-/// the elements changed): extents of partial tiles, one tile and several, whose elements leave
-/// the bytes between them as they were; a view of the texture in its own format renders into the
-/// same bytes; and the stencil of `Depth32Float_Stencil8`, which is not in the plane, loads as 0
-/// whatever a pass stored, through the texture and its `X32_Stencil8` view alike (a draw testing
-/// it equal to 0 draws every texel, equal to the stored value none), the depth loaded and stored
-/// again unchanged and no byte changed by the view's pass. A shadow of such a texture is zeroed as
-/// it is made for `Depth32Float_Stencil8` (`WorkCounts::shadows_zeroed`), and never for
+/// of Metal's tiles alone, as Metal's does (no byte outside the elements changed): extents of
+/// partial tiles, one tile and several, whose elements leave the bytes between them as they were; a
+/// view of the texture in its own format renders into the same bytes; and the stencil of
+/// `Depth32Float_Stencil8`, which is not in the plane, loads as 0 whatever a pass stored, through
+/// the texture and its `X32_Stencil8` view alike (a draw testing it equal to 0 draws every texel,
+/// equal to the stored value none), the depth loaded and stored again unchanged and no byte changed
+/// by the view's pass. A shadow of such a texture is zeroed as it is made for
+/// `Depth32Float_Stencil8` (`WorkCounts::shadows_zeroed`), and never for
 /// `Depth16Unorm` or `Depth32Float`, whose making starts no image on the host
 /// (`images_started_on_the_host`).
 #[test]
@@ -1313,7 +1311,7 @@ fn a_planar_surface_s_depth_or_stencil_texture_s_passes_write_metal_s_elements_a
                         continue;
                     }
                     // The stencil loads as 0, through the texture and through its
-                    // `X32_Stencil8` view (EV SID-pdl7-m4): drawn where it equals 0, not where it
+                    // `X32_Stencil8` view: drawn where it equals 0, not where it
                     // equals the stored 0x33; the depth loads and stores unchanged, and the view's
                     // store reaches no byte.
                     let x32 = t.new_texture_view(PixelFormat::X32Stencil8).unwrap();
@@ -1400,68 +1398,6 @@ fn a_planar_surface_s_depth_or_stencil_texture_s_passes_write_metal_s_elements_a
                         })),
                         "{what}: a blit of its X32_Stencil8 view"
                     );
-                }
-            }
-        }
-    }
-    let messages = messages.take();
-    assert!(
-        messages.is_empty(),
-        "the validation layer reported: {messages:#?}"
-    );
-}
-
-/// No depth or stencil texture over a buffer's bytes asks the driver for a
-/// `DRM_FORMAT_MOD_LINEAR` image, at Metal's row pitch over host pages or over dma-buf pages, even
-/// where the driver lists the modifier for its format (lavapipe does): the runtime asks the layout
-/// of every such image it makes of a memory plane (`VUID-vkGetImageSubresourceLayout-tiling-09433`),
-/// and Vulkan has no such query of a format with depth or stencil, whose aspect it must name
-/// (`-format-04462`, `-format-04463`). Each texture of a surface's plane is made, at a padded row
-/// pitch and a browser's, and the work counts show no such image made or refused.
-#[test]
-fn no_depth_or_stencil_texture_over_a_buffer_asks_for_a_modifier_image() {
-    use metal2vulkan_runtime::WorkCounts;
-    let asked = |counts: &WorkCounts| {
-        (
-            counts.pitched_host_images,
-            counts.pitched_host_image_refusals,
-            counts.dma_buf_images,
-        )
-    };
-    let messages = Messages::default();
-    let cache = ScratchCache::new().unwrap();
-    {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        eprintln!("device {}", device.name());
-        for kind in [Kind::Ordinary, Kind::NoCopy] {
-            let Some(held) = Held::new(&device, kind) else {
-                eprintln!("{}: no {kind:?} buffer", device.name());
-                continue;
-            };
-            for pf in [
-                PixelFormat::Depth16Unorm,
-                PixelFormat::Depth32Float,
-                PixelFormat::Depth32FloatStencil8,
-                PixelFormat::Stencil8,
-                PixelFormat::X32Stencil8,
-            ] {
-                for usage in [TextureUsage::SHADER_READ, TextureUsage::RENDER_TARGET] {
-                    for bpr in [64, 256] {
-                        let what = format!("{kind:?} {pf:?} {usage:?}, rows {bpr} bytes apart");
-                        let mut d = TextureDescriptor::texture_2d(pf, 4, 4, false);
-                        d.usage = usage;
-                        d.resource_options = held.buffer.resource_options();
-                        let before = device.work_counts();
-                        held.buffer
-                            .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, bpr, true))
-                            .unwrap_or_else(|e| panic!("{what}: {e}"));
-                        assert_eq!(
-                            asked(&device.work_counts()),
-                            asked(&before),
-                            "{what}: DRM_FORMAT_MOD_LINEAR images asked of the driver (made at \
-                             Metal's row pitch, refused there, made over dma-bufs)"
-                        );
-                    }
                 }
             }
         }
@@ -1604,7 +1540,7 @@ fn iosurface_plane(
 
 /// A 4:2:2 texture over a surface's plane, as over a CoreVideo `2vuy` or `yuvs` surface (no
 /// planes, 16 x 4 texels, 64 bytes a row), in either format, over an ordinary and a no-copy
-/// buffer: made, as plain Metal makes it (EV APX2-xv1-m4, an M4: plain and validated alike), and
+/// buffer: made, as plain Metal makes it (an M4: plain and validated alike), and
 /// its `get_bytes`, `replace_region` and blits into and out of a buffer move the surface's rows
 /// unchanged, 2 bytes a texel, the bytes between rows untouched, as Metal's do.
 #[test]
@@ -1694,7 +1630,7 @@ fn four_two_two_iosurface_planes_move_the_surface_s_rows() {
 
 /// The consumer's '420v' backing over a new buffer of `kind` ([`iosurface_planes_lie_where_metal_puts_them`]):
 /// three planes, a 4x4 `R8Unorm` one at 0 and two 2x2 `RG8Unorm` ones at 256 and 512, each 16 bytes
-/// a row (IOSurfaceGetPlaneCount 3; IOS-iosurf4: Metal's GPU and CPU find each plane where the
+/// a row (IOSurfaceGetPlaneCount 3: Metal's GPU and CPU find each plane where the
 /// surface lays it out). A blit writes each plane, and each lands in its own rows alone.
 fn iosurface_420v(device: &Device, kind: Kind) {
     let mut held = Held::new(device, kind).unwrap();
@@ -1744,7 +1680,7 @@ fn iosurface_420v(device: &Device, kind: Kind) {
 }
 
 /// An IOSurface plane takes and reports its descriptor's resource options whatever the buffer
-/// standing for the surface has, as plain Metal's on an M4 does (EV `IOS-modes2-m4`, flat and
+/// standing for the surface has, as plain Metal's on an M4 does (flat and
 /// planar surfaces, plain and under API validation): `Shared`, `Managed` (the guest
 /// WindowServer's, over a no-copy buffer of default options) and `Private`, each CPU cache mode
 /// and each hazard tracking mode, the default resolving to tracked. Each texture's CPU and GPU

@@ -3,7 +3,7 @@
 //! An `ARGB8Unorm` attachment's image is `R8G8B8A8_UNORM`, holding Metal's alpha, red, green and
 //! blue in its red, green, blue and alpha (`metal::format::to_rotated_image`). Metal blends the
 //! format as `RGBA8Unorm`, channel by channel: its alpha by the alpha operation and factors, which
-//! read Metal's alphas, and its red, green and blue by the color ones (EV GSM2-a8r-m4: eleven blend
+//! read Metal's alphas, and its red, green and blue by the color ones (eleven blend
 //! states, every texel the `RGBA8Unorm` one's rotated). Vulkan's color operation and factors govern
 //! the image's red, green and blue (Metal's alpha, red and green), its alpha ones the image's alpha
 //! (Metal's blue), and a Vulkan factor that reads an alpha reads the image's (Metal's blue). So
@@ -33,16 +33,15 @@
 //! alpha arithmetic, and the rotation moves Metal's blue into the image's alpha and Metal's alpha
 //! into its red: under `SourceAlpha` over `OneMinusSourceAlpha` Metal's color is `fma(d, 1 - a, s *
 //! a)`, where the image's alpha blends a factor and one minus it as `fma(f, s - d, d)`, which
-//! rounds one code apart near half-code ties (EVs GSM2-f84b-m4, GSM2-f84d-m4 and -m3). A swept 440
-//! blend states held 1 to 1,767 differing texels of 65,536 in 40 of them (EV GSM2-f84e-m4). The
-//! blend states [`MEASURED`] lists store Metal's bytes rotated in the forms this module gives them,
-//! on the M4 and the M3 Max at 65,536 tie-heavy texels and on every lane device at the
-//! rotated-targets lane's; under `SourceAlpha` over `OneMinusSourceAlpha` with the add operation,
-//! where the device's blend is Apple's (`VkProperty::MetalColorWrites`), the image's alpha takes
-//! one over one minus the second output's alpha and the function writes Metal's blue premultiplied
-//! by Metal's alpha (`RotatedBlendForm::Premultiplied`), which the blend then computes as Metal's
-//! own `fma(d, 1 - a, s * a)`. Every other blend state is the search's, announced
-//! (`RotatedBlendForm::Unmeasured`, `PrecisionNote::RotatedBlendRounding`).
+//! rounds one code apart near half-code ties. A swept 440 blend states held 1 to 1,767 differing
+//! texels of 65,536 in 40 of them. The blend states [`MEASURED`] lists store Metal's bytes rotated
+//! in the forms this module gives them, on the M4 and the M3 Max at 65,536 tie-heavy texels and on
+//! every lane device at the rotated-targets lane's; under `SourceAlpha` over `OneMinusSourceAlpha`
+//! with the add operation, where the device's blend is Apple's (`VkProperty::MetalColorWrites`),
+//! the image's alpha takes one over one minus the second output's alpha and the function writes
+//! Metal's blue premultiplied by Metal's alpha (`RotatedBlendForm::Premultiplied`), which the blend
+//! then computes as Metal's own `fma(d, 1 - a, s * a)`. Every other blend state is the search's,
+//! announced (`RotatedBlendForm::Unmeasured`, `PrecisionNote::RotatedBlendRounding`).
 
 use crate::device::requirements::{VkFeature, VkProperty};
 use crate::device::DeviceProfile;
@@ -116,7 +115,7 @@ const MEASURED: [Measured; 11] = {
             O::Add,
         ),
         // Straight alpha: the image's red, green and blue by the second output's alpha (Metal's
-        // source alpha), its alpha (Metal's blue) premultiplied (EV GSM2-f84c-m4).
+        // source alpha), its alpha (Metal's blue) premultiplied.
         Measured {
             metal: (
                 [
@@ -548,6 +547,60 @@ pub(crate) fn rotated_blend(
         _ => FactorLane::Zero,
     });
     Ok(Some(RotatedBlend::Synthesized(state, lanes)))
+}
+
+/// Vulkan's blend of attachment `a` on an `R8_UNORM` image holding Metal's alpha in red
+/// (`metal::format::alpha_in_red`, `A8Unorm`), whose fragment output the function writes rotated
+/// (the red of each output, of either dual-source index, Metal's alpha): `None` without blending,
+/// and the descriptor's own errors. Metal blends `A8Unorm`'s alpha by its alpha operation and
+/// factors alone, each factor reading alphas: `SourceColor` and `SourceAlpha` the source's,
+/// `DestinationColor` and `DestinationAlpha` the destination's, `SourceAlphaSaturated` one,
+/// `BlendColor` and `BlendAlpha` the blend color's, `Source1Color` and `Source1Alpha` the second
+/// output's (probe `a8`, an M3 Max under macOS 27.0.1: every factor as source and as
+/// destination, under every operation). Vulkan's color operation and factors govern the image's
+/// red, where each of those alphas is that of the red it reads (the source's red, the
+/// destination's, the second output's), but the blend color's, which `CONSTANT_ALPHA` reads
+/// unrotated, and the saturated alpha's one. The image has no alpha, so its alpha factors are the
+/// same as its color factors, read by nothing.
+pub(crate) fn alpha_in_red_blend(
+    a: &ColorAttachmentDescriptor,
+    p: &DeviceProfile,
+) -> Result<Option<BlendState>, Error> {
+    // The descriptor's own errors first: a placeholder, and a `Source1` factor without
+    // dual-source blending.
+    if blend_factors(a, p)?.is_none() {
+        return Ok(None);
+    }
+    use vk::BlendFactor as B;
+    use BlendFactor as F;
+    let red = |f: BlendFactor| match f {
+        F::Zero => Some(B::ZERO),
+        F::One | F::SourceAlphaSaturated => Some(B::ONE),
+        F::SourceColor | F::SourceAlpha => Some(B::SRC_COLOR),
+        F::OneMinusSourceColor | F::OneMinusSourceAlpha => Some(B::ONE_MINUS_SRC_COLOR),
+        F::DestinationColor | F::DestinationAlpha => Some(B::DST_COLOR),
+        F::OneMinusDestinationColor | F::OneMinusDestinationAlpha => Some(B::ONE_MINUS_DST_COLOR),
+        F::BlendColor | F::BlendAlpha => Some(B::CONSTANT_ALPHA),
+        F::OneMinusBlendColor | F::OneMinusBlendAlpha => Some(B::ONE_MINUS_CONSTANT_ALPHA),
+        F::Source1Color | F::Source1Alpha => Some(B::SRC1_COLOR),
+        F::OneMinusSource1Color | F::OneMinusSource1Alpha => Some(B::ONE_MINUS_SRC1_COLOR),
+        F::Unspecialized => None,
+    };
+    let (Some(src), Some(dst)) = (
+        red(a.source_alpha_blend_factor),
+        red(a.destination_alpha_blend_factor),
+    ) else {
+        return Err(Unsupported::not_implemented(Feature::Format).into());
+    };
+    let op = blend_op(a.alpha_blend_operation)?;
+    Ok(Some(BlendState {
+        src_color: src,
+        dst_color: dst,
+        color_op: op,
+        src_alpha: src,
+        dst_alpha: dst,
+        alpha_op: op,
+    }))
 }
 
 #[cfg(test)]

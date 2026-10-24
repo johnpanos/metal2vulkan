@@ -1,20 +1,20 @@
-//! The load pass of an extended-range, padded 10-bit or bfloat color attachment.
+//! The load pass of an extended-range, padded 10-bit or bfloat color attachment, and under the
+//! exact tile store of a signed normalized or `RGB9E5Float` one.
 //!
-//! - **Metal's answer** (EVs XRR2-xrb2 and -xrb3 on an Apple M4 under macOS 27.0.1 and on the
-//!   consumer's Apple M3 Max under macOS 26.7, alike; EVs XRR2-x6g to -x6k, -x6is on both).
-//!   An Apple GPU stores a render pass's attachments a 32 x 32 tile at a time. A pass that loads
-//!   a color attachment of `BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`, `R10Unorm_X6`,
-//!   `RG10Unorm_X12` or one of their `_sRGB` twins and records a draw writes every texel of each
-//!   tile it stores back: a channel a fragment writes takes the write, and every other texel
-//!   keeps its codes with the bits they leave unused made canonical (`bind::unused_bits_module`:
-//!   `BGR10_XR`'s bits 30 and 31 ones, `BGRA10_XR`'s low six bits of each field zeros and its
-//!   alpha code clamped to `[384, 894]`, the two-plane color word's top two bits zeros, a padded
-//!   word's low six bits zeros, the padded `_sRGB` twins' codes through Metal's table). That
-//!   includes the texels no fragment covers, fragments that discard or fail a test, and channels
-//!   a write mask leaves out. A pass that loads a bfloat color attachment (`R16Bfloat`,
-//!   `RG16Bfloat`, `RGBA16Bfloat`) and draws does so too, its tiles holding `half` values: every
-//!   code of each tile it stores back goes through `half` to nearest even and back to the nearest
-//!   bfloat code, a NaN to `0x7fc0` (`ExtendedRange::load_code`; EV FRT-bfp1-m4 on an Apple M4
+//! - **Metal's answer** (on an Apple M4 under macOS 27.0.1 and on the consumer's Apple M3 Max under
+//!   macOS 26.7, alike; on both). An Apple GPU stores a render pass's attachments a 32 x 32 tile at
+//!   a time. A pass that loads a color attachment of `BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`,
+//!   `R10Unorm_X6`, `RG10Unorm_X12` or one of their `_sRGB` twins and records a draw writes every
+//!   texel of each tile it stores back: a channel a fragment writes takes the write, and every
+//!   other texel keeps its codes with the bits they leave unused made canonical
+//!   (`bind::unused_bits_module`: `BGR10_XR`'s bits 30 and 31 ones, `BGRA10_XR`'s low six bits of
+//!   each field zeros and its alpha code clamped to `[384, 894]`, the two-plane color word's top
+//!   two bits zeros, a padded word's low six bits zeros, the padded `_sRGB` twins' codes through
+//!   Metal's table). That includes the texels no fragment covers, fragments that discard or fail a
+//!   test, and channels a write mask leaves out. A pass that loads a bfloat color attachment
+//!   (`R16Bfloat`, `RG16Bfloat`, `RGBA16Bfloat`) and draws does so too, its tiles holding `half`
+//!   values: every code of each tile it stores back goes through `half` to nearest even and back to
+//!   the nearest bfloat code, a NaN to `0x7fc0` (`ExtendedRange::load_code`; on an Apple M4
 //!   under macOS 27.0.1, every code of each format: 56,829 move, and only in the tiles the draws'
 //!   primitives reach). The tiles it stores are those a draw's primitives reach (the half of a rect
 //!   whose edge lies on x = 32 reaches the tiles right of it; a zero-area rect or one off the
@@ -53,6 +53,17 @@
 //!   tiles there no draw reaches are rewritten here where Metal keeps them; but where capture
 //!   replay found the tiles the draws' primitives reach (`render/capture.rs`, Metal's, announced by
 //!   the command buffer where a primitive's reach was not measured).
+//! - **The exact tile store** (`TileStorePolicy::Exact`). The same pass, once it draws, writes a
+//!   single-sampled signed normalized or `RGB9E5Float` attachment's tiles back through their
+//!   values (an Apple M3 Max under macOS 27.0.1): a channel's minimum code (-128, or -32768) is
+//!   stored as the code above it, and a word whose largest mantissa is below 256 under an exponent
+//!   above 0 normalized (`bind::unused_bits_module` of the format). Under the exact tile store the
+//!   load pass takes such an attachment as it takes an extended-range one, where the driver's pass
+//!   does not store them so already (`DriverFact::TileStoreIsMetals`: MoltenVK's pass is a Metal
+//!   pass); under the default, `TileStorePolicy::Device`, it leaves them to the device's load and
+//!   store, and a draw announces `snorm-minimum-kept` or `shared-exponent-kept`
+//!   ([`snorm_minimum_kept`], [`shared_exponent_kept`]), as it does for one the load pass does not
+//!   take.
 //! - **Not here** (`degrade_unused_bits` announces `extended-range-bits-kept` at each draw): a
 //!   multisampled attachment (no copy reaches its samples), a texture held as a shadow of another
 //!   image or of a heap's bytes, a sparse one, and one whose image the device does not copy both
@@ -63,18 +74,22 @@ use super::capture::CapturedReach;
 use crate::buffer_texture::Texels;
 use crate::clear_reach::{DrawnTiles, PassReach};
 use crate::degradation::Degradation;
+use crate::device::functions::Vk;
+use crate::device::Device;
 use crate::encoder::EncoderCore;
 use crate::error::{internal, Error};
 use crate::owned_kernel::{OwnedModule, OwnedSets};
 use crate::render_pass::{ColorTarget, PassLayout, Target};
 use crate::render_values::{LoadAction, StoreAction};
 use crate::shadow::ShadowTarget;
+use crate::texture::Texture;
 use crate::tracker::{Access, Barrier, Use, UseRange};
 use crate::values::ResourceOptions;
 use ash::vk;
 use metal2vulkan::bind::{TexelWords, UnusedBitsModule};
+use metal2vulkan::device::{DriverFact, TileStorePolicy};
 use metal2vulkan::metal::format::ExtendedRange;
-use metal2vulkan::metal::TextureType;
+use metal2vulkan::metal::{PixelFormat, TextureType};
 use metal2vulkan::vk::{ImageType, ImageUsageFlags};
 
 /// The side, in texels, of the tiles Metal stores.
@@ -188,7 +203,7 @@ impl<'a> TileReach<'a> {
 /// `bytes / 4` words, and a captured mask's bytes are `bytes` of a live buffer, written before a
 /// barrier the command buffer recorded already.
 unsafe fn record_mask(
-    raw: &ash::Device,
+    raw: &Vk,
     command_buffer: vk::CommandBuffer,
     (buffer, offset, bytes): (vk::Buffer, u64, u64),
     mask: &Mask,
@@ -230,10 +245,10 @@ enum Source<'a> {
     Frame,
 }
 
-/// A color attachment the load pass takes: its form, the target whose texels it rewrites (the
+/// A color attachment the load pass takes: its format, the target whose texels it rewrites (the
 /// texture's own, where a stand-in renders for it), and where it finds them.
 struct Taken<'a> {
-    form: ExtendedRange,
+    format: PixelFormat,
     target: &'a Target,
     source: Source<'a>,
 }
@@ -244,12 +259,37 @@ fn own(color: &ColorTarget) -> &Target {
     color.stand_in.as_ref().map_or(&color.target, |s| &s.own)
 }
 
-/// Whether `color` is of an extended-range, padded or bfloat format, loaded and not discarded
-/// at the store; `late` counts a store action the encoder decides later as storing.
+/// Whether the load pass rewrites a texture of `texture`'s format: an extended-range, padded or
+/// bfloat one's always, and a signed normalized ([`SNORM_MINIMUM`]) or `RGB9E5Float` one's under
+/// the exact tile store (`TileStorePolicy::Exact`) on a driver whose store is not Metal's already
+/// (`DriverFact::TileStoreIsMetals`).
+fn rewrites(texture: &Texture) -> bool {
+    let format = texture.pixel_format();
+    if ExtendedRange::of(format).is_some() {
+        return true;
+    }
+    let device = texture.device();
+    let stored = SNORM_MINIMUM.contains(&format) || format == PixelFormat::RGB9E5Float;
+    stored
+        && device.compile_device().policy().tile_store == TileStorePolicy::Exact
+        && !metals_store(device)
+}
+
+/// Whether `device`'s render pass stores a signed normalized minimum code and an `RGB9E5Float`
+/// word as Metal's tile store does (`DriverFact::TileStoreIsMetals`: MoltenVK's pass is a Metal
+/// pass).
+pub(super) fn metals_store(device: &Device) -> bool {
+    device
+        .properties()
+        .driver_facts
+        .contains(&DriverFact::TileStoreIsMetals)
+}
+
+/// Whether `color` is of a format the load pass rewrites ([`rewrites`]), loaded and not
+/// discarded at the store; `late` counts a store action the encoder decides later as storing.
 fn loaded(color: &ColorTarget, late: bool) -> bool {
-    let format = own(color).texture.pixel_format();
     let discarded = color.store == StoreAction::DontCare && !(late && color.late_store);
-    ExtendedRange::of(format).is_some()
+    rewrites(&own(color).texture)
         && color.load == LoadAction::Load
         && !color.memoryless
         && !discarded
@@ -263,7 +303,7 @@ fn takes(color: &ColorTarget, late: bool) -> Option<Taken<'_>> {
     }
     let target = own(color);
     let texture = &target.texture;
-    let form = ExtendedRange::of(texture.pixel_format())?;
+    let format = texture.pixel_format();
     let turned = texture
         .shadow()
         .is_some_and(|copies| matches!(copies.target(), Some(ShadowTarget::Rotated { .. })));
@@ -279,31 +319,31 @@ fn takes(color: &ColorTarget, late: bool) -> Option<Taken<'_>> {
     // A rotated texture's frame, which its shadow's copy in fills.
     if turned {
         return copies_both_ways().then_some(Taken {
-            form,
+            format,
             target,
             source: Source::Frame,
         });
     }
     if let Some(texels) = texture.buffer_texels() {
-        let words = match form {
-            ExtendedRange::Planes { .. } => TexelWords::ColorPlane,
+        let words = match ExtendedRange::of(format) {
+            Some(ExtendedRange::Planes { .. }) => TexelWords::ColorPlane,
             _ => TexelWords::Raw,
         };
         let flat = matches!(
             texture.texture_type(),
             TextureType::Type2D | TextureType::Type2DArray
         ) && target.layers == 1;
-        let texel = u64::from(UnusedBitsModule::texel_bytes(form, words)?);
+        let texel = u64::from(UnusedBitsModule::texel_bytes(format, words)?);
         let rows_of_texels = texels.layout.row_bytes == u64::from(target.extent[0]) * texel;
         return (flat && rows_of_texels).then_some(Taken {
-            form,
+            format,
             target,
             source: Source::Bytes(texels, words),
         });
     }
     let image = texture.shadow().is_none() && !texture.is_sparse() && copies_both_ways();
     image.then_some(Taken {
-        form,
+        format,
         target,
         source: Source::Image,
     })
@@ -326,10 +366,101 @@ pub(super) fn consumes_capture(layout: &PassLayout, ended: bool) -> bool {
     taken.peek().is_some() && taken.all(|taken| !matches!(taken.source, Source::Frame))
 }
 
-/// Whether `color` is of an extended-range or padded format, loaded and not discarded at the
-/// store, where the load pass does not take it (`degrade_unused_bits`).
+/// Whether `color` is of an extended-range, padded or bfloat format, loaded and not discarded at
+/// the store, where the load pass does not take it (`degrade_unused_bits`).
 pub(super) fn untaken(color: &ColorTarget) -> bool {
-    loaded(color, true) && takes(color, true).is_none()
+    ExtendedRange::of(own(color).texture.pixel_format()).is_some()
+        && loaded(color, true)
+        && takes(color, true).is_none()
+}
+
+/// The signed normalized color formats whose minimum code Metal's tile store rewrites, as
+/// measured on an Apple M3 Max (`snorm-minimum-kept`).
+const SNORM_MINIMUM: [PixelFormat; 6] = [
+    PixelFormat::R8Snorm,
+    PixelFormat::RG8Snorm,
+    PixelFormat::RGBA8Snorm,
+    PixelFormat::R16Snorm,
+    PixelFormat::RG16Snorm,
+    PixelFormat::RGBA16Snorm,
+];
+
+/// Whether `color` is a single-sampled attachment of a signed normalized format
+/// ([`SNORM_MINIMUM`]), loaded and not discarded at the store, where the load pass does not take
+/// it: Metal's pass, once it draws, writes each tile a draw reaches back through the channels'
+/// values, so a minimum code (-128, or -32768) is stored as the code above it, where the device's
+/// pass keeps the bytes its draws do not write (`degrade_snorm_minimum`, which reads
+/// `DriverFact::TileStoreIsMetals`: a driver whose pass stores them as Metal's). The load pass
+/// rewrites them under the exact tile store (`TileStorePolicy::Exact`) where it takes the
+/// attachment.
+pub(super) fn snorm_minimum_kept(color: &ColorTarget) -> bool {
+    let target = own(color);
+    let discarded = color.store == StoreAction::DontCare && !color.late_store;
+    SNORM_MINIMUM.contains(&target.texture.pixel_format())
+        && target.samples == 1
+        && color.load == LoadAction::Load
+        && !color.memoryless
+        && !discarded
+        && takes(color, true).is_none()
+}
+
+/// Whether `color` is a single-sampled `RGB9E5Float` attachment, loaded and not discarded at the
+/// store, where the load pass does not take it: Metal's pass, once it draws, writes each tile a
+/// draw reaches back through its texels' values, so a word whose largest mantissa is below 256
+/// under an exponent above 0 (one no Metal write leaves) is stored normalized, its mantissas
+/// shifted up as its exponent steps down, where the device's pass keeps the bytes its draws do
+/// not write (`degrade_shared_exponent`, which reads `DriverFact::TileStoreIsMetals`). The load
+/// pass rewrites them under the exact tile store (`TileStorePolicy::Exact`) where it takes the
+/// attachment.
+pub(super) fn shared_exponent_kept(color: &ColorTarget) -> bool {
+    let target = own(color);
+    let discarded = color.store == StoreAction::DontCare && !color.late_store;
+    target.texture.pixel_format() == PixelFormat::RGB9E5Float
+        && target.samples == 1
+        && color.load == LoadAction::Load
+        && !color.memoryless
+        && !discarded
+        && takes(color, true).is_none()
+}
+
+/// The color attachments of a pass's layout that each of a draw's kept-attachment notices names, as
+/// `color {index}, {format:?}`: the extended-range or padded ones the load pass does not take
+/// ([`untaken`], `degrade_unused_bits`) and, on a driver whose pass does not store as Metal's
+/// ([`metals_store`]), the signed normalized ones ([`snorm_minimum_kept`],
+/// `degrade_snorm_minimum`) and the `RGB9E5Float` ones ([`shared_exponent_kept`],
+/// `degrade_shared_exponent`). They read the layout's colors, their textures' formats, samples,
+/// shadows and image plans, and the device's tile store policy and driver facts; all but the
+/// layout are fixed at creation, so an encoder decides them once for each layout it records
+/// under.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct KeptAttachments {
+    pub(super) unused_bits: Vec<String>,
+    pub(super) snorm_minimum: Vec<String>,
+    pub(super) shared_exponent: Vec<String>,
+}
+
+impl KeptAttachments {
+    /// The kept attachments of `layout`, a pass of `device`'s.
+    pub(super) fn of(layout: &PassLayout, device: &Device) -> Self {
+        let metals = metals_store(device);
+        let mut kept = Self::default();
+        for (index, color) in layout.colors.iter().enumerate() {
+            let Some(color) = color else {
+                continue;
+            };
+            let name = || format!("color {index}, {:?}", color.target.texture.pixel_format());
+            if untaken(color) {
+                kept.unused_bits.push(name());
+            }
+            if !metals && snorm_minimum_kept(color) {
+                kept.snorm_minimum.push(name());
+            }
+            if !metals && shared_exponent_kept(color) {
+                kept.shared_exponent.push(name());
+            }
+        }
+        kept
+    }
 }
 
 /// The texels of one attachment's region: its columns, the rows of each layer, its layers, and
@@ -391,9 +522,10 @@ pub(super) fn record(
                     "the pass rewrites every 32x32 tile of its render area, where Metal's \
                      rewrites only the tiles a draw's primitives reach (or every tile where a \
                      color attachment is cleared): in tiles no draw reaches the unused bits are \
-                     made canonical and BGRA10_XR alpha codes clamped to [384, 894], and a \
-                     padded word's low six bits zeroed (an _sRGB twin's code through Metal's \
-                     table), where Metal keeps those texels' bytes"
+                     made canonical and BGRA10_XR alpha codes clamped to [384, 894], a padded \
+                     word's low six bits zeroed (an _sRGB twin's code through Metal's table) and, \
+                     under the exact tile store, a signed normalized minimum code raised and an \
+                     RGB9E5Float word normalized, where Metal keeps those texels' bytes"
                         .to_owned(),
                 )
             });
@@ -435,7 +567,7 @@ fn record_taken(
             Source::Bytes(_, words) => words,
             Source::Image | Source::Frame => TexelWords::Raw,
         };
-        let texel = UnusedBitsModule::texel_bytes(taken.form, words)
+        let texel = UnusedBitsModule::texel_bytes(taken.format, words)
             .ok_or_else(|| internal("an unused bits attachment without its words"))?;
         let columns = u64::from(layout.extent[0].next_multiple_of(TILE).min(width));
         let rows = u64::from(layout.extent[1].next_multiple_of(TILE).min(height));
@@ -517,7 +649,7 @@ fn rewrite(
     if !at.is_multiple_of(align) {
         return Err(internal("an unused bits scratch off its alignment"));
     }
-    let kernel = device.owned_kernel(OwnedModule::UnusedBits(taken.form, words))?;
+    let kernel = device.owned_kernel(OwnedModule::UnusedBits(taken.format, words))?;
     let ranges: Vec<_> = bands
         .iter()
         .enumerate()
@@ -655,7 +787,7 @@ impl Copies {
     /// which are live until it completes, and an image rests in `GENERAL`.
     unsafe fn to_scratch(
         &self,
-        raw: &ash::Device,
+        raw: &Vk,
         command_buffer: vk::CommandBuffer,
         scratch: vk::Buffer,
         b: usize,
@@ -684,7 +816,7 @@ impl Copies {
     /// As [`to_scratch`](Self::to_scratch).
     unsafe fn back(
         &self,
-        raw: &ash::Device,
+        raw: &Vk,
         command_buffer: vk::CommandBuffer,
         scratch: vk::Buffer,
         b: usize,

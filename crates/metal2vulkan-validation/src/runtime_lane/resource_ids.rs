@@ -1,14 +1,14 @@
 //! Device tests of resource IDs on the device the cfg selects, under the validation layer: textures
 //! and sampler states placed at an ID (`resourceIndex` with `forceResourceIndex`, a runtime
-//! extension), reservations and their limits, sampler-state uniquing (probes `RT7-place-probe2` to
-//! `6` on an M3 Max and an M4), and what a kernel reading a texture's ID from its argument buffer
-//! reaches: the texture holding the ID as its command buffer runs, whichever texture the encoder
-//! named, or none, as Metal's did (the M4 probe RFL-res-m4, residency part C), a heap's and a
-//! sparse heap's alike, and the neutral texture once that holder went. The kernel samples a 2-by-2
-//! `RGBA32Uint` texture through a sampler held beside it, so its output is the texels it reached (a
-//! float twin of the case reads `RGBA16Float` linearly). Each degradation site of the kinds
-//! ([`RESOURCE_IDS`] and the device heap's: [`UNVIEWABLE`], [`UNNAMED_SHADOWS`], [`PAST_CAPACITY`],
-//! [`OWN_COPIES`]) is taken on a device of its own and announced once.
+//! extension), reservations and their limits, sampler-state uniquing (on an M3 Max and an M4), and
+//! what a kernel reading a texture's ID from its argument buffer reaches: the texture holding the
+//! ID as its command buffer runs, whichever texture the encoder named, or none, as Metal's did (the
+//! M4 probe, residency part C), a heap's and a sparse heap's alike, and the neutral
+//! texture once that holder went. The kernel samples a 2-by-2 `RGBA32Uint` texture through a
+//! sampler held beside it, so its output is the texels it reached (a float twin of the case reads
+//! `RGBA16Float` linearly). Each degradation site of the kinds ([`RESOURCE_IDS`] and the device
+//! heap's: [`UNVIEWABLE`], [`UNNAMED_SHADOWS`], [`PAST_CAPACITY`], [`OWN_COPIES`]) is taken on a
+//! device of its own and announced once.
 
 use super::buffer_texture_blits::linear_rows_differ;
 use super::degrade_notices::{assert_made_once, assert_once, forced, shared_in_system_memory};
@@ -37,11 +37,11 @@ use metal2vulkan::metal::{
 use metal2vulkan_runtime::{
     BlitOption, Buffer, BufferContents, BufferDescriptor, CommandBuffer, CommandBufferError,
     CommandBufferStatus, CommandQueue, ComputePipelineState, Deallocator, DebugMessage,
-    Degradation, Device, DeviceOptions, Error, EventRef, ExecutedPipeline, Heap, HeapDescriptor,
-    HeapType, HostMemory, IdPlacement, IndirectCommandBufferDescriptor, Invalid, IoSurfacePlane,
-    KeepAlive, MemoryKind, MessageSeverity, MessageSink, Origin, Problem, Region,
+    Degradation, Device, DeviceOptions, Error, EventRef, ExecutedPipeline, Fence, Heap,
+    HeapDescriptor, HeapType, HostMemory, IdPlacement, IndirectCommandBufferDescriptor, Invalid,
+    IoSurfacePlane, KeepAlive, MemoryKind, MessageSeverity, MessageSink, Origin, Problem, Region,
     RenderPassDescriptor, ResourceId, ResourceIdKind, ResourceOptions, SamplerState,
-    SamplerStateOptions, Size, Texture, TextureDescriptor, TextureSwizzleChannels,
+    SamplerStateOptions, SharedEvent, Size, Texture, TextureDescriptor, TextureSwizzleChannels,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,7 +72,11 @@ pub(super) const OWN_COPIES: [Degradation; 1] = [Degradation::HeapSetCopied];
 
 /// The kind [`a_no_copy_buffer_s_deallocator_runs_at_its_release_given_a_keep_alive`] takes where
 /// a texture's image over the buffer's pages, which a submitted command buffer may read, holds
-/// their import and the buffer has no keep-alive.
+/// their import and the buffer has no keep-alive; and the tests of a released buffer whose pages a
+/// table of the live buffers a command buffer holds lists (`rebind_reach.rs`,
+/// `indirect_host_steps.rs`); and the test of a buffer released behind work that reads device
+/// addresses, where the device's driver has `FreedAddressMemoryFailsPendingWork`
+/// (`freed_memory.rs`).
 pub(super) const DELAYED_DEALLOCATORS: [Degradation; 1] = [Degradation::HostDeallocatorDelayed];
 
 // Each test asserts exactly the kinds of its sites it took, beside those its steps force on the
@@ -178,7 +182,7 @@ fn on_device_with(adjust: impl FnOnce(&mut DeviceOptions), test: impl FnOnce(&De
 /// argument buffer, a buffer output) on a device: its pipeline state, its resources (the texture
 /// holding the case's texels, and the sampler state), and its argument-buffer texture's literal
 /// and usage.
-struct Sampling {
+pub(super) struct Sampling {
     case: PublicCase,
     pipeline: ComputePipelineState,
     queue: CommandQueue,
@@ -189,7 +193,7 @@ struct Sampling {
 }
 
 impl Sampling {
-    fn new(device: &Device) -> Sampling {
+    pub(super) fn new(device: &Device) -> Sampling {
         Sampling::of(device, HANDLE_SAMPLER)
     }
 
@@ -771,7 +775,7 @@ fn a_holder_of_another_format_is_read_as_itself() {
     });
 }
 
-/// Metal's answers of the M4 probe RFL-res-m4, plain and under API validation alike: a kernel reads
+/// Metal's answers of the M4 probe, plain and under API validation alike: a kernel reads
 /// a texture through its ID in its argument buffer whatever the command's encoder named.
 /// `tex.none`: no encoder of the command buffer named it. `tex.later_compute`: an earlier encoder
 /// dispatches, and a later one only makes it resident. And a texture made after the dispatch was
@@ -859,7 +863,7 @@ impl Sampling {
 }
 
 /// A texture's range token drops as the program releases the texture where no command buffer
-/// holds the texture object, as Metal frees its range (EV XRB-tok1-m4, an M4, three runs alike:
+/// holds the texture object, as Metal frees its range (an M4, three runs alike:
 /// `table`, `unrelated` and `firstmove`), though the runtime keeps its image meanwhile for the
 /// command buffers that may reach it by its ID or took its first move: one reached only through
 /// its ID by a command buffer waiting to run (which then reads the neutral, its image kept, so
@@ -955,7 +959,7 @@ fn a_sparse_heap_s_token_drops_as_it_goes_whatever_keeps_its_textures_images() {
 }
 
 /// An automatic or placement heap's range token drops as the program releases the heap and then
-/// its texture, as Metal frees the heap's range (EV XRB-hep1-m4, an M4, three runs alike: `table`
+/// its texture, as Metal frees the heap's range (an M4, three runs alike: `table`
 /// and `firstmove` free it at the release; `texheld`: the texture keeps it), though the runtime
 /// keeps the texture's image, and the heap's memory it is bound to, for a command buffer that
 /// reaches it only through its ID (which then reads the neutral, its image kept, so the device
@@ -1020,29 +1024,32 @@ fn a_heap_s_token_drops_at_its_release_whatever_keeps_its_textures_images() {
 
 /// A texture over a buffer, the buffer released first and then the texture while a command
 /// buffer waiting to run reaches the texture only through its ID in an argument buffer: the
-/// buffer goes at the texture's release, as Metal frees it (EV XRB-bft1-m4, an M4, three runs
+/// buffer goes at the texture's release, as Metal frees it (an M4, three runs
 /// alike: `table` frees its range at the release; `texheld`: the texture keeps it), though the
 /// runtime keeps the texture's image, and the memory it is bound to, until that command buffer
 /// completed (which then reads the neutral, so the device reports nothing). Two forms:
 ///
 /// - the consumer's surface texture (its `Beside::PendingArgument`): a texture of an IOSurface
 ///   plane over a no-copy buffer of the surface's pages (`new_texture_with_iosurface_plane`),
-///   whose deallocator, the consumer's hold on the surface (a use the host sees), runs at the
-///   texture's release, as Metal lets go of the surface. The deallocator scribbles over the pages,
-///   as a caller reusing them would: the waiting command buffer, which starts after it, reads the
-///   neutral through the ID, never the pages, and completes cleanly;
-/// - a texture over a buffer of the runtime's memory, whose range token drops then.
+///   a shadow on every device (`shadowed-texture`), whose image lies in memory of its own;
+///   the buffer's deallocator, the consumer's hold on the surface (a use the host sees), runs at
+///   the texture's release, as Metal lets go of the surface. The deallocator scribbles over the
+///   pages, as a caller reusing them would: the waiting command buffer, which starts after it,
+///   reads the neutral through the ID, never the pages, and completes cleanly;
+/// - a texture over a buffer of the runtime's memory, an image bound to the buffer's memory where
+///   a linear image of the device holds its texels alone, else a shadow, whose range token drops
+///   then.
 ///
-/// A texture over host pages the device holds as a shadow (`shadowed-texture`) is announced as
-/// its ID's holder once (`UNNAMED_SHADOWS`): the command binds the heap set holding it with its
-/// ID in the argument buffer, neither naming it nor making it resident, so its function may read
-/// the shadow stale; nothing else is.
+/// A shadow is announced as its ID's holder once (`UNNAMED_SHADOWS`): the command binds the heap
+/// set holding it with its ID in the argument buffer, neither naming it nor making it resident,
+/// so its function may read the shadow stale; nothing else is.
 #[test]
 fn a_buffer_under_a_texture_goes_at_its_release_whatever_keeps_the_image() {
     let mapping = Mapping::anonymous(GUEST_PAGE);
     on_device(|device, messages| {
         let sampling = Sampling::new(device);
         let reads = Reads::of(device, &sampling);
+        let mut surface = false;
         for form in ["surface plane", "runtime memory"] {
             let gone = Arc::new(AtomicBool::new(false));
             let noted = Arc::clone(&gone);
@@ -1077,9 +1084,9 @@ fn a_buffer_under_a_texture_goes_at_its_release_whatever_keeps_the_image() {
                     device.new_buffer_with_descriptor(descriptor).unwrap()
                 }
             };
-            // A surface format the devices bind to the pages (an image over them, not a shadow,
-            // where they can: its rows packed, as wide as a device's linear rows), unsigned as the
-            // kernel's: what it reads is gone anyway.
+            // A format and rows a device's linear image holds alone (an image bound to the
+            // runtime's memory, not a shadow, where it can: its rows packed, as wide as a device's
+            // linear rows), unsigned as the kernel's: what it reads is gone anyway.
             let mut d = TextureDescriptor::texture_2d(PixelFormat::RGBA8Uint, ROW_TEXELS, 2, false);
             d.usage = TextureUsage::SHADER_READ;
             d.resource_options = buffer.resource_options();
@@ -1097,6 +1104,11 @@ fn a_buffer_under_a_texture_goes_at_its_release_whatever_keeps_the_image() {
                 "SURFACE-HOLD {} {form}: an image bound to the bytes: {bound}",
                 device.name()
             );
+            assert!(
+                !(bound && form == "surface plane"),
+                "{form}: a texture over host pages takes an image bound to them"
+            );
+            surface |= form == "surface plane";
             drop(buffer);
             assert!(!gone.load(Ordering::SeqCst), "{form}: its texture keeps it");
             let event = device.new_shared_event().unwrap();
@@ -1112,8 +1124,12 @@ fn a_buffer_under_a_texture_goes_at_its_release_whatever_keeps_the_image() {
             let output = sampling.output(&command_buffer, &buffers);
             assert_eq!(output, reads.neutral, "{form}");
         }
-        // A shadow where the device's linear rows lie otherwise, which its driver decides.
-        let shadowed = row_shadow_kinds(device);
+        // The surface's shadow, and the runtime memory's where the device's linear rows lie
+        // otherwise, which its driver decides.
+        let shadowed = match surface {
+            true => [Degradation::ShadowedTexture, UNNAMED_SHADOWS[0]].into(),
+            false => row_shadow_kinds(device),
+        };
         println!(
             "SURFACE-HOLD {}: a shadow: {}",
             device.name(),
@@ -1125,13 +1141,12 @@ fn a_buffer_under_a_texture_goes_at_its_release_whatever_keeps_the_image() {
 
 /// A no-copy buffer and a texture over it released while a submitted command buffer that may
 /// read the texture through its ID runs (its dispatch submitted and done, which an event it
-/// signals then shows; a wait for another event after it holds it): where the texture's image is
-/// bound to the buffer's pages, the image, and the device's import of the pages, stay until that
-/// command buffer completed. With a keep-alive the deallocator runs at the release, as Metal's
-/// does (EV XRB-bft1-m4), and the keep-alive goes only once the command buffer completed; with
-/// none the deallocator waits for that, counted (`host_deallocators_delayed`) and announced once
-/// ([`DELAYED_DEALLOCATORS`]). A texture whose image is its own (a shadow) holds no import: both
-/// run at the release. A command buffer committed but not yet submitted holds nothing
+/// signals then shows; a wait for another event after it holds it). The texture is a shadow
+/// (`shadowed-texture`), whose image lies in memory of its own and holds no import of the pages:
+/// the deallocator runs at the release, as Metal's does, with a keep-alive or
+/// without, and nothing waits for the command buffer; a keep-alive goes on one of the device's
+/// handler threads, after the import's free (`HostImport`'s drop). A command buffer committed but
+/// not yet submitted holds nothing
 /// ([`a_buffer_under_a_texture_goes_at_its_release_whatever_keeps_the_image`]). The device
 /// reports nothing either way.
 #[test]
@@ -1139,7 +1154,6 @@ fn a_no_copy_buffer_s_deallocator_runs_at_its_release_given_a_keep_alive() {
     let mapping = Mapping::anonymous(GUEST_PAGE);
     on_device(|device, messages| {
         let sampling = Sampling::new(device);
-        let mut delays = 0;
         for keeps in [true, false] {
             let ran = Arc::new(AtomicBool::new(false));
             let kept_dropped = Arc::new(AtomicBool::new(false));
@@ -1168,68 +1182,92 @@ fn a_no_copy_buffer_s_deallocator_runs_at_its_release_given_a_keep_alive() {
             d.usage = TextureUsage::SHADER_READ;
             d.resource_options = buffer.resource_options();
             let doomed = buffer.new_texture(&d, 0, ROW_BYTES).unwrap();
+            let what = format!("keep-alive {keeps}");
             // SAFETY: the handle is only compared, while the texture lives.
             let bound = unsafe { doomed.vk_image() }.is_some();
-            let (started, release) = (
-                device.new_shared_event().unwrap(),
-                device.new_shared_event().unwrap(),
-            );
-            let (command_buffer, buffers) = sampling.encode(device, &doomed, None, None);
-            command_buffer
-                .encode_signal_event(EventRef::from(&started), 1)
-                .unwrap();
-            command_buffer
-                .encode_wait_for_event(EventRef::from(&release), 1)
-                .unwrap();
-            command_buffer.commit().unwrap();
             assert!(
-                started.wait_until_signaled_value(1, WAIT),
-                "the dispatch's batch ran"
+                !bound,
+                "{what}: a texture over host pages takes an image bound to them"
             );
+            let reaching = sampling.reaching(device, &doomed);
             let delayed = device.work_counts().host_deallocators_delayed;
             drop(buffer);
             drop(doomed);
-            let what = format!("keep-alive {keeps}, an image bound to the bytes {bound}");
             println!("DEALLOCATOR-HOLD {}: {what}", device.name());
-            // The image holds the import where it is bound to the pages.
-            let delay = bound && !keeps;
-            assert_eq!(
+            assert!(
                 ran.load(Ordering::SeqCst),
-                !delay,
                 "{what}: the deallocator at the release"
             );
+            // Nothing holds the import: it is freed with only the keep-alive waiting for the free,
+            // on one of the device's handler threads, and the keep-alive goes there after it.
+            let deadline = Instant::now() + WAIT;
+            while keeps && !kept_dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             assert_eq!(
                 kept_dropped.load(Ordering::SeqCst),
-                keeps && !bound,
-                "{what}: the keep-alive at the release"
+                keeps,
+                "{what}: the keep-alive with the import's free"
             );
             assert_eq!(
                 device.work_counts().host_deallocators_delayed,
-                delayed + u64::from(delay),
+                delayed,
                 "{what}: counted delayed"
             );
-            release.set_signaled_value(1);
-            // The dispatch read the texture or, once it went, the neutral: either is Metal's.
-            sampling.output(&command_buffer, &buffers);
-            // The import goes as the command buffer lets go of the image: the deallocator waiting
-            // for it runs then, and the keep-alive goes.
-            let done =
-                || ran.load(Ordering::SeqCst) && kept_dropped.load(Ordering::SeqCst) == keeps;
-            let deadline = Instant::now() + WAIT;
-            while !done() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(done(), "{what}: once the command buffer completed");
-            delays += usize::from(delay);
+            reaching.complete(&sampling);
         }
-        // A shadow, where the device's linear rows lie otherwise, reached through its ID is
-        // announced as the lane above says.
-        let mut expected = row_shadow_kinds(device);
-        if delays > 0 {
-            expected.extend(DELAYED_DEALLOCATORS);
-        }
+        // The shadow, reached through its ID, is announced as the lane above says.
+        let expected = [Degradation::ShadowedTexture, UNNAMED_SHADOWS[0]];
         sampling.announced(device, messages, &expected);
     });
+}
+
+/// A command buffer reaching a texture only through its ID in its argument buffer
+/// ([`Sampling::reaching`]), submitted and running: its dispatch submitted and done, which an event
+/// it signals then shows, and a wait for another event after it holding it. It holds the
+/// texture's image, and the memory the image is bound to, and nothing of the texture object or a
+/// buffer under it, until [`complete`](Reaching::complete).
+pub(super) struct Reaching {
+    command_buffer: CommandBuffer,
+    buffers: BTreeMap<u32, Buffer>,
+    release: SharedEvent,
+}
+
+impl Sampling {
+    /// A command buffer whose dispatch reaches `texture` only through its ID, committed and
+    /// submitted: returned once its dispatch ran ([`Reaching`]).
+    pub(super) fn reaching(&self, device: &Device, texture: &Texture) -> Reaching {
+        let (started, release) = (
+            device.new_shared_event().unwrap(),
+            device.new_shared_event().unwrap(),
+        );
+        let (command_buffer, buffers) = self.encode(device, texture, None, None);
+        command_buffer
+            .encode_signal_event(EventRef::from(&started), 1)
+            .unwrap();
+        command_buffer
+            .encode_wait_for_event(EventRef::from(&release), 1)
+            .unwrap();
+        command_buffer.commit().unwrap();
+        assert!(
+            started.wait_until_signaled_value(1, WAIT),
+            "the dispatch's batch ran"
+        );
+        Reaching {
+            command_buffer,
+            buffers,
+            release,
+        }
+    }
+}
+
+impl Reaching {
+    /// Let the command buffer go on, and wait until it completed.
+    pub(super) fn complete(self, sampling: &Sampling) {
+        self.release.set_signaled_value(1);
+        // The dispatch read the texture or, once it went, the neutral: either is Metal's.
+        sampling.output(&self.command_buffer, &self.buffers);
+    }
 }
 
 /// The bytes between rows of the textures over a buffer the lanes above make: Metal's linear
@@ -1333,13 +1371,15 @@ impl Sampling {
 
     /// One compute encoder in `command_buffer` dispatching the case with `named`'s ID in its
     /// argument buffer, binding and making resident the textures of `reaching` and the heap
-    /// `heap` where given: the dispatch's buffers, its output among them.
+    /// `heap` where given, after waiting for the fence `after` where given: the dispatch's
+    /// buffers, its output among them.
     fn encode_in(
         &self,
         device: &Device,
         command_buffer: &CommandBuffer,
         named: &Texture,
         (reaching, heap): (CaseResources, Option<&Heap>),
+        after: Option<&Fence>,
     ) -> BTreeMap<u32, Buffer> {
         let naming = CaseResources {
             argument_textures: BTreeMap::from([(self.key, named.clone())]),
@@ -1348,6 +1388,9 @@ impl Sampling {
         };
         let buffers = bound_buffers(device, &self.case.compute, &naming).unwrap();
         let mut encoder = command_buffer.compute_command_encoder().unwrap();
+        if let Some(fence) = after {
+            encoder.wait_for_fence(fence).unwrap();
+        }
         if let Some(heap) = heap {
             encoder.use_heap(heap).unwrap();
         }
@@ -1421,7 +1464,7 @@ fn shadowed(notices: &[DebugMessage]) -> bool {
 /// Metal's residency lasts the command buffer (the coordinator's ruling of 2026-10-07): a texture
 /// over a buffer one encoder made resident is read through its ID, by a later encoder of the
 /// command buffer that names nothing, as its bytes stand then, after a blit between the two changed
-/// them. Metal's answer, the M4 probe XRB-shd1-m4 `cb_named`: the later encoder reads the blit's
+/// them. Metal's answer, the M4 probe: the later encoder reads the blit's
 /// bytes (with no residency at all, `cb_none`, it read the first encoder's). The texture is a
 /// shadow ([`SHADOW_ROW`]); the line `SHADOW-READ` reports what each encoder read.
 #[test]
@@ -1443,13 +1486,13 @@ fn a_shadowed_texture_a_command_buffer_made_resident_is_read_as_its_bytes_stand(
             argument_textures: BTreeMap::from([(sampling.key, texture.clone())]),
             ..CaseResources::default()
         };
-        let a = sampling.encode_in(device, &command_buffer, &texture, (resident, None));
+        let a = sampling.encode_in(device, &command_buffer, &texture, (resident, None), None);
         let mut blit = command_buffer.blit_command_encoder().unwrap();
         blit.copy_from_buffer_to_buffer(&source, 0, &buffer, 0, buffer.length())
             .unwrap();
         blit.end_encoding().unwrap();
         let nothing = (CaseResources::default(), None);
-        let c = sampling.encode_in(device, &command_buffer, &texture, nothing);
+        let c = sampling.encode_in(device, &command_buffer, &texture, nothing, None);
         command_buffer.commit().unwrap();
         command_buffer.wait_until_completed_for(WAIT).unwrap();
         assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
@@ -1473,9 +1516,13 @@ fn a_shadowed_texture_a_command_buffer_made_resident_is_read_as_its_bytes_stand(
 /// `useHeap:` makes resident every resource of the heap, a texture over a buffer placed in it
 /// among them: such a texture is read through its ID, by an encoder that uses only the heap, as
 /// its bytes stand, after the CPU wrote them and after a blit of the command buffer wrote them.
-/// Metal's answer, the M4 probe XRB-shd1-m4 `heap_use`: each read the bytes as they stood (with no
-/// `useHeap:`, `heap_none`, the first two read zeros). The texture is a shadow ([`SHADOW_ROW`]);
-/// the line `SHADOW-READ` reports what each read.
+/// Metal's answer, the M4 probe: each read the bytes as they stood (with no
+/// `useHeap:`, `heap_none`, the first two read zeros). The heap's resources are untracked (a
+/// heap's default), so the reading encoder waits for a fence the blit updates, as a Metal program
+/// must: on the M3 Max under macOS 27.0.1 (probe `heap_order`) a compute encoder read a texture
+/// over such a buffer before the blit just before it had written it, in every run without the
+/// fence and in none with it. The texture is a shadow ([`SHADOW_ROW`]); the line `SHADOW-READ`
+/// reports what each read.
 #[test]
 fn a_shadowed_texture_over_a_heap_s_buffer_is_read_through_use_heap_as_its_bytes_stand() {
     on_device(|device, messages| {
@@ -1496,20 +1543,23 @@ fn a_shadowed_texture_over_a_heap_s_buffer_is_read_through_use_heap_as_its_bytes
         write_at_start(&buffer, &shadow_rows(&first));
         let texture = sampling.over(&buffer);
         let source = buffer_with(device, &shadow_rows(&third)).unwrap();
+        let fence = device.new_fence();
         let mut got = Vec::new();
         for step in 0..3 {
             if step == 1 {
                 write_at_start(&buffer, &shadow_rows(&second));
             }
             let command_buffer = sampling.queue.command_buffer().unwrap();
-            if step == 2 {
+            let after = (step == 2).then(|| {
                 let mut blit = command_buffer.blit_command_encoder().unwrap();
                 blit.copy_from_buffer_to_buffer(&source, 0, &buffer, 0, length)
                     .unwrap();
+                blit.update_fence(&fence).unwrap();
                 blit.end_encoding().unwrap();
-            }
+                &fence
+            });
             let using_heap = (CaseResources::default(), Some(&heap));
-            let buffers = sampling.encode_in(device, &command_buffer, &texture, using_heap);
+            let buffers = sampling.encode_in(device, &command_buffer, &texture, using_heap, after);
             command_buffer.commit().unwrap();
             command_buffer.wait_until_completed_for(WAIT).unwrap();
             assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
@@ -1532,7 +1582,7 @@ fn a_shadowed_texture_over_a_heap_s_buffer_is_read_through_use_heap_as_its_bytes
         );
         assert_eq!(got[0], wants[0], "CB1");
         assert_eq!(got[1], wants[1], "CB2, after a CPU write");
-        assert_eq!(got[2], wants[2], "CB3, after a blit in it");
+        assert_eq!(got[2], wants[2], "CB3, after a blit in it and its fence");
         drop((texture, buffer, heap));
     });
 }
@@ -1669,7 +1719,7 @@ fn a_sampler_state_made_while_samplers_are_listed_degrades() {
 
 /// Texel (0, 0) of [`HANDLE_SAMPLER`]'s texture, (x + 2y, 10 + x, 20 + y, 7), at each of its four
 /// threads: its kernel's output through a state of its descriptor in pixel coordinates, each of
-/// its coordinates being below 1 (EV RRS-probe-8-m3).
+/// its coordinates being below 1.
 fn corner() -> Vec<u8> {
     [0u32, 10, 20, 7]
         .repeat(4)
@@ -1680,13 +1730,13 @@ fn corner() -> Vec<u8> {
 
 /// A sampler state that takes the ID a dispatch's argument buffer names, made after the dispatch
 /// is encoded and before its command buffer commits, is reached through that ID, as Metal's
-/// function reaches the state holding an ID as its command buffer runs (an M4: EV RRS-probe-12-m4,
-/// a state made after encoding and written into the argument buffer before the commit is the one
-/// sampled; EV RRS-probe-12b-m4, the state named goes after encoding, one in pixel coordinates
-/// made before the commit takes its ID 2, and the kernel reads texel (0, 0) through it): the
-/// case's state goes once the dispatch is encoded, and one of its descriptor in pixel coordinates
-/// takes its ID, so the kernel reads texel (0, 0) at each of its coordinates.
-/// The command buffer lists the argument samplers again as it commits: nothing is announced.
+/// function reaches the state holding an ID as its command buffer runs (an M4: a state made after
+/// encoding and written into the argument buffer before the commit is the one sampled; the state
+/// named goes after encoding, one in pixel coordinates made before the commit takes its ID 2, and
+/// the kernel reads texel (0, 0) through it): the case's state goes once the dispatch is encoded,
+/// and one of its descriptor in pixel coordinates takes its ID, so the kernel reads texel (0, 0) at
+/// each of its coordinates. The command buffer lists the argument samplers again as it commits:
+/// nothing is announced.
 #[test]
 fn a_sampler_state_made_before_the_commit_is_reached_by_its_id() {
     on_device(|device, messages| {
@@ -1860,7 +1910,7 @@ const CROWD: u64 = 2048;
 /// its own, and a function reaching its ID samples through it, as Metal's does: one at the highest
 /// ID Metal makes (16380), in pixel coordinates and standing in the argument buffer for the case's
 /// state, reads texel (0, 0) at all four of the case's coordinates (each below 1), as Metal's does
-/// (EV RRS-probe-8-m3, the M3 Max: bound and through an argument buffer alike), where the neutral
+/// (the M3 Max: bound and through an argument buffer alike), where the neutral
 /// sampler the state would miss to reads the case's own answer; nothing is announced. A state is
 /// left out only where more states live than the arrays hold: the line `SAMPLER-CAPACITY` reports
 /// the device's and the case's pipeline's, and where either holds at most [`CROWD`] elements the
@@ -2005,12 +2055,11 @@ fn sampler_states_are_uniqued_by_their_descriptors() {
 
 /// The device takes a sampler ID for itself as it makes its first command queue, indirect
 /// command buffer, or texture whose memory is its own (shared or not), as Metal's does (the
-/// consumer's M3 Max report at 701572bbf; the M4 probes MESH-rid1-m4 to MESH-rid3-m4): sampler
-/// states made after it take the IDs past it, it stays taken once that object is gone, and a
-/// sampler reservation after it is ignored. A heap's or a buffer's texture, a compute pipeline
-/// state, a render pipeline state without a fragment function (EV TTG-sid7-m4's `vertex_only`)
-/// and a sampler state take none; a render state with one numbers it while it lives
-/// (`numbered_samplers.rs`).
+/// consumer's M3 Max report at 701572bbf; the M4 probes): sampler states made after it take the IDs
+/// past it, it stays taken once that object is gone, and a sampler reservation after it is ignored.
+/// A heap's or a buffer's texture, a compute pipeline state, a render pipeline state without a
+/// fragment function and a sampler state take none; a render state with one numbers it while it
+/// lives (`numbered_samplers.rs`).
 #[test]
 fn the_device_s_first_queue_texture_or_icb_takes_a_sampler_id() {
     // Each state of a descriptor of its own: an equal one gets the live state.
@@ -2109,12 +2158,12 @@ fn the_device_s_first_queue_texture_or_icb_takes_a_sampler_id() {
 }
 
 /// A command queue or an indirect command buffer made before a texture reservation leaves the
-/// texture pool's first range beside the reservation's, as Metal's device does (EV APX2-rid1-m4,
-/// an M4, and the consumer's M3 Max): after a queue, a reservation of 64 to 66 hands out 1, 2
-/// and 3, where it hands out 67 on a fresh device. After a buffer and a reservation of 20, Metal
-/// hands out 21 to 31, 1 to 15, then 1 to 15 again while those textures live, and so does the
-/// runtime (the consumer's G331), announcing nothing: two live textures answer each of 1 to 15, and
-/// an ID both give back comes back once (EV TTG-rid1-m4).
+/// texture pool's first range beside the reservation's, as Metal's device does (an M4, and the
+/// consumer's M3 Max): after a queue, a reservation of 64 to 66 hands out 1, 2 and 3, where it
+/// hands out 67 on a fresh device. After a buffer and a reservation of 20, Metal hands out 21 to
+/// 31, 1 to 15, then 1 to 15 again while those textures live, and so does the runtime (the
+/// consumer's G331), announcing nothing: two live textures answer each of 1 to 15, and an ID both
+/// give back comes back once.
 #[test]
 fn a_queue_or_buffer_made_before_a_texture_reservation_keeps_the_pool_s_first_range() {
     let plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, 4, 4, false);
@@ -2176,8 +2225,8 @@ fn a_queue_or_buffer_made_before_a_texture_reservation_keeps_the_pool_s_first_ra
 
 /// Plain IDs after a reservation are the ones Metal hands out, for textures, sampler states,
 /// pipeline states and indirect command buffers, and an ID given back joins its free neighbours
-/// (each sequence measured on an M4, EVs MESH-rid1-m4 to MESH-rid4-m4): only a kind's first
-/// reservation with an ID counts, and IDs past Metal's placement limit are taken.
+/// (each sequence measured on an M4): only a kind's first reservation with an ID counts, and IDs
+/// past Metal's placement limit are taken.
 #[test]
 fn plain_ids_after_a_reservation_are_metal_s() {
     let plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, 4, 4, false);
@@ -2277,7 +2326,7 @@ fn plain_ids_after_a_reservation_are_metal_s() {
     });
     // Refused, reserving nothing: a texture or sampler state ID of 2^28 or more, and an indirect
     // command buffer ID of 2^30 or more, which ended Metal's process (`x_0_2p28p5`,
-    // `x_1_2p28p5`; MESH-icb3-m4 `x_2p30p5`).
+    // `x_1_2p28p5`).
     on_device(|device, _| {
         let refused = [
             (ResourceIdKind::Texture, 1 << 28),
@@ -2303,7 +2352,7 @@ fn plain_ids_after_a_reservation_are_metal_s() {
         );
     });
     // An indirect command buffer ID needs no records to be reserved: 2^23 + 5 is taken, and the
-    // buffer Metal numbers past it (2^23 + 6, MESH-rid7-m4 `x_5_2p23p5`) has no records address,
+    // buffer Metal numbers past it (2^23 + 6) has no records address,
     // refused `OutOfMemory` as it is made; after 2^23 alone, 1 is handed out (`x_5_2p23`).
     let mut icb = IndirectCommandBufferDescriptor::new();
     icb.command_types = IndirectCommandType::CONCURRENT_DISPATCH;
@@ -2328,7 +2377,7 @@ fn plain_ids_after_a_reservation_are_metal_s() {
 }
 
 /// What holds an indirect command buffer's ID once the program releases the buffer, as plain
-/// Metal holds it (EV MESH-icb1-m4 on an M4, the `h_` cases): a compute execution and a compute
+/// Metal holds it (on an M4, the `h_` cases): a compute execution and a compute
 /// or render `useResource` until their command buffer completes, and nothing once it is dropped
 /// uncommitted; a blit's copy from it or into it, its reset and its optimize not at all, nor a
 /// command buffer that does not use it. Each command buffer waits on an event while the buffer
@@ -2460,11 +2509,10 @@ fn an_indirect_command_buffer_s_id_is_held_as_metal_holds_it() {
     }
 }
 
-/// An indirect command buffer placed at an ID has it, as Metal places it (EV MESH-icb1-m4 and
-/// MESH-icb4-m4 on an M4, plain and under API validation): the index's low 32 bits, plain
-/// allocation where those are 0; plain allocation neither skips a placed ID nor is kept from a
-/// later reservation by it, which a placement makes the kind's first allocation; a placement at
-/// 16384 or more, past Metal's table, is refused typed.
+/// An indirect command buffer placed at an ID has it, as Metal places it (on an M4, plain and under
+/// API validation): the index's low 32 bits, plain allocation where those are 0; plain allocation
+/// neither skips a placed ID nor is kept from a later reservation by it, which a placement makes
+/// the kind's first allocation; a placement at 16384 or more, past Metal's table, is refused typed.
 #[test]
 fn indirect_command_buffers_are_placed_as_metal_places_them() {
     let mut descriptor = IndirectCommandBufferDescriptor::new();

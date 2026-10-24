@@ -1,7 +1,7 @@
 //! A 3840x2160 `YCBCR10_420_2P` texture sampled into 1440x1080 (the consumer's r25: a pass that
 //! samples such a surface minified into a 1440x1080 target wrote rare ±1s in its red, green and
 //! blue), on the device the cfg selects, under the validation layer, beside plain Metal's
-//! answers (EV SID-ycm1-m4: our own probe on an Apple M4 under macOS 27.0.1, synthetic codes).
+//! answers (our own probe on an Apple M4 under macOS 27.0.1, synthetic codes).
 //!
 //! The surface is an `x420` one whose 10-bit codes cover `0..=1023` ([`surface_bytes`]); the
 //! texture of format 505 over its plane 0 is sampled through a linear clamp-to-edge sampler
@@ -18,13 +18,17 @@
 //!
 //! The surface is untagged (no matrix: Metal reads it as BT.601, of the OSType's video range),
 //! its planes once as CoreVideo lays them out ([`PACKED`]) and once at offsets with padded rows
-//! ([`PADDED`]), over which Metal answers the same (EV SID-x42u1-m4).
+//! ([`PADDED`]), over which Metal answers the same.
 //!
 //! Each output's hash is printed beside Metal's ([`METAL`]), which every one must equal. Metal's
 //! switches follow its rule in every band group that switches (4079 of 4096; the exact product
-//! misses about half), and MoltenVK on an M4 and lavapipe answered every output Metal's bytes
-//! (EVs SID-ycm2-mvk4 and SID-ycm2-lvpx86), unannounced but for lavapipe's
-//! `shader-color-conversion`.
+//! misses about half), and MoltenVK on an M4 and lavapipe answered every output Metal's bytes,
+//! unannounced but for lavapipe's `shader-color-conversion`.
+//!
+//! The read's conversion copies the planes into the texture's staging buffer as one region, which
+//! the runtime records as two where its size is no multiple of 4 KiB
+//! (`WorkCounts::copy_regions_split`): [`PADDED`]'s span of 25,440,128 bytes, 3968 past one, where
+//! [`PACKED`]'s of 24,883,200 is one, counted over a second read. `read` checks those bytes too.
 
 use super::argument_linear_samples::{kernel, LINEAR_EDGE};
 use super::degrade_notices::{counts, on_device};
@@ -60,6 +64,15 @@ struct Layout {
     chroma: [u64; 2],
 }
 
+impl Layout {
+    /// The bytes from the first plane's start to the last one's end.
+    fn span(self) -> u64 {
+        let end = |[at, row]: [u64; 2], rows: u64| at + row * (rows - 1) + 2 * W;
+        let start = self.luma[0].min(self.chroma[0]);
+        end(self.luma, H).max(end(self.chroma, H / 2)) - start
+    }
+}
+
 /// The luma plane at byte 0 and the chroma plane right after it, each row as long as its codes.
 const PACKED: Layout = Layout {
     luma: [0, 2 * W],
@@ -67,7 +80,7 @@ const PACKED: Layout = Layout {
 };
 
 /// Planes at offsets off any page, a gap between them, and rows padded past their codes, the
-/// chroma plane's further than the luma plane's (EV SID-x42u1-m4: Metal answers over an untagged
+/// chroma plane's further than the luma plane's (Metal answers over an untagged
 /// surface of this layout what it answers over CoreVideo's own).
 const PADDED: Layout = Layout {
     luma: [20864, 7808],
@@ -79,8 +92,8 @@ const OH: u64 = 1080;
 /// A band's groups: 64 places along the axis, 32 steps in each, 17 coordinates a step.
 const GROUP: usize = 17;
 
-/// Plain Metal's answers (EV SID-ycm1-m4: an Apple M4 under macOS 27.0.1, two processes alike; the
-/// runtime and the constexpr sampler alike; EV SID-x42u1-m4 the same over untagged surfaces of
+/// Plain Metal's answers (an Apple M4 under macOS 27.0.1, two processes alike; the
+/// runtime and the constexpr sampler alike; our probe found the same over untagged surfaces of
 /// other layouts, and `read`, `read()` of every texel), by output.
 const METAL: [(&str, &str); 8] = [
     (
@@ -455,7 +468,7 @@ fn a_minified_ycbcr10_texture_samples_as_metal_does() {
 
 /// Over an untagged surface whose planes lie at offsets with rows padded past their codes
 /// ([`PADDED`]), every texel's `read()`, each band, the grid and the draw answer what Metal
-/// answers over CoreVideo's layout of the same codes (EV SID-x42u1-m4): the planes' places and
+/// answers over CoreVideo's layout of the same codes: the planes' places and
 /// rows decide only where the codes are read, and no matrix or range is inferred beyond the
 /// OSType's video range and BT.601, Metal's defaults.
 #[test]
@@ -472,6 +485,15 @@ fn samples_as_metal_does(layout: Layout, what: &str) {
         let state = sampler(device);
         let mut wrong = Vec::new();
         let got = hash(&read_all(device, &texture));
+        // A second read's only long copy is the planes' into the staging buffer (the first's
+        // zeros the staging buffer too): split where its span is no multiple of 4 KiB (the padded
+        // layout's).
+        let before = device.work_counts().copy_regions_split;
+        let again = hash(&read_all(device, &texture));
+        let split = device.work_counts().copy_regions_split - before;
+        let want = u64::from(!layout.span().is_multiple_of(4096));
+        assert_eq!(split, want, "{what}: the planes' copy split");
+        assert_eq!(again, got, "{what}: a second read");
         let is = verdict("read", &got);
         eprintln!("{what} read: {is:?} hash {got}");
         if is != Some(true) {

@@ -7,11 +7,11 @@ use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::{BuildError, EntryRule, ImageRule, OperandRule};
 use crate::spirv::ids::{TypeId, Value};
 use crate::spirv::ir::{
-    natural_layout, AtomicOp, BinOp, ConstBits, Constant, ConvOp, DerivOp, Dim, ExecMode,
-    ExecModel, GlslOp, GroupArith, ImageOperandKind as K, ImageOperands, ImageQuery, ImageType,
-    ImageUsage, Inst, IoDir, LayoutRule, MemAccess, MemberLayout, MemoryOrder, ModelNeed,
-    QuadDirection, Scope, Semantics, ShuffleOp, StorageClass, StructLayout, TexelMemory, Type,
-    UnOp,
+    natural_layout, AtomicOp, BinOp, ConstBits, Constant, Contraction, ConvOp, DerivOp, Dim,
+    ExecMode, ExecModel, GlslOp, GroupArith, ImageOperandKind as K, ImageOperands, ImageQuery,
+    ImageType, ImageUsage, Inst, IoDir, LayoutRule, MemAccess, MemberLayout, MemoryOrder,
+    ModelNeed, QuadDirection, Scope, Semantics, ShuffleOp, StorageClass, StructLayout, TexelMemory,
+    Type, UnOp,
 };
 
 use crate::spv::{ImageFormat, Op};
@@ -201,10 +201,11 @@ fn comparisons_derive_bool_of_the_component_count() {
     });
 }
 
-/// `OpFmaKHR` takes three operands of one 32-bit float scalar or vector type and gives that type;
-/// the core never emits it at another width (its feature is `shaderFmaFloat32`).
+/// `OpFmaKHR` takes three operands of one 16- or 32-bit float scalar or vector type and gives that
+/// type; the core never emits it at another width (its feature is `shaderFmaFloat16` or
+/// `shaderFmaFloat32`).
 #[test]
-fn fma_khr_takes_three_floats_of_one_32_bit_type() {
+fn fma_khr_takes_three_floats_of_one_16_or_32_bit_type() {
     in_fn(|f, t| {
         let (x, v) = (p(f, t.f32_), p(f, t.vec4));
         let r = f.fma(x, x, x).expect("scalar");
@@ -212,7 +213,8 @@ fn fma_khr_takes_three_floats_of_one_32_bit_type() {
         let r = f.fma(v, v, v).expect("vector");
         assert_eq!(ty(f, r), t.vec4);
         let (h, d, u) = (p(f, t.f16), p(f, t.f64_), p(f, t.u32_));
-        assert_eq!(f.fma(h, h, h), op_err(Op::FmaKHR, OperandRule::Width(0)));
+        let r = f.fma(h, h, h).expect("16-bit scalar");
+        assert_eq!(ty(f, r), t.f16);
         assert_eq!(f.fma(d, d, d), op_err(Op::FmaKHR, OperandRule::Width(0)));
         assert_eq!(f.fma(u, u, u), op_err(Op::FmaKHR, OperandRule::Category(0)));
         assert_eq!(f.fma(x, v, x), op_err(Op::FmaKHR, OperandRule::Mismatch(1)));
@@ -795,7 +797,8 @@ fn device_places_are_block_members_at_offset_zero() {
                 def_of(f, base),
                 Inst::Convert {
                     op: ConvOp::ConvertUToPtr,
-                    a: a64
+                    a: a64,
+                    contract: Contraction::Allowed,
                 }
             );
             let block = block_of(f, pointee, rule);
@@ -1505,6 +1508,67 @@ fn sampling_checks_forms_operands_and_block() {
         assert_eq!(
             f.sample(foreign, uv, None, false, &none),
             op_err(Op::ImageSampleImplicitLod, OperandRule::SampledImageBlock)
+        );
+    });
+}
+
+/// An armed offset (`FunctionBuilder::arm_offset`): an explicit-level sample with it is a
+/// switch-at-use of one arm a value of its dynamic lane (16), each making the sampled image again
+/// and sampling with that value as `ConstOffset` (none for 0), merged by one `OpPhi`; an
+/// implicit-level sample with it is refused in the switch; an offset without a dynamic lane, or of
+/// another lane count, is not armed.
+#[test]
+fn an_armed_offset_samples_in_constant_arms() {
+    use crate::spirv::builder::ops::image::ArmedOffset;
+    use crate::spirv::error::ControlRule;
+    in_fn(|f, t| {
+        let tex2d = image(f, t.f32_, Dim::D2, ImageUsage::Sampled, |_| {});
+        let sampler = mty(f, Type::Sampler);
+        let (img, smp) = (p(f, tex2d), p(f, sampler));
+        let (uv, x, off, sel) = (p(f, t.vec2), p(f, t.f32_), p(f, t.ivec2), p(f, t.u32_));
+        let lanes = vec![None, Some(0)];
+        assert!(f
+            .arm_offset(
+                off,
+                ArmedOffset {
+                    selector: sel,
+                    lanes: vec![Some(1), Some(0)],
+                }
+            )
+            .is_err());
+        assert!(f
+            .arm_offset(
+                off,
+                ArmedOffset {
+                    selector: sel,
+                    lanes: vec![None],
+                }
+            )
+            .is_err());
+        f.arm_offset(
+            off,
+            ArmedOffset {
+                selector: sel,
+                lanes,
+            },
+        )
+        .expect("armed");
+        let si = f.sampled_image(img, smp).expect("sampled image");
+        let lod = ImageOperands {
+            lod: Some(x),
+            offset: Some(off),
+            ..ImageOperands::default()
+        };
+        let r = f.sample(si, uv, None, false, &lod).expect("armed sample");
+        assert_eq!(ty(f, r), t.vec4);
+        let si = f.sampled_image(img, smp).expect("sampled image");
+        let implicit = ImageOperands {
+            offset: Some(off),
+            ..ImageOperands::default()
+        };
+        assert_eq!(
+            f.sample(si, uv, None, false, &implicit),
+            Err(BuildError::Control(ControlRule::TangledInSwitchAtUse))
         );
     });
 }

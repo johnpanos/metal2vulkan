@@ -30,9 +30,10 @@
 //!   sample planes), by the kernel and the draw of `depth_copy.rs`: the depth split, which reads
 //!   the depth aspect through a sampled view into the stand-in, and the `FragDepth` draw of
 //!   `DepthStencilCopy::DepthFromStandIn` back, exact where the driver's fragment depth stores
-//!   every value unchanged (lavapipe), the announced near-equivalent `drawn-depth-copy` where it
-//!   is measured to change some (MoltenVK, NVIDIA's: values outside `[0, 1]`, signed zero, NaN,
-//!   none of which a depth test stores in the clip mode's range), and refused elsewhere. The
+//!   every value unchanged (lavapipe), and elsewhere, for a 32-bit float depth, the announced
+//!   near-equivalent `drawn-depth-copy` (what MoltenVK's and NVIDIA's are measured to change, or
+//!   Vulkan leaves to a driver not measured: values outside `[0, 1]`, denormals, signed zero, NaN,
+//!   none of which a depth test stores in the clip mode's range); a 16-bit depth is refused. The
 //!   split reads an image with `SAMPLED`, which a multisampled depth/stencil render target the
 //!   runtime makes takes on such a device where it costs the image nothing
 //!   (`depth_stencil_scratch::sampled_candidate`); a draw whose instance needs the copy in of an
@@ -57,6 +58,7 @@ use super::texture_descriptor::TextureDescriptor;
 use super::tracker::{Access, Barrier, Use};
 use super::values::ResourceOptions;
 use super::Device;
+use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::bind::DepthStandInForm;
 use metal2vulkan::device::VkProperty;
@@ -495,12 +497,7 @@ impl StandInCopies {
     /// encoder records; the stand-in, its staging buffer, the depth's image and the copies'
     /// objects live until it completes and rest in `GENERAL`; the encoder refused every draw
     /// whose instance needs a copy in that cannot run ([`DepthStandIn::check_filled`]).
-    pub(super) unsafe fn record_in(
-        &self,
-        device: &ash::Device,
-        raw: vk::CommandBuffer,
-        first: bool,
-    ) {
+    pub(super) unsafe fn record_in(&self, device: &Vk, raw: vk::CommandBuffer, first: bool) {
         let fill = match first {
             true => self.fill,
             false => FirstFill::Copy,
@@ -538,7 +535,7 @@ impl StandInCopies {
     /// # Safety
     ///
     /// As for [`StandInCopies::record_in`].
-    pub(super) unsafe fn record_out(&self, device: &ash::Device, raw: vk::CommandBuffer) {
+    pub(super) unsafe fn record_out(&self, device: &Vk, raw: vk::CommandBuffer) {
         Barrier::everything().record(device, raw);
         match &self.back {
             Some(back) => back.record(device, raw),
@@ -553,7 +550,7 @@ impl StandInCopies {
     /// # Safety
     ///
     /// As for [`StandInCopies::record_in`].
-    unsafe fn copy(&self, device: &ash::Device, raw: vk::CommandBuffer, inward: bool) {
+    unsafe fn copy(&self, device: &Vk, raw: vk::CommandBuffer, inward: bool) {
         let general = vk::ImageLayout::GENERAL;
         let stand_in_layers = vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,

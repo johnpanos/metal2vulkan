@@ -21,14 +21,17 @@
 //!   alignment above the host page whose rounding would take pages the range does not touch, an
 //!   offset in the pages that misses the buffer's memory alignment, no memory type both allow, or
 //!   a driver that refuses the pointer.
-//! - **Pages the process cannot write** are refused typed on Linux, before the import
+//! - **Pages the process cannot write** are refused typed on Linux, before the buffer's own import
 //!   ([`refuse_unwritable`] asks the kernel for the process's own mappings over the window, with
-//!   `PROCMAP_QUERY` on `/proc/self/maps`, or reads that file's lines where the kernel predates
-//!   the query, Linux 6.11). Linux drivers pin
-//!   user pages for writing: NVIDIA failed a read-only page as out of device memory, RADV refused
-//!   it, and ANV imported it and lost the device at the GPU's first read. lavapipe read one, so
-//!   there the rule refuses a little more than the driver would. On macOS, MoltenVK hands the
-//!   range to Metal, which reads read-only pages, so there is no check.
+//!   `PROCMAP_QUERY` on `/proc/self/maps`, a file kept open for them (`kept_maps`), or reads
+//!   that file's lines where the kernel predates the query, Linux 6.11;
+//!   `WorkCounts::host_mappings_queried`). A buffer that lies in a live
+//!   import of the same bytes (`host_aliases.rs`) asks nothing: it pins no page, that import's
+//!   making asked for the same window, and [`HostMemory::new`]'s contract keeps imported pages
+//!   writable. Linux drivers pin user pages for writing: NVIDIA failed a read-only page as out of
+//!   device memory, RADV refused it, and ANV imported it and lost the device at the GPU's first
+//!   read. lavapipe read one, so there the rule refuses a little more than the driver would. On
+//!   macOS, MoltenVK hands the range to Metal, which reads read-only pages, so there is no check.
 //! - **What drivers answered**. Private anonymous memory was imported on every venue measured. RADV
 //!   refused shared memory typed: anonymous shared memory, and any mapping of a file, a shared
 //!   memory object or a `memfd` among them (QEMU's `memory-backend-memfd,share=on` guest RAM). It
@@ -42,18 +45,39 @@
 //!   takes by its pointer is made exactly as before, with no call more.
 //! - **When**. The pages are imported when the buffer is made, on every platform, as Metal wires
 //!   them then: the GPU uses the pages mapped at the pointer when the buffer was made, whatever is
-//!   mapped there later, and memory the device cannot import is refused by the call that makes the
-//!   buffer, as Metal answers nil there. The import costs work per page there: on macOS MoltenVK's
+//!   mapped there later, but on a driver whose pointer imports follow their address
+//!   (`DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV, lavapipe), the import of
+//!   the pointer reads the pages mapped there at each submission (a remap under a live buffer,
+//!   which [`HostMemory::new`] forbids, reaches it there; `docs/FAST-PATHS.md`, known gaps). Memory
+//!   the device cannot import is refused by the call that makes the buffer, as Metal answers nil
+//!   there. The import costs work per page there: on macOS MoltenVK's
 //!   `newBufferWithBytesNoCopy:` and its residency set's commit, about 11 to 20 ms per GiB (an M4,
 //!   an M3 Max); Metal makes the buffer at once and pays at the first command using it (24 to 88 ms
 //!   per GiB). The runtime once deferred the macOS import to the buffer's first GPU use, which
 //!   saw pages remapped in between and lost the device where the import then failed.
 //! - **The deallocator** runs once, with the pointer and the length, when the buffer's last
-//!   reference goes: after the imported memory is freed, on the thread that drops it. A committed
+//!   reference goes: after the imported memory is freed. Where that release frees the import, the
+//!   free and the deallocator after it run on the thread that drops it, before the release
+//!   returns, as Metal runs the deallocator in the release (an M3 Max under macOS 27.0.1 ran an
+//!   unused buffer's deallocator inside its final release, on the releasing thread, every time);
+//!   the free waits there on the driver's locks a submission holds, ANV's device lock among them.
+//!   Only where a keep-alive alone waits for the free ([`KeepAlive`], a runtime extension) do the
+//!   free and the keep-alive's drop go to one of the device's handler threads, in a context of its
+//!   own, the release returning first. With neither a deallocator nor a keep-alive the free is
+//!   made in the release: the caller may unmap the pages once it returns, and
+//!   `VK_EXT_external_memory_host` requires the imported range to stay valid for the imported
+//!   memory's whole life. A committed
 //!   command buffer holds the buffer until it completed and its completed handlers ran, so then it
 //!   runs on one of the device's handler threads, in the command buffer's queue's context, after
-//!   the GPU's last use, as Metal's runs on one of its threads. A
-//!   refused call never runs it.
+//!   the GPU's last use, as Metal's runs on one of its threads: what its commands retained and its
+//!   encoders' logs (`replay.rs`) go in its release, and no thread that submits command buffers
+//!   or sees them complete holds a handle past it (`exit_guard::program_release`). One released
+//!   while only command buffers not yet submitted reach it unnamed goes at once, as Metal's does
+//!   (it runs in the release, on the releasing thread, while such a command buffer waits
+//!   committed: probe `dealloc-probe3`, the M3 Max under macOS 27.0.1): on the releasing thread,
+//!   or, where such a command buffer's root table held it until its first submission (a rebind's
+//!   encoding again), on a handler thread then (`command_buffer/first_submission.rs`). A refused
+//!   call never runs it.
 //! - **A keep-alive** ([`KeepAlive`]). The import can outlive the buffer: a texture over the buffer
 //!   that a command buffer submitted before its release may still read through its resource ID
 //!   keeps its image, and the image the import, until that command buffer completes
@@ -63,7 +87,13 @@
 //!   deallocator runs at the release, as Metal's does, and the keep-alive is dropped once the
 //!   import is freed: the pages must stay mapped until then. A buffer over the bytes another
 //!   live buffer lies in shares its import (`host_aliases.rs`), whose pages that buffer's
-//!   contract keeps mapped: its deallocator runs at its release either way.
+//!   contract keeps mapped: its deallocator runs at its release either way, and so is its
+//!   keep-alive dropped, after the deallocator. So is the keep-alive of a buffer whose import
+//!   keeps another's already: every buffer in an import was made over the same bytes, so one
+//!   keep-alive keeps them mapped for all, and an import keeps one at most, however many buffers
+//!   come and go over its bytes while it lives (a consumer's buffer over a surface made at each
+//!   present and released after the next one's). Counted: `WorkCounts::host_keep_alives_kept`
+//!   (held now) and `WorkCounts::host_keep_alives_covered` (dropped at the release).
 
 use super::device::lock;
 #[cfg(unix)]
@@ -71,6 +101,8 @@ use super::dma_buf::DmaBufSource;
 use super::error::{vulkan, Error};
 use super::exit_guard;
 use super::loader_word::LoaderWord;
+use super::program_objects::ProgramObject;
+use super::work_counts::Counters;
 use ash::vk;
 use metal2vulkan::device::{EnableSet, VkExtension};
 use metal2vulkan::error::{Feature, Unsupported};
@@ -134,7 +166,9 @@ impl HostMemory {
     /// On Linux a buffer over a page this process maps without write permission is refused
     /// (`Unsupported`, `HostMemory`), though Metal reads such pages: Linux drivers pin imported
     /// pages for writing, and one (ANV) imported a read-only page and then lost the device at the
-    /// GPU's first read. Some drivers also refuse shared memory (RADV refused anonymous shared
+    /// GPU's first read. So on Linux the pages also stay writable while they are imported: RADV
+    /// failed every command buffer submitted after a page of an import was made read-only
+    /// (`mprotect`). Some drivers also refuse shared memory (RADV refused anonymous shared
     /// memory and mappings of shared memory objects, `memfd` mappings among them); private memory
     /// imports everywhere measured. [`HostMemory::with_dma_buf`] imports such memory where the
     /// device imports dma-bufs.
@@ -158,6 +192,21 @@ impl HostMemory {
     /// that break the source's contract are misuse (`Invalid`, `Problem::DmaBuf`). Measured: RADV
     /// refuses the pointer of `memfd` and other shared mappings and imports `udmabuf`s of their
     /// pages; NVIDIA and lavapipe import the pointer and never call the source.
+    ///
+    /// A no-copy buffer's own import of the chunks (not a heap's or a rebind's) may be released
+    /// while idle, because RADV lists every import in every submission. The release frees its
+    /// `VkBuffer` and memory and keeps the chunks open: the runtime keeps a duplicate descriptor of
+    /// each, within a quarter of the process's `RLIMIT_NOFILE` soft limit. The next blit imports
+    /// them again, on the thread that encodes it, which costs time then. A buffer whose
+    /// descriptors pass that quarter (read once, at the process's first such import) stays
+    /// imported, in every kernel submission's list (`WorkCounts::host_imports_kept_for_fds` counts
+    /// them). The runtime never changes the limit: a program that makes many no-copy buffers at
+    /// once raises its soft limit toward the hard one at startup (`setrlimit`), as QEMU does. Only
+    /// a buffer that blits alone have read is released. One whose `gpu_address` or `VkBuffer` was
+    /// handed out, or with a texture over its bytes, stays imported. Nothing of Metal's observes
+    /// the release: the bytes, the address and the pages stay, the CPU's writes made meanwhile are
+    /// read, and the source is not called again. A blit that finds the device unable to import the
+    /// chunks again (out of memory) is refused.
     ///
     /// # Safety
     ///
@@ -186,26 +235,41 @@ impl HostMemory {
 }
 
 /// A no-copy buffer's deallocator (Metal's block): called once, with the pointer and the length,
-/// when the buffer is released. It may run on a runtime thread, as Metal's runs on any thread. A
-/// panic inside it is caught.
+/// when the buffer is released. It may run on a runtime thread, as Metal's runs on any thread: a
+/// command buffer's queue's handler thread, where that command buffer's release lets go of the
+/// buffer, or, where the release frees the import, the releasing thread before the release
+/// returns, as Metal's; never a thread that submits command buffers or sees them complete. A panic
+/// inside it is caught.
 pub type Deallocator = Box<dyn FnOnce(NonNull<u8>, u64) + Send + 'static>;
 
 /// What keeps the caller's host memory mapped (a runtime extension: Metal has none): given with a
 /// no-copy buffer's or heap's memory, it is dropped once the device's import of the pages is
-/// freed, which may be after the deallocator ran. With one, the deallocator runs when the buffer
+/// freed, which may be after the deallocator ran, or at the buffer's release, after its
+/// deallocator, where the import's pages stay mapped without it: another buffer made over the
+/// same bytes lies in the import, or the import keeps such a buffer's keep-alive already (the
+/// module docs). With one, the deallocator runs when the buffer
 /// is released, as Metal's does, though a command buffer submitted before a texture over the
 /// pages was released may still hold the import; with none, the deallocator waits for the import
 /// (the module docs). Dropped on a runtime thread, possibly; a panic inside its drop is caught.
 /// Never dropped while the process exits: the pages stay imported to its end (`exit_guard`).
 pub type KeepAlive = Box<dyn Send + 'static>;
 
-/// What the caller gives back with its host memory: the deallocator, and the keep-alive.
+/// What the caller gives back with its host memory: the deallocator, and the keep-alive, each
+/// held as the program's object (`program_objects.rs`).
 pub(super) struct HostRelease {
-    pub(super) deallocator: Option<Deallocator>,
-    pub(super) keep_alive: Option<KeepAlive>,
+    deallocator: Option<ProgramObject<Deallocator>>,
+    keep_alive: Option<ProgramObject<KeepAlive>>,
 }
 
 impl HostRelease {
+    /// Hold the caller's `deallocator` and `keep_alive`, at the call that gives them.
+    pub(super) fn new(deallocator: Option<Deallocator>, keep_alive: Option<KeepAlive>) -> Self {
+        HostRelease {
+            deallocator: deallocator.map(ProgramObject::new),
+            keep_alive: keep_alive.map(ProgramObject::new),
+        }
+    }
+
     /// The release of `length` bytes at `pointer` to it, where it gives anything.
     pub(super) fn of(self, pointer: NonNull<u8>, length: u64) -> Option<Release> {
         let HostRelease {
@@ -348,30 +412,65 @@ pub(super) fn import_refused(error: vk::Result) -> Error {
 }
 
 /// Refuse the window's pages, typed, unless the process maps every one of them writable: Linux
-/// drivers pin imported pages for writing. The kernel answers for the mappings over the window
-/// ([`queried_writable`]) at each call, so a page remapped or reprotected since an earlier import
-/// is judged as it is now; a kernel without the query (before Linux 6.11) has the lines of
-/// `/proc/self/maps` read up to the window instead ([`writable`]), which cost about 4.5 ms per
-/// import in a process of 34,000 mappings. When the file cannot be opened, every import is
-/// refused as not implemented here.
+/// drivers pin imported pages for writing. Asked by each call that imports the pages itself, not
+/// by a buffer that lies in a live import of them. The kernel answers for the mappings over the
+/// window ([`queried_writable`]) at each call, so a page remapped or reprotected since an earlier
+/// import is judged as it is now: one query per mapping, so its cost grows with the mappings over
+/// the window (a view of scattered pages maps each run apart). The queries go through the file
+/// the process keeps open ([`kept_maps`]). A kernel without the query (before Linux 6.11) has the
+/// lines of `/proc/self/maps` read up to the window instead ([`writable`]), from a file opened for
+/// the reading, which cost about 4.5 ms per import in a process of 34,000 mappings. Each mapping
+/// asked is counted in `counts` (`WorkCounts::host_mappings_queried`). When the file cannot be
+/// opened, every import is refused as not implemented here.
 #[cfg(target_os = "linux")]
-pub(super) fn refuse_unwritable(window: &ImportWindow) -> Result<(), Error> {
-    use std::io::BufRead;
-    let maps = std::fs::File::open("/proc/self/maps")
-        .map_err(|_| Error::Unsupported(Unsupported::not_implemented(Feature::HostMemory)))?;
-    let end = window.start + window.size;
-    let writable = match queried_writable(&maps, window.start, end) {
-        Some(writable) => writable,
-        None => {
-            let lines = std::io::BufReader::new(maps).lines().map_while(Result::ok);
-            writable(lines, window.start, end)
-        }
-    };
-    if writable {
-        Ok(())
-    } else {
-        Err(not_importable())
+pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Result<(), Error> {
+    let mut asked = 0;
+    let answer = mappings_writable(window.start, window.start + window.size, &mut asked);
+    counts.host_mappings_queried(asked);
+    match answer {
+        Some(true) => Ok(()),
+        Some(false) => Err(not_importable()),
+        None => Err(Error::Unsupported(Unsupported::not_implemented(
+            Feature::HostMemory,
+        ))),
     }
+}
+
+/// Whether the process maps `[start, end)` without a gap, each page with write permission, as the
+/// kernel answers now: for the mappings over it ([`queried_writable`]), or from the lines of
+/// `/proc/self/maps` where the kernel predates the query ([`writable`]); `None` when that file
+/// cannot be opened. Each mapping asked is added to `asked`.
+#[cfg(target_os = "linux")]
+fn mappings_writable(start: u64, end: u64, asked: &mut u64) -> Option<bool> {
+    use std::io::BufRead;
+    let maps = kept_maps()?;
+    if let Some(writable) = queried_writable(&maps, start, end, asked) {
+        return Some(writable);
+    }
+    // The lines are read from a file of their own: reading moves its position, which the kept
+    // one's queries share among threads.
+    let maps = std::fs::File::open("/proc/self/maps").ok()?;
+    let lines = std::io::BufReader::new(maps).lines().map_while(Result::ok);
+    Some(writable(lines, start, end, asked))
+}
+
+/// This process's `/proc/self/maps`, opened once for [`queried_writable`] and kept with the id of
+/// the process that opened it, or opened again (`None` where it cannot be): each `PROCMAP_QUERY`
+/// answers from the process's mappings as they are at the call, so a file kept open reads the same
+/// answers as one opened for the call, without the opening, which cost each import about as much
+/// as its queries (an import over 57 mappings, the consumer's guest pages). A process forked
+/// since holds the file of its parent's mappings, so one of another id opens its own.
+#[cfg(target_os = "linux")]
+pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
+    static KEPT: Mutex<Option<(u32, std::sync::Arc<std::fs::File>)>> = Mutex::new(None);
+    let process = std::process::id();
+    let mut kept = lock(&KEPT);
+    if let Some((_, maps)) = kept.as_ref().filter(|(opener, _)| *opener == process) {
+        return Some(std::sync::Arc::clone(maps));
+    }
+    let maps = std::sync::Arc::new(std::fs::File::open("/proc/self/maps").ok()?);
+    *kept = Some((process, std::sync::Arc::clone(&maps)));
+    Some(maps)
 }
 
 /// `struct procmap_query` of Linux's `include/uapi/linux/fs.h` (Linux 6.11): the argument of
@@ -412,14 +511,20 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
 
 /// Whether the process maps `[start, end)` without a gap, each mapping with write permission, as
 /// the kernel answers `PROCMAP_QUERY` on `maps` (this process's `/proc/self/maps`): one query per
-/// mapping the window touches, each for the mapping covering the first address not yet covered.
-/// `None` where the kernel does not answer the query (before Linux 6.11, `ENOTTY`) or fails it
-/// otherwise; a missing mapping (`ENOENT`) is an answer, not writable.
+/// mapping the window touches, each for the mapping covering the first address not yet covered,
+/// and each added to `asked`. `None` where the kernel does not answer the query (before Linux
+/// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not writable.
 #[cfg(target_os = "linux")]
-pub(super) fn queried_writable(maps: &std::fs::File, start: u64, end: u64) -> Option<bool> {
+pub(super) fn queried_writable(
+    maps: &std::fs::File,
+    start: u64,
+    end: u64,
+    asked: &mut u64,
+) -> Option<bool> {
     use std::os::fd::AsRawFd;
     let mut covered = start;
     while covered < end {
+        *asked += 1;
         let mut query = ProcmapQuery {
             size: std::mem::size_of::<ProcmapQuery>() as u64,
             query_addr: covered,
@@ -453,15 +558,21 @@ pub(super) fn queried_writable(maps: &std::fs::File, start: u64, end: u64) -> Op
 /// Refuse the window's pages unless the process can write them: no check off Linux (MoltenVK
 /// hands the range to Metal, which reads read-only pages).
 #[cfg(not(target_os = "linux"))]
-pub(super) fn refuse_unwritable(_window: &ImportWindow) -> Result<(), Error> {
+pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> Result<(), Error> {
     Ok(())
 }
 
 /// Whether the mappings of `maps` (lines of `/proc/<pid>/maps`, in address order) cover
-/// `[start, end)` without a gap, each with write permission. Reading stops at the first line past
-/// `end`; a line that does not parse is skipped.
+/// `[start, end)` without a gap, each with write permission, adding to `asked` each mapping it
+/// judged (one ending past the address it reached). Reading stops at the first line past `end`; a
+/// line that does not parse is skipped.
 #[cfg(target_os = "linux")]
-pub(super) fn writable(maps: impl IntoIterator<Item = String>, start: u64, end: u64) -> bool {
+pub(super) fn writable(
+    maps: impl IntoIterator<Item = String>,
+    start: u64,
+    end: u64,
+    asked: &mut u64,
+) -> bool {
     let mut covered = start;
     for line in maps {
         if covered >= end {
@@ -473,6 +584,7 @@ pub(super) fn writable(maps: impl IntoIterator<Item = String>, start: u64, end: 
         if to <= covered {
             continue;
         }
+        *asked += 1;
         if from > covered || !write {
             return false;
         }
@@ -501,13 +613,6 @@ pub(super) struct Importer {
     pub(super) page: u64,
     /// `minImportedHostPointerAlignment`.
     pub(super) alignment: u64,
-    /// `vkExportMetalObjectsEXT`, where the device enables `VK_EXT_metal_objects`: each import is
-    /// then allocated for export of its `MTLBuffer` (`metal_texture.rs`).
-    metal: Option<ash::ext::metal_objects::DeviceFn>,
-    /// `vkSetDebugUtilsObjectNameEXT`, where the device exports `MTLBuffer`s and the runtime's
-    /// instance reports through `VK_EXT_debug_utils`: an image made of a Metal texture is named
-    /// [`METAL_TEXTURE_IMAGE`] for the layers' messages.
-    names: Option<ash::ext::debug_utils::DeviceFn>,
     /// `vkGetMemoryFdPropertiesKHR`, where the device enables the dma-buf route (`dma_buf.rs`).
     dma_buf: Option<ash::khr::external_memory_fd::DeviceFn>,
     /// Whether the device also enables the route's image extensions (`create.rs`'s
@@ -519,14 +624,6 @@ pub(super) struct Importer {
     /// such buffer.
     pub(super) sparse_granule: std::sync::OnceLock<Option<u64>>,
 }
-
-/// The debug name of an image the runtime made of a Metal texture over an import's `MTLBuffer`
-/// (`VkImportMetalTextureInfoEXT`, `metal_texture.rs`), where its instance reports messages. The
-/// validation layer (1.4.357, and its main of 2026-10-07) does not model that import, which
-/// Vulkan treats as bound, and reports such an image as used with no memory bound; the name lets
-/// a reader tell those reports from others.
-pub(super) const METAL_TEXTURE_IMAGE: &std::ffi::CStr =
-    c"metal2vulkan: a Metal texture over imported host memory";
 
 impl Importer {
     /// The importer of a device, or the refusal every no-copy buffer on it gets: the device did
@@ -545,8 +642,6 @@ impl Importer {
         enabled: &EnableSet,
         usage: vk::BufferUsageFlags,
         loader_word: &LoaderWord,
-        metal_objects: bool,
-        debug_names: bool,
         dma_buf: bool,
         dma_buf_images: bool,
     ) -> Result<Importer, Unsupported> {
@@ -590,17 +685,12 @@ impl Importer {
             function.map_or(std::ptr::null(), |function| function as *const c_void)
         };
         let functions = ash::ext::external_memory_host::DeviceFn::load(load);
-        let metal = metal_objects.then(|| ash::ext::metal_objects::DeviceFn::load(load));
-        let names =
-            (metal_objects && debug_names).then(|| ash::ext::debug_utils::DeviceFn::load(load));
         let dma_buf = dma_buf.then(|| ash::khr::external_memory_fd::DeviceFn::load(load));
         let dma_buf_images = dma_buf.is_some() && dma_buf_images;
         Ok(Importer {
             functions,
             page,
             alignment,
-            metal,
-            names,
             dma_buf,
             dma_buf_images,
             sparse_granule: std::sync::OnceLock::new(),
@@ -615,9 +705,7 @@ impl Importer {
 
     /// Whether the device makes images over dma-bufs of host pages (`dma_buf.rs`): it imports
     /// dma-bufs and enables `VK_EXT_image_drm_format_modifier` and `VK_EXT_queue_family_foreign`
-    /// (`create.rs`'s `dma_buf_image_names`). A texture over host pages imported by their pointer
-    /// may then be a `DRM_FORMAT_MOD_LINEAR` image at Metal's row pitch too (`texture.rs`'s
-    /// `host_pitched_image`).
+    /// (`create.rs`'s `dma_buf_image_names`).
     pub(super) fn makes_dma_buf_images(&self) -> bool {
         self.dma_buf_images
     }
@@ -653,51 +741,6 @@ impl Importer {
         result.result_with_success(properties.memory_type_bits)
     }
 
-    /// Whether the device's imports are allocated for export of their `MTLBuffer`
-    /// (`VK_EXT_metal_objects`).
-    pub(super) fn exports_metal(&self) -> bool {
-        self.metal.is_some()
-    }
-
-    /// The `id<MTLBuffer>` behind `memory`, an import of this importer's device allocated for
-    /// export; `None` where the device does not export one.
-    ///
-    /// # Safety
-    ///
-    /// `device` is the importer's device and `memory` a live import of it.
-    pub(super) unsafe fn metal_buffer(
-        &self,
-        device: &ash::Device,
-        memory: vk::DeviceMemory,
-    ) -> Option<vk::MTLBuffer_id> {
-        let metal = self.metal.as_ref()?;
-        let mut buffer = vk::ExportMetalBufferInfoEXT::default().memory(memory);
-        let mut info = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut buffer);
-        // SAFETY: the caller's; the memory was allocated for export of its `MTLBuffer`
-        // (`Memory::import_host`), and the function was loaded for this device.
-        unsafe { (metal.export_metal_objects_ext)(device.handle(), &mut info) };
-        let exported = buffer.mtl_buffer;
-        (!exported.is_null()).then_some(exported)
-    }
-
-    /// Name `image`, made of a Metal texture, [`METAL_TEXTURE_IMAGE`] where the instance reports
-    /// messages; a failure to name it is ignored (the name serves messages only).
-    ///
-    /// # Safety
-    ///
-    /// `device` is the importer's device and `image` a live image of it.
-    pub(super) unsafe fn name_metal_image(&self, device: &ash::Device, image: vk::Image) {
-        let Some(names) = &self.names else {
-            return;
-        };
-        let info = vk::DebugUtilsObjectNameInfoEXT::default()
-            .object_handle(image)
-            .object_name(METAL_TEXTURE_IMAGE);
-        // SAFETY: the caller's; the instance enables `VK_EXT_debug_utils` (it reports messages),
-        // and the function was loaded for this device.
-        let _ = unsafe { (names.set_debug_utils_object_name_ext)(device.handle(), &info) };
-    }
-
     /// The memory types `pointer` can be imported into (`vkGetMemoryHostPointerPropertiesEXT`).
     ///
     /// # Safety
@@ -728,8 +771,8 @@ impl Importer {
 pub(super) struct Release {
     pointer: NonNull<u8>,
     length: u64,
-    deallocator: Mutex<Option<Deallocator>>,
-    keep_alive: Mutex<Option<KeepAlive>>,
+    deallocator: Mutex<Option<ProgramObject<Deallocator>>>,
+    keep_alive: Mutex<Option<ProgramObject<KeepAlive>>>,
 }
 
 // SAFETY: the pointer is only handed to the deallocator, which is `Send`; the deallocator and
@@ -750,14 +793,20 @@ impl Release {
         }
     }
 
-    /// Its keep-alive, for the import to drop once it is freed; `None` where the caller gave none.
-    pub(super) fn keep_alive(&self) -> Option<KeepAlive> {
+    /// Its keep-alive, for the import to keep until it is freed, or to drop at the release where
+    /// the import's pages stay mapped without it (`buffer.rs`); `None` where the caller gave none.
+    pub(super) fn keep_alive(&self) -> Option<ProgramObject<KeepAlive>> {
         lock(&self.keep_alive).take()
     }
 
     /// Whether its deallocator is yet to run.
     pub(super) fn deallocates(&self) -> bool {
         lock(&self.deallocator).is_some()
+    }
+
+    /// Whether it still holds the caller's keep-alive.
+    pub(super) fn keeps_alive(&self) -> bool {
+        lock(&self.keep_alive).is_some()
     }
 
     /// The length of the caller's range.
@@ -770,7 +819,9 @@ impl Release {
         let deallocator = lock(&self.deallocator).take();
         if let Some(deallocator) = deallocator {
             let (pointer, length) = (self.pointer, self.length);
-            exit_guard::program(move || deallocator(pointer, length));
+            exit_guard::program_release(move || {
+                deallocator.run(|deallocator| deallocator(pointer, length));
+            });
         }
     }
 }

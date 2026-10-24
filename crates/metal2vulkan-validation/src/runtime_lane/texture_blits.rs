@@ -8,10 +8,10 @@
 
 use super::degrade_notices::{assert_made_once, assert_once, forced, loses_depth_denormals};
 use super::degrade_notices::{decodes_blocks_its_way, shared_in_system_memory};
-use super::degrade_notices::{twins_blocks, twins_depth};
+use super::degrade_notices::{twins_blocks, twins_carried, twins_depth};
 use super::{validated_device, Messages, ScratchCache};
 use crate::gpu::TEST_DEVICE;
-use metal2vulkan::bind::MipmapFilterChain;
+use metal2vulkan::bind::{MipmapFilterChain, MipmapRule};
 use metal2vulkan::device::VkExtension;
 use metal2vulkan::error::Feature;
 use metal2vulkan::metal::format::{is_depth_stencil, x_channel};
@@ -185,7 +185,7 @@ fn texture_blits_copy_where_metal_puts_them() {
 
         // A 3D texture whose images are 18 bytes apart (a multiple of no texel), in and out
         // through a scratch buffer: each row at its offset rounded down to 4 bytes, the second
-        // image's at 16 and 24, as plain Metal places them (EV SPH-bpi1-m4); a region of one
+        // image's at 16 and 24, as plain Metal places them; a region of one
         // texture into another format of one unit.
         let volume = texture(
             &device,
@@ -387,8 +387,7 @@ fn texture_blits_copy_where_metal_puts_them() {
             Origin::new(2, 2, 0),
         )
         .unwrap();
-        // Plain Metal does nothing for a texture of another storage mode, whatever the level
-        // (SPH-managed1-m4).
+        // Plain Metal does nothing for a texture of another storage mode, whatever the level.
         blit.synchronize_texture(&shared, 0, 0).unwrap();
         blit.synchronize_texture(&shared, 0, 7).unwrap();
         blit.synchronize_resource(shared.as_resource()).unwrap();
@@ -418,9 +417,8 @@ fn texture_blits_copy_where_metal_puts_them() {
 /// A 1D texture made after a small 2D one keeps what a command buffer writing both writes into
 /// it: ANV on Intel's Xe-LP GPUs compresses the 2D texture and answers its size short of the
 /// 64-byte line its compression data is written back in, and the 1D texture placed right after it
-/// lost its first texels to the command buffer's end (EVs SPH-diag3-anv to SPH-diag6-anv,
-/// SPH-ccsrepro-ms01), until the runtime rounded such an image's size up to whole 256-byte chunks
-/// of compression data there. Every device runs it.
+/// lost its first texels to the command buffer's end, until the runtime rounded such an image's
+/// size up to whole 256-byte chunks of compression data there. Every device runs it.
 #[test]
 fn a_texture_beside_a_compressed_one_keeps_its_texels() {
     let cache = ScratchCache::new().unwrap();
@@ -489,10 +487,10 @@ fn a_texture_beside_a_compressed_one_keeps_its_texels() {
     );
 }
 
-/// A size of 0 copies what plain Metal copies (EVs `SPH-zerosize1-m4` to `SPH-zerosize4-m4`, an
-/// M4): on an axis a texture of the copy lacks, one texel there (the depth of a 2D texture, the
-/// height of a 1D one); on another axis, or of no slices, nothing, while the encoder's fills before
-/// and after run; and a CPU copy of an empty region, nothing.
+/// A size of 0 copies what plain Metal copies (an M4): on an axis a texture of the copy lacks, one
+/// texel there (the depth of a 2D texture, the height of a 1D one); on another axis, or of no
+/// slices, nothing, while the encoder's fills before and after run; and a CPU copy of an empty
+/// region, nothing.
 #[test]
 fn empty_sizes_copy_what_plain_metal_copies() {
     let cache = ScratchCache::new().unwrap();
@@ -602,10 +600,10 @@ fn rows_from(rows: [usize; 4]) -> Vec<u8> {
     rows.iter().flat_map(|&row| counted(row, 16)).collect()
 }
 
-/// Copies off Metal's rules land where plain Metal puts them (an M4 under macOS 27.0.1, EVs
-/// SPCrp-probe1-m4 and SPCrp-probe3-m4; its validation stops each): offsets and `bytesPerRow` off
-/// the copy unit, blit options a format does not take, compressed regions off their blocks, and the
-/// CPU's pitches; what plain Metal leaves undefined stays refused.
+/// Copies off Metal's rules land where plain Metal puts them (an M4 under macOS 27.0.1; its
+/// validation stops each): offsets and `bytesPerRow` off the copy unit, blit options a format does
+/// not take, compressed regions off their blocks, and the CPU's pitches; what plain Metal leaves
+/// undefined stays refused.
 #[test]
 fn copies_off_metals_rules_land_where_plain_metal_puts_them() {
     let cache = ScratchCache::new().unwrap();
@@ -994,11 +992,10 @@ fn depth_copies_through_the_scratch_buffer_start_at_multiples_of_four() {
 }
 
 /// Copies between textures of different sizes copy what plain Metal copies (an M4 under macOS
-/// 27.0.1, EV SPCrp-probe3-m4 `sz_*`; its validation stops the level copies): a level copy the
-/// region common to both levels from their origins, the rest of the larger kept
-/// (`sz_slices_8x4_to_4x8`); a whole copy the levels paired by size (`sz_whole_8l4_to_4l3`,
-/// `sz_whole_4l3_to_8l4`); and none where no levels are of one size (`sz_whole_8_to_3`, which
-/// aborts plain Metal).
+/// 27.0.1; its validation stops the level copies): a level copy the region common to both levels
+/// from their origins, the rest of the larger kept (`sz_slices_8x4_to_4x8`); a whole copy the
+/// levels paired by size (`sz_whole_8l4_to_4l3`, `sz_whole_4l3_to_8l4`); and none where no levels
+/// are of one size (`sz_whole_8_to_3`, which aborts plain Metal).
 #[test]
 fn copies_between_textures_of_different_sizes_copy_what_metal_copies() {
     let cache = ScratchCache::new().unwrap();
@@ -1087,8 +1084,8 @@ fn copies_between_textures_of_different_sizes_copy_what_metal_copies() {
 }
 
 /// `generate_mipmaps` leaves a texture of one level, of any format, and a depth or stencil
-/// texture of any levels, as it is, as plain Metal does (an M4 under macOS 27.0.1, EV
-/// SPCrp-probe1-m4 `mip_single_*`, `mip_d32_3`; its validation stops both).
+/// texture of any levels, as it is, as plain Metal does (an M4 under macOS 27.0.1; its validation
+/// stops both).
 #[test]
 fn mipmaps_leave_single_levels_and_depth_as_they_are() {
     let cache = ScratchCache::new().unwrap();
@@ -1191,8 +1188,14 @@ pub(super) const MIPMAPS: [Degradation; 1] = [Degradation::MipmapsWithinSpread];
 /// Metal's filter, never by the device's blits (`runtime::mipmap_filter`): a format the filter
 /// computes, on a device with `shaderInt64` (every venue's), the chain far within any device's
 /// limits at these sizes.
-fn filtered(pf: PixelFormat, extent: [u64; 3], levels: u64, volume: bool) -> bool {
-    filter_chain(pf, extent, levels, volume).is_some()
+fn filtered(
+    pf: PixelFormat,
+    extent: [u64; 3],
+    levels: u64,
+    volume: bool,
+    rule: MipmapRule,
+) -> bool {
+    filter_chain(pf, extent, levels, volume, rule).is_some()
 }
 
 /// The chain [`filtered`] plans: where it may differ from an Apple M3 Max's answer
@@ -1203,6 +1206,7 @@ fn filter_chain(
     extent: [u64; 3],
     levels: u64,
     volume: bool,
+    rule: MipmapRule,
 ) -> Option<MipmapFilterChain> {
     let groups = [65535, 65535];
     let extent = extent.map(|e| e as u32);
@@ -1214,6 +1218,7 @@ fn filter_chain(
         levels as u32,
         volume,
         false,
+        rule,
         256,
         1 << 27,
         groups,
@@ -1249,7 +1254,9 @@ pub(super) const UPLOADS: [Degradation; 1] = [Degradation::RestrictedDepthUpload
 /// elsewhere Vulkan leaves such a value undefined (`VUID-vkCmdCopyBufferToImage-pRegions-07931`)
 /// and a device keeps it or stores it clamped to `[0, 1]`, which its upload announces once
 /// ([`UPLOADS`]): each value reads back as one of the two, and the form the device took is
-/// printed. So does a twin, which a copy into a texture without one reads.
+/// printed; where it keeps them, the upload of a negative value into a render target, and a copy
+/// out of a twin into one, switch its depth on to render a pass that loads it over its magnitude
+/// stand-in (`texture/signed_depth.rs`), unannounced.
 /// Copies between two textures with twins, and from a render target into one, land in both its
 /// images.
 #[test]
@@ -1538,6 +1545,7 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
     let messages = Messages::default();
     {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let rule = device.properties().metal_level.mipmap_rule();
         // What the device announced before its first mipmaps.
         messages.take_notices();
         let queue = device.new_command_queue().unwrap();
@@ -1567,6 +1575,14 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
                     ),
                     (Degradation::DecodedBlockTwin, twins_blocks(&device, pf)),
                     (
+                        Degradation::CarriedDecodedTwin,
+                        twins_carried(&device, pf)[0],
+                    ),
+                    (
+                        Degradation::DecodedTexelPrecision,
+                        twins_carried(&device, pf)[1],
+                    ),
+                    (
                         Degradation::CompressedTexelDecode,
                         decodes_blocks_its_way(&device, pf),
                     ),
@@ -1577,13 +1593,13 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
                 // An RGBX format's chain is not yet held (Metal stores X = green in its levels,
                 // zeros for `RGBX8Snorm`'s): refused `NotImplemented(MipmapGeneration)`, below.
                 let computed =
-                    !x_channel(pf) && (filtered(pf, extent, levels, volume) || picked(pf));
+                    !x_channel(pf) && (filtered(pf, extent, levels, volume, rule) || picked(pf));
                 match blit.generate_mipmaps(&t) {
                     // Plain Metal leaves a depth or stencil texture as it is.
                     Ok(()) if is_depth_stencil(pf) => outcome.push("left as it is"),
                     Ok(()) if computed => {
                         exact += 1;
-                        if let Some(chain) = filter_chain(pf, extent, levels, volume) {
+                        if let Some(chain) = filter_chain(pf, extent, levels, volume, rule) {
                             first.extend(forced(&[
                                 (Degradation::MipmapsAsAppleM4, chain.unlike_an_m3),
                                 (Degradation::MipmapTieRounding, chain.near_ties),

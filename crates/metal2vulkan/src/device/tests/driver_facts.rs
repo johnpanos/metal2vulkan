@@ -125,6 +125,10 @@ fn taken(p: &crate::device::DeviceProfile) -> Vec<crate::error::DriverDeviation>
             D::GraphicsCubeGradientRoute,
             routes.0 == CubeGradientRoute::AppleSwizzled,
         ),
+        (
+            D::GraphicsCubeGradientTangents,
+            routes.0 == CubeGradientRoute::AppleProjected,
+        ),
         (D::MetalColorWrites, property(VkProperty::MetalColorWrites)),
         (
             D::MetalFloatColorNans,
@@ -208,6 +212,22 @@ fn taken(p: &crate::device::DeviceProfile) -> Vec<crate::error::DriverDeviation>
             D::Unorm8LinearFilter,
             property(VkProperty::Unorm8LinearFilter),
         ),
+        (
+            D::MetalDepth16Stores,
+            property(VkProperty::MetalDepth16Stores),
+        ),
+        (
+            D::MetalDepth16BiasedStores,
+            property(VkProperty::MetalDepth16BiasedStores),
+        ),
+        (
+            D::MetalInterpolation,
+            property(VkProperty::MetalInterpolation),
+        ),
+        (
+            D::MetalFirstVertexIndices,
+            property(VkProperty::MetalFirstVertexIndices),
+        ),
     ]
     .into_iter()
     .inspect(|&(d, taken)| {
@@ -224,7 +244,8 @@ fn taken(p: &crate::device::DeviceProfile) -> Vec<crate::error::DriverDeviation>
 /// bits, the `half` fused multiply-add, the `float` denormals and the `half` quantize, the `half`
 /// conversion, 4.15, the center varyings, the minimum and maximum family, the `half` arithmetic,
 /// the three half-float storage writes, the fragment simdgroups, and the vertex simdgroups, among
-/// them), the M3 Max's under macOS 26.7 (no committed capture) also its graphics cube route, the
+/// them) and macOS 27's graphics cube route (the fixup's tangents), the M3 Max's under macOS 26.7
+/// (no committed capture) its own graphics cube route instead, the
 /// RTX 5080 Laptop GPU's (NVIDIA's 615.71.09) the two color-NaN stores, the `float` denormals and
 /// the half-float storage writes and their `0x7fc00000` and the half texel writes' NaN bits, as the
 /// RTX 3090 would, with the small float color writes, and another RTX 50 does not, lavapipe's (Mesa
@@ -235,7 +256,9 @@ fn taken(p: &crate::device::DeviceProfile) -> Vec<crate::error::DriverDeviation>
 /// norm ones, macOS 27's Apple identity's and the 780M's the normalized storage writes, the RTX
 /// GPUs', the 780M's, the Iris Xe's and the UHD 770's the 8-bit linear filter's bound (lavapipe's
 /// at Mesa 26.2.4, past the committed captures' 26.0.8 and 26.2.3) under a policy that accepts it
-/// (`Unorm8LinearFilterPolicy::DeviceWithinOneCode`; the default takes it nowhere), and no other
+/// (`Unorm8LinearFilterPolicy::DeviceWithinOneCode`; the default takes it nowhere), every Apple
+/// GPU's, the 780M's, the Iris Xe's and the UHD 770's 16-bit unorm depth stores, every Apple GPU's
+/// interpolation (Metal's own, MoltenVK handing it the varyings), and no other
 /// committed profile takes any. A later MoltenVK release takes them past the measurement, listed in
 /// `deviations_beyond` with the last release measured. An earlier release, and MoltenVK on another
 /// vendor's GPU, take none, each with its conservative route (the cube routes unmeasured); another
@@ -282,19 +305,30 @@ fn the_profile_takes_the_deviations_its_driver_release_is_measured_with() {
         D::MetalHalfTexelWrites,
         D::Unorm8LinearFilter,
     ];
-    // In `taken`'s order: the graphics route before the color writes, and each chip's per-sample
+    // In `taken`'s order: the graphics route (macOS 26.7's on the M3 Max's identity there, macOS
+    // 27's on the identity both chips share) before the color writes, and each chip's per-sample
     // depth last.
     let mut m3_max = apple.clone();
     m3_max.insert(5, D::GraphicsCubeGradientRoute);
     m3_max.push(D::CenterFragCoordDepth);
     let mut m4_measured = apple.clone();
+    m4_measured.insert(5, D::GraphicsCubeGradientTangents);
     m4_measured.push(D::CenterFragCoordDepth);
     // The M4's normalized storage writes, measured on it alone.
     m4_measured.push(D::MetalNormStorageWrites);
+    // Every Apple GPU's 16-bit unorm depth, unbiased and biased, its interpolation and its
+    // first-vertex indices, last in `taken`'s order.
+    let mut apple_all = apple.clone();
+    for list in [&mut m3_max, &mut m4_measured, &mut apple_all] {
+        list.push(D::MetalDepth16Stores);
+        list.push(D::MetalDepth16BiasedStores);
+        list.push(D::MetalInterpolation);
+        list.push(D::MetalFirstVertexIndices);
+    }
     let all_of = |d: &DeviceDescription| match d.device_id {
         crate::device::driver_facts::APPLE_M3_MAX => m3_max.clone(),
         crate::device::driver_facts::APPLE_M4 => m4_measured.clone(),
-        _ => apple.clone(),
+        _ => apple_all.clone(),
     };
     // Under a policy that accepts the 8-bit linear filter's bound, so its rows are taken where
     // measured; the default policy takes it nowhere (checked with the committed profiles).
@@ -325,8 +359,9 @@ fn the_profile_takes_the_deviations_its_driver_release_is_measured_with() {
                 D::MetalHalfStorageWrites,
                 D::MetalFloatStorageNans,
             ],
-            // The per-sample `FragCoord.z` last, in `taken`'s order.
-            (false, "amd-780m-radv") => vec![
+            // The per-sample `FragCoord.z` last, in `taken`'s order. The 780M under Phoenix's
+            // `deviceID` and Hawk Point's alike.
+            (false, "amd-780m-radv" | "amd-780m-hawkpoint-radv") => vec![
                 D::MetalFloatDenormals,
                 D::MetalHalfQuantize,
                 D::MetalSmallFloatColorWrites,
@@ -337,6 +372,8 @@ fn the_profile_takes_the_deviations_its_driver_release_is_measured_with() {
                 D::MetalHalfTexelWrites,
                 D::MetalNormStorageWrites,
                 D::Unorm8LinearFilter,
+                D::MetalDepth16Stores,
+                D::MetalDepth16BiasedStores,
             ],
             (false, "intel-irisxe-rplp-anv") => vec![
                 D::MetalFloatDenormals,
@@ -344,6 +381,7 @@ fn the_profile_takes_the_deviations_its_driver_release_is_measured_with() {
                 D::MetalSmallFloatColorWrites,
                 D::MetalHalfStorageWrites,
                 D::Unorm8LinearFilter,
+                D::MetalDepth16Stores,
             ],
             (false, "intel-uhd770-rpls-anv") => vec![
                 D::MetalFloatDenormals,
@@ -351,6 +389,7 @@ fn the_profile_takes_the_deviations_its_driver_release_is_measured_with() {
                 D::MetalSmallFloatColorWrites,
                 D::MetalHalfStorageWrites,
                 D::Unorm8LinearFilter,
+                D::MetalDepth16Stores,
             ],
             (false, _) => Vec::new(),
         };
@@ -373,11 +412,11 @@ fn the_profile_takes_the_deviations_its_driver_release_is_measured_with() {
         (m4.driver_id, m4.vendor_id, m4.driver_version),
         (Some(DriverId::MOLTENVK), APPLE, 10401)
     );
-    // The M4's graphics cube route is unmeasured, its compute route Metal's.
+    // macOS 27's graphics cube route is the fixup's projected form, its compute route Metal's.
     assert_eq!(
         profile_of(m4.clone()).fields().cube_gradients,
         CubeGradients {
-            graphics: CubeGradientRoute::Unmeasured,
+            graphics: CubeGradientRoute::AppleProjected,
             compute: CubeGradientRoute::Metal,
         }
     );
@@ -470,11 +509,8 @@ const AVERAGE: DriverFact = DriverFact::ColorResolveAverageIsMetals;
 const HIDE: DriverFact = DriverFact::CompressedImagesHideAliasedWrites;
 const HOST: DriverFact = DriverFact::HostTransferImagesKeepTheirBytes;
 const OPTIMIZED: DriverFact = DriverFact::DepthStencilImagesStayGpuOptimized;
-const UNORM_BIAS: DriverFact = DriverFact::UnormDepthBiasIsMetals;
-const UNORM_STORES: DriverFact = DriverFact::Depth16UnormStoresMetals;
 const DEPTH16: DriverFact = DriverFact::FragmentDepthKeepsDepth16Codes;
 const FETCH: DriverFact = DriverFact::SampledFetchRecoversCodes;
-const WHOLE: DriverFact = DriverFact::InterlockedPassWholeFaster;
 const SPLIT: DriverFact = DriverFact::InterlockedPassSplitNoSlower;
 const RESTART: DriverFact = DriverFact::DynamicRestartWarns;
 const FILL: DriverFact = DriverFact::FillCompiledPerCommandPool;
@@ -484,32 +520,51 @@ const COLOR_BLOCKS: DriverFact = DriverFact::ColorBlockDecodeIsMetals;
 const CHANNEL_BLOCKS: DriverFact = DriverFact::ChannelBlockDecodeIsMetals;
 const PLANES: DriverFact = DriverFact::PositionedDepthReadAtStandardPositions;
 const TESTS_DENORMALS: DriverFact = DriverFact::DepthTestKeepsDenormals;
+const TESTS_MAGNITUDES: DriverFact = DriverFact::DepthTestComparesMagnitudes;
 const SPARSE_WAIT: DriverFact = DriverFact::FirstSparseResourceWaitsForQueues;
 const BC6H: DriverFact = DriverFact::Bc6hBlockDecodeIsMetals;
 const BC7: DriverFact = DriverFact::Bc7BlockDecodeIsMetals;
 const SCARCE_POOLS: DriverFact = DriverFact::TimestampPoolsAreCounterSampleBuffers;
 const ONE_OF_METALS: DriverFact = DriverFact::DontCareStoreIsOneOfMetals;
+const COPY_BACK: DriverFact = DriverFact::ShadowCopyBackDispatchFaster;
+const COPY_IN: DriverFact = DriverFact::ShadowCopyInDispatchFaster;
+const ROWS: DriverFact = DriverFact::RowCopiesDispatchFaster;
+const LINEAR_UNINITIALIZED: DriverFact = DriverFact::LinearTilingFeaturesUninitialized;
+const STALL: DriverFact = DriverFact::SemaphoreOperationsStallSubmits;
+const SAMPLED_HIZ: DriverFact = DriverFact::SampledDepthKeepsHiZ;
+const MSAA_DEPTH: DriverFact = DriverFact::MultisampledDepthFasterOutOfGeneral;
+const TILE_STORE: DriverFact = DriverFact::TileStoreIsMetals;
+const FOLLOWS: DriverFact = DriverFact::PointerImportsFollowTheirAddress;
+const INTERLOCK_ORDER: DriverFact = DriverFact::InterlockOrdersDraws;
 
 /// Every committed profile's driver has exactly its measured facts (on a measured identity those
 /// its rows name, on any other its driver's defects alone). A profile of a measured identity: the
-/// 780M (RADV 26.2.4), the gate's lavapipe 26.0.8 (both CPUs), the RPL-P and the RPL-S (ANV
+/// 780M (RADV 26.2.4, Phoenix's and Hawk Point's alike), the gate's lavapipe 26.0.8 (both CPUs), the RPL-P and the RPL-S (ANV
 /// 26.2.4), the M3 Max and the M4 (MoltenVK 1.4.1, one identity under macOS 27) and the RTX 5080
 /// Laptop GPU (NVIDIA's 615.71.09). It reads zero past the bound index range on the 780M, the RPL-S
 /// and the RTX 5080 Laptop GPU, the GPUs measured; its depth images keep denormals on the RTX 5080
 /// Laptop GPU, lavapipe and both MoltenVK GPUs, and values outside `[0, 1]` on MoltenVK; lavapipe
 /// stores fragment depth unchanged and keeps a 16-bit depth's codes; MoltenVK's depth and stencil
-/// images lie apart and stay GPU-optimized, and its color resolve's average is Metal's; the
-/// constant depth bias on a 16-bit unorm depth stores Metal's codes on the 780M and the M4, and the
-/// unbiased one on the 780M, the RPL-P, the RPL-S and the M4; ANV's compressed images hide aliased
-/// writes and its host-transfer images keep their bytes; a pass the interlock would split runs
-/// faster whole on the RPL-S and no slower split on the M3 Max (under macOS 26.7, and under 27 the
-/// M4's identity), the 780M, the RPL-P and the RTX 5080 Laptop GPU; MoltenVK warns of a dynamic
-/// restart, compiles its fill per command pool, stores `DONT_CARE` as Metal's own and orders its
-/// timestamps across queues; BC1 to BC3 decode as Metal's on the 780M and MoltenVK, BC4 and BC5 on
+/// images lie apart and stay GPU-optimized, its color resolve's average is Metal's, and its depth
+/// test keeps denormals and compares magnitudes as Metal's (the M4's identity: the latter measured
+/// on the M3 Max, the M4's by construction); ANV's compressed images hide aliased writes and its
+/// host-transfer images keep their bytes; a pass the interlock would split runs
+/// no slower split on the M3 Max (under macOS 26.7, and under 27 the M4's identity), the 780M, the
+/// RPL-P, the RPL-S and the RTX 5080 Laptop GPU; MoltenVK warns of a dynamic
+/// restart, compiles its fill per command pool, stores `DONT_CARE` as Metal's own, orders its
+/// timestamps across queues and stores a signed normalized minimum code and an `E5B9G9R9` word as
+/// Metal's tile store does; BC1 to BC3 decode as Metal's on the 780M and MoltenVK, BC4 and BC5 on
 /// MoltenVK; NVIDIA's reads a depth rendered at custom sample positions at the standard ones; ANV's
 /// first sparse resource waits for every queue; BC6H decodes as Metal's on the 780M, the RPL-P,
 /// lavapipe 26.0.8, both MoltenVK GPUs and the RTX 5080 Laptop GPU, and BC7 on the same but
-/// lavapipe; `DONT_CARE` keeps one of Metal's two answers on the 780M and the RPL-S. Every other
+/// lavapipe; `DONT_CARE` keeps one of Metal's two answers on the 780M, the RPL-S and the RPL-P; a
+/// shadow's copy back runs faster as a dispatch on the RPL-S and the RPL-P, and a merged shadow's
+/// copy in with its keep on the RPL-S alone, and a copy of rows
+/// there and on the RTX 5080 Laptop GPU; on the RPL-S and the RPL-P a sampled depth keeps its
+/// hierarchical depth and a multisampled one renders faster out of `GENERAL`; MoltenVK reads its
+/// linear-tiling attachment features uninitialized; NVIDIA's stalls a submission per thousand
+/// semaphore operations on the RTX 5080 Laptop GPU; pointer imports follow their address on the
+/// 780M, the RPL-P and lavapipe 26.0.8; the RPL-P's interlock orders consecutive draws. Every other
 /// profile is an unmeasured identity and takes its driver's defects alone: the GTX 1060
 /// (580.178.04) and the RTX 5080 desktop GPU (another GPU at 615.71.09) NVIDIA's custom-position
 /// depth, the ARL (26.2.3) and the Tiger Lake Iris Xe (26.2.2) ANV's hidden aliased writes; the
@@ -533,26 +588,38 @@ fn the_committed_profiles_drivers_have_their_facts() {
     }
     let expected: BTreeMap<String, Vec<DriverFact>> = [
         (
-            "amd-780m-radv",
+            "amd-780m-hawkpoint-radv",
             vec![
                 ZERO,
-                UNORM_BIAS,
-                UNORM_STORES,
                 FETCH,
                 SPLIT,
                 COLOR_BLOCKS,
                 BC6H,
                 BC7,
                 ONE_OF_METALS,
+                FOLLOWS,
+            ],
+        ),
+        (
+            "amd-780m-radv",
+            vec![
+                ZERO,
+                FETCH,
+                SPLIT,
+                COLOR_BLOCKS,
+                BC6H,
+                BC7,
+                ONE_OF_METALS,
+                FOLLOWS,
             ],
         ),
         (
             "gate-lavapipe",
-            vec![DENORMALS, FRAGDEPTH, DEPTH16, FETCH, BC6H],
+            vec![DENORMALS, FRAGDEPTH, DEPTH16, FETCH, BC6H, FOLLOWS],
         ),
         (
             "gate-lavapipe-x86_64",
-            vec![DENORMALS, FRAGDEPTH, DEPTH16, FETCH, BC6H],
+            vec![DENORMALS, FRAGDEPTH, DEPTH16, FETCH, BC6H, FOLLOWS],
         ),
         ("intel-arl-anv", vec![HIDE]),
         ("intel-irisxe-anv", vec![HIDE]),
@@ -561,12 +628,18 @@ fn the_committed_profiles_drivers_have_their_facts() {
             vec![
                 HIDE,
                 HOST,
-                UNORM_STORES,
                 FETCH,
                 SPLIT,
                 SPARSE_WAIT,
                 BC6H,
                 BC7,
+                ONE_OF_METALS,
+                COPY_BACK,
+                ROWS,
+                SAMPLED_HIZ,
+                MSAA_DEPTH,
+                FOLLOWS,
+                INTERLOCK_ORDER,
             ],
         ),
         (
@@ -575,11 +648,13 @@ fn the_committed_profiles_drivers_have_their_facts() {
                 ZERO,
                 HIDE,
                 HOST,
-                UNORM_STORES,
                 FETCH,
-                WHOLE,
+                SPLIT,
                 SPARSE_WAIT,
                 ONE_OF_METALS,
+                COPY_BACK,
+                COPY_IN,
+                ROWS,
             ],
         ),
         (
@@ -590,8 +665,6 @@ fn the_committed_profiles_drivers_have_their_facts() {
                 APART,
                 AVERAGE,
                 OPTIMIZED,
-                UNORM_BIAS,
-                UNORM_STORES,
                 FETCH,
                 SPLIT,
                 RESTART,
@@ -601,9 +674,12 @@ fn the_committed_profiles_drivers_have_their_facts() {
                 COLOR_BLOCKS,
                 CHANNEL_BLOCKS,
                 TESTS_DENORMALS,
+                TESTS_MAGNITUDES,
                 BC6H,
                 BC7,
                 SCARCE_POOLS,
+                LINEAR_UNINITIALIZED,
+                TILE_STORE,
             ],
         ),
         (
@@ -614,8 +690,6 @@ fn the_committed_profiles_drivers_have_their_facts() {
                 APART,
                 AVERAGE,
                 OPTIMIZED,
-                UNORM_BIAS,
-                UNORM_STORES,
                 FETCH,
                 SPLIT,
                 RESTART,
@@ -625,16 +699,21 @@ fn the_committed_profiles_drivers_have_their_facts() {
                 COLOR_BLOCKS,
                 CHANNEL_BLOCKS,
                 TESTS_DENORMALS,
+                TESTS_MAGNITUDES,
                 BC6H,
                 BC7,
                 SCARCE_POOLS,
+                LINEAR_UNINITIALIZED,
+                TILE_STORE,
             ],
         ),
         ("nvidia-pascal-linux", vec![PLANES]),
         ("nvidia-rtx50-linux", vec![PLANES]),
         (
             "nvidia-rtx5080-laptop",
-            vec![ZERO, DENORMALS, FETCH, SPLIT, PLANES, BC6H, BC7],
+            vec![
+                ZERO, DENORMALS, FETCH, SPLIT, PLANES, BC6H, BC7, ROWS, STALL,
+            ],
         ),
     ]
     .into_iter()
@@ -645,8 +724,9 @@ fn the_committed_profiles_drivers_have_their_facts() {
 
 /// A release or GPU not measured is an unmeasured identity: it takes none of its driver's answer
 /// facts, and its driver's defects stand at every release and on every GPU of the driver. The M4
-/// at MoltenVK 1.4.2, or at 1.4.0, or another Apple GPU at 1.4.1, takes MoltenVK's depth images
-/// apart and GPU-optimized alone; the RPL-S at ANV 26.2.5, or another Intel GPU at 26.2.4, takes
+/// at MoltenVK 1.4.2, or at 1.4.0, or another Apple GPU at 1.4.1, takes MoltenVK's defects alone
+/// (its depth images apart and GPU-optimized, its scarce timestamp pools, its uninitialized
+/// linear-tiling features); the RPL-S at ANV 26.2.5, or another Intel GPU at 26.2.4, takes
 /// ANV's hidden aliased writes alone; the RTX 5080 Laptop GPU at another release takes NVIDIA's
 /// custom-position depth alone. No driver takes another driver's defects.
 #[test]
@@ -663,12 +743,18 @@ fn an_unmeasured_identity_takes_its_drivers_defects_alone() {
     for release in [10402, 10400] {
         desc.driver_version = release;
         assert!(!desc.measured_identity());
-        assert_eq!(desc.driver_facts(), [APART, OPTIMIZED, SCARCE_POOLS].into());
+        assert_eq!(
+            desc.driver_facts(),
+            [APART, OPTIMIZED, SCARCE_POOLS, LINEAR_UNINITIALIZED].into()
+        );
     }
     let mut desc = read("moltenvk-m4");
     desc.device_id ^= 1;
     assert!(!desc.measured_identity());
-    assert_eq!(desc.driver_facts(), [APART, OPTIMIZED, SCARCE_POOLS].into());
+    assert_eq!(
+        desc.driver_facts(),
+        [APART, OPTIMIZED, SCARCE_POOLS, LINEAR_UNINITIALIZED].into()
+    );
 
     let mut desc = read("intel-uhd770-rpls-anv");
     assert!(desc.measured_identity());
@@ -694,12 +780,14 @@ fn an_unmeasured_identity_takes_its_drivers_defects_alone() {
 }
 
 /// Each measured identity is a GPU and release a venue ran: the committed profiles of the measured
-/// GPUs carry exactly the identities listed, so no row names a release or GPU nobody measured.
+/// GPUs carry exactly the identities listed, so no row names a release or GPU nobody measured. The
+/// Radeon 780M's capture under its Hawk Point `deviceID` is a measured identity through Phoenix's.
 #[test]
 fn the_measured_identities_are_the_committed_profiles() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
     let mut measured = Vec::new();
     for stem in [
+        "amd-780m-hawkpoint-radv",
         "amd-780m-radv",
         "gate-lavapipe",
         "gate-lavapipe-x86_64",
@@ -726,6 +814,76 @@ fn the_measured_identities_are_the_committed_profiles() {
             "{id:?} is measured but no venue's profile names it"
         );
     }
+}
+
+/// One GPU that reports more than one `deviceID` takes its measured rows under each: the Radeon
+/// 780M of Hawk Point (0x1900) is Phoenix's (0x15bf), so a RADV 26.2.4 description of it is a
+/// measured identity with Phoenix's driver facts, deviations and defects, and derives Phoenix's
+/// profile, its Function storage among it, and fingerprint. The release a row names still holds
+/// exactly: 0x1900 at Mesa 26.2.3 or 26.2.5 is unmeasured, as Phoenix is there. A neighbouring
+/// `deviceID` (0x1901), or 0x1900 of another vendor, is another GPU: unmeasured, its own.
+#[test]
+fn a_gpu_under_another_of_its_device_ids_takes_its_measured_rows() {
+    use crate::device::driver_facts::{defects, deviations};
+    use crate::device::{Device, DevicePolicy, FunctionStorage};
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let text = std::fs::read_to_string(dir.join("amd-780m-radv.json")).expect("amd-780m-radv");
+    let phoenix = DeviceDescription::from_khronos_json(&text, None).expect("profile parses");
+    let profile = |desc: &DeviceDescription| {
+        Device::new(desc.clone(), DevicePolicy::default())
+            .expect("the device is made")
+            .profile()
+            .clone()
+    };
+    let mut hawk_point = phoenix.clone();
+    hawk_point.device_id = 0x1900;
+    assert_eq!(phoenix.canonical_device_id(), 0x15bf);
+    assert_eq!(hawk_point.canonical_device_id(), 0x15bf);
+    assert!(hawk_point.measured_identity());
+    assert!(!hawk_point.driver_facts().is_empty());
+    assert_eq!(hawk_point.driver_facts(), phoenix.driver_facts());
+    assert!(hawk_point.driver_facts_withheld().is_empty());
+    assert!(!deviations(&hawk_point).is_empty());
+    assert_eq!(deviations(&hawk_point), deviations(&phoenix));
+    assert_eq!(defects(&hawk_point), defects(&phoenix));
+    assert_eq!(
+        profile(&hawk_point).fields().function_storage,
+        FunctionStorage::Measured(96 * 1024)
+    );
+    assert_eq!(
+        profile(&hawk_point).fingerprint(),
+        profile(&phoenix).fingerprint()
+    );
+
+    for release in [mesa(26, 2, 3), mesa(26, 2, 5)] {
+        let (mut other, mut phoenix_there) = (hawk_point.clone(), phoenix.clone());
+        other.driver_version = release;
+        phoenix_there.driver_version = release;
+        assert!(!other.measured_identity(), "{release:#x}");
+        assert!(other.driver_facts().is_empty(), "{release:#x}");
+        assert!(!other.driver_facts_withheld().is_empty(), "{release:#x}");
+        assert_eq!(
+            other.driver_facts_withheld(),
+            phoenix_there.driver_facts_withheld()
+        );
+        assert_eq!(deviations(&other), deviations(&phoenix_there));
+    }
+
+    let mut neighbour = hawk_point.clone();
+    neighbour.device_id = 0x1901;
+    let mut other_vendor = hawk_point.clone();
+    other_vendor.vendor_id = 0x8086;
+    for (desc, device) in [(&neighbour, 0x1901), (&other_vendor, 0x1900)] {
+        assert_eq!(desc.canonical_device_id(), device);
+        assert!(!desc.measured_identity(), "{device:#x}");
+        assert!(desc.driver_facts().is_empty(), "{device:#x}");
+    }
+    assert!(!neighbour.driver_facts_withheld().is_empty());
+    assert!(deviations(&neighbour).len() < deviations(&phoenix).len());
+    assert_eq!(
+        profile(&neighbour).fields().function_storage,
+        FunctionStorage::Assumed(16 * 1024)
+    );
 }
 
 /// The identities measured whose venue has no committed profile: the RTX 3090 (gem10) at NVIDIA's
@@ -771,26 +929,35 @@ fn a_driver_that_lays_depth_images_apart_holds_no_depth_twin() {
     }
 }
 
-/// No GPU and release is measured both to run a pass the interlock would split faster whole and
-/// no slower split: each measured row's GPU, at its first release, holds one of the two.
+/// NVIDIA's 615.71.09 stalls a submission about once in every thousand semaphore operations on
+/// the two GPUs measured, the RTX 5080 Laptop GPU and the RTX 3090, which take the fact; another
+/// GPU of the driver (an RTX 5080 desktop GPU) or another release is unmeasured and does not, so
+/// it waits for completed timelines as every other driver does. No other driver has it.
 #[test]
-fn a_gpu_keeps_one_form_of_an_interlocked_pass() {
-    let rows = MEASURED
+fn nvidia_s_semaphore_stall_holds_on_the_gpus_measured() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let read = |stem: &str| {
+        let text = std::fs::read_to_string(dir.join(format!("{stem}.json"))).expect(stem);
+        DeviceDescription::from_khronos_json(&text, None).expect("profile parses")
+    };
+    let laptop = read("nvidia-rtx5080-laptop");
+    assert!(laptop.driver_facts().contains(&STALL));
+    let mut rtx_3090 = laptop.clone();
+    rtx_3090.device_id = NVIDIA_RTX_3090;
+    assert!(rtx_3090.measured_identity());
+    assert!(rtx_3090.driver_facts().contains(&STALL));
+    let mut desktop = laptop.clone();
+    desktop.device_id = 0x2c02;
+    assert!(!desktop.driver_facts().contains(&STALL));
+    let mut later = laptop.clone();
+    later.driver_version = nvidia(615, 71, 10);
+    assert!(!later.driver_facts().contains(&STALL));
+    let drivers: Vec<DriverId> = MEASURED
         .iter()
-        .filter(|row| row.fact == WHOLE || row.fact == SPLIT);
-    let mut measured = 0;
-    for row in rows {
-        let gpu = (row.vendor.unwrap_or(APPLE), row.device.unwrap_or(0));
-        let facts = among(MEASURED, Some(row.driver), gpu, row.first);
-        assert!(
-            facts.contains_key(&WHOLE) != facts.contains_key(&SPLIT),
-            "{:?} on {gpu:x?} at {:#x}: {facts:?}",
-            row.driver,
-            row.first
-        );
-        measured += 1;
-    }
-    assert_eq!(measured, 7, "the GPUs measured");
+        .filter(|row| row.fact == STALL)
+        .map(|row| row.driver)
+        .collect();
+    assert_eq!(drivers, [DriverId::NVIDIA_PROPRIETARY; 2]);
 }
 
 /// MoltenVK's warning of a pipeline whose restart may be disabled (`MVKPipeline.mm` lines 881-893
@@ -828,7 +995,7 @@ fn moltenvk_1_4_1_warns_of_a_pipeline_whose_restart_is_dynamic() {
             warns.then_some(warning),
             "{dynamic:?} {top:?}"
         );
-        for other in [ZERO, DENORMALS, FETCH, WHOLE, SPLIT] {
+        for other in [ZERO, DENORMALS, FETCH, SPLIT] {
             assert_eq!(other.pipeline_creation_diagnostic(dynamic, top), None);
         }
     }
@@ -858,4 +1025,47 @@ fn moltenvk_1_4_1_warns_of_a_pipeline_whose_restart_is_dynamic() {
     desc.driver_version = 10401;
     desc.driver_id = Some(DriverId::MESA_LLVMPIPE);
     assert!(!desc.driver_facts().contains(&RESTART));
+}
+
+/// A description leaves out of every format's linear tiling the features its driver reports from
+/// memory it has not initialized: on MoltenVK, measured or not, the color attachment, its
+/// blending, the blit destination and the depth/stencil attachment
+/// (`DriverFact::LinearTilingFeaturesUninitialized`); on every other driver nothing. Every
+/// committed profile's formats hold none of them.
+#[test]
+fn moltenvks_linear_attachment_features_are_left_out() {
+    use crate::vk::FormatFeatureFlags2 as F;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let attachments =
+        F::COLOR_ATTACHMENT | F::COLOR_ATTACHMENT_BLEND | F::BLIT_DST | F::DEPTH_STENCIL_ATTACHMENT;
+    let mut moltenvk = 0;
+    for path in std::fs::read_dir(&dir).expect("validation/profiles is readable") {
+        let path = path.expect("directory entry").path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("profile is readable");
+        let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("profile parses");
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let unreliable = desc.unreliable_linear_tiling();
+        if desc.driver_id == Some(DriverId::MOLTENVK) {
+            moltenvk += 1;
+            assert_eq!(unreliable, attachments, "{stem}");
+            desc.driver_version += 1;
+            assert_eq!(
+                desc.unreliable_linear_tiling(),
+                attachments,
+                "{stem} unmeasured"
+            );
+        } else {
+            assert!(unreliable.is_empty(), "{stem}");
+        }
+        for (format, p) in &desc.formats.formats {
+            assert!(
+                p.linear_tiling.intersection(unreliable).is_empty(),
+                "{stem} {format:?}"
+            );
+        }
+    }
+    assert!(moltenvk >= 2, "the MoltenVK profiles are read");
 }

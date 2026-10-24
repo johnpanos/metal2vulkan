@@ -54,6 +54,114 @@ pub const METAL_ENVIRONMENT: &str = "apple-m3-max-macos27.0.1";
 /// The longest a lane command buffer may take.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// `device`'s work counts once its pipeline pool holds no piece (`WorkCounts::pipeline_pool_busy`),
+/// waiting at most [`WAIT`]: a draw that took its key's residual form does not wait for its own
+/// key's making, which may outlast the draw's command buffer.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn pipelines_settled(device: &Device) -> metal2vulkan_runtime::WorkCounts {
+    let until = std::time::Instant::now() + WAIT;
+    loop {
+        let counts = device.work_counts();
+        if counts.pipeline_pool_busy == 0 {
+            return counts;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the device's pipeline pool still busy after {WAIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// What [`wait_for_device`] saw: whether the command buffer completed, the wall time it waited,
+/// and the longest wait for a CPU that one of the process's threads had meanwhile.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+#[derive(Clone, Copy, Debug)]
+struct DeviceWait {
+    completed: bool,
+    wall: Duration,
+    queued: Duration,
+}
+
+/// The longest [`wait_for_device`] waits by the wall clock, as a multiple of its bound of the
+/// device's own time: a bound on the wait whatever the run-queue counts read.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+const WALL_CAP: u32 = 5;
+
+/// Wait until `command_buffer` completed, for at most `bound` of the device's own time: the wall
+/// time less the longest wait for a CPU that any one of the process's threads had meanwhile, and
+/// at most [`WALL_CAP`] times `bound` by the wall clock.
+///
+/// A CPU device (lavapipe) runs a command buffer on the process's own threads, which a loaded
+/// host keeps off a CPU for much of the wall time: that wait is the host's, not the device's.
+/// Every other wait stays in the reading: a device that hangs blocked, or spins, still crosses the
+/// bound. On a GPU the threads wait for it blocked, and the reading is about the wall time.
+///
+/// Linux counts each thread's wait for a CPU: the second field of `/proc/self/task/*/schedstat`
+/// (the kernel's `Documentation/scheduler/sched-stats.rst`); where it gives none, the reading is
+/// the wall time. The counts are read after the start's instant and before the end's, so a wait
+/// between the two reads stays in the reading.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn wait_for_device(
+    command_buffer: &metal2vulkan_runtime::CommandBuffer,
+    bound: Duration,
+) -> DeviceWait {
+    let started = std::time::Instant::now();
+    let before = run_queue_waits();
+    let cap = bound * WALL_CAP;
+    loop {
+        let queued = longest_wait_since(&before);
+        let wall = started.elapsed();
+        let own = wall.saturating_sub(queued);
+        if own >= bound || wall >= cap {
+            return DeviceWait {
+                completed: false,
+                wall,
+                queued,
+            };
+        }
+        let slice = (bound - own).min(cap - wall);
+        if command_buffer.wait_until_completed_for(slice).is_ok() {
+            let queued = longest_wait_since(&before);
+            return DeviceWait {
+                completed: true,
+                wall: started.elapsed(),
+                queued,
+            };
+        }
+    }
+}
+
+/// Each of the process's threads' wait for a CPU so far, by thread id, where Linux counts it
+/// ([`wait_for_device`]).
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn run_queue_waits() -> BTreeMap<u64, Duration> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return BTreeMap::new();
+    };
+    let wait = |task: std::fs::DirEntry| {
+        let id = task.file_name().to_str()?.parse().ok()?;
+        let stat = std::fs::read_to_string(task.path().join("schedstat")).ok()?;
+        let waited = stat.split_whitespace().nth(1)?.parse().ok()?;
+        Some((id, Duration::from_nanos(waited)))
+    };
+    tasks.flatten().filter_map(wait).collect()
+}
+
+/// The longest wait for a CPU that one of the process's threads had since `before` (its counts
+/// then, [`run_queue_waits`]); a thread started since counts all its wait.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn longest_wait_since(before: &BTreeMap<u64, Duration>) -> Duration {
+    let since = |(id, waited): (u64, Duration)| {
+        waited.saturating_sub(before.get(&id).copied().unwrap_or_default())
+    };
+    run_queue_waits()
+        .into_iter()
+        .map(since)
+        .max()
+        .unwrap_or_default()
+}
+
 /// One lane test per shard of a census too long to run as one test (the Mac lane stops a test
 /// at 60 s): `census_shards!(census, SHARDS; test_0 = 0, test_1 = 1, ...)` makes each `test_n` a
 /// test that runs `census(n)`. It does not compile unless the shards listed are `0..SHARDS`, each
@@ -126,6 +234,8 @@ mod absent_reads;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod address_maps;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod alpha_in_red;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod amplified_draws;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod anisotropic_filter;
@@ -134,7 +244,15 @@ mod argument_buffers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod argument_linear_samples;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod astc_textures;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod attachment_read_costs;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod attachment_reads;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod attachmentless;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod barycentric_weights;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod bfloat_targets;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -170,6 +288,8 @@ mod clear_reach;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod color_fills;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod color_groups;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod color_reformat;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod color_writes;
@@ -177,6 +297,8 @@ mod color_writes;
 mod command_queues;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod command_render_states;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod commands_replayed;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod commit_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -214,6 +336,8 @@ mod depth_compare_levels;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod depth_compares;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod depth_costs;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod depth_denormals;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod depth_never;
@@ -233,6 +357,10 @@ mod device_lockstep;
 mod discard_counts;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod discard_hoist;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod dispatch_costs;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod dispatch_work;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
 mod dma_buf_imports;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -251,6 +379,10 @@ mod driver_deviations;
 mod dynamic_libraries;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod escaped_slots;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod etc_textures;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod event_round_trips;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod events;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -281,9 +413,15 @@ mod failed_commits;
 mod families;
 mod fatal_signals;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod fence_stages;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod fetch_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod first_use;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod first_use_writes;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod first_vertex;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod format_copies;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -294,6 +432,8 @@ mod fragment_tile_memory;
 mod frame_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod framebuffer_fetch;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod freed_memory;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod frees_in_flight;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -311,7 +451,11 @@ mod global_builtins;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod gpu_times;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod grouped_submissions;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod guarded_effects;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+mod guest_frame_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod half_output_blends;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -324,6 +468,8 @@ mod half_storage_writes;
 mod half_texel_nans;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod half_write_nans;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod handed_objects;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod handler_waits;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -345,6 +491,8 @@ mod hidden_depth;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod host_bytes;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod host_contract;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod host_copied_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod host_memory;
@@ -363,9 +511,19 @@ mod indirect_host_steps;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod inline_bytes;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod inline_reasons;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod int_attributes;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod interlocked_draw_order;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod keep_alives;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod kept_buffer_bytes;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod kept_images;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod kept_resolves;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod kept_variants;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -405,6 +563,8 @@ mod mirror_clamp;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod moved_writers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod msaa_depth_moves;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod nan_resolves;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod narrow_clamps;
@@ -425,7 +585,11 @@ mod padded_loads;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod pass_start_reads;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod patch_culls;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod patch_indices;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod patch_primitive_ids;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod patches;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -441,13 +605,19 @@ mod pixel_samplers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod placement;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod pool_churn;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod pool_slots;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod predication;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod presenting;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod primitive_ids;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod private_memory;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod property_reads;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod pvrtc_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -464,6 +634,8 @@ mod rate_mapped_layers;
 mod rate_mapped_passes;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod rate_maps;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod read_through_views;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod rebind_reach;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -497,6 +669,8 @@ mod rotated_targets;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod rotated_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod row_copies;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod runtime_data;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod runtime_levels;
@@ -513,7 +687,13 @@ mod seq_cst_fences;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod shader_stencil;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod shared_exponent_storage;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod single_sample_passes;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod snapshot_reads;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod snorm_tile_store;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod sparse_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -530,6 +710,8 @@ mod submission_checks;
 mod submission_handlers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod submit_costs;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+mod submit_per_import;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod sum_regroup;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -568,6 +750,8 @@ mod tile_kept_bytes;
 mod tile_memory;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod tile_normalized;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod tile_path_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod tile_reach_kernel;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -608,6 +792,8 @@ mod visibility;
 mod wide_points;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod window_surfaces;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod word_samples;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod wrapped_buffers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -868,11 +1054,20 @@ fn driver_keeps_pipeline_cache(device: &Device) -> bool {
 /// the device and its host apart from the runtime, and nothing else: `metal-level-not-macos` off
 /// macOS and `metal-level-below-host` on a macOS release that is no measured level, where the
 /// options name no Metal level; `driver-pipeline-cache-kept` where the driver lets no device turn
-/// its internal pipeline cache off and that cache is not Metal's own (MoltenVK's); and
+/// its internal pipeline cache off and that cache is not Metal's own (MoltenVK's);
 /// `moltenvk-argument-buffers-unread` on a MoltenVK whose argument-buffer state the runtime does
-/// not read.
+/// not read; and `float-tininess-after-rounding` where the device's policy takes native device
+/// maths and its profile's float functions are not Metal's own (MoltenVK's).
 pub fn creation_kinds(device: &Device, level_named: bool) -> BTreeSet<Degradation> {
     let mut kinds = BTreeSet::new();
+    let compile = device.compile_device();
+    if compile.policy().float_maths == metal2vulkan::device::FloatMathsPolicy::Native
+        && !compile
+            .profile()
+            .takes_driver_deviation(metal2vulkan::error::DriverDeviation::MetalFloatFunctions)
+    {
+        kinds.insert(Degradation::FloatTininessAfterRounding);
+    }
     let properties = device.properties();
     // MoltenVK 1.4.1's argument-buffer state read from its limits: on, or off on an Apple GPU.
     let description = &properties.description;
@@ -957,17 +1152,25 @@ fn dynamic_input_assembly(device: &Device) -> bool {
 ///
 /// - `sync`: the layer's synchronization validation (`validate_sync`), which reports a hazard
 ///   between two accesses the runtime's barriers, waits and submissions leave unordered, inside a
-///   command buffer and, at submission (`syncval_submit_time_validation`), across command
-///   buffers and queues; with the shaders' accesses through descriptors
+///   command buffer and, at submission, across command buffers and queues. The layer validates
+///   at submission by default: `syncval_submit_time_validation` (default on) through 1.4.357,
+///   which 1.4.363 deprecates for `syncval_full_validation` (default on) and reports, when asked
+///   for, as a settings warning, while an older layer reports the newer setting as unrecognized;
+///   so the lane asks for neither and takes the default every release has. With the shaders'
+///   accesses through descriptors
 ///   (`syncval_shader_accesses_heuristic`: the layer's default, off, sees no shader access at
 ///   all, only transfers, attachments and fixed-function reads). Even so, the layer sees no
 ///   access through a descriptor array of more than one element (the runtime's set 1, the heap
 ///   of argument-buffer resources) and none through a buffer device address (a pointer loaded
-///   from memory, an argument buffer's buffer, a large-buffer slot), it takes a descriptor's
-///   whole range as accessed, and it does not model a fragment shader interlock's critical
-///   sections; layer 1.4.341 also drops every write-after-write of a bound descriptor it finds
-///   while recording. A clean run is evidence for the other accesses alone
-///   (`runtime_lane/sync_coverage.rs` holds the controls).
+///   from memory, an argument buffer's buffer, a large-buffer slot), it takes a bound
+///   descriptor's whole range from its offset as accessed (draws that write their own bytes of
+///   one buffer bound at different offsets read as writing each other's: `int_attributes`,
+///   `render_executions`), it reads no indirect draw's counts (a draw of none reads as accessing
+///   what its shaders could: the index bounds pass's idle draw in `draw_bases`, `patches`' draws
+///   of no patches), and it does not model a fragment shader interlock's critical sections; layer
+///   1.4.341 also drops every write-after-write of a bound descriptor it finds while recording.
+///   A clean run is evidence for the other accesses alone (`runtime_lane/sync_coverage.rs` holds
+///   the controls).
 /// - `load-store`: a render pass's load operations checked against an earlier pass's stores
 ///   (`syncval_load_op_after_store_op_validation`, off by default), which a layer release that
 ///   does not know the setting reports as unrecognized (Ubuntu 26.04's 1.4.341 does not; the
@@ -1048,11 +1251,7 @@ impl LaneChecks {
 
     /// The validation layer's settings the checks take.
     pub fn layer_settings(self) -> Vec<LayerSetting> {
-        let synchronization = [
-            c"validate_sync",
-            c"syncval_submit_time_validation",
-            c"syncval_shader_accesses_heuristic",
-        ];
+        let synchronization = [c"validate_sync", c"syncval_shader_accesses_heuristic"];
         let load_after_store = [c"syncval_load_op_after_store_op_validation"];
         let on = |names: &[&std::ffi::CStr]| -> Vec<LayerSetting> {
             names
@@ -1435,7 +1634,6 @@ mod lane_checks {
             vec![
                 setting(c"enable_message_limit", LayerSettingValue::Bool(false)),
                 on(c"validate_sync"),
-                on(c"syncval_submit_time_validation"),
                 on(c"syncval_shader_accesses_heuristic"),
                 on(c"syncval_load_op_after_store_op_validation"),
             ]

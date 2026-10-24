@@ -32,6 +32,7 @@ use super::texture::Texture;
 use super::tracker::{Access, Use, UseRange};
 use super::used_resources::EncoderKind;
 use super::values::{ResourceOptions, StorageMode};
+use crate::device::functions::Vk;
 use ash::vk;
 use std::ops::Range;
 use std::sync::Arc;
@@ -77,15 +78,32 @@ pub(super) const TRANSFER: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::TR
 
 /// A blit command's read of `range` of `buffer`.
 pub(super) fn reads(buffer: &Buffer, range: Range<u64>) -> Use<ResourceKey> {
-    let (identity, range) = buffer.tracked(range);
-    let read = Access::new(TRANSFER, vk::AccessFlags2::TRANSFER_READ);
-    Use::reads(identity.key, identity.tracked, UseRange::Bytes(range), read)
+    reads_by(
+        buffer,
+        range,
+        Access::new(TRANSFER, vk::AccessFlags2::TRANSFER_READ),
+    )
 }
 
 /// A blit command's write of `range` of `buffer`.
 pub(super) fn writes(buffer: &Buffer, range: Range<u64>) -> Use<ResourceKey> {
+    writes_by(
+        buffer,
+        range,
+        Access::new(TRANSFER, vk::AccessFlags2::TRANSFER_WRITE),
+    )
+}
+
+/// A blit command's read of `range` of `buffer` as `read` (a copy of rows that dispatches reads
+/// in a shader, `row_copies.rs`).
+pub(super) fn reads_by(buffer: &Buffer, range: Range<u64>, read: Access) -> Use<ResourceKey> {
     let (identity, range) = buffer.tracked(range);
-    let write = Access::new(TRANSFER, vk::AccessFlags2::TRANSFER_WRITE);
+    Use::reads(identity.key, identity.tracked, UseRange::Bytes(range), read)
+}
+
+/// A blit command's write of `range` of `buffer` as `write` ([`reads_by`]).
+pub(super) fn writes_by(buffer: &Buffer, range: Range<u64>, write: Access) -> Use<ResourceKey> {
+    let (identity, range) = buffer.tracked(range);
     Use::writes(
         identity.key,
         identity.tracked,
@@ -160,7 +178,8 @@ impl CommandBuffer {
             core: EncoderCore::open(self, "blit_command_encoder", true)?,
             pattern: None,
             shadows: Vec::new(),
-            log: self.device().shared().rebinds.any().then(CallLog::new),
+            log: (self.device().shared().rebinds.any())
+                .then(|| self.device().shared().scheduler.spare_logs().blit()),
         })
     }
 }
@@ -224,7 +243,7 @@ impl BlitCommandEncoder {
     pub(super) fn command(
         &mut self,
         uses: &[Use<ResourceKey>],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
         self.command_in(TRANSFER, uses, record)
     }
@@ -235,7 +254,7 @@ impl BlitCommandEncoder {
         &mut self,
         stages: vk::PipelineStageFlags2,
         uses: &[Use<ResourceKey>],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
         self.command_in_reading(stages, uses, &[], record)
     }
@@ -247,7 +266,7 @@ impl BlitCommandEncoder {
         &mut self,
         uses: &[Use<ResourceKey>],
         reads: &[FreshRead],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
         self.command_in_reading(TRANSFER, uses, reads, record)
     }
@@ -259,13 +278,13 @@ impl BlitCommandEncoder {
         stages: vk::PipelineStageFlags2,
         uses: &[Use<ResourceKey>],
         reads: &[FreshRead],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
         let shadows = shadow::copies_used(self.shadows.iter(), uses);
         let copies = self.core.plan_shadows(&shadows, uses)?;
         self.core.shadow_copies(&copies);
         self.core.command_reading(stages, uses, reads, record);
-        self.core.shadows_used(&shadows, uses);
+        self.core.shadows_used(&shadows, uses, &[]);
         Ok(())
     }
 
@@ -327,8 +346,11 @@ impl BlitCommandEncoder {
         let from = bytes_in(CALL, source_offset, size, source_buffer.copy_reach())
             .map_err(|_| out_of_bounds(CALL, source_offset, size, source_buffer.length()))?;
         let to = bytes_in(CALL, destination_offset, size, destination_buffer.length())?;
-        let (source, source_at) = source_buffer.at(source_offset);
-        let (destination, destination_at) = destination_buffer.at(destination_offset);
+        // Read as a blit's: a no-copy buffer's import released while idle is imported again
+        // (`host_residency.rs`).
+        let (source, source_at) = self.core.blit_at(source_buffer, source_offset)?;
+        let (destination, destination_at) =
+            self.core.blit_at(destination_buffer, destination_offset)?;
         // One buffer's bytes, or two no-copy buffers' made over the same bytes, which lie in one
         // import (`host_aliases.rs`): one `VkBuffer` from one byte 0.
         let one_bytes = source == destination
@@ -432,8 +454,8 @@ impl BlitCommandEncoder {
         let range = bytes_in(CALL, range.start, size, buffer.length())?;
         let metal = (range.start, range.end);
         // The words and ends are the `VkBuffer`'s: a no-copy buffer's start in it need not be a
-        // multiple of 4 (`Buffer::base`).
-        let (destination, start) = buffer.at(range.start);
+        // multiple of 4 (`Buffer::base`). Read as a blit's (`host_residency.rs`).
+        let (destination, start) = self.core.blit_at(buffer, range.start)?;
         let pieces = fill_pieces(start..start + size);
         let mut uses = vec![writes(buffer, range)];
         let pattern = if pieces.head.is_empty() && pieces.tail.is_empty() {
@@ -515,7 +537,7 @@ impl BlitCommandEncoder {
     /// `contents` maps (`managed.rs`), after the encoder's earlier commands.
     ///
     /// On a resource of another storage mode it records nothing, as plain Metal does (RT2
-    /// `managed.synchronize.shared`, `.private`; SPH-managed1-m4: `Shared` and `Private` buffers
+    /// `managed.synchronize.shared`, `.private`: `Shared` and `Private` buffers
     /// and textures; Metal's validation stops it).
     ///
     /// Refused (`Invalid`): a resource of another device.

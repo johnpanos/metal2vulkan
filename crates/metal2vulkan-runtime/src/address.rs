@@ -10,17 +10,17 @@
 //!   past every address Metal pinned (on an M3 Max and an M4 every pin at 2^42 or above failed).
 //!   Ranges the runtime picks are aligned and sized to Metal's 16-KiB page, as Metal places
 //!   buffers on Apple silicon.
-//! - **Pinned placement** (`setPinnedGPUAddress:`, a runtime extension; probes `RT7-place-probe1`
-//!   to `4` on an M3 Max and an M4; EV TXN3-span1-m4 and the consumer's M3 Max probes): a buffer or
-//!   heap made at a caller's address has exactly that address, at any byte of a 32-KiB granule's
-//!   first page, and holds Metal's span of it: the pages its bytes touch and one guard page after
-//!   them, rounded up to 32 KiB (2 pages for 1, 4 for 2 or 3, 6 for 4 or 5, 66 for 64 or 65), so
-//!   the page before a pinned range cannot start another pin either. A pin whose first page is not
-//!   a 32-KiB granule's (`OffGranule`), whose span meets bytes another resource holds, or that
-//!   leaves the space, is refused ([`PlacementConflict`]); Metal answers nil for each and aliases
-//!   nothing. A released pin frees its whole span, as Metal's does. Metal's own process layout
-//!   refused some ranges inside the space (below 2^36, 2^39, just below 2^40, 2^42 and above); that
-//!   is no contract, and the runtime pins any free range of the space.
+//! - **Pinned placement** (`setPinnedGPUAddress:`, a runtime extension; measured on an M3 Max and
+//!   an M4, and by the consumer's M3 Max probes): a buffer or heap made at a caller's address
+//!   has exactly that address, at any byte of a 32-KiB granule's first page, and holds Metal's span
+//!   of it: the pages its bytes touch and one guard page after them, rounded up to 32 KiB (2 pages
+//!   for 1, 4 for 2 or 3, 6 for 4 or 5, 66 for 64 or 65), so the page before a pinned range cannot
+//!   start another pin either. A pin whose first page is not a 32-KiB granule's (`OffGranule`),
+//!   whose span meets bytes another resource holds, or that leaves the space, is refused
+//!   ([`PlacementConflict`]); Metal answers nil for each and aliases nothing. A released pin frees
+//!   its whole span, as Metal's does. Metal's own process layout refused some ranges inside the
+//!   space (below 2^36, 2^39, just below 2^40, 2^42 and above); that is no contract, and the
+//!   runtime pins any free range of the space.
 //! - **A shared range** (the consumer's ask C3): a no-copy buffer made over the same first byte of
 //!   host memory as a live no-copy buffer, no longer than it (`BufferDescriptor::range_of`),
 //!   answers that buffer's address and holds its range with it, as Metal answers one IOSurface's
@@ -53,7 +53,7 @@
 //!   lie at `records_address` of it, `2^63 + id * 2^40`, the address a translated kernel encoding
 //!   through the ID reaches. So the records take no Metal address, as Metal's indirect command
 //!   buffers take none of its buffers' (four of 1024 commands moved no buffer made after them).
-//! - **Records IDs** (the M4 probe MESH-icb1-m4, plain Metal). The buffer holds its ID
+//! - **Records IDs** (the M4 probe, plain Metal). The buffer holds its ID
 //!   ([`RecordsId`]), not its records' memory: the ID is free again once the buffer and every
 //!   command that holds it are gone, a compute or render execution and a `useResource` until their
 //!   command buffer completes or is dropped uncommitted, while a blit's copy, reset or optimize
@@ -67,6 +67,7 @@
 use super::device::lock;
 use super::error::{internal, Error, MemoryKind};
 use super::exit_guard;
+use super::program_objects::ProgramObject;
 use super::range::RangeAllocator;
 use super::resource_ids::Pool;
 use metal2vulkan::bind::indirect_commands::{
@@ -157,15 +158,15 @@ impl From<AddressPlacement> for Place {
 /// command buffers that hold any of them are gone, whatever the runtime keeps of its image after
 /// that (for a command buffer committed before it went that may reach it by its resource ID, or the
 /// batch that took its first move), as Metal frees a released texture's range while a command
-/// buffer that only names it in an argument buffer still runs (an Apple M4, EV XRB-tok1-m4).
+/// buffer that only names it in an argument buffer still runs (an Apple M4).
 pub type RangeToken = Box<dyn std::any::Any + Send + Sync>;
 
-/// Where a resource keeps its caller's [`RangeToken`]: set once as the resource is made
-/// ([`keep`](Self::keep)), and dropped by [`release`](Self::release), which the resource's
+/// Where a resource keeps its caller's [`RangeToken`], held as the program's object
+/// (`program_objects.rs`): set once as the resource is made ([`keep`](Self::keep)), and dropped by [`release`](Self::release), which the resource's
 /// teardown calls once its range is free. Never dropped otherwise: a resource the runtime leaves
 /// to the process's exit leaks its token with it (`ManuallyDrop`).
 #[derive(Default)]
-pub(super) struct KeptToken(ManuallyDrop<Mutex<Option<RangeToken>>>);
+pub(super) struct KeptToken(ManuallyDrop<Mutex<Option<ProgramObject<RangeToken>>>>);
 
 impl KeptToken {
     /// Keep `token`. Internal where one is kept already: no creator gives two.
@@ -174,7 +175,7 @@ impl KeptToken {
         if kept.is_some() {
             return Err(internal("a resource's range token kept twice"));
         }
-        *kept = Some(token);
+        *kept = Some(ProgramObject::new(token));
         Ok(())
     }
 
@@ -189,7 +190,7 @@ impl KeptToken {
         }
         let token = lock(&self.0).take();
         if let Some(token) = token {
-            exit_guard::program(move || drop(token));
+            exit_guard::program_release(move || drop(token));
         }
     }
 }

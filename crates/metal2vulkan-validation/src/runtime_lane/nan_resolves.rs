@@ -1,18 +1,21 @@
 //! Device tests of the resolve of NaN and infinite samples a draw writes into a `half`,
 //! small-float or `float` multisampled attachment, resolved by the store action of the pass that
-//! drew them, against Metal's resolve rule (EV ZIN-zms7-m4, an M4 under macOS 27.0.1): a `half`
+//! drew them, against Metal's resolve rule (an M4 under macOS 27.0.1): a `half`
 //! resolve counts each NaN sample as 0 and each infinite one as 65536 of its sign, sums the samples
 //! in `float` in order, multiplies by `1/n` and rounds to `half` to nearest even; a `float` resolve
-//! is the float rule (a NaN anywhere `0x7fc00000`).
+//! is the float rule (a NaN anywhere `0x7fc00000`). On every set here that gives what the rules
+//! the M3 Max measures under macOS 27.0.1 give (`bind::ColorResolveFormat`'s module docs: the
+//! samples floored to a grid below their largest exponent, the average's tie toward +∞, and
+//! `RG11B10Float`'s `half` rounded to nearest even on its grid, held to its largest finite value
+//! unless infinite); outside these sets the two differ.
 //!
 //! Each row of one format and sample count writes a set of samples per pixel by a draw at
 //! sample rate (`runtime_samples::SampleFill`) into a texture of `PixelFormatView` usage (Metal's
-//! rule does not change with it: EV ZIN-zms7-m4), reads every sample back through its unsigned
+//! rule does not change with it), reads every sample back through its unsigned
 //! view, and resolves into a plain 1x texture read by a blit; the rule is applied to the samples
 //! as stored. `RG11B10Float`, which no fill writes, is drawn through its `R32Uint` view and
-//! resolved by a pass that loads it, its rule extrapolated from `half`'s (each NaN 0, each
-//! infinity 65536) and printed as such. Each row prints `RESOLVE-NANINF`: how many sets resolve
-//! as the rule says, the first that do not, and whether the device announced
+//! resolved by a pass that loads it. Each row prints `RESOLVE-NANINF`: how many sets resolve as
+//! the rule says, the first that do not, and whether the device announced
 //! `device-rounded-resolve`. A row that differs unannounced fails. (the coordinator's question:) so
 //! does a drawn sample stored other than as written where the device announced no
 //! `device-nan-encoding` (the fragment function's note, a `half` output's NaN the device stores as
@@ -401,12 +404,8 @@ fn drawn_nan_and_infinite_samples_resolve_by_metal_s_rule() {
                     )),
                 }
             }
-            let rule = match row.fill {
-                Some(_) => "Metal's rule",
-                None => "the rule extrapolated from half's",
-            };
             println!(
-                "RESOLVE-NANINF {label} on {name}: {exact}/{width} sets as {rule}{}; \
+                "RESOLVE-NANINF {label} on {name}: {exact}/{width} sets as Metal's rule{}; \
                  device-rounded-resolve {}{}",
                 if rewritten > 0 {
                     format!(
@@ -431,7 +430,7 @@ fn drawn_nan_and_infinite_samples_resolve_by_metal_s_rule() {
                     false => format!("; differ: {}", differ[..differ.len().min(6)].join("; ")),
                 }
             );
-            if !differ.is_empty() && !announced && row.fill.is_some() {
+            if !differ.is_empty() && !announced {
                 silent.push(format!("{label}: {}", differ.join("; ")));
             }
             if rewritten > 0 && !nan_announced {
@@ -454,7 +453,7 @@ fn drawn_nan_and_infinite_samples_resolve_by_metal_s_rule() {
 }
 
 /// A blit copy between multisampled textures keeps every sample's bits, NaNs included, as
-/// Metal's copy does (EV ZIN-zms1-m4), or announces `device-nan-encoding`: each row's sets written
+/// Metal's copy does, or announces `device-nan-encoding`: each row's sets written
 /// into a 4x texture of `PixelFormatView` usage through an unsigned view of its texel size (which
 /// stores the bits on every device), copied by `copy_texture` into another, and both read back
 /// through their unsigned view. The copy goes into a `PixelFormatView` texture and into a plain one

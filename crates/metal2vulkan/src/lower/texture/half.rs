@@ -36,11 +36,11 @@
 //! - That value is rounded to nearest even once by integer arithmetic on its bits, in every
 //!   rounding form: it is a normal `half`'s, or a `half` already. The texel itself, for the other
 //!   families, is rounded to nearest even once by the module's `half` rounding
-//!   (`narrow::round_texel`) where the device's is measured to be Metal's (`QuantizeForm::Device`
-//!   and `Converted`), else by the integer sequence (`texel_round::f32_to_half`,
-//!   `QuantizeForm::Integer`), so every device answers alike. The grid's value is selected after
-//!   that rounding, so where a device specializes a grid class, no rounding of the texel (on
-//!   MoltenVK a `[[clang::optnone]]` call at every access) is left.
+//!   (`narrow::round_texel`) where the device's is measured or controlled to be Metal's
+//!   (`QuantizeForm::Device`, `Converted` and `Controlled`), else by the integer sequence
+//!   (`texel_round::f32_to_half`, `QuantizeForm::Integer`), so every device answers alike. The
+//!   grid's value is selected after that rounding, so where a device specializes a grid class, no
+//!   rounding of the texel (on MoltenVK a `[[clang::optnone]]` call at every access) is left.
 //! - A sample of a float or half-float texel rounds toward zero saturating or to nearest with ties
 //!   away: from the device's rounding to nearest even where that is Metal's, by stepping to its
 //!   neighbour where the directed mode differs (`texel_round::f32_to_half_from_even`), else by the
@@ -56,9 +56,9 @@
 //! (`ratio_to_half`), and a small float's value rounds to nearest even (it is a `half` value
 //! already, so exactly). A two-plane YCbCr format's one texel (`TexelLanes::Texel`: a read or a
 //! sample of one texel; `PackedTexels::ycbcr`) and a 2D gather's lanes (`Gathered`) round its
-//! value, a step of `1/2048` or `1/8192`, with ties away from zero (EVs TXN2-ycr1-m4, every channel
-//! of five formats on the grid `8192`, and TXN2-ycg1-m4, the gathers; a step of `1/2048` is a
-//! `half`). A value that may be filtered (`TexelLanes::Filtered`: a sample the device filters, or a
+//! value, a step of `1/2048` or `1/8192`, with ties away from zero (every channel of five formats
+//! on the grid `8192`, and the gathers; a step of `1/2048` is a `half`). A value that may be
+//! filtered (`TexelLanes::Filtered`: a sample the device filters, or a
 //! cube gather's lanes, each one channel's) keeps the `OTHER` arm, even under a packed normalized
 //! class's `EXACT` family (`TexelFormat::packed_exact`), whose grids are per channel; a small
 //! float's takes the half-float family's. The emulated linear filter of these formats
@@ -66,9 +66,9 @@
 //!
 //! **On a device that samples through Metal's own texture unit**: where the device's `f32` texel is
 //! Metal's `float` result of the same access (`VkProperty::MetalSampler`) and the module's rounding
-//! to nearest even is Metal's (`QuantizeForm::Device` and `Converted`), the routine tells apart
-//! only the families whose `half` result is not that `float` result rounded to nearest even
-//! ([`HalfFamilies::MetalSampler`]): a 32-bit float texel's sample (toward zero), the 16-bit
+//! to nearest even is Metal's (`QuantizeForm::Device`, `Converted` and `Controlled`), the routine
+//! tells apart only the families whose `half` result is not that `float` result rounded to nearest
+//! even ([`HalfFamilies::MetalSampler`]): a 32-bit float texel's sample (toward zero), the 16-bit
 //! normalized grids (their `f32` value rounds twice: `65455 / 65535`, `65519 / 65535` and `32759 /
 //! 32767`), and a YCbCr field's one texel on the grid `8192` (ties away). Every other family's
 //! `half` is the `OTHER` arm's rounding of the device's texel there: an 8-bit normalized step `n /
@@ -76,7 +76,12 @@
 //! and a filter grid's step, rounded to `f32` and then to `half`, is the step's own `half` (every
 //! step checked, `metal_float_steps_round_to_their_half`), and a half-float or small-float texel's
 //! value is a `half` already. So the module reads none of their bits, and their classes specialize
-//! alike with a slot bound to nothing (`spirv::spec_bits`).
+//! alike with a slot bound to nothing (`spirv::spec_bits`). The 16-bit grids' exact `half` is there
+//! one product of the step by a factor whose every product rounds as the quotient does
+//! (`texel_round::ones_ratio_factor`), rounded by the module, all float arithmetic: Metal's
+//! compiler, which MoltenVK hands the routine inlined at every access, takes far less time over it
+//! than over the integer form (about 2 s over a function of 311 such accesses). Where the module's
+//! rounding is the device's own (native half rounding) they keep the integer form.
 //!
 //! A sample's filtered value is the device's where the device filters it: on MoltenVK, which
 //! samples through Metal's own sampler (`VkProperty::MetalSampler`), that is Metal's `float`
@@ -87,7 +92,7 @@
 
 use crate::lower::arith::legal::{FloatFmt, Form, Held};
 use crate::lower::arith::narrow;
-use crate::lower::arith::ops::{elem_ty, splat, ty};
+use crate::lower::arith::ops::{elem_ty, fsplat, splat, ty};
 use crate::lower::arith::texel_round;
 use crate::metal::bicubic::BicubicTexels;
 use crate::metal::texel_format::{PackedTexels, TexelFormat};
@@ -200,7 +205,7 @@ pub enum HalfFamilies {
 pub fn define(mb: &mut ModuleBuilder, families: HalfFamilies) -> BResult<FuncId> {
     let families = match mb.quantize_form() {
         QuantizeForm::Integer => HalfFamilies::Every,
-        QuantizeForm::Device | QuantizeForm::Converted => families,
+        QuantizeForm::Device | QuantizeForm::Converted | QuantizeForm::Controlled => families,
     };
     let f32_ = mb.ty(SType::Float { width: 32 })?;
     let u32_ = mb.ty(SType::Int {
@@ -217,7 +222,7 @@ pub fn define(mb: &mut ModuleBuilder, families: HalfFamilies) -> BResult<FuncId>
     let channel = fb.param(u32_)?;
     let r = match families {
         HalfFamilies::Every => body(&mut fb, x, flags, sample, channel, vu)?,
-        HalfFamilies::MetalSampler => metal_body(&mut fb, x, flags, sample, channel, vu)?,
+        HalfFamilies::MetalSampler => metal_body(&mut fb, x, flags, sample, channel)?,
     };
     fb.ret(Some(r))?;
     fb.finish()
@@ -464,7 +469,7 @@ fn body(
     // selected after it, so a device that specializes a grid class drops the rounding of `x`
     // whole.
     let rounded = match fb.module().quantize_form() {
-        QuantizeForm::Device | QuantizeForm::Converted => {
+        QuantizeForm::Device | QuantizeForm::Converted | QuantizeForm::Controlled => {
             // The module's rounding is Metal's here, and is every other family's, the `OTHER`
             // arm's among them, so a sample's directed rounding follows from `even`.
             let even = narrow::round_texel(fb, hform(), x)?;
@@ -491,7 +496,7 @@ fn body(
 
 /// [`body`] on a device whose texel is Metal's `float` result and whose rounding to nearest even
 /// is Metal's ([`HalfFamilies::MetalSampler`]): the 16-bit normalized grids' exact `half`
-/// (`ones_ratio_to_half`), a 32-bit float sample toward zero and a YCbCr field's one texel on the
+/// ([`grid16_by_product`]), a 32-bit float sample toward zero and a YCbCr field's one texel on the
 /// grid `8192` with ties away (`f32_to_half_from_even`), every other texel to nearest even
 /// (`narrow::round_texel`). It reads the class's `LINEAR`, `SNORM` and `WIDE16` bits (a class
 /// with `WIDE16` is `EXACT`'s, never packed) and the packed field's top bit
@@ -502,10 +507,8 @@ fn metal_body(
     flags: SValue,
     sample: SValue,
     channel: SValue,
-    vu: TypeId,
 ) -> BResult<SValue> {
     let f = fform();
-    let u = uform(4);
     let ft = ty(fb, f)?;
     let u1 = |fb: &mut FunctionBuilder<'_>, v: u32| splat(fb, uform(1), u64::from(v));
     let f1 = |fb: &mut FunctionBuilder<'_>, bits: u64| {
@@ -524,14 +527,87 @@ fn metal_body(
     let is_float = has(fb, BicubicTexels::LINEAR)?;
     let wide = has(fb, BicubicTexels::WIDE16)?;
     let signed = has(fb, BicubicTexels::SNORM)?;
-    // The 16-bit grids: the step `n` on the grid, and its exact `half` with the sign of `n`
-    // (`+0` for `n = 0`), a `half` already.
+    // The 16-bit grids: the step `n` on the grid, and the `half` of `n / D` (`+0` for `n = 0`).
     let (g16, _) = grid_bits(TexelFormat::GRID16);
     let (g16s, _) = grid_bits(TexelFormat::GRID16S);
     let (g16, g16s) = (f1(fb, g16)?, f1(fb, g16s)?);
     let d = fb.select(signed, g16s, g16)?;
     let d = fb.composite_construct(ft, &[d; 4])?;
     let neg_d = fb.unary(UnOp::FNegate, d)?;
+    let on_grid = match fb.module().native_half() {
+        false => grid16_by_product(fb, x, (d, neg_d), signed)?,
+        true => grid16_by_integers(fb, x, (d, neg_d), signed)?,
+    };
+    // A YCbCr field's one texel on the grid `8192`: ties away from zero.
+    let ycbcr = has(fb, TexelFormat::YCBCR_8192)?;
+    let texel_lanes = u1(fb, TEXEL_LANES)?;
+    let single = fb.binary(BinOp::ULessThanEqual, channel, texel_lanes)?;
+    let ycbcr = fb.binary(BinOp::LogicalAnd, ycbcr, single)?;
+    let even = narrow::round_texel(fb, hform(), x)?;
+    let sampled = texel_round::f32_to_half_from_even(fb, f, (x, even), is_float)?;
+    let takes = fb.binary(BinOp::LogicalAnd, sample, is_float)?;
+    let takes = fb.binary(BinOp::LogicalOr, takes, ycbcr)?;
+    let rounded = fb.select(takes, sampled, even)?;
+    fb.select(wide, on_grid, rounded)
+}
+
+/// The `half` of a 16-bit normalized texel `x` (four `f32` lanes) on its grid `D` (`d` and
+/// `neg_d`, `65535`, or `32767` where `signed`): its step `n` (`texel_round::grid_round`), and `n
+/// / D` correctly rounded to `half` with the sign of `n`, `+0` for `n = 0`, as one product. The
+/// magnitude `|n| · c`, for the grid's factor `c` (`texel_round::ones_ratio_factor`: every step's
+/// product rounds to the `half` of its quotient, either way it rounds to `f32`), rounded to `half`
+/// by the module's rounding ([`narrow::round`]: the device's conversion behind its barrier, or its
+/// quantize), which a module whose rounding is measured to be Metal's takes as exact. The sign is
+/// put back by a test of `n` below `-1/2`, so that a `-0` step gives `+0`. Every operation is a
+/// float one: on MoltenVK, Metal's compiler takes about 2 s less over a function converting 311
+/// such texels than over [`grid16_by_integers`]'s integer multiplication, leading-bit search and
+/// shifts (the M3 Max, macOS 27.0.1, MoltenVK's MSL of a guest's 270,000-word fragment function).
+fn grid16_by_product(
+    fb: &mut FunctionBuilder<'_>,
+    x: SValue,
+    (d, neg_d): (SValue, SValue),
+    signed: SValue,
+) -> BResult<SValue> {
+    let f = fform();
+    let ft = ty(fb, f)?;
+    let factor = |fb: &mut FunctionBuilder<'_>, b: u32| {
+        let s = Form {
+            held: Held::Float(FloatFmt::F32),
+            lanes: 1,
+        };
+        splat(
+            fb,
+            s,
+            u64::from(texel_round::ones_ratio_factor(b).to_bits()),
+        )
+    };
+    let (c15, c16) = (factor(fb, 15)?, factor(fb, 16)?);
+    let c = fb.select(signed, c15, c16)?;
+    let c = fb.composite_construct(ft, &[c; 4])?;
+    let n = texel_round::grid_round(fb, x, d, neg_d)?;
+    let m = fb.glsl(GlslOp::FAbs, &[n])?;
+    let p = fb.binary_no_contraction(BinOp::FMul, m, c)?;
+    let below = fsplat(fb, f, -0.5)?;
+    let negative = fb.binary(BinOp::FOrdLessThan, n, below)?;
+    let minus = fb.unary(UnOp::FNegate, p)?;
+    let v = fb.select(negative, minus, p)?;
+    narrow::round(fb, hform(), v)
+}
+
+/// [`grid16_by_product`]'s `half` by integer arithmetic alone (`texel_round::ones_ratio_to_half`):
+/// the 16-bit grids' value where the module's rounding is the device's own (native half rounding),
+/// so that their exact `half` does not take it.
+fn grid16_by_integers(
+    fb: &mut FunctionBuilder<'_>,
+    x: SValue,
+    (d, neg_d): (SValue, SValue),
+    signed: SValue,
+) -> BResult<SValue> {
+    let f = fform();
+    let u = uform(4);
+    let ft = ty(fb, f)?;
+    let vu = ty(fb, u)?;
+    let u1 = |fb: &mut FunctionBuilder<'_>, v: u32| splat(fb, uform(1), u64::from(v));
     let n = texel_round::grid_step(fb, f, x, d, neg_d)?;
     let z = splat(fb, u, 0)?;
     let negative = fb.binary(BinOp::SLessThan, n, z)?;
@@ -544,18 +620,7 @@ fn metal_body(
     let sign = splat(fb, u, 0x8000_0000)?;
     let sign = fb.select(negative, sign, z)?;
     let bits = fb.binary(BinOp::BitwiseOr, bits, sign)?;
-    let on_grid = fb.convert(ConvOp::Bitcast, bits, ft)?;
-    // A YCbCr field's one texel on the grid `8192`: ties away from zero.
-    let ycbcr = has(fb, TexelFormat::YCBCR_8192)?;
-    let texel_lanes = u1(fb, TEXEL_LANES)?;
-    let single = fb.binary(BinOp::ULessThanEqual, channel, texel_lanes)?;
-    let ycbcr = fb.binary(BinOp::LogicalAnd, ycbcr, single)?;
-    let even = narrow::round_texel(fb, hform(), x)?;
-    let sampled = texel_round::f32_to_half_from_even(fb, f, (x, even), is_float)?;
-    let takes = fb.binary(BinOp::LogicalAnd, sample, is_float)?;
-    let takes = fb.binary(BinOp::LogicalOr, takes, ycbcr)?;
-    let rounded = fb.select(takes, sampled, even)?;
-    fb.select(wide, on_grid, rounded)
+    fb.convert(ConvOp::Bitcast, bits, ft)
 }
 
 /// The held `half` texel of image texel `x` (a `vec4` of `f32`), converted by `routine` under the

@@ -16,7 +16,6 @@ use std::path::Path;
 
 use crate::bind::{BindState, WriteSource};
 use crate::budget::Budget;
-use crate::device::profile::FramebufferFetchPolicy;
 use crate::device::requirements::VkFeature;
 use crate::device::subgroup::OpBits;
 use crate::device::{Device, DeviceDescription};
@@ -35,7 +34,7 @@ use crate::pipeline::lower_inputs::{FramebufferFetchInputs, LoweringInputs};
 use crate::pipeline::sym::ResourceKind;
 use crate::pipeline::testing::{
     compile, compile_with, engine_dir, interlocked_coherence, link_and_validate, llvm_assemble,
-    moltenvk_msl_compile, profile, typed_module, typed_module_with, AssembleError,
+    moltenvk_msl_compile, profile, typed_module, typed_module_with, AssembleError, Scratch,
 };
 use crate::spirv::ids::FuncId;
 use crate::spirv::ir::{ExecMode, Inst, Terminator, TypedModule};
@@ -379,12 +378,11 @@ fn a_discard_without_a_language_version_is_refused() {
         .map(|l| format!("{l}\n"))
         .collect();
     assert_ne!(stripped.len(), text.len(), "the fixture states its version");
-    let dir = std::env::temp_dir().join(format!("m2v-fragment-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new("m2v-fragment-test");
+    let dir = scratch.path();
     let path = dir.join("unversioned.ll");
     std::fs::write(&path, stripped).expect("write");
     let bc = assemble(&path);
-    let _ = std::fs::remove_dir_all(&dir);
     let Some(bc) = bc else { return };
     let (_, p) = committed_profiles()
         .expect("profiles")
@@ -472,10 +470,9 @@ fn fetch_state(read: &[u32], formats: &[PixelFormat], blending: bool) -> Lowerin
 /// rasterization-order color attachment access it is one input attachment with a `FramebufferFetch`
 /// fact. With only the ordered pixel interlock it is one storage image read (and written) inside
 /// the interlock, under its pipeline's state (standalone, the function needs that state); where
-/// that state blocks the storage form, `RequireOrdered` refuses with the blocker and
-/// `AcceptUnordered` reads an input attachment unordered with a precision note. With neither,
-/// `RequireOrdered` refuses naming both and `AcceptUnordered` reads unordered. Every compiled
-/// module passes L3.
+/// that state blocks the storage form (a blend of a format whose blend the shader does not compute),
+/// it is refused with the blocker; a 16-bit float or 8-bit unorm attachment's blend the shader
+/// computes. With neither, it is refused naming both. Every compiled module passes L3.
 #[test]
 fn framebuffer_fetch_reads_in_an_ordered_form_where_the_device_has_one() {
     let Some(bc) = fixture("fragment_fetch") else {
@@ -496,23 +493,19 @@ fn framebuffer_fetch_reads_in_an_ordered_form_where_the_device_has_one() {
         ("fetch_scalar", &[0], &[PixelFormat::R32Float]),
         ("fetch_ordered", &[0], &[PixelFormat::RGBA16Float]),
     ];
-    let unordered = |a: &crate::library::FunctionArtifact| {
-        a.precision
-            .contains(&PrecisionNote::UnorderedFramebufferFetch)
-    };
     let mut forms = [0usize; 3];
     for (stem, strict) in committed_profiles().expect("profiles") {
-        let policy = DevicePolicy {
-            framebuffer_fetch: FramebufferFetchPolicy::AcceptUnordered,
-            ..Default::default()
-        };
-        let lenient = profile(&stem, policy).expect("profile");
         let frag = strict.fields().fragment;
         for (entry, colors, formats) in entries {
-            // A color input in a raster order group needs the interlock.
-            if entry == "fetch_ordered" && !frag.pixel_interlock {
+            // A color input in a raster order group needs the interlock, where rasterization-order
+            // access orders the read; with neither ordered form the read is refused first, naming
+            // both (below).
+            if entry == "fetch_ordered"
+                && !frag.pixel_interlock
+                && frag.rasterization_order_color_access
+            {
                 assert_eq!(
-                    refusal(&bc, entry, &lenient),
+                    refusal(&bc, entry, &strict),
                     (Feature::RasterOrderGroups, pixel_interlock()),
                     "{stem}"
                 );
@@ -534,29 +527,49 @@ fn framebuffer_fetch_reads_in_an_ordered_form_where_the_device_has_one() {
                             a.facts
                         );
                     }
-                    assert!(!unordered(&a), "{entry} on {stem}");
                 }
             } else if frag.pixel_interlock {
                 forms[1] += 1;
-                for p in [&strict, &lenient] {
-                    assert!(
-                        matches!(
-                            compile(&bc, entry, p),
-                            Err(Error::NeedsInput(RuntimeInput::FramebufferFetch))
-                        ),
-                        "{entry} on {stem}"
-                    );
-                    let a = compile_with(&bc, entry, p, &clean)
-                        .unwrap_or_else(|e| panic!("{entry} on {stem}: {e}"));
-                    link_and_validate(&a, p)
-                        .unwrap_or_else(|e| panic!("{entry} on {stem}: L3: {e}"));
-                    assert_eq!(storage_attachments(&a), colors, "{entry} on {stem}");
-                    assert!(attachments(&a).is_empty(), "{entry} on {stem}");
-                    assert!(!unordered(&a), "{entry} on {stem}");
-                }
-                // Blending the written color 0 blocks its storage form (an in-shader blend is
-                // not implemented): refused with that reason, or read unordered.
+                assert!(
+                    matches!(
+                        compile(&bc, entry, &strict),
+                        Err(Error::NeedsInput(RuntimeInput::FramebufferFetch))
+                    ),
+                    "{entry} on {stem}"
+                );
+                let a = compile_with(&bc, entry, &strict, &clean)
+                    .unwrap_or_else(|e| panic!("{entry} on {stem}: {e}"));
+                link_and_validate(&a, &strict)
+                    .unwrap_or_else(|e| panic!("{entry} on {stem}: L3: {e}"));
+                assert_eq!(storage_attachments(&a), colors, "{entry} on {stem}");
+                assert!(attachments(&a).is_empty(), "{entry} on {stem}");
+                // Blending the written color 0 blocks its storage form where the shader computes
+                // no blend of its format (`R32Float`): refused with that reason. A 16-bit float or
+                // 8-bit unorm one's blend the shader computes, as Metal's.
                 let blended = fetch_state(colors, formats, true);
+                if matches!(
+                    formats[0],
+                    PixelFormat::RGBA16Float | PixelFormat::RGBA8Unorm
+                ) {
+                    let a = compile_with(&bc, entry, &strict, &blended)
+                        .unwrap_or_else(|e| panic!("{entry} on {stem}: blended: {e}"));
+                    link_and_validate(&a, &strict)
+                        .unwrap_or_else(|e| panic!("{entry} on {stem}: blended: L3: {e}"));
+                    assert_eq!(storage_attachments(&a), colors, "{entry} on {stem}");
+                    assert!(
+                        a.facts.iter().any(|f| matches!(
+                            f,
+                            RuntimeFact::InterlockedFramebufferFetch {
+                                color: 0,
+                                blend: Some(_),
+                                ..
+                            }
+                        )),
+                        "{entry} on {stem}: {:?}",
+                        a.facts
+                    );
+                    continue;
+                }
                 match compile_with(&bc, entry, &strict, &blended) {
                     Err(Error::Unsupported(u)) => assert_eq!(
                         (u.feature, u.needs),
@@ -565,13 +578,6 @@ fn framebuffer_fetch_reads_in_an_ordered_form_where_the_device_has_one() {
                     ),
                     other => panic!("{entry} on {stem}: {:?}", other.map(|_| ())),
                 }
-                let a = compile_with(&bc, entry, &lenient, &blended)
-                    .unwrap_or_else(|e| panic!("{entry} on {stem}: {e}"));
-                link_and_validate(&a, &lenient)
-                    .unwrap_or_else(|e| panic!("{entry} on {stem}: L3: {e}"));
-                assert!(attachments(&a).contains(&0), "{entry} on {stem}");
-                assert!(!storage_attachments(&a).contains(&0), "{entry} on {stem}");
-                assert!(unordered(&a), "{entry} on {stem}");
             } else {
                 forms[2] += 1;
                 // Each entry writes the color it reads first: the interlock's alternative names
@@ -594,12 +600,6 @@ fn framebuffer_fetch_reads_in_an_ordered_form_where_the_device_has_one() {
                     ),
                     "{entry} on {stem}"
                 );
-                let a = compile(&bc, entry, &lenient)
-                    .unwrap_or_else(|e| panic!("{entry} on {stem}: {e}"));
-                link_and_validate(&a, &lenient)
-                    .unwrap_or_else(|e| panic!("{entry} on {stem}: L3: {e}"));
-                assert_eq!(attachments(&a), colors, "{entry} on {stem}");
-                assert!(unordered(&a), "{entry} on {stem}");
             }
         }
     }
@@ -731,7 +731,7 @@ fn the_binder_writes_storage_attachments_and_refuses_layered_passes() {
                     color_index: 0,
                     format: vk::Format::R32_SFLOAT,
                     view: crate::pipeline::StorageAttachmentView::Attachment,
-                    uint_view: None,
+                    view_alias: None,
                 }
         })
         .collect();
@@ -1122,13 +1122,11 @@ fn fetch_with_discard() -> Option<Vec<u8>> {
             "define float @fetch_scalar(float noundef %0) local_unnamed_addr #2",
             "define float @fetch_scalar(float noundef %0) local_unnamed_addr",
         );
-    let dir = std::env::temp_dir().join(format!("m2v-fetch-discard-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new("m2v-fetch-discard");
+    let dir = scratch.path();
     let path = dir.join("fetch_discard.ll");
     std::fs::write(&path, edited).expect("write");
-    let bc = assemble(&path);
-    let _ = std::fs::remove_dir_all(&dir);
-    bc
+    assemble(&path)
 }
 
 /// The storage form declares early fragment tests where a depth or stencil attachment's tests could
@@ -1138,9 +1136,8 @@ fn fetch_with_discard() -> Option<Vec<u8>> {
 /// writes in the storage form without them (a discarded fragment writes nothing). Beside a depth
 /// attachment, where its write precedes the depth test, it states `TestedStorageWrites` without
 /// early tests, whose draws' plans check their tests, and under `read_only_tests` declares early
-/// tests and states it with them; under `AcceptUnordered` it reads unordered, as before, stating
-/// nothing. A stage compiled without a depth attachment declares no early tests, so it links into
-/// no pipeline with one: `NeedsInput(FramebufferFetch)`.
+/// tests and states it with them. A stage compiled without a depth attachment declares no early
+/// tests, so it links into no pipeline with one: `NeedsInput(FramebufferFetch)`.
 #[test]
 fn the_storage_form_declares_early_tests_only_where_they_keep_metals_writes() {
     let (Some(plain), Some(discarding)) = (fixture("fragment_fetch"), fetch_with_discard()) else {
@@ -1199,16 +1196,6 @@ fn the_storage_form_declares_early_tests_only_where_they_keep_metals_writes() {
             );
         }
     }
-    let lenient = profile(
-        "moltenvk-m3",
-        DevicePolicy {
-            framebuffer_fetch: FramebufferFetchPolicy::AcceptUnordered,
-            ..Default::default()
-        },
-    )
-    .expect("profile");
-    let a = compile_with(&discarding, "fetch_scalar", &lenient, &state(true)).expect("unordered");
-    assert_eq!((early(&a), tested(&a)), (None, None), "{:?}", a.facts);
     // Compiled without a depth attachment, into a pipeline with one.
     let Some(io) = fixture("stage_io") else {
         return;
@@ -1251,7 +1238,7 @@ fn the_storage_form_declares_early_tests_only_where_they_keep_metals_writes() {
 /// A fetching function that writes other memory (`dvp_rog_coherence`'s `fetch_coherent`), beside a
 /// depth or stencil attachment, compiles in the storage form without early tests, its stores before
 /// the tests, and states `TestedStorageWrites` without the early-tests variant: Metal runs its
-/// memory writes for the fragments its tests drop (EV XRR2-fx1-m4). Without such an attachment it
+/// memory writes for the fragments its tests drop. Without such an attachment it
 /// states nothing. The whole pipeline on `moltenvk-m3` (a `BGRA8Unorm_sRGB` color,
 /// `Depth32Float_Stencil8`) plans a draw whose tests drop no fragment, and refuses one that does
 /// not state its tests, or whose tests a visibility result counts, at the depth attachment. (A draw
@@ -1765,14 +1752,178 @@ fn a_fetched_attachment_s_module_is_the_same_for_each_format_it_reads_alike() {
     assert!(shared > 0, "no committed profile shares the module");
 }
 
+/// In the shape of the pipeline a guest made on ANV: `fetch_ordered` reads and writes color 0, a
+/// `BGRA8Unorm` attachment, beside an `RGBA16Float` color 1, no blending, every channel written. On
+/// the ANV profile (no `shaderStorageImageReadWithoutFormat`, and SPIR-V names no image format for
+/// `B8G8R8A8_UNORM`) the whole pipeline is made, its fetched attachment a written storage
+/// attachment viewed in `R8G8B8A8_UNORM` (`StorageAttachmentUse::view_alias`), declared `Rgba8`,
+/// which the plan's write binds; the fragment module exchanges red and blue (an `OpVectorShuffle`
+/// of lanes 2, 1, 0, 3 on its read and its write) and passes `spirv-val`. So at 4 samples, through
+/// sample planes, and under a write mask that keeps green and alpha. A pipeline fetching an
+/// `RGBA16Float` color 0 alone is made there too, viewed in its own format, declared `Rgba16f`. On
+/// a profile that reads and writes `B8G8R8A8_UNORM` without a format the pipeline keeps its own
+/// format, declared without one, as before.
+#[test]
+fn a_fetched_bgra_attachment_is_viewed_in_its_rgba_twin_where_no_declaration_reaches_it() {
+    use crate::metal::ColorWriteMask;
+    use crate::pipeline::{StorageAttachmentUse, StorageAttachmentView};
+    let (Some(io), Some(fetch)) = (fixture("stage_io"), fixture("fragment_fetch")) else {
+        return;
+    };
+    let device = |stem: &str| {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../metal2vulkan-validation/profiles")
+            .join(format!("{stem}.json"));
+        let text = std::fs::read_to_string(path).expect("profile");
+        let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+        Device::new(desc, DevicePolicy::default()).expect("device")
+    };
+    let function = |bc: &[u8], name: &str| {
+        StageSource::Function(FunctionDescriptor::new(
+            Library::from_air(bc)
+                .expect("library")
+                .function(name)
+                .expect("function"),
+        ))
+    };
+    let descriptor = |colors: &[PixelFormat], samples: u32, mask: ColorWriteMask| {
+        let mut d = RenderPipelineDescriptor::new(function(&io, "stage_io_vertex_position"));
+        d.fragment = Some(function(&fetch, "fetch_ordered"));
+        for (i, &pf) in colors.iter().enumerate() {
+            d.color_attachments[i] = Some(ColorAttachmentDescriptor::new(pf));
+        }
+        if let Some(c) = d.color_attachments[0].as_mut() {
+            c.write_mask = mask;
+        }
+        d.raster_sample_count = samples;
+        d
+    };
+    // The instructions of opcode `op` in `words`, each as its words.
+    let instructions = |words: &[u32], op: u32| {
+        let mut at = 5;
+        let mut found = Vec::new();
+        while at < words.len() {
+            let count = (words[at] >> 16) as usize;
+            if count == 0 || at + count > words.len() {
+                break;
+            }
+            if words[at] & 0xffff == op {
+                found.push(words[at..at + count].to_vec());
+            }
+            at += count;
+        }
+        found
+    };
+    // The `OpVectorShuffle`s (79) of four lanes 2, 1, 0, 3: an exchange of red and blue.
+    let exchanges = |words: &[u32]| {
+        instructions(words, 79)
+            .iter()
+            .filter(|i| i.len() == 9 && i[5..] == [2, 1, 0, 3])
+            .count()
+    };
+    // Whether `words` declare an `OpTypeImage` (25) of storage (`Sampled` 2) in `format`.
+    let declares = |words: &[u32], format: crate::spv::ImageFormat| {
+        instructions(words, 25)
+            .iter()
+            .any(|i| i.len() >= 9 && i[7] == 2 && i[8] == format as u32)
+    };
+    let consumer = [PixelFormat::BGRA8Unorm, PixelFormat::RGBA16Float];
+    let partial = ColorWriteMask::RED.union(ColorWriteMask::BLUE);
+    let anv = device("intel-irisxe-anv");
+    for (samples, mask) in [
+        (1, ColorWriteMask::ALL),
+        (4, ColorWriteMask::ALL),
+        (1, partial),
+    ] {
+        let what = format!("{samples}x {mask:?}");
+        let p = anv
+            .compile_render_pipeline(&descriptor(&consumer, samples, mask), &Budget::standard())
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        let view = match samples {
+            1 => StorageAttachmentView::Attachment,
+            layers => StorageAttachmentView::SamplePlanes { layers },
+        };
+        let kept = match mask == partial {
+            true => vk::ColorComponentFlags::G | vk::ColorComponentFlags::A,
+            false => vk::ColorComponentFlags::empty(),
+        };
+        let want = StorageAttachmentUse::new(0, vk::Format::B8G8R8A8_UNORM, true, false, view)
+            .with_view_alias(vk::Format::R8G8B8A8_UNORM)
+            .with_kept(kept);
+        assert_eq!(p.graphics.storage_attachments, [want], "{what}");
+        assert_eq!(want.view_format(), vk::Format::R8G8B8A8_UNORM);
+        let plan = p.plan(&anv, &BindState::default().shape()).expect("plan");
+        let bound = plan.descriptors.iter().any(|w| {
+            w.source
+                == WriteSource::TileAttachment {
+                    color_index: 0,
+                    format: vk::Format::B8G8R8A8_UNORM,
+                    view,
+                    view_alias: Some(vk::Format::R8G8B8A8_UNORM),
+                }
+        });
+        assert!(bound, "{what}: {:?}", plan.descriptors);
+        let fragment = (p.stages.iter())
+            .find(|m| m.stage == vk::ShaderStage::FRAGMENT)
+            .expect("a fragment stage");
+        let rgba8 = declares(&fragment.spirv, crate::spv::ImageFormat::Rgba8);
+        assert!(rgba8, "{what}: no Rgba8 storage image");
+        // A read, a write and, under the partial mask, the merge's read of the kept channels.
+        let reads = 1 + usize::from(mask == partial);
+        assert_eq!(exchanges(&fragment.spirv), reads + 1, "{what}");
+        check_words_valid(&fragment.spirv, &p.requirements, anv.profile())
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+    // `RGBA16Float` fetched alone: its own format, declared `Rgba16f`.
+    let p = anv
+        .compile_render_pipeline(
+            &descriptor(&[PixelFormat::RGBA16Float], 1, ColorWriteMask::ALL),
+            &Budget::standard(),
+        )
+        .expect("an RGBA16Float fetch");
+    let want = StorageAttachmentUse::new(
+        0,
+        vk::Format::R16G16B16A16_SFLOAT,
+        true,
+        false,
+        StorageAttachmentView::Attachment,
+    );
+    assert_eq!(p.graphics.storage_attachments, [want]);
+    let fragment = (p.stages.iter())
+        .find(|m| m.stage == vk::ShaderStage::FRAGMENT)
+        .expect("a fragment stage");
+    assert!(declares(&fragment.spirv, crate::spv::ImageFormat::Rgba16f));
+    assert_eq!(exchanges(&fragment.spirv), 0);
+    // A device that reads and writes `B8G8R8A8_UNORM` without a format keeps its own view.
+    for stem in ["amd-rdna3-radv", "nvidia-rtx5080-laptop"] {
+        let dev = device(stem);
+        let p = dev
+            .compile_render_pipeline(
+                &descriptor(&consumer, 1, ColorWriteMask::ALL),
+                &Budget::standard(),
+            )
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let want = StorageAttachmentUse::new(
+            0,
+            vk::Format::B8G8R8A8_UNORM,
+            true,
+            true,
+            StorageAttachmentView::Attachment,
+        );
+        assert_eq!(p.graphics.storage_attachments, [want], "{stem}");
+    }
+}
+
 /// In the shapes of two pipelines a guest made: a fetched attachment written under a blend of one
 /// and zero, added, for color and alpha (all of `RG16Float`'s channels) beside two
 /// `RGB10A8_2P_XR10` attachments of mask none, with early tests (`con_fetch_coverage`); and a
 /// fetched attachment written under mask none by a function that discards, beside a depth and
 /// stencil attachment, so without early tests (`msf_fetch_discard`). Each takes the storage form on
 /// every committed profile that orders fetch through the interlock (a write of mask none stores
-/// nothing), passes L3, and the first makes its whole pipeline on `moltenvk-m3`; a blend that adds
-/// the destination stays refused. A stored channel without early tests compiles, stating
+/// nothing), passes L3, and the first makes its whole pipeline on `moltenvk-m3`; under a blend that
+/// adds the destination too, the function computing Metal's blend of its `half2` output (one and
+/// one, added: Metal's `h(s + d)`, measured bit-exact by the narrow sweeps), its
+/// fact naming the blend, and passes L3. A stored channel without early tests compiles, stating
 /// `TestedStorageWrites`, whose draws' plans check their tests; the write of mask none states
 /// nothing of them.
 #[test]
@@ -1813,12 +1964,6 @@ fn a_replacing_blend_or_a_write_that_stores_nothing_takes_the_storage_form() {
         inputs.framebuffer_fetch = Some(FramebufferFetchInputs::of([read], colors, true, false, 1));
         inputs
     };
-    let ni = |r: Result<std::sync::Arc<crate::library::FunctionArtifact>, Error>| match r {
-        Err(Error::Unsupported(u)) => {
-            (u.feature, u.needs) == (Feature::FramebufferFetch, Needs::NotImplemented)
-        }
-        _ => false,
-    };
     let mut checked = 0;
     for (stem, p) in committed_profiles().expect("profiles") {
         if !crate::lower::fragment::interlock_orders(&p) {
@@ -1834,10 +1979,19 @@ fn a_replacing_blend_or_a_write_that_stores_nothing_takes_the_storage_form() {
         checked += 1;
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
         let adds = state(1, &replacing(BlendFactor::One), &p);
-        assert!(
-            ni(compile_with(&coverage, "con_fetch_coverage", &p, &adds)),
-            "{stem}"
-        );
+        let a = compile_with(&coverage, "con_fetch_coverage", &p, &adds)
+            .unwrap_or_else(|e| panic!("{stem}: adds: {e}"));
+        let fetched = a.facts.iter().find_map(|f| match f {
+            RuntimeFact::InterlockedFramebufferFetch {
+                color: 1,
+                writes,
+                blend,
+                ..
+            } => Some((*writes, blend.is_some())),
+            _ => None,
+        });
+        assert_eq!(fetched, Some((true, true)), "{stem}: adds: {:?}", a.facts);
+        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: adds: L3: {e}"));
         let none = state(0, &discarding(ColorWriteMask::NONE), &p);
         let a = compile_with(&discard, "msf_fetch_discard", &p, &none)
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
@@ -3726,9 +3880,8 @@ fn kills_after_the_interlock(stages: &[crate::pipeline::artifact::StageModule]) 
 /// storage form refuses its writes where the module declares early tests, naming the defect. Beside
 /// a depth attachment, where the module would declare them only for its own sake, it declares none:
 /// it stores before the tests and states `TestedStorageWrites` without the early-tests variant, so
-/// the plan runs only its draws whose tests drop no fragment. `AcceptUnordered` reads the
-/// attachment unordered instead, as before; without a depth attachment, or at one sample, it
-/// compiles as before. A device of the same form without the defect (`intel-arl-anv`: sample
+/// the plan runs only its draws whose tests drop no fragment. Without a depth attachment, or at
+/// one sample, it compiles as before. A device of the same form without the defect (`intel-arl-anv`: sample
 /// planes too) compiles the per-sample form with early tests.
 #[test]
 fn the_per_sample_form_refuses_early_tests_writes_on_a_driver_that_drops_them() {
@@ -3804,16 +3957,6 @@ fn the_per_sample_form_refuses_early_tests_writes_on_a_driver_that_drops_them() 
             other => panic!("{:?}", other.map(|_| ())),
         }
     }
-    let policy = DevicePolicy {
-        framebuffer_fetch: FramebufferFetchPolicy::AcceptUnordered,
-        ..Default::default()
-    };
-    let lenient = profile("moltenvk-m3", policy).expect("profile");
-    let a = compile_with(&bc, "fetch_scalar", &lenient, &state(true, true)).expect("unordered");
-    assert_eq!(early(&a), None);
-    assert!(a
-        .precision
-        .contains(&PrecisionNote::UnorderedFramebufferFetch));
     let a = compile_with(&bc, "fetch_scalar", &anv, &state(true, true)).expect("anv");
     assert_eq!(early(&a), Some(true));
 }
@@ -3904,7 +4047,7 @@ fn a_demoting_site_exits_a_quad_of_helpers_before_a_later_simdgroup_operation() 
 }
 
 /// Where Metal places the sum ahead of each discard of the owned fixture `fragment_discard_hoist`,
-/// as Apple M4 and M3 Max draw it (EVs REF-hfix, REF-hfix-m3), and what canonicalization makes of
+/// as Apple M4 and M3 Max draw it, and what canonicalization makes of
 /// it: `Moved` where Metal counts only the lanes that survive the discard, `Counted` where it
 /// counts the dropped quads too for a measured reason, `Unknown` where no rule covers the shape (a
 /// use between, a nested discard, which Metal was measured placing both ways), which alone records
@@ -4481,17 +4624,11 @@ attributes #1 = {{ convergent nounwind willreturn }}
 !10 = !{{!"Metal", i32 4, i32 0, i32 0}}
 "#
     );
-    let dir = std::env::temp_dir().join(format!(
-        "m2v-unm-varying-{}-{}",
-        std::process::id(),
-        name.replace(' ', "-")
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new(&format!("m2v-unm-varying-{}", name.replace(' ', "-")));
+    let dir = scratch.path();
     let path = dir.join("f.ll");
     std::fs::write(&path, text).expect("write");
-    let bc = assemble(&path);
-    let _ = std::fs::remove_dir_all(&dir);
-    bc
+    assemble(&path)
 }
 
 /// The answer of `f` in the module `bc` on each committed profile, as whether it records `note`:
@@ -4507,40 +4644,46 @@ fn notes_on(bc: &[u8], what: &str, note: PrecisionNote, noted: &[&str]) {
     }
 }
 
-/// On a driver whose interpolation is measured not to be Metal's
-/// (`DriverWorkaround::InterpolationNotMetals`: NVIDIA's 615.71.09, both committed profiles of
-/// it), a fragment function that reads a varying the device interpolates records
-/// `PrecisionNote::DeviceInterpolation`, whatever its sampling and perspective; one whose varying
-/// is flat, which no interpolation touches, does not, and no other profile records it (NVIDIA's
-/// older 580 release, measured by no one, among them).
+/// A fragment function that reads a varying the device interpolates records
+/// `PrecisionNote::DeviceInterpolation`, whatever its sampling and perspective, on every committed
+/// profile but MoltenVK's, which take `DriverDeviation::MetalInterpolation` (Metal interpolates
+/// there): those record none and require `VkProperty::MetalInterpolation` instead. One whose
+/// varying is flat, which no interpolation touches, records neither anywhere.
 #[test]
 fn a_varying_the_device_interpolates_records_the_device_interpolation_note() {
+    use crate::device::requirements::VkProperty;
     let note = PrecisionNote::DeviceInterpolation;
-    let nvidia = ["nvidia-rtx50-linux", "nvidia-rtx5080-laptop"];
+    let profiles = committed_profiles().expect("profiles");
+    let devices: Vec<&str> = profiles
+        .iter()
+        .map(|(stem, _)| stem.as_str())
+        .filter(|stem| !is_moltenvk_capture(stem))
+        .collect();
+    assert!(devices.len() > 10, "{devices:?}");
     let body = "  %r = add i32 %x, 1";
     let cases = [
-        (
-            "perspective",
-            r#"!"air.center", !"air.perspective""#,
-            &nvidia[..],
-        ),
-        (
-            "linear",
-            r#"!"air.center", !"air.no_perspective""#,
-            &nvidia[..],
-        ),
-        (
-            "centroid",
-            r#"!"air.centroid", !"air.perspective""#,
-            &nvidia[..],
-        ),
-        ("flat", r#"!"air.flat""#, &[][..]),
+        ("perspective", r#"!"air.center", !"air.perspective""#, true),
+        ("linear", r#"!"air.center", !"air.no_perspective""#, true),
+        ("centroid", r#"!"air.centroid", !"air.perspective""#, true),
+        ("flat", r#"!"air.flat""#, false),
     ];
-    for (what, interp, noted) in cases {
+    for (what, interp, interpolated) in cases {
         let Some(bc) = varying_fragment(what, interp, body, "") else {
             return;
         };
+        let noted = if interpolated { &devices[..] } else { &[][..] };
         notes_on(&bc, what, note, noted);
+        for (stem, p) in &profiles {
+            let Ok(a) = compile(&bc, "f", p) else {
+                continue;
+            };
+            let requires = a
+                .requirements
+                .properties
+                .contains(&VkProperty::MetalInterpolation);
+            let by_metal = interpolated && is_moltenvk_capture(stem);
+            assert_eq!(requires, by_metal, "{what} on {stem}");
+        }
     }
 }
 
@@ -5021,16 +5164,21 @@ fn helper_invocations_skip_an_optnone_branch_on_a_driver_that_drops_a_simdgroups
 /// samples a `half` texture through a runtime sampler after a branch on a constant block's flag and
 /// writes a buffer; under the sampler's YCbCr variant the emulated linear filter branches on the
 /// sampler's specialization constants, and its device-sample arm converts the texel through a
-/// rounded add, which SPIRV-Cross writes as an `optnone` call. On `moltenvk-m3`, with and without
-/// the variant: no helper census entry, no guard, no `HelperBranchDropsSimdgroupStores`, the
-/// emulated filter only under the variant, and L3.
+/// rounded add, which SPIRV-Cross writes as an `optnone` call. On `moltenvk-m3` under Metal's
+/// filter of the format (`YCbCrFilterPolicy::Exact`), with and without the variant: no helper
+/// census entry, no guard, no `HelperBranchDropsSimdgroupStores`, the emulated filter only under
+/// the variant, and L3.
 #[test]
 fn a_branch_every_invocation_takes_alike_leaves_no_helper_alone() {
     use crate::pipeline::sym::{SlotClass, SlotRef, Stage};
     let Some(bc) = fixture("rch_uniform_branch") else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let policy = DevicePolicy {
+        ycbcr_filter: crate::device::YCbCrFilterPolicy::Exact,
+        ..DevicePolicy::default()
+    };
+    let p = profile("moltenvk-m3", policy).expect("profile");
     let noted = PrecisionNote::HelperBranchDropsSimdgroupStores;
     for ycbcr in [false, true] {
         let what = format!("rch_uniform_branch on moltenvk-m3, YCbCr variant {ycbcr}");
@@ -5168,4 +5316,257 @@ fn a_fragment_functions_derivatives_are_fine() {
         compiled += 1;
     }
     assert!(compiled >= 10, "{compiled} profiles compiled it");
+}
+
+/// A draw that reads a texture its subpass renders through a snapshot (`BindState::
+/// snapshot_textures`): owned fixture `tob_renders`'s `tob_rect` and `tob_read`
+/// (`t.read(uint2(in.position.xy))`, whose texel reaches only its output), planned with slots 0
+/// and 3 asking for snapshots, keeps slot 0 alone (the function has no slot 3) on every profile
+/// with the pixel interlock, fragment stores, the feedback loop layout and dynamic color write
+/// masks. Its variant binds slot 0's snapshot as a storage image, states `snapshot_reads`, makes
+/// the write masks dynamic, requires the feedback loop layout, writes no memory of the
+/// function's, passes L3, and plans the same variant
+/// against itself, writing `WriteSource::SnapshotTexels` and leaving the phase to the consumer as a
+/// fragment hole, zero in the plan's bytes. A pipeline with a depth attachment, a multisampled
+/// one, a profile without one of those features, and a draw that asks for no snapshot keep the
+/// plain pipeline.
+#[test]
+fn a_snapshot_read_plans_its_variant_where_the_pipeline_can() {
+    use crate::bind::{DrawCall, PushHole};
+    use crate::pipeline::sym::{PushField, SlotClass, SlotRef, SnapshotForm, Stage};
+    let Some(bc) = fixture("tob_renders") else {
+        return;
+    };
+    let function = |name: &str| {
+        StageSource::Function(FunctionDescriptor::new(
+            Library::from_air(&bc)
+                .expect("library")
+                .function(name)
+                .expect("function"),
+        ))
+    };
+    let descriptor = |depth: bool, samples: u32| {
+        let mut d = RenderPipelineDescriptor::new(function("tob_rect"));
+        d.fragment = Some(function("tob_read"));
+        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
+        if depth {
+            d.depth_format = Some(PixelFormat::Depth32Float);
+        }
+        d.raster_sample_count = samples;
+        d
+    };
+    let snapshots = |p: &crate::pipeline::RenderPipeline| -> Vec<(u32, vk::DescriptorType)> {
+        p.layout
+            .sets
+            .iter()
+            .flat_map(|s| &s.bindings)
+            .filter_map(|b| match b.source {
+                BindingSource::SnapshotTexels(slot) => Some((slot, b.ty)),
+                _ => None,
+            })
+            .collect()
+    };
+    let slot = SlotRef {
+        stage: Stage::Fragment,
+        class: SlotClass::Texture,
+        index: 0,
+    };
+    let state = BindState {
+        snapshot_textures: [0, 3].into(),
+        ..Default::default()
+    };
+    let draw = DrawCall::Primitives {
+        vertex_start: 0,
+        vertex_count: 4,
+        instance_count: 1,
+        base_instance: 0,
+    };
+    let mut planned = 0;
+    for stem in [
+        "intel-irisxe-anv",
+        "amd-780m-radv",
+        "nvidia-rtx5080-laptop",
+        "lavapipe",
+        "vk12-floor",
+    ] {
+        let desc = crate::pipeline::testing::description(stem).expect("description");
+        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let base = dev
+            .compile_render_pipeline(&descriptor(false, 1), &Budget::standard())
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert!(snapshots(&base).is_empty(), "{stem}");
+        assert!(!base.graphics.snapshot_reads, "{stem}");
+        let plain = base
+            .plan(&dev, &BindState::default().shape())
+            .expect("plain plan");
+        assert!(plain.variant.snapshot_textures.is_empty(), "{stem}");
+        let plan = base.plan(&dev, &state.shape()).expect("plan");
+        // The binder plans the variant where the device enabled what its draws take: the pixel
+        // interlock, fragment stores, the feedback loop layout and dynamic write masks.
+        let enabled = &dev.profile().fields().enabled.features;
+        let takes = dev.profile().fields().fragment.pixel_interlock
+            && [
+                VkFeature::FragmentStoresAndAtomics,
+                VkFeature::AttachmentFeedbackLoopLayout,
+                VkFeature::ExtendedDynamicState3ColorWriteMask,
+            ]
+            .iter()
+            .all(|feature| enabled.contains(feature));
+        if !takes {
+            assert!(plan.variant.snapshot_textures.is_empty(), "{stem}");
+            continue;
+        }
+        planned += 1;
+        // No texture bound: the fetched lanes' bits.
+        assert_eq!(
+            plan.variant.snapshot_textures,
+            [(slot, SnapshotForm::Bits)].into(),
+            "{stem}"
+        );
+        assert!(
+            matches!(
+                plan.instantiate_draw(&state, &draw),
+                Err(BindError::NeedsVariant { .. })
+            ),
+            "{stem}: the base pipeline is the other variant"
+        );
+        let variant = dev
+            .compile_render_variant(&descriptor(false, 1), &plan.variant, &Budget::standard())
+            .unwrap_or_else(|e| panic!("{stem}: variant: {e}"));
+        assert_eq!(
+            snapshots(&variant),
+            [(0, vk::DescriptorType::STORAGE_IMAGE)],
+            "{stem}"
+        );
+        assert!(variant.graphics.snapshot_reads, "{stem}");
+        assert!(
+            variant
+                .graphics
+                .dynamic_states
+                .contains(&vk::DynamicState::COLOR_WRITE_MASK_EXT),
+            "{stem}: dynamic write masks"
+        );
+        assert!(
+            variant
+                .requirements
+                .features
+                .contains(&VkFeature::AttachmentFeedbackLoopLayout)
+                && variant
+                    .requirements
+                    .features
+                    .contains(&VkFeature::ExtendedDynamicState3ColorWriteMask),
+            "{stem}: {:?}",
+            variant.requirements.features
+        );
+        assert!(!variant.graphics.fragment_writes_memory, "{stem}");
+        for m in &variant.stages {
+            check_words_valid(&m.spirv, &variant.requirements, dev.profile())
+                .unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
+        }
+        let again = variant.plan(&dev, &state.shape()).expect("variant plan");
+        assert_eq!(again.variant, plan.variant, "{stem}: a fixed point");
+        assert!(
+            again
+                .descriptors
+                .iter()
+                .any(|w| w.source == WriteSource::SnapshotTexels { slot: 0 }),
+            "{stem}: {:?}",
+            again.descriptors
+        );
+        let cmds = again
+            .instantiate_draw(&state, &draw)
+            .unwrap_or_else(|e| panic!("{stem}: draw: {e:?}"));
+        let holes: Vec<(vk::ShaderStageFlags, u32)> = cmds
+            .push_holes
+            .iter()
+            .filter_map(|h| match *h {
+                PushHole::SnapshotPhase { stages, offset } => Some((stages, offset)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(holes.len(), 1, "{stem}: {:?}", cmds.push_holes);
+        let (stages, offset) = holes[0];
+        assert_eq!(stages, vk::ShaderStageFlags::FRAGMENT, "{stem}");
+        let at = offset as usize;
+        let bytes = cmds
+            .push_constants
+            .iter()
+            .find(|w| w.stages == stages)
+            .map(|w| (w.offset as usize, &w.bytes))
+            .expect("the fragment's push bytes");
+        assert_eq!(
+            bytes.1.get(at - bytes.0..at - bytes.0 + 4),
+            Some(&[0u8; 4][..]),
+            "{stem}: phase 0 in the plan's bytes"
+        );
+        assert!(
+            again
+                .push
+                .fields
+                .iter()
+                .any(|f| f.field == PushField::SnapshotPhase),
+            "{stem}"
+        );
+        // A bound texture's form: the codes of a normalized or half-float format, the bits of a
+        // 32-bit float format's lanes and of an sRGB format's decoded ones; each variant passes L3
+        // and binds its snapshot.
+        for (format, form) in [
+            (PixelFormat::RGBA8Unorm, SnapshotForm::Unorm8),
+            (PixelFormat::BGRA8Unorm, SnapshotForm::Unorm8),
+            (PixelFormat::R8Unorm, SnapshotForm::Unorm8),
+            (PixelFormat::RGBA8Snorm, SnapshotForm::Snorm8),
+            (PixelFormat::RG16Unorm, SnapshotForm::Unorm16),
+            (PixelFormat::RGBA16Float, SnapshotForm::Half),
+            (PixelFormat::RGBA32Float, SnapshotForm::Bits),
+            (PixelFormat::RGB10A2Unorm, SnapshotForm::Bits),
+        ] {
+            let mut bound = state.clone();
+            let mut table = crate::bind::state::StageTable::default();
+            let facts =
+                crate::bind::state::TextureFacts::new(crate::metal::TextureType::Type2D, format);
+            table.textures.insert(
+                0,
+                crate::bind::state::BoundTexture::Texture {
+                    facts,
+                    resource_id: None,
+                },
+            );
+            bound.stages.insert(Stage::Fragment, table);
+            let plan = base.plan(&dev, &bound.shape()).expect("bound plan");
+            assert_eq!(
+                plan.variant.snapshot_textures,
+                [(slot, form)].into(),
+                "{stem}: {format:?}"
+            );
+            let variant = dev
+                .compile_render_variant(&descriptor(false, 1), &plan.variant, &Budget::standard())
+                .unwrap_or_else(|e| panic!("{stem}: {format:?}: {e}"));
+            assert_eq!(
+                snapshots(&variant),
+                [(0, vk::DescriptorType::STORAGE_IMAGE)],
+                "{stem}: {format:?}"
+            );
+            for m in &variant.stages {
+                check_words_valid(&m.spirv, &variant.requirements, dev.profile())
+                    .unwrap_or_else(|e| panic!("{stem}: {format:?}: L3: {e}"));
+            }
+        }
+        // No snapshot again: the plain pipeline.
+        let unread = variant
+            .plan(&dev, &BindState::default().shape())
+            .expect("plain plan of the variant");
+        assert!(unread.variant.snapshot_textures.is_empty(), "{stem}");
+        // A depth attachment, or more than one sample, keeps the plain pipeline.
+        for (depth, samples) in [(true, 1), (false, 4)] {
+            let other = dev
+                .compile_render_pipeline(&descriptor(depth, samples), &Budget::standard())
+                .unwrap_or_else(|e| panic!("{stem}: {depth} {samples}: {e}"));
+            let plan = other.plan(&dev, &state.shape()).expect("plan");
+            assert!(
+                plan.variant.snapshot_textures.is_empty(),
+                "{stem}: {depth} {samples}"
+            );
+        }
+    }
+    assert!(planned >= 4, "the interlocked profiles");
 }

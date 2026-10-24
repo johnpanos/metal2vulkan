@@ -1,14 +1,15 @@
 //! Color attachments rendered into linear images in place.
 //!
-//! A texture over a buffer's memory, a no-copy buffer's host pages included, is a linear image
-//! over the buffer's bytes where the device makes one that lies on Metal's layout there
-//! (`Device::alias_image`), and a heap's texture may be a linear image (`texture/heap.rs`). On a
-//! device that enabled `VK_NV_linear_color_attachment`'s `linearColorAttachment` (`enables.rs`),
-//! such an image of a format whose linear tiling has `LINEAR_COLOR_ATTACHMENT_NV` takes color
-//! attachment usage (`ImageFacts::linear`), and a pass renders into it in place: no shadow, no
-//! copy in, no copy back. Vulkan renders it there only where every color attachment of the
-//! render pass instance is linear (the extension's rule): such an attachment is *bound*
-//! ([`bound`]; `ImageFacts::linear_attachment_rule`). A multisampled image is never linear, so:
+//! A texture over a buffer of the runtime's memory is a linear image over the buffer's bytes where
+//! the device makes one that lies on Metal's layout there (`Device::alias_image`; one over a
+//! no-copy buffer's host pages is a shadow), and a heap's texture may be a linear image
+//! (`texture/heap.rs`). On a device that enabled `VK_NV_linear_color_attachment`'s
+//! `linearColorAttachment` (`enables.rs`), such an image of a format whose linear tiling has
+//! `LINEAR_COLOR_ATTACHMENT_NV` takes color attachment usage (`ImageFacts::linear`), and a pass
+//! renders into it in place: no shadow, no copy in, no copy back. Vulkan renders it there only
+//! where every color attachment of the render pass instance is linear (the extension's rule): such
+//! an attachment is *bound* ([`bound`]; `ImageFacts::linear_attachment_rule`). A multisampled image
+//! is never linear, so:
 //!
 //! - **A pass beside a color attachment that is not linear** (a private texture's image, an image
 //!   of the runtime's standing in for an attachment), **or with a depth or stencil attachment**
@@ -53,7 +54,7 @@
 //! box's undrawn pixels back as the copy in read them and hid the pass's earlier draws from its
 //! reads: the consumer's x86 guest's alert corners and hover fills.)
 //!
-//! Measured (EV ZIN2-lc1-nvidia on an RTX 3090 and the consumer's run of it on an RTX 5080 Laptop
+//! Measured (on an RTX 3090 and the consumer's run of it on an RTX 5080 Laptop
 //! GPU; 1080p `BGRA8` over host pages, in place against copies of the draws' box, medians of 31
 //! interleaved): on the 5080 a blending draw reads and writes its pixels across the bus once each
 //! in place, so one layer costs 0.55 to 0.87 of the copies at every area and two or more 1.5 to 7.4
@@ -80,7 +81,7 @@ use metal2vulkan::pipeline::ColorAttachmentState;
 #[derive(Clone, Debug, Default)]
 pub(super) struct Coverage {
     /// By color index: the box of every pixel a draw may write, `[x0, y0, x1, y1]`, half-open.
-    colors: Vec<Option<[u32; 4]>>,
+    colors: [Option<[u32; 4]>; MAX_COLOR_ATTACHMENTS],
     /// A draw's pixels were not bounded (an execution of render commands, a tile dispatch, a
     /// draw through a rasterization-rate map or of a state the host does not read): each
     /// attachment's draws write over the whole render area, in no box.
@@ -92,7 +93,7 @@ impl Coverage {
     /// (`render/executions.rs`), whose pass the executing encoder ends.
     pub(super) fn unbounded() -> Coverage {
         Coverage {
-            colors: Vec::new(),
+            colors: [None; MAX_COLOR_ATTACHMENTS],
             unbounded: true,
         }
     }
@@ -112,9 +113,6 @@ impl Coverage {
         let Some(bounds) = bounds else {
             return;
         };
-        if self.colors.len() < writes.len() {
-            self.colors.resize(writes.len(), None);
-        }
         for (color, write) in self.colors.iter_mut().zip(writes) {
             if write.is_some() {
                 *color = Some(color.map_or(bounds, |b| union(b, bounds)));
@@ -266,19 +264,18 @@ pub(super) fn apart(
 }
 
 /// Render the bound attachments among `layout`'s colors, a pass's as it ends, apart where a
-/// render pass instance of it holds a color attachment that is not linear: `others` by instance,
-/// the color indices an instance renders through an image of the runtime's (a stand-in of
-/// another format). Refused (`NotImplemented(Render)`) where a draw took a view of a bound one
+/// render pass instance of it holds a color attachment that is not linear: `other`, the first
+/// color index an instance renders through an image of the runtime's (a stand-in of another
+/// format), of the first instance with one. Refused (`NotImplemented(Render)`) where a draw took a view of a bound one
 /// (`taken`): the pass renders it in place.
 pub(super) fn settle(
     maker: &CommandBuffer,
     colors: &mut [Option<ColorTarget>],
-    others: &[Vec<usize>],
+    mut other: Option<usize>,
     taken: impl Fn(usize) -> bool,
 ) -> Result<(), Error> {
     let device = maker.device();
     let mut bound_at = Vec::new();
-    let mut other = others.iter().flatten().next().copied();
     for (index, color) in colors.iter().enumerate() {
         let Some(color) = color else {
             continue;

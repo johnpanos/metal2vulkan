@@ -23,7 +23,7 @@ use crate::spirv::ir::TypedModule;
 fn routines(b: &mut ModuleBuilder, fma: Fma) -> BResult<SnapRoutines> {
     let (path, khr) = match fma.route {
         Route::Khr => (Path::Fused, true),
-        Route::Wide | Route::Soft | Route::HalfOdd | Route::F16 | Route::Native => {
+        Route::Wide | Route::Soft | Route::HalfOdd | Route::F16 | Route::F16Khr | Route::Native => {
             (Path::Integer, false)
         }
     };
@@ -74,6 +74,7 @@ fn by(route: Route) -> Fma {
     let routes = fma::Routes {
         float: route,
         half: Route::HalfOdd,
+        tiny: None,
     };
     Fma::by(routes, SCALAR).expect("float")
 }
@@ -236,7 +237,7 @@ fn check(lanes: &[([f32; 3], u32)], got: &[[f32; 3]], wrap: FaceWrap, what: &str
     }
 }
 
-/// Lanes of WRG's cube rounding probe 2 (WRG-cube-round-probe-2, Apple M3 Max on macOS 26.7 and
+/// Lanes of WRG's cube rounding probe 2 (Apple M3 Max on macOS 26.7 and
 /// M4 on macOS 27.0.1, byte-identical) on faces of 1,024 texels along which Metal's texture
 /// unit's reciprocal is not `RN(1 / |m_a|)`: each direction's bits (face `+x`) and the texel
 /// Metal read on the face's `s` and `t` axes. Every 25th of the 202 such lanes that Metal's

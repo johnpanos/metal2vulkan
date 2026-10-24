@@ -7,7 +7,7 @@
 //!
 //! A queue holds at most its `maxCommandBufferCount` uncompleted command buffers, as Metal's does
 //! (measured on an M3 Max with macOS 26.7 and an M4 with macOS 27.0.1, with and without API
-//! validation: EVs `RT10-qlprobe`, `-qlprobe2`, `-qlprobe3`):
+//! validation):
 //! - `newCommandQueue` holds 64; `newCommandQueueWithMaxCommandBufferCount:` holds the count
 //!   given (every count from 1 to `NSIntegerMax` is taken). A count of 0 fails Metal's command
 //!   queue creation validation, which ends the process with or without API validation; the
@@ -15,24 +15,32 @@
 //! - A command buffer holds one of its queue's slots from its creation, whether it is made with
 //!   retained references or not, until it completes (after its completed handlers, before its
 //!   `wait_until_completed` returns), or until it is dropped uncommitted. Enqueued, committed and
-//!   scheduled command buffers hold theirs.
+//!   scheduled command buffers hold theirs. A completed one's comes back as its last completed
+//!   handler returns, whether or not the program still holds it, and without waiting for the
+//!   release of what its commands used: a blocked make returns while a no-copy buffer's
+//!   deallocator run there still runs (probe `slotdealloc`, the M3 Max under macOS 27.0.1: 0.04
+//!   to 0.3 ms after a handler of 0 to 200 ms, with a deallocator of 200 ms under way; counted,
+//!   `WorkCounts::slot_return_nanos`).
 //! - At the limit, `commandBuffer` blocks until a slot comes back; it never answers nil. The
 //!   runtime blocks too, except where no slot can come back: in the queue's own context (its
 //!   handlers and deallocators) while every slot is held by a committed command buffer, where
 //!   Metal's never returns, it refuses at once (`WaitWouldDeadlock`, `command_buffer/own.rs`).
 //! - The limit is the queue's alone: another queue's command buffers are made meanwhile.
 
+use super::attachment_stand_in::BackingPool;
 use super::command_buffer::own::{running, slot_wait, Answer, Context};
 use super::command_buffer::CommandBuffer;
 use super::contexts;
 use super::degradation::Degradation;
 use super::device::{lock, Device};
 use super::error::{Error, Invalid, Problem};
+use super::texture::kept_image::KeptImages;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 
 /// The uncompleted command buffers a queue holds when made with `new_command_queue`: Metal's
-/// default `maxCommandBufferCount`, measured (`RT10-qlprobe`).
+/// default `maxCommandBufferCount`, measured.
 const DEFAULT_MAX_COMMAND_BUFFER_COUNT: usize = 64;
 
 /// A Metal command queue (`MTLCommandQueue`). Cheap to clone (a retain); `Send + Sync`.
@@ -57,9 +65,15 @@ struct QueueShared {
     /// The slots its uncompleted command buffers hold.
     slots: Arc<Slots>,
     /// The latest GPU end, in nanoseconds of the host's clock, of its command buffers completed
-    /// so far, which the completion thread places in its order (`gpu_time.rs`). A leaf lock:
+    /// so far, which the completion turns place in its order (`gpu_time.rs`). A leaf lock:
     /// taken under a command buffer's, never held while another is taken.
     latest_gpu_end: Mutex<u64>,
+    /// The backings of memoryless attachments its passes render into images of their own
+    /// (`attachment_stand_in::pooled_backing`). A leaf lock: never held while another is taken.
+    memoryless_backings: Mutex<BackingPool>,
+    /// The kept images its merges' keeps made, kept for its later keeps
+    /// (`texture/kept_image.rs`).
+    kept_images: KeptImages,
 }
 
 /// A queue's slots: one per uncompleted command buffer, at most `max`.
@@ -231,6 +245,8 @@ impl Device {
             label: Mutex::new(None),
             slots: Slots::new(count, Arc::clone(&self.shared().uncommitted)),
             latest_gpu_end: Mutex::new(0),
+            memoryless_backings: Mutex::new(BackingPool::default()),
+            kept_images: KeptImages::default(),
         }))
     }
 }
@@ -268,13 +284,15 @@ impl CommandQueue {
         Ok(CommandBuffer::new(self, slot))
     }
 
-    /// A slot for a new command buffer, waiting for one to come back while all are held.
+    /// A slot for a new command buffer, waiting for one to come back while all are held: counted
+    /// (`WorkCounts::slot_waits`).
     fn slot(&self) -> Result<Slot, Error> {
         let slots = &self.0.slots;
         let mut held = slots.lock();
         if let Some(slot) = slots.take(&mut held) {
             return Ok(slot);
         }
+        let waited = Instant::now();
         let context = self.context();
         let _blocked = match slot_wait(running(), context, held.open > 0) {
             Answer::Wait | Answer::Return => None,
@@ -289,6 +307,9 @@ impl CommandQueue {
         };
         loop {
             if let Some(slot) = slots.take(&mut held) {
+                drop(held);
+                let nanos = u64::try_from(waited.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.0.device.shared().counts.slot_waited(nanos);
                 return Ok(slot);
             }
             held = slots
@@ -316,6 +337,17 @@ impl CommandQueue {
     /// The index of the device's `VkQueue` the queue submits to.
     pub(super) fn vk_queue(&self) -> usize {
         self.0.vk_queue
+    }
+
+    /// The backings of memoryless attachments the queue keeps for its passes
+    /// (`attachment_stand_in::pooled_backing`).
+    pub(super) fn memoryless_backings(&self) -> &Mutex<BackingPool> {
+        &self.0.memoryless_backings
+    }
+
+    /// The kept images the queue keeps for its merges' keeps (`texture/kept_image.rs`).
+    pub(super) fn kept_images(&self) -> &KeptImages {
+        &self.0.kept_images
     }
 
     /// Place a command buffer of the queue that completed after every one placed before: `place`

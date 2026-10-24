@@ -29,12 +29,11 @@
 //!   buffer's `bytesPerRow` is any length that covers the row. A texture buffer's offset is any:
 //!   Metal's validation alone stops one off 16, and a plain run makes the texture, its functions
 //!   reading and writing from the offset rounded down to 16 and its blits and the CPU at the
-//!   offset (an M4, macOS 27.0.1, EVs SPCrp-probe1-m4 `lin_tb_off*`, SPCrp-probe6-m4 `tbo_*`;
-//!   `buffer_texture.rs`), so the runtime does too. The SPI's texture buffer, unmeasured there,
-//!   keeps the validated rule. An array's `bytesPerImage` is ignored: each slice starts
-//!   `bytesPerRow` × `height`, rounded up to 128, after the one before. Metal's validation alone
-//!   asserts that it is a multiple of 128; a plain run makes the array at any (16, 32, 64, 80 and
-//!   192 measured, probe 9b), so the runtime does too.
+//!   offset (an M4, macOS 27.0.1; `buffer_texture.rs`), so the runtime does too. The SPI's texture
+//!   buffer, unmeasured there, keeps the validated rule. An array's `bytesPerImage` is ignored:
+//!   each slice starts `bytesPerRow` × `height`, rounded up to 128, after the one before. Metal's
+//!   validation alone asserts that it is a multiple of 128; a plain run makes the array at any (16,
+//!   32, 64, 80 and 192 measured, probe 9b), so the runtime does too.
 //! - **Length.** Validation counts `offset + bytesPerRow × (height × slices − 1) + the packed row`
 //!   against the buffer's length: for an array, as if its slices were not rounded. Where an
 //!   array's last slice still runs past the length, Metal answers nil when the buffer is at least
@@ -46,8 +45,7 @@
 //! **IOSurface planes** (`Buffer::new_texture_with_iosurface_plane`, the stand-in for
 //! `newTextureWithDescriptor:iosurface:plane:` over the caller's memory). Measured on the M3 Max
 //! (macOS 26.7) and an M4 (macOS 27.0.1), which agree on every byte but the memory-dependent reads
-//! and the overlapping writes below (EVs `SPH-iosurf1-m4`, `SPH-iosurf2-m4`, `SPH-iosurf3-m3`,
-//! `SPH-iosurf3-m4`, `IOS-iosurf4-m4` and `IOS-iosurf4-m3`; one process a case, plain twice and
+//! and the overlapping writes below (one process a case, plain twice and
 //! under API validation, which flags none of them):
 //!
 //! - **Made.** A surface without planes takes a `bytesPerRow` that is a multiple of 16 only: Metal
@@ -56,7 +54,7 @@
 //!   its '420v' backing, base and offset alike) takes any offset and any `bytesPerRow` that covers
 //!   its row, a multiple of the texel's size or not. IOSurface makes no plane whose pitch is below
 //!   its row.
-//! - **Options** (EV `IOS-modes2-m4`, an M4, macOS 27.0.1, flat and planar surfaces). The texture
+//! - **Options** (an M4, macOS 27.0.1, flat and planar surfaces). The texture
 //!   takes and reports its descriptor's storage, CPU cache and hazard tracking modes (its default
 //!   hazard tracking mode resolved to tracked), whatever the surface's memory or the buffer
 //!   standing for it: `Shared` and `Managed`, each CPU cache mode and each hazard tracking mode are
@@ -78,7 +76,7 @@
 //!   process, and after a write other bytes, neither the surface's nor the written ones (not the
 //!   same on the M3 Max and the M4). The runtime's GPU reads those rows where its writes put them,
 //!   a recorded near-equivalent (`Degradation::NarrowSurfaceRows`, [`Placed::narrow`]).
-//! - **4:2:2 planes** (an M4 under macOS 27.0.1, EV `APX2-xv1-m4`, plain twice and validated
+//! - **4:2:2 planes** (an M4 under macOS 27.0.1, plain twice and validated
 //!   alike): a texture of either 4:2:2 format over a CoreVideo `2vuy` or `yuvs` surface (no planes,
 //!   `bytesPerRow` 64 for 16 x 4) is made, in either format over either surface; `getBytes` reads
 //!   the surface's rows, `replaceRegion` writes them leaving the bytes between untouched, and a
@@ -99,12 +97,12 @@
 //!   plane the texture keeps one aspect's unit a texel (`copy_plan::surface_depth_unit`: its depth,
 //!   else its stencil; the stencil of `Depth32Float_Stencil8` is not in the plane), laid out by the
 //!   rules above as a colour texel's: its reads, samples and CPU access take the plane's bytes
-//!   there (EVs SID-pdl1-m4 to SID-pdl6-m4). The texture is a shadow of those bytes (`shadow.rs`),
-//!   whose copies move that aspect alone. A render pass stores it otherwise, in Metal's tiled
-//!   layout (`texture/heap_tiled.rs`) from the plane's offset rounded down to 128: it renders
-//!   through a tiled twin (`texture/surface_depth.rs`, which lists what stays the runtime's gap,
+//!   there. The texture is a shadow of those bytes (`shadow.rs`), whose copies move that aspect
+//!   alone. A render pass stores it otherwise, in Metal's tiled layout (`texture/heap_tiled.rs`)
+//!   from the plane's offset rounded down to 128: it renders through a tiled twin
+//!   (`texture/surface_depth.rs`, which lists what stays the runtime's gap,
 //!   `NotImplemented(RuntimeGap::SurfaceDepthStencil)`, with a blit of the stencil of
-//!   `Depth32Float_Stencil8`; EVs SID-pdl1-m4 to SID-pdl7-m4).
+//!   `Depth32Float_Stencil8`).
 //!
 //! The runtime holds both layouts: the GPU's ([`Placed::gpu`]) is the texture's texels for every
 //! command, the copies of its shadow, an aliasing image and their hazards; the CPU's
@@ -119,13 +117,11 @@
 //! (it lacks nothing, [`linear_lack`]), and the image the device made, at the pitch it chose
 //! itself, sits exactly on Metal's layout and holds no byte but the texels ([`aliases`]). A
 //! texture whose rows or slices lie with the buffer's bytes between them, which Metal leaves as the
-//! program writes them, is one only where it only reads, under the policy's default
-//! (`PaddedReadsPolicy::Alias`): its image then holds those bytes too, which Vulkan lets its layout
-//! transitions write, and it takes one, its first move ([`holding`]). A texture that renders or
-//! writes over such rows never is one, as a render pass's load and store operations write every
-//! byte of an attachment's subresource. Otherwise it is a shadow image the encoders copy from and
-//! to the buffer (`shadow.rs`), whose copies address the buffer's texels alone, which is exact for
-//! Metal's defined behaviour.
+//! program writes them, never is one, whatever its usage ([`holding`]): its image would hold those
+//! bytes too, which Vulkan lets its layout transitions (its first move among them) and a render
+//! pass's load and store operations write. Otherwise it is a shadow image the encoders copy from
+//! and to the buffer (`shadow.rs`), whose copies address the buffer's texels alone, which is exact
+//! for Metal's defined behaviour.
 
 use super::chroma_pairs::is_four_two_two;
 use super::copy_plan::block_extent;
@@ -133,7 +129,6 @@ use super::image_plan::{compatible, view_formats, ImageFacts, ImagePlan};
 use super::metal_level::MetalLevel;
 use super::texture_descriptor::TextureLayout;
 use super::values::StorageMode;
-use metal2vulkan::device::PaddedReadsPolicy;
 use metal2vulkan::error::LinearNeed;
 use metal2vulkan::metal::format::is_depth_stencil;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
@@ -238,13 +233,15 @@ fn backed(pf: PixelFormat) -> Result<(), BufferTextureProblem> {
 
 /// `pf`'s alignment in a buffer ([`LINEAR_ALIGNMENT`]) on a device answering at `level`, or why
 /// no buffer can back it: also a format the level describes none of
-/// ([`MetalLevel::describes`]), whose alignment queries Metal asserts on (EVs XRR2-pla1-m4 and
-/// XRR2-pla1-m3).
+/// ([`MetalLevel::describes`]), whose alignment queries Metal asserts on, and one it describes as a
+/// depth or a stencil format, `AnyDepth` and `AnyStencil` among them, which Vulkan has no format
+/// for ("Linear textures do not support depth/stencil pixel formats").
 pub(super) fn linear_alignment(
     pf: PixelFormat,
     level: MetalLevel,
 ) -> Result<u64, BufferTextureProblem> {
-    if !level.describes(pf) {
+    let info = level.pixel_format_info(u64::from(pf.as_raw()));
+    if !info.describes_a_format() || info.depth_or_stencil() {
         return Err(BufferTextureProblem::NotLinear { pixel_format: pf });
     }
     backed(pf).map(|()| LINEAR_ALIGNMENT)
@@ -702,13 +699,11 @@ pub(super) struct LinearImage {
 /// memory block), holds exactly Metal's texels in the `room` bytes from there to the end of the
 /// buffer's memory: the binding is a multiple of the image's alignment, its texels start at the
 /// binding, its row pitch is Metal's and so is its slice pitch where it has several slices, its
-/// subresources hold no byte but what `holds` lets them (the texture's texels, and for
-/// [`Holds::Padding`] the bytes between its rows), and its memory stays in the buffer's. A driver
-/// may report a pitch other than the one asked of it (NVIDIA does for explicit layouts it does not
-/// support), so the image's own report decides.
+/// subresources hold no byte but the texture's texels ([`texels_alone`]), and its memory stays in
+/// the buffer's. A driver may report a pitch other than the one asked of it (NVIDIA does for
+/// explicit layouts it does not support), so the image's own report decides.
 pub(super) fn aliases(
     layout: &BufferLayout,
-    holds: Holds,
     memory_offset: u64,
     room: u64,
     image: &LinearImage,
@@ -718,60 +713,14 @@ pub(super) fn aliases(
         && image.offset == 0
         && image.row_pitch == layout.row_pitch
         && (layout.slices == 1 || image.array_pitch == layout.slice_pitch)
-        && holds.fits(layout, image.subresource, image.array_pitch)
+        && texels_alone(layout, image.subresource, image.array_pitch)
         && image.size <= room
 }
 
-/// What an image over a texture's texels in a buffer may hold in its subresources beside the
-/// texels ([`holding`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Holds {
-    /// The texels alone: no byte of its subresources is another's ([`texels_alone`]).
-    Texels,
-    /// The texels and the bytes between the texture's rows (and slices), its last row's to its row
-    /// pitch among them, but nothing past them ([`padded_alone`]): a texture that only reads, over
-    /// rows that lie apart, under `PaddedReadsPolicy::Alias`.
-    Padding,
-}
-
-impl Holds {
-    /// Whether an image whose subresources take `size` bytes each from the first texel of their
-    /// slice, `array_pitch` apart, holds only what `self` lets it over `layout`'s texels.
-    pub(super) fn fits(self, layout: &BufferLayout, size: u64, array_pitch: u64) -> bool {
-        match self {
-            Holds::Texels => texels_alone(layout, size, array_pitch),
-            Holds::Padding => padded_alone(layout, size, array_pitch),
-        }
-    }
-
-    /// The bytes from the texture's first texel that its image's subresources may reach.
-    pub(super) fn reach(self, layout: &BufferLayout) -> u64 {
-        match self {
-            Holds::Texels => layout.end() - layout.offset,
-            Holds::Padding => rows_end(layout) - layout.offset,
-        }
-    }
-}
-
-/// Whether a texture of Metal `usage` (as Metal reports it: `Unknown` as `ShaderRead |
-/// ShaderWrite | RenderTarget | PixelFormatView`, `texture_descriptor::texture_usage`) only reads:
-/// no render pass takes its image as an attachment (`RenderTarget`), and no shader writes it
-/// (`ShaderWrite`, `ShaderAtomic`, block writes).
-pub(super) fn only_reads(usage: TextureUsage) -> bool {
-    !usage.intersects(
-        TextureUsage::RENDER_TARGET
-            | TextureUsage::SHADER_WRITE
-            | TextureUsage::SHADER_ATOMIC
-            | TextureUsage::BLOCK_WRITES_ONLY,
-    )
-}
-
-/// What an image over `layout`'s texels may hold beside them, for a texture of Metal `usage` (as
-/// [`only_reads`] takes it) under `policy`, or why no image may hold them: the texels alone
-/// where its rows (and slices) lie one after another, or it has one row (one slice); else, where
+/// Whether an image over `layout`'s texels, for a texture of Metal `usage`, may hold them: where
+/// its rows (and slices) lie one after another, or it has one row (one slice); else why not, where
 /// they lie with bytes between them that are not texels (the buffer's, which Metal's writes of the
-/// texture never reach), those bytes too where the texture only reads and the policy aliases them
-/// (`PaddedReadsPolicy::Alias`), and else why not.
+/// texture never reach), whatever its usage.
 ///
 /// An image whose rows lie `row_pitch` apart holds those bytes in its subresource
 /// (`VkSubresourceLayout`: "size includes any extra memory that is required based on rowPitch"),
@@ -793,17 +742,13 @@ pub(super) fn only_reads(usage: TextureUsage) -> bool {
 ///
 /// A copy and a shader's read or write of the image touch its texels alone (the Memory
 /// Model: "A memory operation must not affect memory at a memory location not within its set of
-/// memory locations"). So a texture that renders or writes is a shadow: a write back of what was
-/// read would undo the program's write of the bytes meanwhile, which Metal keeps, and lavapipe
-/// reads the bytes its 4-texel blocks reach past a row's texels and writes them back, a signaling
-/// NaN's bits quieted. A texture that only reads meets the bytes at its first move alone, which
-/// keeps them where the driver's move does (`docs/FAST-PATHS.md`'s known gap, which tight rows
-/// share): the policy's default aliases them, and `PaddedReadsPolicy::Shadow` keeps the shadow.
-pub(super) fn holding(
-    layout: &BufferLayout,
-    usage: TextureUsage,
-    policy: PaddedReadsPolicy,
-) -> Result<Holds, String> {
+/// memory locations"). But every image takes a first move, across which the host could keep the
+/// bytes only by reading them before it and writing them back after (`texture/first_move.rs`'s
+/// `Keep`), undoing a CPU write made to them meanwhile, where Metal keeps every one; and lavapipe's
+/// shader writes read the bytes its 4-texel blocks reach past a row's texels and write them back, a
+/// signaling NaN's bits quieted. So such a texture is a shadow, whose copies address its texels
+/// alone.
+pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(), String> {
     let (rows, slices) = apart(layout);
     let apart = if rows {
         format!(
@@ -816,12 +761,8 @@ pub(super) fn holding(
             layout.slice_pitch, layout.rows, layout.row_pitch
         )
     } else {
-        return Ok(Holds::Texels);
+        return Ok(());
     };
-    let reads = only_reads(usage);
-    if reads && policy == PaddedReadsPolicy::Alias {
-        return Ok(Holds::Padding);
-    }
     let writers = if usage.contains(TextureUsage::RENDER_TARGET) {
         "its layout transitions read and write, and a render pass's load and store operations \
          write back"
@@ -829,15 +770,8 @@ pub(super) fn holding(
         "its layout transitions read and write, its first move from the layout it is made in \
          among them"
     };
-    let asked = if reads {
-        " (the device's policy asks no image over them for a texture that only reads, \
-         `PaddedReadsPolicy::Shadow`)"
-    } else {
-        ""
-    };
     Err(format!(
-        "{apart}: an image over them holds the bytes between them, which Vulkan lets \
-         {writers}{asked}"
+        "{apart}: an image over them holds the bytes between them, which Vulkan lets {writers}"
     ))
 }
 
@@ -854,24 +788,6 @@ pub(super) fn texels_alone(layout: &BufferLayout, size: u64, array_pitch: u64) -
     let texels = layout.end() - layout.offset;
     let last = array_pitch.saturating_mul(layout.slices - 1);
     apart(layout) == (false, false) && last.saturating_add(size) <= texels
-}
-
-/// Whether a linear image over `layout`'s texels, whose subresources take `size` bytes each from
-/// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels and
-/// the bytes between its rows and slices ([`Holds::Padding`]): its last subresource ends at its last
-/// row's pitch or before ([`rows_end`]). A byte past that is no row's, and no move of the image may
-/// reach it, as [`texels_alone`] keeps it for tight rows (lavapipe's rows rounded up to 4).
-pub(super) fn padded_alone(layout: &BufferLayout, size: u64, array_pitch: u64) -> bool {
-    let last = array_pitch.saturating_mul(layout.slices - 1);
-    last.saturating_add(size) <= rows_end(layout) - layout.offset
-}
-
-/// One past `layout`'s last row at its row pitch: the texels' end with the last row's padding.
-fn rows_end(layout: &BufferLayout) -> u64 {
-    layout
-        .offset
-        .saturating_add(layout.slice_pitch.saturating_mul(layout.slices - 1))
-        .saturating_add(layout.row_pitch.saturating_mul(layout.rows))
 }
 
 /// Whether `layout`'s rows, and its slices, lie with bytes between them that are not texels.

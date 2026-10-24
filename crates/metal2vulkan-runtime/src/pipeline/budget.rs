@@ -15,12 +15,18 @@
 //!   rank of those that may take it:
 //!   1. a making in a command buffer's host step, which holds its device's scheduler (every
 //!      command buffer's submission) while it waits ([`Urgency::HostStep`]);
-//!   2. a making a committed command buffer's batch waits for: the GPU's queue, and the
+//!   2. a making the first batch held on a command queue waits for: every batch committed after
+//!      it there waits behind it, and the program's thread, once the queue's command buffers are
+//!      all held, in `commandBuffer` ([`Urgency::Head`]). The scheduler raises a batch's makings
+//!      to it once the batch is first in its queue's line (`scheduler/mod.rs`, `hasten_heads`):
+//!      Metal makes a pipeline state at its creation, so no submission of Metal's waits for a
+//!      making, and the one that holds a queue goes before the rest;
+//!   3. a making a committed command buffer's batch waits for: the GPU's queue, and the
 //!      program's watchdog on it, wait behind it ([`Urgency::Committed`]);
-//!   3. a making a program's thread waits for: its own draw's, dispatch's or helper's, a state's
+//!   4. a making a program's thread waits for: its own draw's, dispatch's or helper's, a state's
 //!      creation's predicted key on the creating thread, a caller blocked on a making in flight
 //!      ([`Urgency::Program`]);
-//!   4. a making nothing waits for yet: a draw's piece before its command buffer commits
+//!   5. a making nothing waits for yet: a draw's piece before its command buffer commits
 //!      ([`Urgency::Ahead`]). These take idle turns, but hold at most the budget's `ahead`
 //!      turns (by default all but one) at once, so a waited making that comes
 //!      finds a turn free: the turns past the `ahead` ones are only for makings a thread, a
@@ -30,10 +36,10 @@
 //!   as it is handed), never falls. Within a rank the earlier ticket goes first. No turn is
 //!   taken back (no preemption).
 //! - **Aging** (the consumer's reviews). A making that has waited [`AGE`] is ordered as a committed
-//!   command buffer's (rank 2) by its ticket, so a steady stream of other makings cannot starve a
+//!   command buffer's (rank 3) by its ticket, so a steady stream of other makings cannot starve a
 //!   draw's piece of the ahead turns. Aging moves a making nothing waits for up the order only: it
 //!   still takes only an ahead turn, so it never takes the turn a waited making finds free, and a
-//!   host step's making goes before it always.
+//!   host step's making, or a queue's first held batch's, goes before it always.
 //! - **Nothing seen is decided here.** The budget orders driver calls in time and decides nothing
 //!   else: which pipelines are made, their keys, memo entries, creation log numbers, notices and
 //!   everything the program sees are decided by the callers as before; a turn only delays a call.
@@ -43,7 +49,11 @@
 //!   (`making.rs`, `Turn::wait`: a memo's `get_or_make` or `Pending::wait`) asserts in builds
 //!   with debug assertions that its thread holds no turn ([`holds_turn`]). The makings that a
 //!   making's own path reaches (a draw's mesh pipelines, `Making::get_or_make` on the draw's
-//!   path) are asked for on the draw's thread before any turn, never inside a piece's.
+//!   path) are asked for on the draw's thread before any turn, never inside a piece's. A piece
+//!   that waits for its twin's making in the air (`flight.rs`), and a caller that waits for
+//!   another's making of a pipeline library it links (`libraries.rs`, `Library::made`), gives
+//!   its thread's turn back for the wait and takes one again after it at the rank it was given
+//!   at ([`without_turn`]).
 //! - **A pool's turn is its next piece's.** A pool's thread is given its turn together with the
 //!   piece the turn was ranked by, taken from the pool under the budget's lock ([`pool_turn`]), so
 //!   no piece runs on a turn another piece's rank won; and a thread asking counts as busy, so a
@@ -61,7 +71,7 @@
 use super::pool::{PoolQueue, Work};
 use crate::device::lock;
 use crate::exit_guard;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -74,20 +84,20 @@ use std::time::{Duration, Instant};
 /// - **On Apple's platforms, four** ([`APPLE_TURNS`]): MoltenVK's compiles go to Metal's compiler
 ///   service, which every device of the process shares and which schedules its own work. On the
 ///   M3 Max, eight distinct compiles of a large fragment at once all finished in 1.5 times one's
-///   time (EV RRS2-conc3-m3); on the consumer's Mac under a guest's cold boot (E26, C15, C14 at
+///   time; on the consumer's Mac under a guest's cold boot (E26, C15, C14 at
 ///   7486754bb) a large fragment's compiles beside their siblings took 28-31 s each where one took
 ///   5-8 s.
 /// - **Elsewhere, twelve from sixteen threads up ([`WIDE_HOST`]), else half the host's threads,
 ///   never fewer than four**: the driver compiles each pipeline on the thread that asks. On the RTX 3090's 16-thread host, nine makings of the
 ///   consumer's Xgc fragment inside one creation took 157 s one at a time, 98 s two, 63 s four
-///   and 44.5 s eight at a time (each making 17, 20, 22.5 and 26 s; EV PRDP-cw1-nv3090), for 45%
-///   more CPU time in all and about 0.4 GB of the driver's memory per compile in flight. On the RTX
-///   5080 laptop's 24 threads, ten such makings took 41 s eight at a time and 27-28 s twelve,
-///   sixteen or twenty-four at a time (all ten at once), for 13% more CPU time and about 0.5 GB per
-///   compile in flight (EV PRDP-bu2-5080). On the RTX 3090's 16 threads, the same ten took 56-59 s
-///   eight at a time and 37-40 s twelve, sixteen or twenty-four at a time, for 17% more CPU time
-///   (EV PRDP-bu1-nv3090). Hosts below sixteen threads are not measured above half their threads,
-///   and keep it. Never fewer than the four every host had before.
+///   and 44.5 s eight at a time (each making 17, 20, 22.5 and 26 s), for 45% more CPU time in all
+///   and about 0.4 GB of the driver's memory per compile in flight. On the RTX 5080 laptop's 24
+///   threads, ten such makings took 41 s eight at a time and 27-28 s twelve, sixteen or twenty-four
+///   at a time (all ten at once), for 13% more CPU time and about 0.5 GB per compile in flight. On
+///   the RTX 3090's 16 threads, the same ten took 56-59 s eight at a time and 37-40 s twelve,
+///   sixteen or twenty-four at a time, for 17% more CPU time. Hosts below sixteen threads are not
+///   measured above half their threads, and keep it. Never fewer than the four every host had
+///   before.
 pub(crate) fn turns_for(threads: usize) -> usize {
     if cfg!(target_vendor = "apple") {
         APPLE_TURNS
@@ -120,9 +130,18 @@ static PROCESS: OnceLock<Arc<Budget>> = OnceLock::new();
 /// The counter tickets are drawn from (a pool's pieces' numbers too): one order for the process.
 static TICKETS: AtomicU64 = AtomicU64::new(0);
 
+/// The turn a thread holds: its budget, whether it is an ahead turn, and the rank it was given at
+/// (its asker's urgency and ticket, unaged), at which a lent turn is taken again
+/// ([`without_turn`]).
+struct Held {
+    budget: Arc<Budget>,
+    ahead: bool,
+    rank: Rank,
+}
+
 thread_local! {
-    /// Whether this thread holds a turn now.
-    static HOLDS: Cell<bool> = const { Cell::new(false) };
+    /// The turn this thread holds now, if any.
+    static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
     /// How long this thread's making waited for its turn, or its piece in its pool, since
     /// [`take_waited`] last read it (the creation log, `creation_log.rs`).
     static WAITED: Cell<Duration> = const { Cell::new(Duration::ZERO) };
@@ -143,7 +162,7 @@ pub(crate) fn waited_in_pool(waited: Duration) {
 /// Whether this thread holds a turn now: a making's waits for another making assert it does
 /// not (`making.rs`, the module docs' "no making waits on another while it holds a turn").
 pub(crate) fn holds_turn() -> bool {
-    HOLDS.with(Cell::get)
+    HELD.with(|held| held.borrow().is_some())
 }
 
 /// A new ticket: later than every ticket drawn before it.
@@ -224,6 +243,9 @@ enum Asker {
 pub(crate) enum Urgency {
     /// A command buffer's host step makes it, holding its device's scheduler.
     HostStep,
+    /// The first batch held on a command queue waits for it: every batch after it there waits
+    /// behind it.
+    Head,
     /// A committed command buffer's batch waits for it.
     Committed,
     /// A program's thread waits for it.
@@ -237,9 +259,10 @@ impl Urgency {
     fn code(self) -> u8 {
         match self {
             Urgency::HostStep => 0,
-            Urgency::Committed => 1,
-            Urgency::Program => 2,
-            Urgency::Ahead => 3,
+            Urgency::Head => 1,
+            Urgency::Committed => 2,
+            Urgency::Program => 3,
+            Urgency::Ahead => 4,
         }
     }
 
@@ -247,9 +270,10 @@ impl Urgency {
     fn from_code(code: u8) -> Option<Urgency> {
         match code {
             0 => Some(Urgency::HostStep),
-            1 => Some(Urgency::Committed),
-            2 => Some(Urgency::Program),
-            3 => Some(Urgency::Ahead),
+            1 => Some(Urgency::Head),
+            2 => Some(Urgency::Committed),
+            3 => Some(Urgency::Program),
+            4 => Some(Urgency::Ahead),
             _ => None,
         }
     }
@@ -327,14 +351,8 @@ pub(crate) struct Turn {
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        HOLDS.with(|holds| holds.set(false));
-        let mut state = lock(&self.budget.state);
-        state.held -= 1;
-        if self.ahead {
-            state.held_ahead -= 1;
-        }
-        drop(state);
-        self.budget.freed.notify_all();
+        HELD.with(|held| held.borrow_mut().take());
+        self.budget.give_back(self.ahead);
     }
 }
 
@@ -371,6 +389,17 @@ impl Budget {
         self.age
     }
 
+    /// A turn given back, an ahead turn where `ahead`: the askers rank themselves again.
+    fn give_back(&self, ahead: bool) {
+        let mut state = lock(&self.state);
+        state.held -= 1;
+        if ahead {
+            state.held_ahead -= 1;
+        }
+        drop(state);
+        self.freed.notify_all();
+    }
+
     /// Wake the askers to rank themselves again: a pool's piece rose in rank (hastened).
     pub(crate) fn reranked(&self) {
         drop(lock(&self.state));
@@ -380,6 +409,17 @@ impl Budget {
     /// Wait for a turn as `asker`, with the piece it was ranked by for a pool's thread; `None`
     /// where it is a pool's thread whose pool has nothing left to take.
     fn take(self: &Arc<Self>, asker: Asker) -> Option<(Turn, Option<Work>)> {
+        let (ahead, piece) = self.take_held(asker)?;
+        let turn = Turn {
+            budget: Arc::clone(self),
+            ahead,
+        };
+        Some((turn, piece))
+    }
+
+    /// [`take`](Self::take)'s turn, counted held and noted as this thread's ([`Held`]) but
+    /// given back by no [`Turn`] of its own: whether it is an ahead turn, and the piece.
+    fn take_held(self: &Arc<Self>, asker: Asker) -> Option<(bool, Option<Work>)> {
         let mut state = lock(&self.state);
         let id = state.next;
         state.next += 1;
@@ -421,11 +461,11 @@ impl Budget {
                 // A pool's thread takes the piece its rank was, under this lock (taken before the
                 // pool's, never under it), so no other piece runs on the turn: one it may take
                 // as `ahead_free` says, whose own `ahead` the turn is counted by.
-                let (piece, ahead) = match asker {
-                    Asker::Thread(..) => (None, ahead),
+                let (piece, rank, ahead) = match asker {
+                    Asker::Thread(urgency, ticket, _) => (None, (urgency, ticket), ahead),
                     Asker::Pool(queue) => {
                         match queue.upgrade().and_then(|q| q.next_piece(ahead_free)) {
-                            Some((work, ahead)) => (Some(work), ahead),
+                            Some((work, (rank, ahead))) => (Some(work), rank, ahead),
                             None => {
                                 drop(state);
                                 self.freed.notify_all();
@@ -439,14 +479,17 @@ impl Budget {
                     state.held_ahead += 1;
                 }
                 drop(state);
-                HOLDS.with(|holds| holds.set(true));
+                let budget = Arc::clone(self);
+                HELD.with(|held| {
+                    *held.borrow_mut() = Some(Held {
+                        budget,
+                        ahead,
+                        rank,
+                    })
+                });
                 // The next asker may have a turn too.
                 self.freed.notify_all();
-                let turn = Turn {
-                    budget: Arc::clone(self),
-                    ahead,
-                };
-                return Some((turn, piece));
+                return Some((ahead, piece));
             }
             // Woken by a turn given back, a new asker or a rise in rank; and at least four times
             // an age, so a making that aged meanwhile is ranked again.
@@ -470,7 +513,7 @@ impl Budget {
 /// step; `None` where this thread
 /// holds one already (a pool's piece, a helper's making).
 pub(crate) fn program_turn() -> Option<Turn> {
-    if HOLDS.with(Cell::get) {
+    if holds_turn() {
         return None;
     }
     thread_turn_in(process(), ticket())
@@ -507,10 +550,44 @@ pub(crate) fn helper_turn<M>(
     objects: &Mutex<M>,
     made: impl FnOnce(&mut M) -> bool,
 ) -> Option<Turn> {
-    if HOLDS.with(Cell::get) || made(&mut lock(objects)) {
+    if holds_turn() || made(&mut lock(objects)) {
         return None;
     }
     program_turn()
+}
+
+/// Run `wait` holding no turn (the module docs' "no making waits on another while it holds a
+/// turn"): where this thread holds one (a pool's piece), it is given back for the wait and taken
+/// again after it, by an unwinding wait too, as an asker of the rank it was given at, so it is an
+/// ahead turn again where it was one; the holder of the thread's [`Turn`] gives that back at its
+/// end as before. Its wait counts in the making's wait ([`take_waited`]).
+pub(crate) fn without_turn<T>(wait: impl FnOnce() -> T) -> T {
+    let Some(held) = HELD.with(|held| held.borrow_mut().take()) else {
+        return wait();
+    };
+    held.budget.give_back(held.ahead);
+    let again = Again(held);
+    let out = wait();
+    drop(again);
+    out
+}
+
+/// A turn lent by [`without_turn`], taken again when dropped.
+struct Again(Held);
+
+impl Drop for Again {
+    fn drop(&mut self) {
+        let (urgency, ticket) = self.0.rank;
+        let asked = Instant::now();
+        // An asker of the turn's own rank: one nothing waits for takes an ahead turn, as the
+        // turn lent was (its urgency `Ahead`), and any other a turn of the rest.
+        let _ = self
+            .0
+            .budget
+            .take_held(Asker::Thread(urgency, ticket, asked));
+        let waited = asked.elapsed();
+        WAITED.with(|cell| cell.set(cell.get() + waited));
+    }
 }
 
 /// A turn for this thread's making with `ticket`, from `budget` (the tests).
@@ -522,8 +599,8 @@ pub(crate) fn waited_turn(budget: &Arc<Budget>, ticket: u64) -> Turn {
 #[cfg(test)]
 mod tests {
     use super::{
-        helper_turn, program_turn, ticket, turns_for, waited_turn, Budget, Urgency, APPLE_TURNS,
-        MOST_TURNS,
+        helper_turn, holds_turn, program_turn, ticket, turns_for, waited_turn, without_turn,
+        Budget, Urgency, APPLE_TURNS, MOST_TURNS,
     };
     use crate::pipeline::pool::Pool;
     use std::sync::{mpsc, Arc, Mutex};
@@ -588,6 +665,38 @@ mod tests {
             order.lock().unwrap().push(name);
         })
         .unwrap()
+    }
+
+    /// A pool's piece that waits holding no turn (for its twin's making in the air, `flight.rs`)
+    /// gives its thread's back for the wait: a making asked for meanwhile takes it, though the
+    /// budget has that one turn. The piece takes one again after its wait, at its rank, and every
+    /// turn is given back once it ends.
+    #[test]
+    fn a_piece_waiting_without_its_turn_lends_it() {
+        let budget = Arc::new(Budget::new(1, 1));
+        let pool = Pool::within(Arc::clone(&budget));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (lent, waiting) = mpsc::channel();
+        let (go, wait) = mpsc::channel::<()>();
+        let noted = Arc::clone(&order);
+        pool.run(Box::new(move || {
+            assert!(holds_turn());
+            without_turn(|| {
+                assert!(!holds_turn());
+                lent.send(()).unwrap();
+                wait.recv().unwrap();
+            });
+            assert!(holds_turn());
+            noted.lock().unwrap().push("piece");
+        }));
+        waiting.recv().unwrap();
+        until(|| budget.census() == (0, 0));
+        let waiter = ask(&budget, &order, ("waited", false));
+        waiter.join().unwrap();
+        go.send(()).unwrap();
+        until(|| order.lock().unwrap().len() == 2);
+        assert_eq!(*order.lock().unwrap(), ["waited", "piece"]);
+        until(|| budget.census() == (0, 0));
     }
 
     /// A free turn goes to the making something waits for before one nothing waits for, though
@@ -675,11 +784,11 @@ mod tests {
         until(|| budget.census() == (0, 0));
     }
 
-    /// The ranks go first, whatever the order asked (none aged): a host step's making, then a committed
-    /// command buffer's, then a program's, then one nothing waits for, each asked for after the
-    /// one it goes before.
+    /// The ranks go first, whatever the order asked (none aged): a host step's making, then a
+    /// queue's first held batch's, then a committed command buffer's, then a program's, then one
+    /// nothing waits for, each asked for after the one it goes before.
     #[test]
-    fn the_ranks_go_host_step_committed_program_ahead() {
+    fn the_ranks_go_host_step_head_committed_program_ahead() {
         let budget = Arc::new(Budget::new(1, 1));
         let held = waited_turn(&budget, ticket());
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -693,17 +802,63 @@ mod tests {
         pool.run(noting(&order, "committed"))
             .hasten(Urgency::Committed);
         until(|| budget.census() == (1, 3));
-        let step = ask(&budget, &order, ("host step", true));
+        let head = Pool::within(Arc::clone(&budget));
+        head.run(noting(&order, "head")).hasten(Urgency::Head);
         until(|| budget.census() == (1, 4));
+        let step = ask(&budget, &order, ("host step", true));
+        until(|| budget.census() == (1, 5));
         drop(held);
         for thread in [program, step] {
             thread.join().unwrap();
         }
-        until(|| order.lock().unwrap().len() == 4);
+        until(|| order.lock().unwrap().len() == 5);
         assert_eq!(
             *order.lock().unwrap(),
-            ["host step", "committed", "program", "ahead"]
+            ["host step", "head", "committed", "program", "ahead"]
         );
+        until(|| budget.census() == (0, 0));
+    }
+
+    /// A queue's first held batch's making goes first to a freed turn, though a piece nothing
+    /// waits for, aged (ordered as a committed one's), and a committed batch's piece behind
+    /// another queue's head were handed before it: Metal holds no submission for a making, so the
+    /// making a queue waits behind goes before the makings of batches that could not go yet
+    /// anyway. Those then go in their order: the aged one by its earlier ticket.
+    ///
+    /// One turn is free at a time, so the order noted is the order the turns were given: the head's
+    /// piece holds its turn until the end, and the committed piece may take only the turn the aged
+    /// one gives back once it noted itself. The aging is waited for as the pool ranks it (the aged
+    /// piece first among those waiting), not slept for.
+    #[test]
+    fn a_queue_s_first_held_batch_s_making_goes_before_aged_and_earlier_committed_ones() {
+        let budget = Arc::new(Budget::aging(2, 1, Duration::from_millis(50)));
+        let first = waited_turn(&budget, ticket());
+        let second = waited_turn(&budget, ticket());
+        let pool = Pool::within(Arc::clone(&budget));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let aged = pool.run(noting(&order, "aged"));
+        pool.run(noting(&order, "committed"))
+            .hasten(Urgency::Committed);
+        let (release, gate) = mpsc::channel::<()>();
+        let head = {
+            let order = Arc::clone(&order);
+            pool.run(Box::new(move || {
+                order.lock().unwrap().push("head");
+                gate.recv().unwrap();
+            }))
+        };
+        until(|| budget.census() == (2, 3));
+        // The piece nothing waits for ages: ranked as a committed one, its earlier ticket puts it
+        // before the committed piece.
+        until(|| aged.is_first());
+        // The scheduler finds the head's batch first in its queue's line.
+        head.hasten(Urgency::Head);
+        drop(first);
+        until(|| !order.lock().unwrap().is_empty());
+        drop(second);
+        until(|| order.lock().unwrap().len() == 3);
+        assert_eq!(*order.lock().unwrap(), ["head", "aged", "committed"]);
+        release.send(()).unwrap();
         until(|| budget.census() == (0, 0));
     }
 
@@ -821,7 +976,7 @@ mod tests {
         };
         let pending = making.pending();
         // A commit's wait, before the making has a place.
-        pending.hasten();
+        pending.hasten(Urgency::Committed);
         let made = {
             let order = Arc::clone(&order);
             Box::new(move || {

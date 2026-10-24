@@ -20,7 +20,7 @@
 use crate::error::{Error, Problem, Unproven};
 use crate::texture::heap_tiled::{BlockFamily, BlockPlacement, GpuRows};
 use crate::Degradation;
-use metal2vulkan::bind::CompressedBlit;
+use metal2vulkan::bind::{CompressedBlit, MipmapRule};
 use metal2vulkan::metal::PixelFormat;
 use std::fmt;
 
@@ -31,11 +31,11 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetalLevel {
-    /// macOS 26.7 (build 25G229), measured on an Apple M3 Max (EVs XRR2-pfi1-m3 and
-    /// XRR2-pla1-m3).
+    /// macOS 26.7 (build 25G229), measured on an Apple M3 Max.
     MacOS26_7,
-    /// macOS 27.0.1 (build 26A434), measured on an Apple M4 (EVs XRR2-pfi1-m4, XRR2-pf576b-m4
-    /// and XRR2-pla1-m4).
+    /// macOS 27.0.1 (build 26A434), measured on an Apple M3 Max. An Apple M4's answers differ where
+    /// both were measured in the formats from 630 to 645, which it describes, in `gpuCoreCount` and
+    /// in `supportsComputeCompressedTextureWrite`.
     MacOS27_0_1,
 }
 
@@ -71,12 +71,19 @@ struct Row {
     /// through a losslessly compressed texture (`compressed_blit.rs`); where not, the runtime
     /// keeps the bytes, its device's answer.
     compressed_blits: bool,
+    /// The alignment its `heapTextureSizeAndAlignWithDescriptor:` answers, with 0 bytes, for a
+    /// texture of `Unspecialized`, `RGBA16Float_XR`, `AnyDepth` or `AnyStencil` of a type with
+    /// layers, faces or depth: a 1D or 2D array, a cube, a cube array, a 3D texture or a 2D
+    /// multisample array (`texture/heap.rs`'s `no_texture_alignment`).
+    no_texture_stack_alignment: u64,
+    /// How its Metal's `generateMipmapsForTexture:` makes each level after the first.
+    mipmaps: MipmapRule,
 }
 
 /// How a level's Metal places a block-compressed texture's blocks in its levels' tiles, per
-/// family (`texture/heap_tiled.rs`); `None` where not measured. Measured on one machine a
-/// level, an Apple M3 Max under macOS 26.7 and an Apple M4 under 27.0.1: whether the GPU or the
-/// release makes their difference is not known.
+/// family (`texture/heap_tiled.rs`); `None` where not measured. Where two levels' rows differ,
+/// the release makes the difference: an Apple M3 Max places them as each release's row says (and
+/// an Apple M4 under 27.0.1 alike).
 struct HeapBlocks {
     bc: Option<BlockPlacement>,
     etc: Option<BlockPlacement>,
@@ -104,25 +111,38 @@ const MACOS_26_7: Row = Row {
     // The package share-cblit on the consumer's M3 Max (25G229): every line of the predicate,
     // the four rules and the clears identical to the M4's.
     compressed_blits: true,
+    // Measured plain and validated, every usage and storage mode.
+    no_texture_stack_alignment: 16 << 10,
+    mipmaps: MipmapRule::AppleM3MaxPasses,
 };
 
-/// macOS 27.0.1 on an Apple M4: its descriptor knows every value the runtime names (it describes
-/// none of the three-channel formats and the 12-bit `Uint` formats from 646 to 650; the table of
-/// `pixel_format_info`).
+/// macOS 27.0.1 on an Apple M3 Max: its descriptor knows every value the runtime names (it
+/// describes none from 630 on but `AnyDepth` and `AnyStencil`; the table of
+/// `pixel_format_info`). Its heap blocks and compressed blits are its own, an Apple M4's at 27.0.1
+/// alike; the heap shapes the M3 Max was asked of every format (22,856 answers) are the model's.
 const MACOS_27_0_1: Row = Row {
     macos: "27.0.1",
     version: [27, 0, 1],
     unknown: &[],
-    // Every BC, ETC2, EAC and ASTC format, every element of every level of 815 textures (EVs
-    // TXN3-htl5-m4 and TXN3-bcsw1-m4 to TXN3-bcsw4-m4).
+    // Every BC, ETC2, EAC and ASTC format, every element of every level of 815 textures on an
+    // Apple M4; the M3 Max answers the 809 of `tests/heap_tiled_blocks.rs` alike, each one's size,
+    // alignment, CPU span and GPU span.
     heap_blocks: HeapBlocks {
         bc: Some(BlockPlacement::Narrow),
         etc: Some(BlockPlacement::Narrow),
         astc: Some(BlockPlacement::Halved),
         gpu_rows: GpuRows::AsCpu,
     },
-    // EVs FXR-fxr3-m4, FXR-fxr5-m4 and FXR-cblit-m4: every rule matched every texel.
+    // Each rule matched every texel of its formats' blits through a texture Metal compresses
+    // (private, array, heap, texture to texture, a shared texture's blit out), and every texture
+    // Metal keeps uncompressed, every CPU copy and 7 other formats kept their bytes; an Apple M4
+    // alike.
     compressed_blits: true,
+    // Measured on the M3 Max (and an Apple M4 alike): every type but a texture buffer 128, private
+    // and shared storage, `ShaderRead` and `ShaderWrite` usage.
+    no_texture_stack_alignment: 128,
+    // Every level the filter of the level above (`bind::mipmap_filter`'s "By release").
+    mipmaps: MipmapRule::Filter,
 };
 
 impl MetalLevel {
@@ -161,7 +181,7 @@ impl MetalLevel {
     /// `Problem::AttachmentNotAFormat`). An Apple GPU, whose Metal every device answers as,
     /// describes neither `Depth24Unorm_Stencil8` nor `X24_Stencil8` at any level (an M3 Max under
     /// macOS 26.7 and an M4 under 27.0.1 stop a texture, a depth and a stencil attachment of each
-    /// as of no format; EV XRR2-ol4-m4 and the consumer's M3 run), so
+    /// as of no format; our probe and the consumer's M3 run), so
     /// `isDepth24Stencil8PixelFormatSupported` answers no.
     pub fn describes(self, pf: PixelFormat) -> bool {
         self.pixel_format_info(u64::from(pf.as_raw()))
@@ -194,6 +214,21 @@ impl MetalLevel {
             .compressed_blits
             .then(|| CompressedBlit::of(pf))
             .flatten()
+    }
+
+    /// The alignment the release's `heapTextureSizeAndAlignWithDescriptor:` answers, with 0
+    /// bytes, for a texture of `Unspecialized`, `RGBA16Float_XR`, `AnyDepth` or `AnyStencil` of
+    /// a type with layers, faces or depth (`Row::no_texture_stack_alignment`).
+    pub(crate) fn no_texture_stack_alignment(self) -> u64 {
+        self.row().no_texture_stack_alignment
+    }
+
+    /// How the release's `generateMipmapsForTexture:` makes each level of a chain after the
+    /// first on its Apple GPU (`MipmapFilterChain::plan`'s rule), which the device's mipmaps
+    /// answer ([`BlitCommandEncoder::generate_mipmaps`](crate::BlitCommandEncoder::generate_mipmaps)).
+    /// No Metal counterpart: Metal makes its own release's.
+    pub fn mipmap_rule(self) -> MipmapRule {
+        self.row().mipmaps
     }
 
     /// The newest level whose release is at or below macOS `version` (major, minor, patch), if

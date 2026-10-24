@@ -17,8 +17,11 @@
 //!   (`VK_ATTACHMENT_UNUSED`) until a stand-in that has it takes its place
 //!   (`attachment_stand_in.rs`). A color attachment the draws
 //!   read and write as a storage image in the pixel interlock is left out of the subpass
-//!   (`VK_ATTACHMENT_UNUSED`) and keeps its attachment description, whose operations Vulkan then
-//!   ignores; so every instance of a split pass has the same attachments in the same order.
+//!   (`VK_ATTACHMENT_UNUSED`) and keeps its attachment description, which loads and stores
+//!   nothing (`DONT_CARE`, what Vulkan does for an attachment no subpass uses in any case), so
+//!   every instance of a split pass has the same attachments in the same order; its framebuffer
+//!   view is of a placeholder image the device keeps, never of the image the draws write
+//!   (`storage_placeholder.rs`).
 //! - **The sample planes' anchor.** A multisampled subpass that would so be left with no
 //!   attachment (every color attachment it has read as sample planes, `sample_planes.rs`, and no
 //!   depth/stencil attachment) keeps the first of them ([`PassShape::anchor`]): a subpass without
@@ -59,8 +62,16 @@
 //!   needs. Storage the pixel interlock orders (the fragment imageblock's, `fragment_imageblock.rs`,
 //!   and an interlocked color's storage image, `framebuffer_fetch.rs`) takes the fragment
 //!   shader's scopes alone (`STORAGE_SELF_DEPENDENCY`, `between_storage_draws`), and a memory
-//!   barrier over the render targets all of them (`between_draws`, `fence.rs`). Every pass has
-//!   it, so every pass of a shape stays compatible with every other.
+//!   barrier over the render targets all of them (`between_draws`, `fence.rs`). It depends on
+//!   itself too from the draws' reads of their indirect arguments to every graphics stage, an
+//!   execution dependency alone, not by region (`INDIRECT_SELF_DEPENDENCY`): the dependency of
+//!   the barrier before a draw that writes what an earlier draw of the instance read as its
+//!   arguments (`after_indirect_reads`); and from the shader writes of the stages a draw runs
+//!   before its fragments to the fragment shader's reads and writes, not by region
+//!   (`GEOMETRY_SELF_DEPENDENCY`): the dependency of the barrier before a draw whose fragment
+//!   shader reads or writes what an earlier draw of the instance wrote in those stages
+//!   (`after_geometry_writes`). Every pass of a device has all three, so every pass of a shape
+//!   stays compatible with every other.
 //! - **Later resolves**. A depth/stencil resolve the device makes one aspect at a time
 //!   (`resolve.rs`) resolves its first aspect in the draws' subpass and its second after the pass's
 //!   instances, in a render pass of its own ([`later_resolve`]) that has only the depth/stencil
@@ -71,7 +82,20 @@
 //!   compatible pass.
 //! - **Layouts.** Every attachment is in `GENERAL` before, during and after the pass, the layout
 //!   every runtime image rests in, so a pass changes no layout and its attachments need no layout
-//!   tracking.
+//!   tracking. Two exceptions hold an attachment in another layout for an instance's whole render
+//!   pass instance, moved there by an image barrier just before it begins and back to `GENERAL`
+//!   by another just after it ends ([`moved_barriers`]): a color a draw of the instance reads
+//!   through a snapshot (`render/snapshot.rs`), in `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT`
+//!   ([`Feedback`]), its framebuffer view of the usage that layout needs; and, on a device
+//!   measured to render it faster so (`DriverFact::MultisampledDepthFasterOutOfGeneral`), a
+//!   multisampled depth/stencil attachment, in `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`
+//!   ([`depth_layout`]). Such a depth that a render encoder holds (`texture/held_depth.rs`) rests
+//!   in that layout between passes instead: it is there when the instance begins and stays there
+//!   after it ends, the scheduler moving it only between encoders. Each move keeps the texels: "The
+//!   contents of any portion of an image subresource that is transitioned from one layout to
+//!   another are preserved" unless the old layout is `UNDEFINED` (the Synchronization chapter's
+//!   Image Layout Transitions). Render pass compatibility ignores the layouts, so such an
+//!   instance's draws record against the same compatible pass as any other's.
 //! - **Operations.** Metal's load actions are Vulkan's: `Load`, `Clear` (with the value
 //!   `clear_value.rs` converts as Metal does) and `DontCare`. `Store` stores; `DontCare` is
 //!   `DONT_CARE`, a recorded near-equivalent: Apple's GPU keeps the attachment's earlier texels
@@ -99,33 +123,66 @@
 //!   and `STORE`: render pass compatibility ignores the operations, so the draws' secondary
 //!   command buffer and the encoder's graphics pipelines record against it while the store
 //!   actions may still change.
-//! - **Made and kept.** The pass `end_encoding` begins and the framebuffer are made per encoder,
-//!   but for a kept pass; its command buffer holds them until it completes. The compatible pass of
-//!   a shape the device keeps ([`shared_compatible_pass`]): made when an encoder of the shape
-//!   first needs one and destroyed with the device, for at most [`KEPT_SHAPES`] shapes; an
-//!   encoder of a shape past them makes its own, which its command buffer holds so.
+//! - **Made and kept.** A device keeps every pass it makes (`create`, [`KeptRenderPasses`]):
+//!   the compatible pass of a shape, and each pass an instance begins, by its shape, its
+//!   attachments' operations and its layouts (all a pass is made of, beside the device's
+//!   profile), made when an encoder first needs it and destroyed with the device, for at most
+//!   [`KEPT_PASSES`] passes; one past them is made per encoder, which its command buffer holds
+//!   until it completes. A render pass is never changed once made, so one serves every encoder
+//!   and thread at once. The framebuffer is made per instance; its command buffer holds it.
 
 use super::attachment_stand_in::Cause;
 use super::attachmentless;
 use super::binding_view::VkView;
+use super::color_list::ColorList;
 use super::device::lock;
 use super::error::{internal, Error};
 use super::exit_guard;
 use super::framebuffer_fetch;
+use super::image_barrier::{image_barrier, ImageDst};
+use super::key_hash::KeyMap;
 use super::render_pass::{
     AspectClear, AspectTarget, ColorTarget, DepthStencilTarget, PassLayout, Target,
+    MAX_COLOR_ATTACHMENTS,
 };
 use super::render_values::{LoadAction, StoreAction};
 use super::resolve::{Resolve, ResolveMode, ResolveStep};
 use super::resource::ResourceKey;
-use super::tracker::{Access, Use};
+use super::storage_placeholder::Placeholder;
+use super::texture::TextureMemory;
+use super::tracker::{Access, LegacyBarrier, Use};
 use super::Device;
 use crate::release;
 use ash::vk;
 use metal2vulkan::bind::ViewSetup;
 use metal2vulkan::device::{DeviceProfile, DriverFact};
-use std::collections::HashMap;
 use std::sync::Arc;
+
+/// The color attachments of a render pass instance in
+/// `VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT` (the module docs), by index: bit `i` for
+/// color `i`. A pass of a shape is compatible with every other of it whatever its feedback colors:
+/// render pass compatibility ignores "Initial and final image layout in attachment descriptions"
+/// and "Image layout in attachment references".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Feedback(pub(super) u32);
+
+impl Feedback {
+    /// No color in the feedback loop layout.
+    pub(super) const NONE: Feedback = Feedback(0);
+
+    /// Whether color `index` is.
+    pub(super) fn has(self, index: usize) -> bool {
+        index < u32::BITS as usize && self.0 & (1 << index) != 0
+    }
+
+    /// Its layout for color `index`.
+    fn layout(self, index: usize) -> vk::ImageLayout {
+        match self.has(index) {
+            true => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+            false => vk::ImageLayout::GENERAL,
+        }
+    }
+}
 
 /// What makes two passes compatible: each color index's format (`None` without a texture), the
 /// depth/stencil attachment's format, the samples of every attachment, the draws' subpass's
@@ -134,11 +191,11 @@ use std::sync::Arc;
 /// color index's resolve format, and the depth/stencil resolve's format and modes).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct PassShape {
-    pub(super) colors: Vec<Option<metal2vulkan::vk::Format>>,
+    pub(super) colors: ColorList<Option<metal2vulkan::vk::Format>>,
     pub(super) depth_stencil: Option<metal2vulkan::vk::Format>,
     pub(super) samples: u32,
     /// As long as `colors`: the resolve attachment's format where the index resolves.
-    pub(super) color_resolves: Vec<Option<metal2vulkan::vk::Format>>,
+    pub(super) color_resolves: ColorList<Option<metal2vulkan::vk::Format>>,
     /// The draws' subpass's depth/stencil resolve ([`subpass_step`]): its attachment's format,
     /// and its depth and stencil resolve mode (`resolve.rs`).
     pub(super) depth_stencil_resolve: Option<(metal2vulkan::vk::Format, ResolveMode, ResolveMode)>,
@@ -148,11 +205,11 @@ pub(super) struct PassShape {
     /// The color indices, ascending, whose images take no input attachment usage (a caller's
     /// image, `texture/wrapped.rs`) where the subpass reads the others as input attachments: their
     /// input references are `VK_ATTACHMENT_UNUSED`.
-    pub(super) no_inputs: Vec<u32>,
+    pub(super) no_inputs: ColorList<u32>,
     /// The color indices, ascending, the draws' subpass leaves out (`VK_ATTACHMENT_UNUSED`): the
     /// attachments its pipelines read and write as storage images in the pixel interlock
     /// (`framebuffer_fetch.rs`), but for the [`anchor`](PassShape::anchor).
-    pub(super) storage: Vec<u32>,
+    pub(super) storage: ColorList<u32>,
     /// Every subpass's view mask: the views of the instance's amplified draws, 0 without
     /// multiview (the module docs).
     pub(super) view_mask: u32,
@@ -160,51 +217,47 @@ pub(super) struct PassShape {
     /// names, by fragment output location: the pass color each location stores into
     /// (`color_reformat::Routing`), `None` for no attachment. Empty where location `i` names
     /// color `i`.
-    pub(super) locations: Vec<Option<u32>>,
+    pub(super) locations: ColorList<Option<u32>>,
 }
 
 impl PassShape {
     /// The shape of `layout`.
     pub(super) fn of(layout: &PassLayout) -> Result<PassShape, Error> {
-        let mut no_inputs = Vec::new();
+        let mut no_inputs = ColorList::new();
         if layout.fetch_inputs {
             for (index, color) in layout.colors.iter().enumerate() {
                 if let Some(color) = color {
                     if !takes_input(&color.target)? {
-                        no_inputs.push(index as u32);
+                        no_inputs.push(index as u32)?;
                     }
                 }
             }
         }
         Ok(PassShape {
-            colors: layout
-                .colors
-                .iter()
-                .map(|color| color.as_ref().map(|c| c.target.format))
-                .collect(),
+            colors: ColorList::of(
+                (layout.colors.iter()).map(|color| color.as_ref().map(|c| c.target.format)),
+            )?,
             depth_stencil: layout.depth_stencil.as_ref().map(|ds| ds.target.format),
             samples: layout.samples,
-            color_resolves: layout
-                .colors
-                .iter()
-                .map(|color| subpass_resolve(color.as_ref()).map(|r| r.attachment.format))
-                .collect(),
+            color_resolves: ColorList::of(
+                (layout.colors.iter())
+                    .map(|color| subpass_resolve(color.as_ref()).map(|r| r.attachment.format)),
+            )?,
             depth_stencil_resolve: subpass_step(layout)
                 .map(|step| (step.resolve.attachment.format, step.depth, step.stencil)),
             fetch_inputs: layout.fetch_inputs,
             no_inputs,
-            storage: Vec::new(),
+            storage: ColorList::new(),
             view_mask: 0,
-            locations: Vec::new(),
+            locations: ColorList::new(),
         })
     }
 
-    /// This shape with `storage` (ascending) left out of the draws' subpass.
-    pub(super) fn with_storage(&self, storage: Vec<u32>) -> PassShape {
-        PassShape {
-            storage,
-            ..self.clone()
-        }
+    /// This shape with `storage` (ascending) left out of the draws' subpass; refused (an
+    /// invariant) past a pass's color attachments.
+    pub(super) fn with_storage(self, storage: &[u32]) -> Result<PassShape, Error> {
+        let storage = ColorList::of(storage.iter().copied())?;
+        Ok(PassShape { storage, ..self })
     }
 
     /// This shape with every subpass of `view_mask`.
@@ -213,9 +266,11 @@ impl PassShape {
     }
 
     /// This shape with the draws' subpass's color references naming `locations`
-    /// ([`locations`](PassShape::locations)).
-    pub(super) fn with_locations(self, locations: Vec<Option<u32>>) -> PassShape {
-        PassShape { locations, ..self }
+    /// ([`locations`](PassShape::locations)); refused (an invariant) past a pass's color
+    /// attachments.
+    pub(super) fn with_locations(self, locations: &[Option<u32>]) -> Result<PassShape, Error> {
+        let locations = ColorList::of(locations.iter().copied())?;
+        Ok(PassShape { locations, ..self })
     }
 
     /// The draws' subpass's color reference count: one per fragment output location a pipeline
@@ -299,7 +354,7 @@ pub(super) fn later_steps(layout: &PassLayout) -> impl Iterator<Item = &ResolveS
 }
 
 /// One attachment's operations: of its color or depth aspect, then of its stencil aspect.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Ops {
     load: vk::AttachmentLoadOp,
     store: vk::AttachmentStoreOp,
@@ -389,6 +444,16 @@ fn resolve_ops(mode: ResolveMode) -> (vk::AttachmentLoadOp, vk::AttachmentStoreO
 
 /// The sample planes' anchor's operations (the module docs): neither loaded nor stored.
 const ANCHORED: Ops = Ops {
+    load: vk::AttachmentLoadOp::DONT_CARE,
+    store: vk::AttachmentStoreOp::DONT_CARE,
+    stencil_load: vk::AttachmentLoadOp::DONT_CARE,
+    stencil_store: vk::AttachmentStoreOp::DONT_CARE,
+};
+
+/// The operations of a color the draws' subpass leaves out for the pixel interlock (the module
+/// docs), which no subpass uses: neither loaded nor stored, as such an attachment is in any case
+/// (`storage_placeholder.rs`).
+const LEFT_OUT: Ops = Ops {
     load: vk::AttachmentLoadOp::DONT_CARE,
     store: vk::AttachmentStoreOp::DONT_CARE,
     stencil_load: vk::AttachmentLoadOp::DONT_CARE,
@@ -493,10 +558,12 @@ impl Drop for RenderPassObject {
     }
 }
 
-/// A `VkFramebuffer` the runtime made, destroyed with its last holder.
+/// A `VkFramebuffer` the runtime made, destroyed with its last holder, and the placeholders whose
+/// views it holds (`storage_placeholder.rs`), which outlive it.
 pub(super) struct FramebufferObject {
     device: Device,
     pub(super) raw: vk::Framebuffer,
+    placeholders: Vec<Arc<Placeholder>>,
 }
 
 impl Drop for FramebufferObject {
@@ -511,7 +578,9 @@ impl Drop for FramebufferObject {
 }
 
 /// A dependency of the draws' subpass on itself (the module docs), whose scopes a barrier
-/// recorded between two draws of an instance takes (`between_storage_draws`, `between_draws`).
+/// recorded between two draws of an instance takes (`between_storage_draws`, `between_draws`,
+/// `after_geometry_writes`): `stages` are both scopes' stages, but for
+/// [`GEOMETRY_SELF_DEPENDENCY`]'s, whose source stages are the device's.
 pub(super) struct SelfDependency {
     pub(super) stages: vk::PipelineStageFlags,
     pub(super) src_access: vk::AccessFlags,
@@ -568,6 +637,161 @@ pub(super) fn self_dependency_flags(view_mask: u32) -> vk::DependencyFlags {
     }
 }
 
+/// The draws' subpass's dependency on itself from the draws' reads of their indirect arguments,
+/// in `DRAW_INDIRECT`, to every graphics stage, with no access type: an execution dependency,
+/// which "Write-after-read hazards can be solved with just" (the Synchronization chapter's
+/// Execution and Memory Dependencies). `DRAW_INDIRECT` is no framebuffer-space stage, so it is not
+/// by region, and the stage of its source scope is logically earlier than or equal to every stage
+/// of its destination scope, as a subpass's dependency on itself over other stages needs
+/// (`VUID-VkSubpassDependency2-srcSubpass-03087`). A barrier before a draw that writes what an
+/// earlier draw of its instance read as its arguments takes it (`after_indirect_reads`).
+pub(super) const INDIRECT_SELF_DEPENDENCY: (vk::PipelineStageFlags, vk::PipelineStageFlags) = (
+    vk::PipelineStageFlags::DRAW_INDIRECT,
+    vk::PipelineStageFlags::ALL_GRAPHICS,
+);
+
+/// The flags of [`INDIRECT_SELF_DEPENDENCY`] and [`GEOMETRY_SELF_DEPENDENCY`] in a pass whose
+/// subpasses have `view_mask`, which their barriers take too: view by view in a subpass of more
+/// than one view (`VUID-VkRenderPassCreateInfo2-pDependencies-03060`), and never by region, which
+/// "must not" be in the dependency of a barrier that is not
+/// (`VUID-vkCmdPipelineBarrier-None-07889`).
+fn stage_dependency_flags(view_mask: u32) -> vk::DependencyFlags {
+    if view_mask.count_ones() > 1 {
+        vk::DependencyFlags::VIEW_LOCAL
+    } else {
+        vk::DependencyFlags::empty()
+    }
+}
+
+/// Record, into `draws`, a render pass instance's secondary command buffer (or its pass's
+/// command buffer, inline) whose subpasses have `view_mask`, the barrier before a draw that
+/// writes, in `stages`, memory an earlier draw of the instance read as its indirect arguments:
+/// an execution dependency from the earlier draws' `DRAW_INDIRECT` to `stages`, within
+/// [`INDIRECT_SELF_DEPENDENCY`] and with its flags. Metal reads a draw's arguments before a later
+/// draw of the encoder writes them, behind no barrier (measured on an M3 Max and an M4); Vulkan
+/// orders the read before the write only by a dependency, which a write-after-read hazard needs
+/// with no memory dependency.
+///
+/// # Safety
+///
+/// `draws` is a command buffer of `raw`'s device recording inside a pass this module made, of
+/// `view_mask`, and only this thread records it; `stages` are graphics stages the device has.
+pub(super) unsafe fn after_indirect_reads(
+    raw: &ash::Device,
+    draws: vk::CommandBuffer,
+    view_mask: u32,
+    stages: vk::PipelineStageFlags,
+) {
+    // SAFETY: the caller's contract; the pass's subpass depends on itself from `DRAW_INDIRECT`
+    // to every graphics stage with these flags, so the barrier is valid inside it.
+    unsafe {
+        raw.cmd_pipeline_barrier(
+            draws,
+            INDIRECT_SELF_DEPENDENCY.0,
+            stages,
+            stage_dependency_flags(view_mask),
+            &[],
+            &[],
+            &[],
+        );
+    }
+}
+
+/// The destination scope and the access types of the source scope of the draws' subpass's
+/// dependency on itself from the shader writes of the stages a draw runs before its fragments
+/// ([`geometry_write_stages`], the source stages) to the fragment shader's reads and writes:
+/// Metal's tile-based passes run every draw's vertex, object and mesh functions before any draw's
+/// fragments, which Vulkan orders only by a dependency ("read-after-write and write-after-write
+/// hazards need appropriate memory dependencies to be included between them", the
+/// Synchronization chapter's Execution and Memory Dependencies). No source stage is a
+/// framebuffer-space one, so it is not by region (`VUID-VkSubpassDependency2-srcSubpass-02245`
+/// asks that only of a dependency whose two scopes hold one), and every source stage is
+/// logically earlier than the fragment shader (`VUID-VkSubpassDependency2-srcSubpass-03087`). A
+/// barrier before a draw whose fragment shader reads or writes what an earlier draw of its
+/// instance wrote in those stages takes it (`after_geometry_writes`).
+pub(super) const GEOMETRY_SELF_DEPENDENCY: SelfDependency = SelfDependency {
+    stages: vk::PipelineStageFlags::FRAGMENT_SHADER,
+    src_access: vk::AccessFlags::SHADER_WRITE,
+    dst_access: vk::AccessFlags::from_raw(
+        vk::AccessFlags::SHADER_READ.as_raw()
+            | vk::AccessFlags::SHADER_WRITE.as_raw()
+            | vk::AccessFlags::UNIFORM_READ.as_raw(),
+    ),
+};
+
+/// The source stages of [`GEOMETRY_SELF_DEPENDENCY`] on `device`: the vertex shader, and the
+/// tessellation, geometry, task and mesh shaders where the device enables them (a dependency names
+/// no stage whose feature is off, `VUID-VkSubpassDependency2-srcStageMask-04091` and its
+/// siblings). Every pass of the device names the same, so its passes stay compatible.
+fn geometry_write_stages(device: &Device) -> vk::PipelineStageFlags {
+    use metal2vulkan::device::VkFeature;
+    let features = &device.enabled().features;
+    let mut stages = vk::PipelineStageFlags::VERTEX_SHADER;
+    for (feature, more) in [
+        (
+            VkFeature::TessellationShader,
+            vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER
+                | vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+        ),
+        (
+            VkFeature::GeometryShader,
+            vk::PipelineStageFlags::GEOMETRY_SHADER,
+        ),
+        (
+            VkFeature::TaskShader,
+            vk::PipelineStageFlags::TASK_SHADER_EXT,
+        ),
+        (
+            VkFeature::MeshShader,
+            vk::PipelineStageFlags::MESH_SHADER_EXT,
+        ),
+    ] {
+        if features.contains(&feature) {
+            stages |= more;
+        }
+    }
+    stages
+}
+
+/// Record, into `draws`, a render pass instance's secondary command buffer (or its pass's
+/// command buffer, inline) whose subpasses have `view_mask`, the barrier before a draw whose
+/// fragment shader reads or writes memory an earlier draw of the instance wrote before its
+/// fragments: `barrier`, from the earlier writes' stages and access types to the fragment shader
+/// and the later draw's access types there, within [`GEOMETRY_SELF_DEPENDENCY`] and with its
+/// flags. Metal runs the earlier draw's vertex, object and mesh functions before the later
+/// draw's fragments.
+///
+/// # Safety
+///
+/// `draws` is a command buffer of `raw`'s device recording inside a pass this module made, of
+/// `view_mask`, and only this thread records it; `barrier`'s source stages are among
+/// [`geometry_write_stages`]'s and its access types within [`GEOMETRY_SELF_DEPENDENCY`]'s, and
+/// its destination stage is the fragment shader.
+pub(super) unsafe fn after_geometry_writes(
+    raw: &ash::Device,
+    draws: vk::CommandBuffer,
+    view_mask: u32,
+    barrier: LegacyBarrier,
+) {
+    let memory = vk::MemoryBarrier::default()
+        .src_access_mask(barrier.src_access)
+        .dst_access_mask(barrier.dst_access);
+    // SAFETY: the caller's contract; the pass's subpass depends on itself from the device's
+    // stages before the fragments to the fragment shader with these access types and flags, so
+    // the barrier is valid inside it.
+    unsafe {
+        raw.cmd_pipeline_barrier(
+            draws,
+            barrier.src_stages,
+            barrier.dst_stages,
+            stage_dependency_flags(view_mask),
+            &[memory],
+            &[],
+            &[],
+        );
+    }
+}
+
 /// Record, into `draws`, a render pass instance's secondary command buffer whose subpasses have
 /// `view_mask`, a barrier of the `DRAWS_SELF_DEPENDENCY`'s scopes: the draws after it see the
 /// fragment stages' writes of the draws before it, pixel by pixel.
@@ -602,9 +826,10 @@ pub(super) unsafe fn between_draws(raw: &ash::Device, draws: vk::CommandBuffer, 
 /// (`fragment_imageblock.rs`) or an interlocked color's storage image (`framebuffer_fetch.rs`).
 /// Its scopes are the fragment shader's (`STORAGE_SELF_DEPENDENCY`), within the draws' subpass's
 /// dependency on itself and with its flags (`self_dependency_flags`: by region, and view by view
-/// under multiview). RADV on an AMD 780M (Mesa 26.2.4) did not order such draws by the interlock
+/// under multiview). RADV on an AMD 780M (Mesa 26.2.4) does not order such draws by the interlock
 /// alone, as Vulkan's rasterization order promises: a later draw, of the same pipeline or
-/// another, read texels as they were before the earlier one's writes.
+/// another, read texels as they were before the earlier one's writes. A driver measured to order
+/// them takes none between draws that reach only colors (`DriverFact::InterlockOrdersDraws`).
 ///
 /// # Safety
 ///
@@ -634,89 +859,326 @@ pub(super) unsafe fn between_storage_draws(
     }
 }
 
+/// An attachment's image, the subresource a render pass instance renders of it, and the layout
+/// the instance holds it in ([`moved_barriers`]).
+#[derive(Clone, Copy)]
+pub(super) struct MovedImage {
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    layout: vk::ImageLayout,
+}
+
+/// The attachments of `layout` an instance of `views` holds out of `GENERAL` ([`viewed`]): its
+/// `feedback` colors, in the feedback loop layout, and its depth/stencil attachment where it holds
+/// it in `depth` ([`depth_layout`]). The images, subresources and layouts its barriers move.
+pub(super) fn moved_images(
+    layout: &PassLayout,
+    views: ViewSetup,
+    feedback: Feedback,
+    depth: vk::ImageLayout,
+) -> Result<Vec<MovedImage>, Error> {
+    let mut images = Vec::new();
+    for (index, color) in layout.colors.iter().enumerate() {
+        let Some(color) = color.as_ref().filter(|_| feedback.has(index)) else {
+            continue;
+        };
+        let target = viewed(&color.target, views);
+        images.push(MovedImage {
+            image: target.texture.raw_image()?,
+            range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: target.level,
+                level_count: 1,
+                base_array_layer: target.layer,
+                layer_count: target.layers,
+            },
+            layout: vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+        });
+    }
+    if let Some(ds) = layout.depth_stencil.as_ref() {
+        if depth != vk::ImageLayout::GENERAL {
+            let target = viewed(&ds.target, views);
+            images.push(MovedImage {
+                image: target.texture.raw_image()?,
+                range: vk::ImageSubresourceRange {
+                    aspect_mask: super::texture::image_aspects(target.texture.image_plan()?.format)
+                        .into(),
+                    base_mip_level: target.level,
+                    level_count: 1,
+                    base_array_layer: target.layer,
+                    layer_count: target.layers,
+                },
+                layout: depth,
+            });
+        }
+    }
+    Ok(images)
+}
+
+/// The layout the draws' subpass of an instance of `layout` holds its depth/stencil attachment in
+/// (the module docs): `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` for a multisampled one of a depth format,
+/// not a transient attachment, on a device whose driver is measured to render it faster there
+/// than in `GENERAL`, the moves included (`DriverFact::MultisampledDepthFasterOutOfGeneral`);
+/// `GENERAL` for every other, and for a pass without one.
+pub(super) fn depth_layout(device: &Device, layout: &PassLayout) -> Result<vk::ImageLayout, Error> {
+    let general = vk::ImageLayout::GENERAL;
+    let Some(ds) = layout.depth_stencil.as_ref() else {
+        return Ok(general);
+    };
+    let measured = (device.properties().driver_facts)
+        .contains(&DriverFact::MultisampledDepthFasterOutOfGeneral);
+    if !measured || ds.target.samples < 2 {
+        return Ok(general);
+    }
+    let plan = ds.target.texture.image_plan()?;
+    let depth = plan
+        .format
+        .block()
+        .is_some_and(|block| block.depth.is_some());
+    let transient = (plan.usage).contains(metal2vulkan::vk::ImageUsageFlags::TRANSIENT_ATTACHMENT);
+    Ok(match depth && !transient {
+        true => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        false => general,
+    })
+}
+
+/// Record, outside a render pass, the barriers that move `images` (an instance's attachments held
+/// out of `GENERAL`, [`moved_images`]) from `GENERAL` into their layouts before the instance
+/// begins (`into`), or back after it ends, recorded for a queue family of `family`'s flags: from
+/// every earlier command's writes to every later command's accesses.
+///
+/// The instance's pass moves no layout itself ([`Feedback`], [`depth_layout`]): a move from a
+/// description's initial
+/// layout would be ordered after nothing before the pass, as "If there is no subpass dependency
+/// from VK_SUBPASS_EXTERNAL to the first subpass that uses an attachment, then an implicit subpass
+/// dependency exists", whose `srcStageMask` is `VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT` (`NONE`) and
+/// `srcAccessMask` 0 (the Render Pass chapter); the passes the runtime makes have no external
+/// dependency, and one in every pass would order every pass's begin. An image barrier's own move
+/// is ordered between its scopes: "When a layout transition is specified in a memory dependency,
+/// it happens-after the availability operations in the memory dependency, and happens-before the
+/// visibility operations" (Image Layout Transitions). The feedback loop
+/// layout is valid for the colors' images, made with the usage it needs
+/// (`texture::feedback_candidate`): "This layout is valid only for image subresources of images
+/// created with the VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT usage flag set, and either the
+/// VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT or ... and either the VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT or
+/// VK_IMAGE_USAGE_SAMPLED_BIT usage flags set", and `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` for a
+/// depth/stencil attachment's, made with `VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT`
+/// (`VUID-VkImageMemoryBarrier-oldLayout-01210`). Between the two barriers the subresource is in
+/// that layout, which every access of it there names: the instance's attachment, and a feedback
+/// color's draws' sampled descriptors of it (`binding.rs`; a draw reads a depth attachment's
+/// texture through a copy, `texture/attached_reads.rs`), as "the layouts of the image
+/// subresources that are accessed must all match exactly the layout specified via the API
+/// controlling those accesses" (Image Layout Matching Rules).
+///
+/// # Safety
+///
+/// `command_buffer` is recording outside a render pass, only the caller records it, the images are
+/// live until it completes, and each subresource is in the layout the move leaves.
+pub(super) unsafe fn moved_barriers(
+    raw: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    images: &[MovedImage],
+    into: bool,
+    family: vk::QueueFlags,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let general = vk::ImageLayout::GENERAL;
+    let barriers: Vec<vk::ImageMemoryBarrier<'_>> = images
+        .iter()
+        .map(|i| {
+            let layouts = match into {
+                true => (general, i.layout),
+                false => (i.layout, general),
+            };
+            image_barrier(
+                i.image,
+                i.range,
+                layouts,
+                vk::AccessFlags::MEMORY_WRITE,
+                ImageDst::Every,
+                family,
+            )
+        })
+        .collect();
+    let all = vk::PipelineStageFlags::ALL_COMMANDS;
+    // SAFETY: the caller's contract; each barrier names a live image's subresource in the
+    // layout it leaves, and no queue family transfer.
+    unsafe {
+        raw.cmd_pipeline_barrier(
+            command_buffer,
+            all,
+            all,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+    }
+}
+
 /// The pass of `shape` with every operation `LOAD` and `STORE`: compatible with every pass of
-/// that shape. A shape without attachments takes its device's kept pass (`attachmentless.rs`).
+/// that shape, kept by its device ([`create`]). A shape without attachments takes its device's
+/// kept pass (`attachmentless.rs`).
 pub(super) fn compatible_pass(
     device: &Device,
     shape: &PassShape,
 ) -> Result<RenderPassObject, Error> {
-    match attachmentless::kept(device, shape)? {
-        Some(kept) => Ok(kept),
-        None => made_compatible_pass(device, shape),
+    if let Some(kept) = attachmentless::kept(device, shape)? {
+        return Ok(kept);
     }
-}
-
-/// The most shapes whose compatible pass a device keeps (the module docs): far more than a
-/// program's passes take, which a few formats and sample counts make.
-const KEPT_SHAPES: usize = 64;
-
-/// The compatible passes a device keeps, by shape ([`shared_compatible_pass`]).
-#[derive(Default)]
-pub(super) struct KeptCompatible(HashMap<PassShape, vk::RenderPass>);
-
-impl KeptCompatible {
-    /// Destroy every kept pass; the device is idle, and is destroyed next.
-    pub(super) fn destroy(&self, raw: &ash::Device) {
-        for &pass in self.0.values() {
-            // SAFETY: the device is idle, so no pending command uses the pass, and a pipeline
-            // made with it does not keep it.
-            unsafe { release::object(raw, pass) };
-        }
+    // Found without writing its operations out.
+    if let Some(raw) = lock(&device.shared().render_passes).compatible(shape) {
+        return Ok(RenderPassObject::kept(device, raw));
     }
-}
-
-/// [`compatible_pass`], kept: the device's pass of `shape` (the module docs), made now where it
-/// keeps none. Every pass of a shape is compatible with every other, so one serves every encoder.
-pub(super) fn shared_compatible_pass(
-    device: &Device,
-    shape: &PassShape,
-) -> Result<Arc<RenderPassObject>, Error> {
-    let kept = &device.shared().compatible_passes;
-    if let Some(&raw) = lock(kept).0.get(shape) {
-        return Ok(Arc::new(RenderPassObject::kept(device, raw)));
-    }
-    let pass = compatible_pass(device, shape)?;
-    let mut passes = lock(kept);
-    // Another encoder's may have come first; a kept pass (without attachments) is kept already.
-    if pass.owner == Owner::Holders && passes.0.len() < KEPT_SHAPES && !passes.0.contains_key(shape)
-    {
-        let raw = pass.into_kept();
-        passes.0.insert(shape.clone(), raw);
-        return Ok(Arc::new(RenderPassObject::kept(device, raw)));
-    }
-    Ok(Arc::new(pass))
-}
-
-/// The pass of `shape` with every operation `LOAD` and `STORE`, made now.
-pub(super) fn made_compatible_pass(
-    device: &Device,
-    shape: &PassShape,
-) -> Result<RenderPassObject, Error> {
-    let colors = vec![KEEP; shape.colors.iter().flatten().count()];
-    let resolves = vec![KEEP; shape.color_resolves.iter().flatten().count()];
+    let (colors, resolves) = kept_operations(shape);
+    let rest = PassRest::compatible(shape);
     create(
         device,
         shape,
         &colors,
-        shape.depth_stencil.map(|_| KEEP),
+        rest.depth_stencil,
         &resolves,
-        shape.depth_stencil_resolve.map(|_| KEEP),
-        true,
+        rest.depth_stencil_resolve,
+        rest.resolving,
+        rest.feedback,
+        rest.depth,
     )
+}
+
+/// [`compatible_pass`], shared: every pass of a shape is compatible with every other, so one
+/// serves every encoder.
+pub(super) fn shared_compatible_pass(
+    device: &Device,
+    shape: &PassShape,
+) -> Result<Arc<RenderPassObject>, Error> {
+    compatible_pass(device, shape).map(Arc::new)
+}
+
+/// The pass of `shape` with every operation `LOAD` and `STORE`, made now, of its own (the pass a
+/// device keeps for a shape without attachments, `attachmentless.rs`).
+pub(super) fn made_compatible_pass(
+    device: &Device,
+    shape: &PassShape,
+) -> Result<RenderPassObject, Error> {
+    let (colors, resolves) = kept_operations(shape);
+    let rest = PassRest::compatible(shape);
+    make_pass(
+        device,
+        shape,
+        &colors,
+        rest.depth_stencil,
+        &resolves,
+        rest.depth_stencil_resolve,
+        rest.resolving,
+        rest.feedback,
+        rest.depth,
+    )
+}
+
+/// The color and resolve operations of a compatible pass of `shape`: [`KEEP`] for each present
+/// color attachment, and for each color resolve.
+fn kept_operations(shape: &PassShape) -> (Vec<Ops>, Vec<Ops>) {
+    let colors = vec![KEEP; shape.colors.iter().flatten().count()];
+    let resolves = vec![KEEP; shape.color_resolves.iter().flatten().count()];
+    (colors, resolves)
+}
+
+/// The most passes a device keeps (the module docs): far more than a program's passes take,
+/// which a few shapes, each begun with a few operations and layouts, make.
+const KEPT_PASSES: usize = 256;
+
+/// The render passes a device keeps ([`create`]), by shape, each with the rest of what it was
+/// made of.
+#[derive(Default)]
+pub(super) struct KeptRenderPasses {
+    by_shape: KeyMap<PassShape, Vec<KeptPass>>,
+    /// How many it keeps, of every shape.
+    count: usize,
+}
+
+/// One pass a device keeps: what [`create`] made it of beside its shape, and the pass.
+struct KeptPass {
+    colors: Vec<Ops>,
+    resolves: Vec<Ops>,
+    rest: PassRest,
+    raw: vk::RenderPass,
+}
+
+/// What [`create`] makes a pass of beside its shape and its color and resolve operations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PassRest {
+    depth_stencil: Option<Ops>,
+    depth_stencil_resolve: Option<Ops>,
+    resolving: bool,
+    feedback: Feedback,
+    depth: vk::ImageLayout,
+}
+
+impl PassRest {
+    /// A compatible pass's ([`compatible_pass`]): every attachment loaded and stored, in
+    /// `GENERAL`, resolving.
+    fn compatible(shape: &PassShape) -> PassRest {
+        PassRest {
+            depth_stencil: shape.depth_stencil.map(|_| KEEP),
+            depth_stencil_resolve: shape.depth_stencil_resolve.map(|_| KEEP),
+            resolving: true,
+            feedback: Feedback::NONE,
+            depth: vk::ImageLayout::GENERAL,
+        }
+    }
+}
+
+impl KeptRenderPasses {
+    /// The kept compatible pass of `shape`: its operations those of [`kept_operations`].
+    fn compatible(&self, shape: &PassShape) -> Option<vk::RenderPass> {
+        let rest = PassRest::compatible(shape);
+        let kept = |ops: &[Ops], count: usize| ops.len() == count && ops.iter().all(|o| *o == KEEP);
+        let colors = shape.colors.iter().flatten().count();
+        let resolves = shape.color_resolves.iter().flatten().count();
+        let mut found = self.by_shape.get(shape)?.iter();
+        let found = found.find(|k| k.rest == rest && kept(&k.colors, colors));
+        found.filter(|k| kept(&k.resolves, resolves)).map(|k| k.raw)
+    }
+
+    /// The kept pass of `shape` made of `colors`, `resolves` and `rest`.
+    fn get(
+        &self,
+        shape: &PassShape,
+        (colors, resolves): (&[Ops], &[Ops]),
+        rest: PassRest,
+    ) -> Option<vk::RenderPass> {
+        let kept = self.by_shape.get(shape)?.iter();
+        let mut kept = kept.filter(|k| k.rest == rest && k.colors == colors);
+        kept.find(|k| k.resolves == resolves).map(|k| k.raw)
+    }
+
+    /// Destroy every kept pass; the device is idle, and is destroyed next.
+    pub(super) fn destroy(&self, raw: &ash::Device) {
+        for kept in self.by_shape.values().flatten() {
+            // SAFETY: the device is idle, so no pending command uses the pass, and a pipeline
+            // made with it does not keep it.
+            unsafe { release::object(raw, kept.raw) };
+        }
+    }
 }
 
 /// The instance of `shape` at `at` of the pass `layout` begins, with its load and store
 /// operations. Every store action is known (the encoder checked). The pass's last instance
 /// resolves, and stores the depth/stencil aspects a resolve after the pass reads
 /// ([`later_resolve`]); one before it resolves nothing, its resolve references unused, which
-/// Vulkan's render pass compatibility ignores in a pass of one subpass (the module docs). A pass
-/// without attachments begins its device's kept pass, which has no operation
-/// (`attachmentless.rs`).
+/// Vulkan's render pass compatibility ignores in a pass of one subpass (the module docs), its
+/// `feedback` colors in the feedback loop layout and its depth/stencil attachment in `depth`
+/// ([`depth_layout`]; the caller records the moves, [`moved_images`]). A pass without attachments
+/// begins its device's kept pass, which has no operation (`attachmentless.rs`).
 pub(super) fn final_pass(
     device: &Device,
     layout: &PassLayout,
     shape: &PassShape,
     at: Position,
+    feedback: Feedback,
+    depth: vk::ImageLayout,
 ) -> Result<RenderPassObject, Error> {
     if let Some(kept) = attachmentless::kept(device, shape)? {
         return Ok(kept);
@@ -727,8 +1189,14 @@ pub(super) fn final_pass(
         .colors
         .iter()
         .enumerate()
-        .filter_map(|(index, color)| Some((index, color.as_ref()?)))
-        .map(|(index, color)| color_ops(color, anchor == Some(index as u32), at, dont_care))
+        .filter_map(|(index, color)| Some((index as u32, color.as_ref()?)))
+        .map(|(index, color)| match shape.storage.contains(&index) {
+            // A color its draws read and write as a storage image: the sample planes' anchor,
+            // which the subpass keeps, or one it leaves out.
+            true if anchor == Some(index) => ANCHORED,
+            true => LEFT_OUT,
+            false => color_ops(color, at, dont_care),
+        })
         .collect();
     let depth_stencil = layout
         .depth_stencil
@@ -750,15 +1218,17 @@ pub(super) fn final_pass(
         &resolves,
         subpass_step(layout).map(step_ops),
         at.last,
+        feedback,
+        depth,
     )
 }
 
-/// The operations of color attachment `color` in an instance at `at`, the sample planes'
-/// `anchor` or not, its `DontCare` `dont_care`'s, but the image a texture over a buffer keeps for
+/// The operations of color attachment `color` of the draws' subpass in an instance at `at`, its
+/// `DontCare` `dont_care`'s, but the image a texture over a buffer keeps for
 /// a pass that does not store it, which nothing reads after the pass (`kept_bytes.rs`). An
 /// attachment the exact resolve reads after the pass keeps its samples for it, and one whose
 /// texels are copied as its resolve its texels.
-fn color_ops(color: &ColorTarget, anchor: bool, at: Position, dont_care: DontCare) -> Ops {
+fn color_ops(color: &ColorTarget, at: Position, dont_care: DontCare) -> Ops {
     let exact = color.resolve.as_ref().is_some_and(|r| r.shader.is_some())
         || color.copied_resolve.is_some();
     let unheld = color.memoryless
@@ -766,18 +1236,14 @@ fn color_ops(color: &ColorTarget, anchor: bool, at: Position, dont_care: DontCar
             .stand_in
             .as_ref()
             .is_some_and(|s| s.cause == Cause::KeptBytes);
-    if anchor {
-        ANCHORED
-    } else {
-        Ops {
-            load: load_at(color.load, at),
-            store: match exact {
-                true => vk::AttachmentStoreOp::STORE,
-                false => store_at(color.store, at, dont_care.unless(unheld)),
-            },
-            stencil_load: vk::AttachmentLoadOp::DONT_CARE,
-            stencil_store: vk::AttachmentStoreOp::DONT_CARE,
-        }
+    Ops {
+        load: load_at(color.load, at),
+        store: match exact {
+            true => vk::AttachmentStoreOp::STORE,
+            false => store_at(color.store, at, dont_care.unless(unheld)),
+        },
+        stencil_load: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_store: vk::AttachmentStoreOp::DONT_CARE,
     }
 }
 
@@ -832,7 +1298,6 @@ pub(super) fn handed_dont_care(
         first: true,
         last: true,
     };
-    let anchor = shape.anchor(device.compile_device().profile());
     let dont_care = DontCare::of(device);
     let colors = layout
         .colors
@@ -842,8 +1307,7 @@ pub(super) fn handed_dont_care(
             let index = index as u32;
             color.as_ref().is_some_and(|color| {
                 !shape.storage.contains(&index)
-                    && color_ops(color, anchor == Some(index), only, dont_care).store
-                        == vk::AttachmentStoreOp::DONT_CARE
+                    && color_ops(color, only, dont_care).store == vk::AttachmentStoreOp::DONT_CARE
             })
         })
         .collect();
@@ -934,16 +1398,16 @@ pub(super) fn later_resolve(
         .as_ref()
         .ok_or_else(|| internal("a depth/stencil resolve without its attachment"))?;
     let shape = PassShape {
-        colors: Vec::new(),
+        colors: ColorList::new(),
         depth_stencil: Some(ds.target.format),
         samples: layout.samples,
-        color_resolves: Vec::new(),
+        color_resolves: ColorList::new(),
         depth_stencil_resolve: Some((step.resolve.attachment.format, step.depth, step.stencil)),
         fetch_inputs: false,
-        no_inputs: Vec::new(),
-        storage: Vec::new(),
+        no_inputs: ColorList::new(),
+        storage: ColorList::new(),
         view_mask: 0,
-        locations: Vec::new(),
+        locations: ColorList::new(),
     };
     let pass = create(
         device,
@@ -953,6 +1417,8 @@ pub(super) fn later_resolve(
         &[],
         Some(step_ops(step)),
         true,
+        Feedback::NONE,
+        vk::ImageLayout::GENERAL,
     )?;
     let usage = metal2vulkan::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
     let attachments = [
@@ -968,7 +1434,7 @@ pub(super) fn later_resolve(
 /// before its pass (`clear_reach.rs`), and the uses they make: one subpass of the attachment
 /// alone, over the pass's layers, every aspect loaded and stored. Not a load operation's clear: a
 /// device that renders through Metal (MoltenVK) clears a pass without a draw over the whole
-/// attachment, as Metal does (lane `clear_reach` on MoltenVK, EV RRS-lane9-mvk3).
+/// attachment, as Metal does (lane `clear_reach` on MoltenVK).
 pub(super) fn reach_pass(
     device: &Device,
     target: &Target,
@@ -978,22 +1444,22 @@ pub(super) fn reach_pass(
     let load = vk::AttachmentLoadOp::LOAD;
     let store = vk::AttachmentStoreOp::STORE;
     let shape = PassShape {
-        colors: Vec::new(),
+        colors: ColorList::new(),
         depth_stencil: None,
         samples: target.samples,
-        color_resolves: Vec::new(),
+        color_resolves: ColorList::new(),
         depth_stencil_resolve: None,
         fetch_inputs: false,
-        no_inputs: Vec::new(),
-        storage: Vec::new(),
+        no_inputs: ColorList::new(),
+        storage: ColorList::new(),
         view_mask: 0,
-        locations: Vec::new(),
+        locations: ColorList::new(),
     };
     let (pass, usage, stages, read, write) = match depth_stencil {
         false => {
             let shape = PassShape {
-                colors: vec![Some(target.format)],
-                color_resolves: vec![None],
+                colors: ColorList::of([Some(target.format)])?,
+                color_resolves: ColorList::of([None])?,
                 ..shape
             };
             let ops = Ops {
@@ -1003,7 +1469,17 @@ pub(super) fn reach_pass(
                 stencil_store: vk::AttachmentStoreOp::DONT_CARE,
             };
             (
-                create(device, &shape, &[ops], None, &[], None, false)?,
+                create(
+                    device,
+                    &shape,
+                    &[ops],
+                    None,
+                    &[],
+                    None,
+                    false,
+                    Feedback::NONE,
+                    vk::ImageLayout::GENERAL,
+                )?,
                 metal2vulkan::vk::ImageUsageFlags::COLOR_ATTACHMENT,
                 COLOR_STAGES,
                 vk::AccessFlags2::COLOR_ATTACHMENT_READ,
@@ -1022,7 +1498,17 @@ pub(super) fn reach_pass(
                 stencil_store: store,
             };
             (
-                create(device, &shape, &[], Some(ops), &[], None, false)?,
+                create(
+                    device,
+                    &shape,
+                    &[],
+                    Some(ops),
+                    &[],
+                    None,
+                    false,
+                    Feedback::NONE,
+                    vk::ImageLayout::GENERAL,
+                )?,
                 metal2vulkan::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
                 DEPTH_STAGES,
                 vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
@@ -1055,12 +1541,16 @@ pub(super) fn reach_pass(
 
 /// The pass of `shape` with `colors`' operations (one per present color attachment, in index
 /// order), `depth_stencil`'s, and the resolve attachments' (`resolves`, one per color index that
-/// resolves, then `depth_stencil_resolve`'s), every attachment in `GENERAL`: the draws' subpass
-/// (the module docs). Made with `vkCreateRenderPass2` (core in Vulkan 1.2, which every runtime
-/// device has), whose subpass states the depth/stencil resolve. A color attachment the draws'
-/// subpass leaves out resolves nothing there (Vulkan resolves only a referenced attachment), nor
-/// does the sample planes' anchor (its samples are undefined there); the pass resolves nothing
-/// unless `resolving`.
+/// resolves, then `depth_stencil_resolve`'s), every attachment in `GENERAL` but the `feedback`
+/// colors, in `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT` throughout, and the depth/stencil attachment,
+/// in `depth` throughout: the draws' subpass (the module docs). Made with `vkCreateRenderPass2`
+/// (core in Vulkan 1.2, which every runtime device has), whose subpass states the depth/stencil
+/// resolve. A color attachment the draws' subpass leaves out resolves nothing there (Vulkan
+/// resolves only a referenced attachment), nor does the sample planes' anchor (its samples are
+/// undefined there); the pass resolves nothing unless `resolving`. Kept by the device
+/// ([`KeptRenderPasses`]), at most [`KEPT_PASSES`] of them: the pass of the same shape,
+/// operations and layouts is the same object, made once (its creation reads nothing else but the
+/// device's profile, which is fixed); one past them is made of its own, for its holders.
 fn create(
     device: &Device,
     shape: &PassShape,
@@ -1069,19 +1559,81 @@ fn create(
     resolves: &[Ops],
     depth_stencil_resolve: Option<Ops>,
     resolving: bool,
+    feedback: Feedback,
+    depth: vk::ImageLayout,
+) -> Result<RenderPassObject, Error> {
+    let rest = PassRest {
+        depth_stencil,
+        depth_stencil_resolve,
+        resolving,
+        feedback,
+        depth,
+    };
+    let kept = &device.shared().render_passes;
+    if let Some(raw) = lock(kept).get(shape, (colors, resolves), rest) {
+        return Ok(RenderPassObject::kept(device, raw));
+    }
+    let pass = make_pass(
+        device,
+        shape,
+        colors,
+        depth_stencil,
+        resolves,
+        depth_stencil_resolve,
+        resolving,
+        feedback,
+        depth,
+    )?;
+    let mut passes = lock(kept);
+    // Another encoder's may have come first: then this one is its holders'.
+    if passes.count < KEPT_PASSES && passes.get(shape, (colors, resolves), rest).is_none() {
+        let raw = pass.into_kept();
+        let entry = KeptPass {
+            colors: colors.to_vec(),
+            resolves: resolves.to_vec(),
+            rest,
+            raw,
+        };
+        passes
+            .by_shape
+            .entry(shape.clone())
+            .or_default()
+            .push(entry);
+        passes.count += 1;
+        return Ok(RenderPassObject::kept(device, raw));
+    }
+    Ok(pass)
+}
+
+/// [`create`]'s pass, made now with `vkCreateRenderPass2`, its holders' (counted:
+/// `WorkCounts::render_passes_made`).
+fn make_pass(
+    device: &Device,
+    shape: &PassShape,
+    colors: &[Ops],
+    depth_stencil: Option<Ops>,
+    resolves: &[Ops],
+    depth_stencil_resolve: Option<Ops>,
+    resolving: bool,
+    feedback: Feedback,
+    depth: vk::ImageLayout,
 ) -> Result<RenderPassObject, Error> {
     let general = vk::ImageLayout::GENERAL;
-    let description = |format: metal2vulkan::vk::Format, samples: u32, ops: &Ops| {
-        vk::AttachmentDescription2::default()
-            .format(format.into())
-            .samples(vk::SampleCountFlags::from_raw(samples))
-            .load_op(ops.load)
-            .store_op(ops.store)
-            .stencil_load_op(ops.stencil_load)
-            .stencil_store_op(ops.stencil_store)
-            .initial_layout(general)
-            .final_layout(general)
-    };
+    // A feedback color, and a depth/stencil attachment held in `depth`, is in its layout before,
+    // during and after the instance: the image barriers around it move it (`moved_barriers`), so
+    // the pass itself moves no layout.
+    let description =
+        |format: metal2vulkan::vk::Format, samples: u32, ops: &Ops, layout: vk::ImageLayout| {
+            vk::AttachmentDescription2::default()
+                .format(format.into())
+                .samples(vk::SampleCountFlags::from_raw(samples))
+                .load_op(ops.load)
+                .store_op(ops.store)
+                .stencil_load_op(ops.stencil_load)
+                .stencil_store_op(ops.stencil_store)
+                .initial_layout(layout)
+                .final_layout(layout)
+        };
     let unused = vk::AttachmentReference2::default()
         .attachment(vk::ATTACHMENT_UNUSED)
         .layout(vk::ImageLayout::UNDEFINED);
@@ -1089,11 +1641,12 @@ fn create(
     let add = |attachments: &mut Vec<vk::AttachmentDescription2<'static>>,
                format: metal2vulkan::vk::Format,
                samples: u32,
-               ops: &Ops| {
+               ops: &Ops,
+               layout: vk::ImageLayout| {
         let reference = vk::AttachmentReference2::default()
             .attachment(attachments.len() as u32)
-            .layout(general);
-        attachments.push(description(format, samples, ops));
+            .layout(layout);
+        attachments.push(description(format, samples, ops, layout));
         reference
     };
     let anchor = shape.anchor(device.compile_device().profile());
@@ -1107,7 +1660,13 @@ fn create(
         let ops = ops
             .next()
             .ok_or_else(|| internal("a color attachment without its operations"))?;
-        let reference = add(&mut attachments, *format, shape.samples, ops);
+        let reference = add(
+            &mut attachments,
+            *format,
+            shape.samples,
+            ops,
+            feedback.layout(index),
+        );
         // A storage attachment keeps its description, but no subpass uses it unless it is the
         // sample planes' anchor (the module docs).
         if shape.storage.contains(&(index as u32)) && anchor != Some(index as u32) {
@@ -1117,7 +1676,9 @@ fn create(
         }
     }
     let depth_stencil = match (shape.depth_stencil, depth_stencil) {
-        (Some(format), Some(ops)) => Some(add(&mut attachments, format, shape.samples, &ops)),
+        (Some(format), Some(ops)) => {
+            Some(add(&mut attachments, format, shape.samples, &ops, depth))
+        }
         (None, None) => None,
         _ => {
             return Err(internal(
@@ -1135,7 +1696,7 @@ fn create(
         let ops = ops
             .next()
             .ok_or_else(|| internal("a resolve attachment without its operations"))?;
-        let reference = add(&mut attachments, *format, 1, ops);
+        let reference = add(&mut attachments, *format, 1, ops, general);
         // `storage` holds the anchor too.
         if resolving && !shape.storage.contains(&(index as u32)) {
             resolve_references.push(reference);
@@ -1151,7 +1712,7 @@ fn create(
     let ds_resolve_reference = shape
         .depth_stencil_resolve
         .zip(depth_stencil_resolve)
-        .map(|((format, _, _), ops)| add(&mut attachments, format, 1, &ops));
+        .map(|((format, _, _), ops)| add(&mut attachments, format, 1, &ops, general));
     let mut ds_resolve = shape
         .depth_stencil_resolve
         .zip(ds_resolve_reference.as_ref())
@@ -1224,14 +1785,31 @@ fn create(
         draws = draws.push_next(ds_resolve);
     }
     let own = DRAWS_SELF_DEPENDENCY;
-    let dependencies = [vk::SubpassDependency2::default()
-        .src_subpass(0)
-        .dst_subpass(0)
-        .src_stage_mask(own.stages)
-        .dst_stage_mask(own.stages)
-        .src_access_mask(own.src_access)
-        .dst_access_mask(own.dst_access)
-        .dependency_flags(self_dependency_flags(shape.view_mask))];
+    let (indirect, graphics_stages) = INDIRECT_SELF_DEPENDENCY;
+    let dependencies = [
+        vk::SubpassDependency2::default()
+            .src_subpass(0)
+            .dst_subpass(0)
+            .src_stage_mask(own.stages)
+            .dst_stage_mask(own.stages)
+            .src_access_mask(own.src_access)
+            .dst_access_mask(own.dst_access)
+            .dependency_flags(self_dependency_flags(shape.view_mask)),
+        vk::SubpassDependency2::default()
+            .src_subpass(0)
+            .dst_subpass(0)
+            .src_stage_mask(indirect)
+            .dst_stage_mask(graphics_stages)
+            .dependency_flags(stage_dependency_flags(shape.view_mask)),
+        vk::SubpassDependency2::default()
+            .src_subpass(0)
+            .dst_subpass(0)
+            .src_stage_mask(geometry_write_stages(device))
+            .dst_stage_mask(GEOMETRY_SELF_DEPENDENCY.stages)
+            .src_access_mask(GEOMETRY_SELF_DEPENDENCY.src_access)
+            .dst_access_mask(GEOMETRY_SELF_DEPENDENCY.dst_access)
+            .dependency_flags(stage_dependency_flags(shape.view_mask)),
+    ];
     let subpasses = [draws];
     let info = vk::RenderPassCreateInfo2::default()
         .attachments(&attachments)
@@ -1240,12 +1818,21 @@ fn create(
     // SAFETY: `info` and every array and structure it points at are live for the call; the
     // device is Vulkan 1.2 or later (the compile layer's floor).
     let raw = unsafe { crate::creation::render_pass2(device.shared().vk(), &info) }?;
+    device.shared().counts.render_pass_made();
     Ok(RenderPassObject {
         device: device.clone(),
         raw,
         owner: Owner::Holders,
     })
 }
+
+/// The usage of a feedback color's framebuffer view ([`framebuffer`]).
+const FEEDBACK_VIEW: metal2vulkan::vk::ImageUsageFlags =
+    metal2vulkan::vk::ImageUsageFlags::from_raw(
+        metal2vulkan::vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+            | metal2vulkan::vk::ImageUsageFlags::SAMPLED.as_raw()
+            | metal2vulkan::vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT.as_raw(),
+    );
 
 /// The view of color attachment `target`: an input attachment too where the pass's draws read
 /// it so (`fetch_inputs`, `PassLayout::fetch_inputs`) and its image takes that usage. The
@@ -1357,12 +1944,37 @@ pub(super) fn covers(views: ViewSetup, layers: u32) -> bool {
 /// ([`viewed`]), of the pass's, which every attachment renders (`render_pass.rs` refuses what
 /// would make an image of fewer in a layered pass). A multiview instance's framebuffer has one
 /// layer, and its attachments' views hold its views (`VUID-VkFramebufferCreateInfo-renderPass-02531`,
-/// `-04536`).
+/// `-04536`). A `feedback` color's view has the usage its layout needs
+/// (`VUID-vkCmdBeginRenderPass-initialLayout-07000`: "either the
+/// VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT or VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT usage flags
+/// set, and either the VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT or VK_IMAGE_USAGE_SAMPLED_BIT usage
+/// flags set", and `-07001`: "the VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT usage flag
+/// set"), which its image has (`texture::feedback_candidate`). A color an instance of `shape`
+/// leaves out of its subpass for the pixel interlock, but for one whose draws read and write sample
+/// planes, has a view of the device's placeholder of its format and sample count, which the
+/// framebuffer holds, in place of one of the image its draws write (`storage_placeholder.rs`).
 pub(super) fn framebuffer(
     device: &Device,
     pass: &RenderPassObject,
     layout: &PassLayout,
+    shape: &PassShape,
     views: ViewSetup,
+    feedback: Feedback,
+) -> Result<FramebufferObject, Error> {
+    framebuffer_over(device, pass, layout, shape, views, feedback, layout.extent)
+}
+
+/// [`framebuffer`]'s framebuffer, but over `extent` from the origin, which every attachment holds
+/// and which holds the render area: an instance whose `Clear` loads reach past the render area
+/// renders over their reach (`render/inline_first.rs`).
+pub(super) fn framebuffer_over(
+    device: &Device,
+    pass: &RenderPassObject,
+    layout: &PassLayout,
+    shape: &PassShape,
+    views: ViewSetup,
+    feedback: Feedback,
+    extent: [u32; 2],
 ) -> Result<FramebufferObject, Error> {
     let colors = layout.colors.iter().flatten();
     let resolves = colors.clone().filter_map(|c| subpass_resolve(Some(c)));
@@ -1379,9 +1991,35 @@ pub(super) fn framebuffer(
         return Err(internal("views past their pass's layers"));
     }
     let viewed = |target: &Target| viewed(target, views);
+    let anchor = shape.anchor(device.compile_device().profile());
+    let mut placeholders = Vec::new();
     let mut attachments = Vec::new();
-    for color in colors {
-        attachments.push(color_view(&viewed(&color.target), layout.fetch_inputs)?);
+    for (index, color) in layout.colors.iter().enumerate() {
+        let Some(color) = color else {
+            continue;
+        };
+        let target = viewed(&color.target);
+        let left_out = shape.storage.contains(&(index as u32))
+            && anchor != Some(index as u32)
+            && color.planes.is_none();
+        if left_out {
+            let layers = target.layer - color.target.layer
+                ..target.layer - color.target.layer + target.layers;
+            // Each its own: no two attachments alias.
+            let place = (placeholders.iter())
+                .filter(|p: &&Arc<Placeholder>| p.is_of(target.format, target.samples))
+                .count();
+            let of = (target.format, target.samples, place);
+            let (placeholder, view) = device.storage_placeholder(of, extent, layers)?;
+            placeholders.push(placeholder);
+            attachments.push(view);
+            device.shared().counts.storage_placeholder_attachment();
+            continue;
+        }
+        attachments.push(match feedback.has(index) {
+            true => attachment_view(&target, FEEDBACK_VIEW)?,
+            false => color_view(&target, layout.fetch_inputs)?,
+        });
     }
     if let Some(ds) = &layout.depth_stencil {
         attachments.push(attachment_view(
@@ -1406,7 +2044,9 @@ pub(super) fn framebuffer(
     } else {
         1
     };
-    made_framebuffer(device, pass, &attachments, layout.extent, layers)
+    let mut made = made_framebuffer(device, pass, &attachments, extent, layers)?;
+    made.placeholders = placeholders;
+    Ok(made)
 }
 
 /// The framebuffer of `pass`, a pass without attachments (`attachmentless.rs`), over `extent`
@@ -1442,18 +2082,41 @@ fn made_framebuffer(
     Ok(FramebufferObject {
         device: device.clone(),
         raw,
+        placeholders: Vec::new(),
     })
+}
+
+/// The clear values of a pass's attachments, in its framebuffer's order (`clear_values`): each
+/// color's, then the depth/stencil attachment's, held in place rather than allocated at every
+/// pass.
+#[derive(Clone, Copy)]
+pub(super) struct ClearValues {
+    values: [vk::ClearValue; MAX_COLOR_ATTACHMENTS + 1],
+    len: usize,
+}
+
+impl ClearValues {
+    fn push(&mut self, value: vk::ClearValue) {
+        self.values[self.len] = value;
+        self.len += 1;
+    }
+
+    /// The values, in the framebuffer's order.
+    pub(super) fn as_slice(&self) -> &[vk::ClearValue] {
+        &self.values[..self.len]
+    }
 }
 
 /// The clear values of `layout`'s attachments, in the framebuffer's order (ignored where the load
 /// operation is not `CLEAR`).
-pub(super) fn clear_values(layout: &PassLayout) -> Vec<vk::ClearValue> {
-    let mut values: Vec<vk::ClearValue> = layout
-        .colors
-        .iter()
-        .flatten()
-        .map(|color| vk::ClearValue { color: color.clear })
-        .collect();
+pub(super) fn clear_values(layout: &PassLayout) -> ClearValues {
+    let mut values = ClearValues {
+        values: [vk::ClearValue::default(); MAX_COLOR_ATTACHMENTS + 1],
+        len: 0,
+    };
+    for color in layout.colors.iter().flatten() {
+        values.push(vk::ClearValue { color: color.clear });
+    }
     if let Some(ds) = &layout.depth_stencil {
         let mut value = vk::ClearDepthStencilValue::default();
         for aspect in [ds.depth.as_ref(), ds.stencil.as_ref()]
@@ -1485,12 +2148,38 @@ const DEPTH_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
 /// What the pass of `layout` uses, for the tracker: each attachment's level and layers, read (its
 /// load) and written (its draws, clear and store), in the stages its operations run in.
 pub(super) fn attachment_uses(layout: &PassLayout) -> Result<Vec<Use<ResourceKey>>, Error> {
-    let mut uses = Vec::new();
-    for color in layout.colors.iter().flatten() {
-        uses.extend(target_uses(&color.target, false)?);
+    attachment_uses_but(layout, |_| false)
+}
+
+/// The pass's uses as [`attachment_uses`] gives them, but those of the color attachments `left`
+/// names by index (their resolves' kept).
+pub(super) fn attachment_uses_but(
+    layout: &PassLayout,
+    left: impl Fn(usize) -> bool,
+) -> Result<Vec<Use<ResourceKey>>, Error> {
+    let kept = || {
+        let colors = layout.colors.iter().enumerate();
+        colors
+            .filter(|&(index, _)| !left(index))
+            .filter_map(|(_, color)| color.as_ref())
+    };
+    // Room for every use at once, a read and a write of each attachment and resolve, so the list
+    // is allocated once.
+    let resolves = layout
+        .colors
+        .iter()
+        .flatten()
+        .filter(|c| c.resolve.is_some());
+    let targets = kept().count()
+        + usize::from(layout.depth_stencil.is_some())
+        + resolves.count()
+        + depth_stencil_steps(layout).count();
+    let mut uses = Vec::with_capacity(2 * targets);
+    for color in kept() {
+        add_target_uses(&mut uses, &color.target, false)?;
     }
     if let Some(ds) = &layout.depth_stencil {
-        uses.extend(target_uses(&ds.target, true)?);
+        add_target_uses(&mut uses, &ds.target, true)?;
     }
     let mut add =
         |target: &Target, stages, read, write| add_uses(&mut uses, target, stages, (read, write));
@@ -1522,6 +2211,62 @@ pub(super) fn attachment_uses(layout: &PassLayout) -> Result<Vec<Use<ResourceKey
     Ok(uses)
 }
 
+/// Whether one of `uses`, what a command's functions bind or reach, reads or writes memory an
+/// attachment of the pass of `layout` renders (its resolve textures included): a use of the
+/// attachment other than as an attachment, inside its render pass instance, which Vulkan leaves
+/// undefined (`texture/attached_reads.rs`). A use that reads a copy or a snapshot names another
+/// resource. An attachment's memory is the key and range [`attachment_uses`] gives both its read
+/// and its write, taken here one attachment at a time, nothing collected: every draw asks while
+/// the notice is pending (`Device::degrade_attachment_reads`).
+pub(super) fn shares_attachment(
+    layout: &PassLayout,
+    uses: &[Use<ResourceKey>],
+) -> Result<bool, Error> {
+    let used = || {
+        uses.iter()
+            .filter(|used| used.read != Access::NONE || used.write != Access::NONE)
+    };
+    if used().next().is_none() {
+        return Ok(false);
+    }
+    let colors = layout.colors.iter().flatten();
+    let targets = colors
+        .clone()
+        .map(|color| &color.target)
+        .chain(layout.depth_stencil.as_ref().map(|ds| &ds.target))
+        .chain(colors.filter_map(|color| color.resolve.as_ref().map(|r| &r.attachment)))
+        .chain(depth_stencil_steps(layout).map(|step| &step.resolve.attachment));
+    for target in targets {
+        let levels = target.level..target.level + 1;
+        let layers = target.layer..target.layer + target.layers;
+        let a = target
+            .texture
+            .image_use(levels, layers, Access::NONE, false)?;
+        if used().any(|used| a.key == used.key && a.range.overlaps(&used.range)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The keys of the buffers whose bytes the pass's attachments lie in (their resolve textures
+/// included): the buffer a texture is over, or the bytes of the heap it, or its buffer, lies in.
+/// A rebind or a detach of one swaps the images of the textures over it (`rebind.rs`,
+/// `detach.rs`).
+pub(super) fn attachment_bytes(layout: &PassLayout) -> impl Iterator<Item = ResourceKey> + '_ {
+    let colors = layout.colors.iter().flatten();
+    let targets = colors
+        .clone()
+        .map(|color| &color.target)
+        .chain(layout.depth_stencil.as_ref().map(|ds| &ds.target))
+        .chain(colors.filter_map(|color| color.resolve.as_ref().map(|r| &r.attachment)));
+    targets.filter_map(|target| match target.texture.memory() {
+        TextureMemory::Heap(heap) => heap.bytes().map(|own| own.identity().key),
+        TextureMemory::Buffer(buffer) => Some(buffer.identity().key),
+        TextureMemory::Own(_) => None,
+    })
+}
+
 /// What a pass's attachment `target` uses, as [`attachment_uses`] counts it: a color
 /// attachment's, or a depth/stencil attachment's (`depth_stencil`).
 pub(super) fn target_uses(
@@ -1529,27 +2274,36 @@ pub(super) fn target_uses(
     depth_stencil: bool,
 ) -> Result<Vec<Use<ResourceKey>>, Error> {
     let mut uses = Vec::with_capacity(2);
+    add_target_uses(&mut uses, target, depth_stencil)?;
+    Ok(uses)
+}
+
+/// Add to `uses` what [`target_uses`] gives.
+fn add_target_uses(
+    uses: &mut Vec<Use<ResourceKey>>,
+    target: &Target,
+    depth_stencil: bool,
+) -> Result<(), Error> {
     match depth_stencil {
         false => add_uses(
-            &mut uses,
+            uses,
             target,
             COLOR_STAGES,
             (
                 vk::AccessFlags2::COLOR_ATTACHMENT_READ,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             ),
-        )?,
+        ),
         true => add_uses(
-            &mut uses,
+            uses,
             target,
             DEPTH_STAGES,
             (
                 vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
                 vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             ),
-        )?,
+        ),
     }
-    Ok(uses)
 }
 
 /// Add to `uses` `target`'s level and layers, read (`read`) and written (`write`) in `stages`.

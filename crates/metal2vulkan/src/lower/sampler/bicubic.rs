@@ -21,7 +21,7 @@
 //! filtered bilinearly over taps `i` and `i + 1` whatever its format, with the same fraction.
 //!
 //! **Small levels and mirrored axes** (Apple M3 Max, macOS 26.7, the primary Metal reference; the
-//! RT13-bc2 and RT13-bc3 probes, every lane of each run with and without Metal's validation layer,
+//! probes probes, every lane of each run with and without Metal's validation layer,
 //! `r8Unorm`, `rgba8Unorm`, and `rgba16Float` on random texels at dyadic coordinates from 2.5
 //! periods below to 3.5 above):
 //! - A 2D level below four texels on either axis (1x1 to 13x4, 15 sizes) is filtered by Metal's
@@ -70,7 +70,7 @@
 //!
 //! Everything else above is Metal's reading, except inferences:
 //! - The signed clamp's lower bound comes from the format's range (no reading went below `-1`).
-//! - The small-level and mirrored-axis rules of the formats RT13-bc2 and RT13-bc3 did not read
+//! - The small-level and mirrored-axis rules of the formats our probes did not read
 //!   (all but `R8Unorm`, `RGBA8Unorm`, `RGBA16Float`, and `R32Float`) are their families'.
 //! - `RG8UnormSRGB`, never probed, takes its family's treatment. So do `RG8Unorm`, `RG8Snorm`,
 //!   `RG16Unorm`, `BGRA8Unorm`, and `A8Unorm`, which take the exact rule no case reads on them.
@@ -97,7 +97,6 @@
 
 use crate::air::abi::{AddressMode, BorderColor, Filter, SamplerState};
 use crate::air::intrinsics::ImageDim;
-use crate::air::ir::ValueId;
 use crate::error::{Error, Feature, Unsupported};
 use crate::lower::emit::EmitCx;
 use crate::lower::texture::{OffsetBase, TexelConv};
@@ -225,7 +224,7 @@ pub(super) fn state(r: SamplerRef) -> Result<Option<SamplerState>, Error> {
 /// The state of a runtime sampler whose min or mag filter is Metal's `Cubic`, from its word's
 /// `SamplerWord::CUBIC_STATE` bits (`LoweringInputs::cubic_samplers`): Metal samples through such
 /// a sampler as through a constexpr bicubic sampler of the same address modes, border color, and
-/// coordinates, whatever its other filter and the level (EV GSM2-bcs2-m4: 990 runs of 8,192
+/// coordinates, whatever its other filter and the level (990 runs of 8,192
 /// lanes, nine formats, every address mode and border color, normalized and pixel coordinates,
 /// min/mag pairs `(2, 2)`, `(2, 1)`, `(1, 2)`, `(2, 0)` and `(0, 2)`, implicit, explicit and
 /// gradient levels, bit for bit; through an argument buffer alike). `clamp_to_zero` reads the
@@ -540,8 +539,8 @@ fn axis(
 /// `o` itself, added before the taps are addressed, but 0 on a repeating or mirrored axis whose
 /// sizes drop it (`position::offset_dropped`; the linear and bicubic filters, gathers and nearest
 /// samples alike), a runtime sampler's axis by the mode its word states, under which a
-/// `MirrorClampToEdge` axis's sizes drop it too, its pixel coordinates' as its normalized ones'
-/// (RRP-probe5-m4); by the parent's base-level size where `parent` holds.
+/// `MirrorClampToEdge` axis's sizes drop it too, its pixel coordinates' as its normalized ones'; by
+/// the parent's base-level size where `parent` holds.
 fn placed_offset(
     fb: &mut FunctionBuilder<'_>,
     t: &Tys,
@@ -960,6 +959,12 @@ impl Footprint {
             _ => Ok(texel),
         }
     }
+
+    /// The border texel (a `vec4` of `f32`) a tap outside a border axis reads, where an axis has
+    /// a border.
+    pub(super) fn border_texel(&self) -> Option<SValue> {
+        self.border
+    }
 }
 
 /// Where an emulation reads its taps: the image of its own binding, or, in the shared emulation of
@@ -1130,37 +1135,35 @@ pub(super) fn footprint_from(
 }
 
 /// The footprint over `taps` of a sample at plane coordinate `coord` (and array layer `layer`)
-/// of image `img` (image facts `image`) at its base level, whose taps are fetched from `img`, the
+/// of image `img` (image facts `image`) at the taps' level, whose taps are fetched from `img`, the
 /// border color seen through the channels of the format's treatment `bits`: an extended-range
 /// texture's emulated sample (`super::extended`), which reads its slot's own image, its offset
-/// placed by the slot's `SpecKey::OffsetBaseAxes` tests `parent` where it reads them.
+/// (its taps' constant one, or a sampling routine's call's value `offset`, as [`At::offset`])
+/// placed by the slot's `SpecKey::OffsetBaseAxes` tests `parent` where it reads them (a level's
+/// taps read its size, and the offset rule the base level's too, as [`footprint_from`]'s).
 pub(super) fn footprint_of_image(
-    cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     t: &Tys,
-    (coord, layer): (ValueId, Option<ValueId>),
+    (coord, layer, offset): (SValue, Option<SValue>, Option<(SValue, u8)>),
     (img, image): (SValue, CombinedImage),
     bits: Bits,
     (taps, parent): (&Taps<'_>, Option<OffsetBase>),
 ) -> BResult<Footprint> {
-    if taps.level.is_some() {
-        return Err(missing_tap());
-    }
-    let coord = cx.operand(fb, coord)?;
-    let layer = match layer {
-        Some(l) => Some(cx.operand(fb, l)?),
-        None => None,
-    };
     let at = At {
         coord,
         layer,
         parent,
-        offset: None,
+        offset,
     };
     let zero_u = fb.u32_const(0)?;
     let zero_u = value(fb, zero_u)?;
-    let size = fb.query(ImageQuery::SizeLod(zero_u), img)?;
-    footprint_at(fb, t, &at, (size, None, image), bits, taps)
+    let size = fb.query(ImageQuery::SizeLod(taps.level.unwrap_or(zero_u)), img)?;
+    let offset = at.offset.is_some() || taps.offset.is_some_and(|o| o.iter().any(|o| *o != 0));
+    let base = match (taps.level, offset) {
+        (Some(_), true) => Some(fb.query(ImageQuery::SizeLod(zero_u), img)?),
+        _ => None,
+    };
+    footprint_at(fb, t, &at, (size, base, image), bits, taps)
 }
 
 /// The footprint of sample `s` over `taps` on an image of level-0 size `size` (image facts

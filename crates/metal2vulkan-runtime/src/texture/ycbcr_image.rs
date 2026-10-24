@@ -15,6 +15,7 @@ use crate::device::lock;
 use crate::error::{internal, Error};
 use crate::image_plan::plan_image;
 use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource};
+use crate::shadow_merge::ScratchSpares;
 use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
 use crate::tracker::UseRange;
 use crate::values::ResourceOptions;
@@ -48,8 +49,7 @@ fn image_formats(codes: YCbCrCodes) -> [Format; 2] {
     }
 }
 
-/// The modes Metal samples a two-plane YCbCr texture with, by its codes (EVs XRR2-ycc2-m4,
-/// TXN2-ycr1-m4, TXN2-ycb1-m4 and -m3, TXN2-ycq1-m4, TXN2-ycb2-m4): a 4:2:0 or 4:2:2 texture
+/// The modes Metal samples a two-plane YCbCr texture with, by its codes: a 4:2:0 or 4:2:2 texture
 /// samples repeat, mirrored repeat and mirror-clamp-to-edge as clamp-to-edge, a 4:4:4 one as
 /// themselves; one read as codes samples clamp-to-zero and clamp-to-border-color as
 /// clamp-to-edge too, under every border color, where the others read the border (its alpha 1,
@@ -158,7 +158,8 @@ impl Device {
         }
         let hazard = texels.options().hazard_tracking_mode()?;
         let image = self.new_image(plan, layout, descriptor, hazard)?;
-        let view = image.view(&VkView {
+        // The conversion's set holds it as long as the image (`Image::own_view`).
+        let view = image.own_view(&VkView {
             view_type: ImageViewType::TYPE_2D,
             format: written,
             components: ComponentMapping::IDENTITY,
@@ -188,8 +189,10 @@ impl Device {
                 layers: 0..1,
             },
             tracked: texels.tracked(),
-            // Metal drops a function's writes to the texture (EV XRR2-ycc1-m4).
+            // Metal drops a function's writes to the texture.
             drops_writes: true,
+            backing: texels.backing(),
+            merge_scratch: ScratchSpares::default(),
         };
         Ok(Storage::Shadow {
             image: image.shared(),
@@ -204,8 +207,8 @@ impl Texture {
     /// (`view_plan::check_format` admits `YCBCR8_420_2P` as `YCBCR8_420_2P_sRGB` and
     /// `YCBCR10_420_2P` as `YCBCR10_420_2P_sRGB`, as Metal makes them, its usage `ShaderRead`
     /// alone): a converted image of the view's format over the same planes, which reads what
-    /// Metal's view reads, a texture of that format over the surface's reads bit for bit (EV
-    /// TXN2-ycv1-m4). `None` for a texture whose texels are no conversion of planes. Refused as
+    /// Metal's view reads, a texture of that format over the surface's reads bit for bit. `None`
+    /// for a texture whose texels are no conversion of planes. Refused as
     /// a texture of the view's format over the planes is.
     pub(super) fn converted_view(
         &self,
@@ -312,7 +315,8 @@ impl Texture {
         descriptor.resource_options = ResourceOptions::private();
         let hazard = texels.options().hazard_tracking_mode()?;
         let image = device.new_image(plan, &layout, &descriptor, hazard)?;
-        let view = image.view(&VkView {
+        // The write-back's set holds it as long as the image (`Image::own_view`).
+        let view = image.own_view(&VkView {
             view_type: ImageViewType::TYPE_2D,
             format: Format::R32G32B32A32_UINT,
             components: ComponentMapping::IDENTITY,
@@ -344,6 +348,8 @@ impl Texture {
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            backing: texels.backing(),
+            merge_scratch: ScratchSpares::default(),
         };
         Ok((image, copies))
     }
@@ -440,7 +446,8 @@ impl Texture {
         descriptor.resource_options = ResourceOptions::private();
         let hazard = texels.options().hazard_tracking_mode()?;
         let image = device.new_image(plan, &layout, &descriptor, hazard)?;
-        let view = image.view(&VkView {
+        // The write-back's set holds it as long as the image (`Image::own_view`).
+        let view = image.own_view(&VkView {
             view_type: ImageViewType::TYPE_2D,
             format: bits,
             components: ComponentMapping::IDENTITY,
@@ -472,6 +479,8 @@ impl Texture {
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            backing: texels.backing(),
+            merge_scratch: ScratchSpares::default(),
         };
         let storage = Storage::Shadow {
             image: image.shared(),

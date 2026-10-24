@@ -60,7 +60,8 @@ use super::resources::{separate_samplers, ResourcePlanner};
 use super::slots::{
     address_map_variant, anisotropic_variant, bindings, bound_value, buffer_use, check_slots,
     check_sparse_textures, cross_variant, cubic_variant, mark_disjoint, plan_buffer, psb_variant,
-    record_specialized, srgb_variant, storage_view_variant, used_uses, ycbcr_variant,
+    record_specialized, srgb_twin_variant, srgb_variant, storage_view_variant, used_uses,
+    ycbcr_variant,
 };
 use super::{
     BindingPlan, BoundKind, ComputeTemplate, DescriptorWrite, FieldLocation, LocalRules,
@@ -459,6 +460,7 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
         diagnostics: Vec::new(),
         uses: Vec::new(),
         template: Default::default(),
+        alpha_red_texels: Default::default(),
     };
     let mut heap = HeapPlanner::new(device.profile(), &p.layout, &p.dependencies, shape, |_| {
         vec![Stage::Kernel]
@@ -616,7 +618,7 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
                     color_index,
                     format: tile_view_format(p, color_index)?,
                     view: StorageAttachmentView::Attachment,
-                    uint_view: None,
+                    view_alias: None,
                 },
                 other => return Err(internal(format!("a compute binding {other:?}"))),
             };
@@ -780,7 +782,13 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
     variant.psb_slots = psb_variant(&p.dependencies, &buffers, device.profile());
     variant.storage_view_slots = storage_view_variant(&p.dependencies, &buffers, device.profile());
     variant.cross_class = cross_variant(&p.dependencies, &p.interface.slots, shape);
-    variant.srgb_textures = srgb_variant(&p.dependencies, shape, &variant.cross_class);
+    variant.srgb_textures = srgb_variant(
+        device.profile(),
+        &p.dependencies,
+        shape,
+        &variant.cross_class,
+    );
+    variant.srgb_twins = srgb_twin_variant(device.profile(), &variant.srgb_textures, shape);
     variant.ycbcr_textures = ycbcr_variant(&p.dependencies, shape);
     variant.address_maps = address_map_variant(&p.dependencies, shape);
     variant.cubic_samplers = cubic_variant(&p.dependencies, shape)?;

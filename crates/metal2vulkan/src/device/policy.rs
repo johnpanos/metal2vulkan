@@ -1,12 +1,15 @@
 //! `DevicePolicy`: the consumer's product choices that, together with a `DeviceDescription`,
 //! decide a `DeviceProfile`.
 
-use crate::device::profile::{FramebufferFetchPolicy, GuestIsolation, HandleDomain, PointerDomain};
+use crate::device::profile::{GuestIsolation, HandleDomain, PointerDomain};
 
-/// Policy inputs of `Device::new`. Every field but `padded_reads` can change emitted code, so the
-/// profile carries it (containment as the encoding it selects) and its fingerprint covers it;
-/// `padded_reads` is the runtime's alone (how it makes a texture over a buffer), and no profile
-/// carries it.
+/// Policy inputs of `Device::new`. Every field but `decoded_texels`, `heap_compression`,
+/// `completion`, `tile_store`, `resolve` and `batch_order` can change emitted code, so the profile
+/// carries it (containment as the encoding it selects) and its fingerprint covers it; those six
+/// are the runtime's alone (the texels of a carried texture's decoded twin, a heap's compressed
+/// texture's image, when the host sees a command buffer complete, what a render pass's load leaves
+/// in the texels its draws do not write, how a multisampled color attachment resolves, and how a
+/// batch begins after the earlier ones of its queue), and no profile carries them.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -19,8 +22,6 @@ pub struct DevicePolicy {
     pub containment: ContainmentPolicy,
     /// Whether guest shaders are isolated from each other's resources.
     pub isolation: GuestIsolation,
-    /// Framebuffer-fetch ordering without rasterization-order attachment access.
-    pub framebuffer_fetch: FramebufferFetchPolicy,
     /// Whether an 8-bit unsigned normalized texture's linear sample may be the device's own
     /// filter on a device measured within one code of Metal; by default it is Metal's filter,
     /// emulated exactly.
@@ -28,6 +29,10 @@ pub struct DevicePolicy {
     /// Whether a device that does not sample through Metal's own sampler samples natively (the
     /// default) or emulates Metal's sampler exactly.
     pub sampling: SamplingPolicy,
+    /// Whether, under native device sampling, a linear sample of a texture slot bound to a
+    /// two-plane YCbCr texture is the device's own filter of its texels (the default) or Metal's
+    /// filter of the format, emulated in a variant of the pipeline the draw binding it makes.
+    pub ycbcr_filter: YCbCrFilterPolicy,
     /// Whether the math library's functions (`sin`, `cos`, `exp`, `log`, `pow` and the rest), a
     /// precise division and Metal's fast reciprocal, and a fused multiply-add are the device's
     /// own instructions (native device maths, the default) or the translation's routines of
@@ -54,36 +59,69 @@ pub struct DevicePolicy {
     /// attachment in the device's blend (the default) or in Metal's `half` arithmetic, which the
     /// function computes in the shader.
     pub half_blend: HalfBlendPolicy,
-    /// Whether a texture over a buffer whose rows (or slices) lie with bytes between them, and
-    /// which only reads (its usage holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block
-    /// writes), is an image over the buffer's bytes at Metal's row pitch (the default) or the
-    /// runtime's shadow of them, copied in before each use. The runtime's choice alone: no
+    /// Whether a texture whose format the device lacks, held in a carrier (an ASTC LDR texture,
+    /// or an EAC 11-bit one), samples a decoded twin of compact codes (the default) or of Metal's
+    /// values exactly. The runtime's choice alone: no emitted code changes.
+    pub decoded_texels: DecodedTexelsPolicy,
+    /// Whether a heap's colour texture that Metal keeps losslessly compressed, on a driver whose
+    /// compressed images hide writes through an alias, is the driver's compressed image (the
+    /// default) or one the driver keeps uncompressed in the heap's bytes. The runtime's choice
+    /// alone: no emitted code changes.
+    pub heap_compression: HeapCompressionPolicy,
+    /// Whether command buffers committed on one `VkQueue` that the runtime's scheduler finds ready
+    /// together go to the driver in one kernel submission, each seen complete once the last of
+    /// them completed (the default, on a driver that merges such submissions), or each in a
+    /// submission of its own, seen complete at its own end. The runtime's choice alone: no
     /// emitted code changes.
-    pub padded_reads: PaddedReadsPolicy,
+    pub completion: CompletionPolicy,
+    /// Whether a render pass that loads a signed normalized or `RGB9E5Float` color attachment and
+    /// draws keeps the texels its draws do not write as the device's load and store leave them
+    /// (the default), or as Metal's tile store writes them back in the tiles a draw reaches. The
+    /// runtime's choice alone: no emitted code changes.
+    pub tile_store: TileStorePolicy,
+    /// Whether a multisampled color attachment whose format has Metal's resolve rule resolves by
+    /// the device's own `AVERAGE` in the pass (the default), or by Metal's rule in one more render
+    /// pass instance after it, on a device whose average is not measured to be Metal's. The
+    /// runtime's choice alone: no emitted code changes.
+    pub resolve: ResolvePolicy,
+    /// Whether a batch of command buffers on one `VkQueue` begins after the batches before it
+    /// there by their ends (the default, on a driver measured to run no two kernel submissions of
+    /// one queue side by side), or by a barrier for each access that depends on theirs. The
+    /// runtime's choice alone: no emitted code changes.
+    pub batch_order: BatchOrderPolicy,
 }
 
 impl DevicePolicy {
-    /// The untrusted-guest production policy: containment and isolation on,
-    /// ordered framebuffer fetch required, Metal's 8-bit linear filter emulated exactly where the
-    /// emulation runs, native device sampling, native device maths, the device's own texel
+    /// The untrusted-guest production policy: containment and isolation on, Metal's 8-bit linear
+    /// filter emulated exactly where the emulation runs, native device sampling (a two-plane YCbCr texture's samples among them),
+    /// native device maths, the device's own texel
     /// conversions, native half rounding, the device's NaN and minimum and maximum, the device's
-    /// rounding order, the device's blend of a `half` output into a 16-bit float attachment, and
-    /// an image over a texture's padded rows where the texture only reads.
+    /// rounding order, the device's blend of a `half` output into a 16-bit float attachment,
+    /// compact codes in a carried texture's decoded twin, the driver's compressed image of a
+    /// heap's texture Metal keeps compressed, command buffers ready together in one kernel
+    /// submission, the device's load and store of a signed normalized or `RGB9E5Float` color
+    /// attachment, the device's resolve of a multisampled color attachment, and batches of one
+    /// queue ordered by their ends where the driver runs them one after another.
     pub const UNTRUSTED: DevicePolicy = DevicePolicy {
         pointer_domain: PointerDomain::ResidentTable,
         handle_domain: HandleDomain::Table,
         containment: ContainmentPolicy::Contained,
         isolation: GuestIsolation::On,
-        framebuffer_fetch: FramebufferFetchPolicy::RequireOrdered,
         unorm8_linear_filter: Unorm8LinearFilterPolicy::Exact,
         sampling: SamplingPolicy::NativeDevice,
+        ycbcr_filter: YCbCrFilterPolicy::Device,
         float_maths: FloatMathsPolicy::Native,
         texel_conversion: TexelConversionPolicy::Device,
         half_rounding: HalfRoundingPolicy::Native,
         nan_and_min_max: NanMinMaxPolicy::Native,
         rounding_order: RoundingOrderPolicy::Native,
         half_blend: HalfBlendPolicy::Device,
-        padded_reads: PaddedReadsPolicy::Alias,
+        decoded_texels: DecodedTexelsPolicy::Compact,
+        heap_compression: HeapCompressionPolicy::Compressed,
+        completion: CompletionPolicy::Grouped,
+        tile_store: TileStorePolicy::Device,
+        resolve: ResolvePolicy::Device,
+        batch_order: BatchOrderPolicy::Ends,
     };
 
     /// This policy with Metal's answer wherever the choices offer it: its maths functions,
@@ -91,18 +129,30 @@ impl DevicePolicy {
     /// ([`TexelConversionPolicy::Exact`]), its `half` rounding ([`HalfRoundingPolicy::Exact`]), its
     /// NaN and minimum and maximum ([`NanMinMaxPolicy::Exact`]), its rounding order
     /// ([`RoundingOrderPolicy::Exact`]), its 16-bit float blend of a `half` output
-    /// ([`HalfBlendPolicy::Exact`]), and the bytes between a texture's rows that no first move of
-    /// an image over them reaches ([`PaddedReadsPolicy::Shadow`]). Sampling and every other field
-    /// are kept.
+    /// ([`HalfBlendPolicy::Exact`]), its filter of a two-plane YCbCr texture
+    /// ([`YCbCrFilterPolicy::Exact`]), its decode of a carried texture's texels
+    /// ([`DecodedTexelsPolicy::Exact`]), a heap's texture whose bytes alias the heap's
+    /// as written ([`HeapCompressionPolicy::Uncompressed`]), each command buffer seen complete
+    /// at its own end ([`CompletionPolicy::Exact`]), a loaded attachment's texels as its tile
+    /// store leaves them ([`TileStorePolicy::Exact`]), its multisample color resolve
+    /// ([`ResolvePolicy::Exact`]), and each batch ordered after the earlier ones of its queue by
+    /// the accesses it depends on alone ([`BatchOrderPolicy::Exact`]). Sampling and every other
+    /// field are kept.
     pub const fn exact_answers(self) -> DevicePolicy {
         DevicePolicy {
+            ycbcr_filter: YCbCrFilterPolicy::Exact,
             float_maths: FloatMathsPolicy::Exact,
             texel_conversion: TexelConversionPolicy::Exact,
             half_rounding: HalfRoundingPolicy::Exact,
             nan_and_min_max: NanMinMaxPolicy::Exact,
             rounding_order: RoundingOrderPolicy::Exact,
             half_blend: HalfBlendPolicy::Exact,
-            padded_reads: PaddedReadsPolicy::Shadow,
+            decoded_texels: DecodedTexelsPolicy::Exact,
+            heap_compression: HeapCompressionPolicy::Uncompressed,
+            completion: CompletionPolicy::Exact,
+            tile_store: TileStorePolicy::Exact,
+            resolve: ResolvePolicy::Exact,
+            batch_order: BatchOrderPolicy::Exact,
             ..self
         }
     }
@@ -170,6 +220,38 @@ pub enum SamplingPolicy {
     Exact,
 }
 
+/// How a linear sample of a texture slot bound to a two-plane YCbCr texture
+/// (`metal::format::ycbcr_format`) is filtered where the module leaves the slot's samples to the
+/// device's sampler: on a device that samples natively ([`SamplingPolicy::NativeDevice`], the
+/// module requiring `VkProperty::DeviceSampling`), and on one that samples through Metal's own
+/// sampler (MoltenVK on Apple's GPU) under native sampling. The texture's image holds Metal's reads
+/// of the planes exactly, steps of `1/2048` or `1/8192`; Metal's filter sums those steps on their
+/// grid, each term truncated, at its own weights, so the device's filter of the same texels lands
+/// off Metal's answer: natively within the bound `PrecisionNote::DeviceSampling` states, through
+/// Metal's own sampler within one step of the grid (`ycbcr-filter-not-exact`). Under
+/// [`SamplingPolicy::Exact`] every sample is Metal's, through the slot's variant on MoltenVK.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum YCbCrFilterPolicy {
+    /// The device's filter of the texture's texels, as for every other format (the default: the
+    /// owner's ruling, making time before exactness, recorded and announced): the pipeline a draw
+    /// binding such a texture takes is the one a draw binding any other texture takes, so the draw
+    /// makes none. A natively sampling module records
+    /// [`PrecisionNote::DeviceSampling`](crate::pipeline::PrecisionNote::DeviceSampling), whose
+    /// docs state the bound measured against Metal; through Metal's own sampler the module records
+    /// its filter note under the bound format, which the runtime announces as
+    /// `ycbcr-filter-not-exact` where a draw binds such a texture, and a `half` sample's one texel
+    /// on the grid `8192` through a runtime sampler rounds to nearest even
+    /// ([`PrecisionNote::HalfTexelConversion`](crate::pipeline::PrecisionNote::HalfTexelConversion)).
+    #[default]
+    Device,
+    /// Metal's filter of the format, emulated: a draw that binds such a texture at a slot the
+    /// function samples linearly takes the slot's YCbCr variant (`RuntimeFact::YCbCrTexture`), a
+    /// pipeline of its own, made at that draw.
+    Exact,
+}
+
 /// How the `float` and `half` maths functions, divisions and fused multiply-adds Metal answers
 /// beyond Vulkan's precision table are computed on a device whose functions are not Metal's own
 /// (the owner's "Maths functions" of 2026-10-11, native by default). On a device whose functions
@@ -200,7 +282,7 @@ pub enum FloatMathsPolicy {
 /// device that does not sample through Metal's own texture unit (`VkProperty::MetalSampler`). On
 /// such a device Metal's conversion of a texel is emulated by a routine that tells the bound
 /// format's class apart at every access, and the class is data, so no driver folds it: on the
-/// consumer's fragments those routines were most of the driver's making time (EV SRT-nm1: 296 calls
+/// consumer's fragments those routines were most of the driver's making time (296 calls
 /// in `Xgc`, 311 in `A2Xghfc`).
 ///
 /// The choice is made per access. A read's texel is this policy's. A sample's or gather's is too
@@ -237,7 +319,10 @@ pub enum TexelConversionPolicy {
 /// GPUs" of 2026-10-11, which the device's conversion may do besides its rounding, native by
 /// default). Where either is measured to be Metal's (`DriverDeviation::MetalHalfConversion`,
 /// MoltenVK on an Apple GPU; `DriverDeviation::MetalHalfQuantize`, MoltenVK, RADV and ANV where
-/// measured) the module rounds through it under either policy.
+/// measured), or the device's float controls make the conversion Metal's by the Vulkan spec
+/// (`shaderFloat16` with `RoundingModeRTE`, `DenormPreserve` and `SignedZeroInfNanPreserve` for
+/// 16 bits, on a driver that keeps the conversion's round trip: ANV and RADV, which take it before
+/// a measured quantize), the module rounds through it under either policy.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -273,16 +358,21 @@ pub enum HalfRoundingPolicy {
 pub enum NanMinMaxPolicy {
     /// The device's own (the default): every NaN Metal answers is the device's (its sign and
     /// payload; no select of Metal's bits), and those functions are the device's `NMin`, `NMax`
-    /// and `NClamp`. Such a module records
+    /// and `NClamp`. On a device that rounds a `half` through its conversion under the float
+    /// controls (ANV, RADV), a `half` read from its bits is the device's widening of them, and a
+    /// `half` texel takes that conversion's NaN. Such a module records
     /// [`PrecisionNote::NativeNanEncoding`](crate::pipeline::PrecisionNote::NativeNanEncoding)
     /// or [`NativeMinMax`](crate::pipeline::PrecisionNote::NativeMinMax), whose docs state the
     /// bound.
     #[default]
     Native,
     /// Metal's: the translation selects Metal's NaN where the device may answer another, and
-    /// Metal's operand where the device's instructions may pick another. A `half` texel read,
-    /// sampled or gathered keeps the NaN the device decoded through native half rounding too
-    /// (`HalfRoundingPolicy::Native`), where the default takes the rounding's.
+    /// Metal's operand where the device's instructions may pick another; a `half` widened to
+    /// `float` answers `0x7fc00000` for every NaN, as Metal does. A `half` texel read, sampled or
+    /// gathered keeps the NaN the device decoded through native half rounding too
+    /// (`HalfRoundingPolicy::Native`) and through the conversion under the float controls, and a
+    /// `half` read from its bits is decoded in integer arithmetic where the default takes the
+    /// device's widening (a `half` stored back unchanged keeps its bits under either).
     Exact,
 }
 
@@ -313,8 +403,10 @@ pub enum RoundingOrderPolicy {
 /// (`air.compile.fast_math_disable`, safe or relaxed math) blends into an `R16Float`, `RG16Float`
 /// or `RGBA16Float` attachment. Metal blends it in `half` arithmetic: the `half` the function
 /// returns, each factor (`1 - x` and the blend color's `half` included), each product and the sum
-/// rounded to `half`, nearest even (EV FLT-hb2-m3); a device's own blend adds in its arithmetic and
-/// rounds once.
+/// rounded to `half`, nearest even; a device's own blend adds in its arithmetic and
+/// rounds once. It governs an attachment the function does not read: one the function fetches in
+/// the interlocked storage form takes Metal's blend there whatever this says, no Vulkan blend
+/// applying to a storage write.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -337,30 +429,167 @@ pub enum HalfBlendPolicy {
     Exact,
 }
 
-/// How the runtime makes a texture over a buffer whose rows (or an array's slices) lie with bytes
-/// between them that are not its texels (a guest browser's padded surfaces), and which only reads:
-/// its usage, as Metal reports it (`Unknown` reads as `ShaderRead | ShaderWrite | RenderTarget |
-/// PixelFormatView`), holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block writes.
-/// Metal never writes those bytes. A render target, or a texture a shader writes, is a shadow
-/// under either value: a render pass's load and store operations may write back any byte of an
-/// attachment's subresource.
+/// What texels the runtime holds in the decoded twin of a texture whose blocks it holds in a
+/// carrier on a device without the format (the runtime's `texture/decoded_twin.rs`), which the
+/// texture's samples, reads and gathers read: an ASTC LDR texture's (`bind::AstcDecode`), and an
+/// EAC 11-bit texture's (`bind::EtcDecode`). Metal reads an ASTC LDR channel as a 12-bit value,
+/// `(C >> 4) / 4095` of the decode's 16-bit result, which no 8- or 16-bit texel holds; it reads
+/// an EAC 11-bit channel as `c / 2047` (signed `c / 1023`), which no 16-bit normalized code
+/// holds. (An ASTC sRGB texture's twin holds the 8-bit codes `C >> 8` under either, which its
+/// slots read raw and decode through Metal's table, exact; so does a PVRTC texture's twin, and an
+/// 8-bit ETC2 or EAC texture's.) The runtime's choice alone: no emitted code changes.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum PaddedReadsPolicy {
-    /// An image over the buffer's bytes at Metal's row pitch, as a texture whose rows lie one
-    /// after another has (the default): the device's own linear image, a `DRM_FORMAT_MOD_LINEAR`
-    /// image at that pitch, or one over a dma-buf of the pages, holding the bytes between the
-    /// rows in its subresource. After its first move every command uses it in `GENERAL`, and
-    /// copies and shader reads touch its texels alone; the first move, a layout transition, "may
-    /// perform read and write accesses on all memory bound to the image subresource range"
-    /// (Vulkan's Image Layout Transitions), and from `UNDEFINED` may discard it. So the bytes
-    /// between the rows stay the program's only as far as the driver's move keeps them, which
-    /// the validation lane checks per driver (docs/FAST-PATHS.md, its known gaps).
+pub enum DecodedTexelsPolicy {
+    /// Compact texels (the default): an ASTC LDR texture's `R8G8B8A8_UNORM` codes, 4 bytes a
+    /// texel, each channel the code nearest Metal's value, at most `1/510` off it. An EAC 11-bit
+    /// texture's 16-bit normalized codes (`R16_UNORM`, `R16_SNORM` and their two-channel forms),
+    /// 2 bytes a channel, each nearest Metal's value, at most half a 16-bit step off it.
+    /// Announced `decoded-texel-precision` where such a texture is made.
     #[default]
-    Alias,
-    /// The runtime's shadow image of the texels, copied in from the buffer before each use: the
-    /// copies address the texels alone, so no byte between the rows is ever read or written
-    /// through an image.
-    Shadow,
+    Compact,
+    /// Metal's values exactly, an ASTC LDR texture's in `R32G32B32A32_SFLOAT`, 16 bytes a texel
+    /// (an EAC 11-bit texture's in `R32_SFLOAT` or `R32G32_SFLOAT`, 4 bytes a channel), where the
+    /// device samples, filters and copies into the format (else the compact texels, announced).
+    Exact,
+}
+
+/// The image of a heap's colour texture that Metal keeps losslessly compressed (with
+/// `allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage, and a
+/// level 0 of 16 texels or more a side), on a driver whose compressed images may keep their texels
+/// apart from the memory they are bound to (`DriverFact::CompressedImagesHideAliasedWrites`: ANV
+/// on Intel's GPUs). Metal's own texture shows no aliased write as written either: an M3 Max read
+/// opaque magenta (`0xffff00ff`) in every texel of drawn content a buffer's fill over the
+/// texture's bytes covered, and the fill's bytes where the texture held only a clear. A texture
+/// Metal keeps uncompressed takes the uncompressed image under either value. The runtime's choice
+/// alone: no emitted code changes.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum HeapCompressionPolicy {
+    /// The driver's compressed optimal image (the default), its fast clears, compression and
+    /// tiling kept: a write through a buffer or texture over its bytes may leave its texels as
+    /// they were or change them otherwise than Metal's, and its writes may show in those bytes
+    /// compressed. Announced `heap-texture-compressed` where such a texture is made.
+    #[default]
+    Compressed,
+    /// An image the driver keeps uncompressed in the heap's bytes, as for a texture Metal keeps
+    /// uncompressed: host-transfer usage where the device enabled `hostImageCopy`, else a linear
+    /// image, else the optimal one (each announced as such), so a write through a buffer over the
+    /// texture's bytes shows in its texels as written.
+    Uncompressed,
+}
+
+/// When the host sees a command buffer complete, on a driver that merges a submission signalling
+/// nothing into the next one in the same `vkQueueSubmit` (Mesa's common queue,
+/// `vk_queue_submits_merge`: ANV, RADV, lavapipe, NVK, Turnip and the other Mesa drivers of a kernel
+/// submission), where each kernel submission costs CPU time for every `VkDeviceMemory` of the
+/// device (ANV on i915 lists each in every execbuffer). Elsewhere every command buffer goes in a
+/// submission of its own under either value. The runtime's choice alone: no emitted code changes.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CompletionPolicy {
+    /// Up to four batches of command buffers on one `VkQueue` that the scheduler finds ready
+    /// together, none of which signals a binary semaphore, takes a fence, moves the caller's
+    /// images or does first work, and none but the first of which waits for anything not seen
+    /// complete, go in one `vkQueueSubmit`, and only the last signals, the queue's timeline and
+    /// every event they signal (the default): one kernel submission for all of them. The commands,
+    /// their barriers and their GPU times are unchanged; each but the last is seen complete (its
+    /// status, handlers and waits) once the last completed, and an event's values they signal are
+    /// reached then, late by the GPU time of the batches after it, never early and in commit
+    /// order. The submission checks of up to three batches right behind a queue's next batch run
+    /// with its own, in commit order, so checked command buffers are found ready together: such a
+    /// check runs before the previous batch's submission rather than after it. Announced
+    /// `grouped-completion` at the first such submission.
+    #[default]
+    Grouped,
+    /// Each batch in a submission of its own that signals its own values, so each command buffer
+    /// is seen complete, and its event signals land, at its own end, as Metal's are; each batch's
+    /// submission checks run once the batch before it was submitted.
+    Exact,
+}
+
+/// What a render pass that loads a single-sampled color attachment of a signed normalized format
+/// (`R8Snorm`, `RG8Snorm`, `RGBA8Snorm`, `R16Snorm`, `RG16Snorm`, `RGBA16Snorm`) or of
+/// `RGB9E5Float`, stores it and draws leaves in the texels its draws do not write. An Apple GPU
+/// writes each 32 x 32 tile a draw reaches back through its texels' values (an Apple M3 Max under
+/// macOS 27.0.1): a channel's minimum code (-128, or -32768), which reads as -1.0 as the code above
+/// it does, is stored as that code (-127, -32767), and an `RGB9E5Float` word whose largest
+/// mantissa is below 256 under an exponent above 0 is stored normalized (its mantissas shifted up
+/// as its exponent steps down, to 0 at most). No Metal write leaves such a code or word: only
+/// uploaded or copied bytes hold one. The extended-range, padded 10-bit and bfloat attachments'
+/// tile store, the runtime's load pass, runs under either value. The runtime's choice alone: no
+/// emitted code changes.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TileStorePolicy {
+    /// The device's load and store (the default): such a texel keeps its code or word, announced
+    /// `snorm-minimum-kept` or `shared-exponent-kept` at each draw in such a pass.
+    #[default]
+    Device,
+    /// The runtime's load pass rewrites such an attachment's texels in the tiles the pass's draws
+    /// reach, as Metal's tile store leaves them, before the pass (as it does an extended-range
+    /// attachment's): a copy of the render area into a scratch buffer and back, with a dispatch.
+    /// An attachment the load pass cannot take (a texture held as a shadow, a sparse one, or one
+    /// whose image the device does not copy both ways) keeps the device's, announced as under
+    /// [`Device`](Self::Device).
+    Exact,
+}
+
+/// How a multisampled color attachment resolves into its resolve texture where its format has
+/// Metal's resolve rule at its sample count (`bind::ColorResolveFormat`: unorm, snorm, sRGB,
+/// 32-bit float and packed 16-bit unorm formats at every count, 16-bit float, `RG11B10Float` and
+/// `RGB9E5Float` ones at 2 and 4 samples), on a device whose own `AVERAGE` resolve is not measured
+/// to write Metal's (`DriverFact::ColorResolveAverageIsMetals`, which only MoltenVK on Apple's GPUs
+/// holds: there the device's resolve is Metal's under either value, and nothing is announced).
+/// Metal's resolve rounds each average by its format's rule; Vulkan's `AVERAGE` leaves the
+/// rounding, an sRGB average's space and what a NaN or infinite sample makes of it to the device.
+/// An attachment whose samples a fetching pass holds in its sample planes as it ends resolves from
+/// them by Metal's rule under either value, which costs less than merging them back for the
+/// device's resolve. The runtime's choice alone: no emitted code changes.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ResolvePolicy {
+    /// The device's `AVERAGE` resolve in the pass (the default), announced
+    /// `device-rounded-resolve`: a resolved channel can differ from Metal's by one code (an sRGB
+    /// channel by two) where the average lies near a rounding boundary, a float channel in its
+    /// last bits, and wholly where a sample is a NaN or an infinity. Measured at 2 and 4 samples
+    /// on RADV, ANV, NVIDIA and lavapipe; each rounds an 8-bit unorm tie down (RADV: 32512 of
+    /// `R8Unorm`'s 65536 pairs of samples one code below Metal's at 2 samples).
+    #[default]
+    Device,
+    /// Metal's rule, drawn after the pass: one more render pass instance per resolved attachment,
+    /// between barriers, reads its samples (as an input attachment, or from a copy of them where
+    /// its image takes no input attachment usage) and writes the resolve texture, announced
+    /// `shader-resolve` (a performance note).
+    Exact,
+}
+
+/// How a batch of command buffers on one `VkQueue` (the work the runtime submits for a command
+/// buffer between its event waits and signals) begins after the earlier batches there. Metal
+/// orders a command buffer after the earlier ones of its queue only where its work depends on
+/// theirs, so an independent one may run beside the one before it; it writes its `GPUStartTime`
+/// as its work begins. The runtime's choice alone: no emitted code changes.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BatchOrderPolicy {
+    /// By their ends (the default) on a driver measured to run no two kernel submissions of one
+    /// queue side by side, with or without a barrier between them, where it runs the same work
+    /// recorded in one command buffer side by side (ANV, RADV and NVIDIA's driver): every batch
+    /// ends with a barrier that orders all its commands before every command after it on its
+    /// queue, so a later batch plans no barrier for the accesses of earlier ones, and its first
+    /// encoder's GPU start time is written once the work before it ended, at the bottom of the
+    /// pipe. Each batch then still starts once the one before it ended, as those drivers start it
+    /// anyway. On any other driver, as [`Exact`](Self::Exact).
+    #[default]
+    Ends,
+    /// A barrier at a batch's start for each access that depends on an earlier batch's, as for
+    /// the accesses within a batch, and its first encoder's GPU start time written as it begins,
+    /// at the top of the pipe, where the driver may run it beside the batch before it.
+    Exact,
 }

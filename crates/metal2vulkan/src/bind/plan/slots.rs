@@ -14,9 +14,11 @@ use crate::metal;
 use crate::pipeline::artifact::RuntimeDependency;
 use crate::pipeline::facts::{Mechanism, RuntimeFact, UniformViewChoice};
 use crate::pipeline::interface::SlotInterface;
-use crate::pipeline::interface::{AccessSet, BufferForm, BufferSlot, DescriptorView, Window};
+use crate::pipeline::interface::{AccessSet, BufferForm, BufferSlot, Window};
 use crate::pipeline::layout::{BindingSource, PipelineLayout};
-use crate::pipeline::sym::{PushField, SampledType, SlotClass, SlotRef, SpecKey, Stage};
+use crate::pipeline::sym::{
+    PushField, SampledType, SlotClass, SlotRef, SnapshotForm, SpecKey, Stage,
+};
 use crate::vk;
 
 use super::compute::internal;
@@ -87,14 +89,6 @@ impl BoundKind {
     }
 }
 
-/// Whether a buffer form reads through a uniform-buffer view.
-pub(crate) fn uniform(form: BufferForm) -> bool {
-    matches!(
-        form,
-        BufferForm::Descriptor(DescriptorView::UniformWords | DescriptorView::UniformVec4)
-    )
-}
-
 /// The plan of buffer slot `slot` with interface `b` and what the shape binds there: its descriptor
 /// binding (descriptor forms), the view's descriptor base alignment and range limit, and a
 /// `MissingDeviceAddress` refusal for a device-address slot bound without an address. The base
@@ -108,7 +102,7 @@ pub(crate) fn plan_buffer(
     bindings: &BTreeMap<BindingSource, (u32, u32)>,
 ) -> Result<PlannedBuffer, BindError> {
     let bound = BoundKind::of(shape);
-    let (min_offset, max_range) = if uniform(b.form) {
+    let (min_offset, max_range) = if b.form.uniform_view() {
         (
             limits.min_uniform_buffer_offset_alignment,
             u64::from(limits.max_uniform_buffer_range),
@@ -154,6 +148,37 @@ pub(crate) fn plan_buffer(
     })
 }
 
+/// The `SpecKey::RangeAtBindOffset` of buffer slot `b`, bound as `shape` states: whether the
+/// descriptor range starts at its bind offset (`instantiate::starts_at_bind`, under the view's
+/// descriptor base alignment, as [`plan_buffer`] takes it): inline bytes, at offset 0 of the
+/// consumer's aligned upload; a buffer, at an offset whose alignment class
+/// (`BufferShape::Buffer::offset_alignment`: `BindState::view_base_alignment` where the runtime
+/// tells it apart at the slot and it divides the offset, else a power of two up to 4) the base
+/// alignment divides. A slot bound to nothing takes false, the form that reads at the residual:
+/// its residual is 0 (`instantiate::slot_field`), so either form reads the Metal offset alone of
+/// the same descriptor, and false keeps the key of a draw that leaves the slot unbound the key
+/// that reads every such slot at its residual, which a consumer can make before any draw binds
+/// it (the runtime's creation, `pipeline/predicted.rs`).
+pub(crate) fn range_at_bind_offset(
+    b: &BufferSlot,
+    shape: Option<&BufferShape>,
+    limits: &Limits,
+) -> bool {
+    let min = match b.form.uniform_view() {
+        true => limits.min_uniform_buffer_offset_alignment,
+        false => limits.min_storage_buffer_offset_alignment,
+    };
+    let offset = match shape {
+        Some(&BufferShape::Buffer {
+            offset_alignment, ..
+        }) => u64::from(offset_alignment),
+        Some(BufferShape::Bytes { .. }) => 0,
+        None => return false,
+    };
+    let alignment = crate::memory::views::base_alignment(min);
+    crate::bind::instantiate::starts_at_bind(offset, b.window, alignment)
+}
+
 /// The value of `key` for a draw or dispatch of `shape`, whose resources `resources` plans, where
 /// the bound resources decide it: a slot's presence, a bound sampler's words, a bound texture's
 /// class, swizzle, sparseness and view axes. It is what a specialization constant of `key` is set
@@ -181,6 +206,14 @@ pub(crate) fn bound_value(
         SpecKey::SparseTexture(slot) => sparse_texture(shape, slot),
         SpecKey::ConstantLanes(slot) => constant_lanes(shape, slot),
         SpecKey::OffsetBaseAxes(slot) => offset_base_axes(shape, slot),
+        SpecKey::RangeAtBindOffset(slot) => match resources.slots.get(&slot) {
+            Some(SlotInterface::Buffer(b)) => u64::from(range_at_bind_offset(
+                b,
+                bound_buffer(shape, slot),
+                &resources.profile.fields().limits,
+            )),
+            _ => 0,
+        },
         _ => return Ok(None),
     }))
 }
@@ -245,13 +278,15 @@ fn offset_base_axes(shape: &BindShape, slot: SlotRef) -> u64 {
 }
 
 /// The texture slots whose function decodes an 8-bit sRGB texel from its raw code
-/// (`RuntimeFact::SrgbTexture`) at which `shape` binds a texture of such a format
-/// (`metal::texel_format::srgb_raw`): the plan's `VariantKey::srgb_textures`. So is each slot of
-/// `cross` that the variant reads in the float class (an integer slot), whose accesses there take
-/// `float` results, which the raw code serves as a float slot's: the variant's compile states
-/// `SrgbTexture` there. The variant's compile states the same facts, so its plan for the same shape
-/// states the same key.
+/// (`RuntimeFact::SrgbTexture`) at which `shape` binds a texture of such a format whose codes
+/// `profile`'s device holds (`metal::texel_format::srgb_raw_on`: not an ASTC sRGB format it
+/// decodes itself): the plan's `VariantKey::srgb_textures`. So is each slot of `cross` that the
+/// variant reads in the float class (an integer slot), whose accesses there take `float` results,
+/// which the raw code serves as a float slot's: the variant's compile states `SrgbTexture` there.
+/// The variant's compile states the same facts, so its plan for the same shape states the same
+/// key.
 pub(crate) fn srgb_variant(
+    profile: &DeviceProfile,
     dependencies: &[RuntimeDependency],
     shape: &BindShape,
     cross: &BTreeMap<SlotRef, SampledType>,
@@ -269,9 +304,79 @@ pub(crate) fn srgb_variant(
         .chain(read_float)
         .filter(|slot| {
             matches!(bound_texture(shape, *slot), Some(TextureShape::Texture { pixel_format, .. })
-                if metal::texel_format::srgb_raw(*pixel_format))
+                if metal::texel_format::srgb_raw_on(*pixel_format, profile))
         })
         .collect()
+}
+
+/// The slots of `srgb` (`VariantKey::srgb_textures`) at which `shape` binds a texture whose 8-bit
+/// sRGB format `profile`'s device cannot sample, which the runtime holds as the format's UNORM twin
+/// (`metal::format::srgb_raw_twin`), a format it can: the plan's `VariantKey::srgb_twins`. Its
+/// views read the codes, so the function decodes what the device samples there. Derived from the
+/// device's format features alone, as the runtime's image plan holds the twin.
+pub(crate) fn srgb_twin_variant(
+    profile: &DeviceProfile,
+    srgb: &std::collections::BTreeSet<SlotRef>,
+    shape: &BindShape,
+) -> std::collections::BTreeSet<SlotRef> {
+    use crate::device::requirements::FormatUsage;
+    let samples = |pf: metal::PixelFormat| {
+        metal::format::vk_format(pf, &[FormatUsage::SampledImage].into(), profile).is_ok()
+    };
+    srgb.iter()
+        .filter(|slot| {
+            matches!(bound_texture(shape, **slot), Some(TextureShape::Texture { pixel_format, .. })
+                if !samples(*pixel_format)
+                    && metal::format::srgb_raw_twin(*pixel_format).is_some_and(samples))
+        })
+        .copied()
+        .collect()
+}
+
+/// The form each of the snapshot slots `slots` keeps its texels in (`VariantKey::snapshot_textures`,
+/// `SnapshotForm::of`): by the view the snapshot's copy fetches through, the bound texture's
+/// sampled view or, at a slot whose raw codes the variant reads (`srgb`, `slots::srgb_variant`),
+/// its raw view (`metal::texel_format::srgb_raw_view`), and the slot's declared sampled type.
+/// [`SnapshotForm::Bits`] at a slot the variant reads in another class (`cross`), a depth twin's,
+/// or one whose sampled view the device has no format for. The variant's compile reads the same
+/// key, so its plan for the same shape states the same forms.
+pub(crate) fn snapshot_forms(
+    profile: &DeviceProfile,
+    slots: &std::collections::BTreeSet<SlotRef>,
+    interface: &BTreeMap<SlotRef, SlotInterface>,
+    shape: &BindShape,
+    (srgb, cross): (
+        &std::collections::BTreeSet<SlotRef>,
+        &BTreeMap<SlotRef, SampledType>,
+    ),
+) -> BTreeMap<SlotRef, SnapshotForm> {
+    let form = |slot: SlotRef| {
+        let Some(SlotInterface::Texture(t)) = interface.get(&slot) else {
+            return SnapshotForm::Bits;
+        };
+        let Some(TextureShape::Texture {
+            pixel_format,
+            depth_twin: false,
+            ..
+        }) = bound_texture(shape, slot)
+        else {
+            return SnapshotForm::Bits;
+        };
+        if cross.contains_key(&slot) {
+            return SnapshotForm::Bits;
+        }
+        let usages: std::collections::BTreeSet<_> =
+            [crate::device::requirements::FormatUsage::SampledImage].into();
+        let Ok(m) = metal::format::vk_format(*pixel_format, &usages, profile) else {
+            return SnapshotForm::Bits;
+        };
+        let view = match srgb.contains(&slot) {
+            true => metal::texel_format::srgb_raw_view(m.format).unwrap_or(m.format),
+            false => m.format,
+        };
+        SnapshotForm::of(view, t.sampled_type)
+    };
+    slots.iter().map(|&slot| (slot, form(slot))).collect()
 }
 
 /// The sampled texture slots whose function reads their texels in any numeric class
@@ -312,9 +417,9 @@ pub(crate) fn cross_variant(
         .collect()
 }
 
-/// The texture slots whose linear samples the function emulates on a device that samples
-/// through Metal's own sampler where the slot is bound in a YCbCr format
-/// (`RuntimeFact::YCbCrTexture`) at which `shape` binds a texture of a two-plane YCbCr format
+/// The texture slots whose linear samples the function emulates where the slot is bound in a
+/// YCbCr format, on a profile that takes the variant (`RuntimeFact::YCbCrTexture`,
+/// `ProfileFields::ycbcr_variant`), at which `shape` binds a texture of a two-plane YCbCr format
 /// (`metal::format::ycbcr_format`), whose view Metal's sampler filters as the view's format, not as
 /// Metal's filter of the YCbCr format: the plan's `VariantKey::ycbcr_textures`. The variant's
 /// compile states the same facts, so its plan for the same shape states the same key.
@@ -368,7 +473,7 @@ pub(crate) fn address_map_variant(
 /// The runtime sampler slots whose function samples through them (`RuntimeFact::CubicSampler`)
 /// at which `shape` binds a sampler whose min or mag filter is `Cubic`, each with the bound word
 /// masked by `SamplerWord::CUBIC_STATE`: the plan's `VariantKey::cubic_samplers`. Metal samples
-/// through such a sampler with its bicubic filter of that state (EV GSM2-bcs2-m4). The variant's
+/// through such a sampler with its bicubic filter of that state. The variant's
 /// compile states the same facts, so its plan for the same shape states the same key. A bound
 /// word whose state the bicubic filter is not measured under, whatever the function samples
 /// (`metal::bicubic::runtime_cubic_measured`: a mip filter, anisotropy, another reduction), is
@@ -432,6 +537,14 @@ pub(crate) fn anisotropic_variant(
 }
 
 /// The texture `shape` binds at `slot`.
+/// What `shape` binds at buffer `slot`.
+fn bound_buffer(shape: &BindShape, slot: SlotRef) -> Option<&BufferShape> {
+    shape
+        .stages
+        .get(&slot.stage)
+        .and_then(|s| s.buffers.get(&slot.index))
+}
+
 fn bound_texture(shape: &BindShape, slot: SlotRef) -> Option<&TextureShape> {
     shape
         .stages
@@ -623,7 +736,7 @@ pub(crate) fn buffer_use(b: &PlannedBuffer, stages: vk::PipelineStageFlags2) -> 
     ResourceUse {
         resource: UseTarget::Slot(b.slot),
         access: b.access,
-        class: if uniform(b.form) {
+        class: if b.form.uniform_view() {
             AccessClass::Uniform
         } else {
             AccessClass::Storage

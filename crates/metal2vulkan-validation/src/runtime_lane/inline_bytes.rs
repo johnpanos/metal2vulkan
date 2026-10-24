@@ -8,11 +8,11 @@
 //!   their own bytes; a buffer bound at the index replaces the bytes, and bytes set there replace
 //!   the buffer; 4096 bytes, Metal's limit, are read whole, and 4097 are refused at the call;
 //!   after `setBufferOffset:atIndex:` at the index the bytes read as zeros, as plain Metal reads
-//!   them (an M4, EV `APX-bytes1-m4`).
+//!   them (an M4).
 //! - A vertex function's attribute reads them as its vertex buffer (the owned fixture
 //!   `ob3_vertex_input`, `vertex_strides.rs`): at the layout's own stride, and under
 //!   `MTLBufferLayoutStrideDynamic` at stride 0 after the plain setter and at the stride form's
-//!   stride, as plain Metal reads them (EV `RFL-vbytes-m4`); at `MTLAttributeStrideStatic` the
+//!   stride, as plain Metal reads them; at `MTLAttributeStrideStatic` the
 //!   draw is refused (`MissingVertexStride`).
 //! - A fragment function reads them through a `const device` pointer and a `constant`
 //!   reference (`cfb_ts_read_bytes` of the owned fixture `cfb_tile_shadows`).
@@ -37,7 +37,7 @@ use metal2vulkan_runtime::{
 
 /// The kernels: `inline_bytes_constant` reads buffer 0 through a `constant` pointer,
 /// `inline_bytes_device` through a `const device` one; each thread copies its word to buffer 1.
-const KERNELS: &str = r#"; Owned synthetic kernels (WP-APX): copy word gid of buffer 0 to buffer 1.
+const KERNELS: &str = r#"; Owned synthetic kernels: copy word gid of buffer 0 to buffer 1.
 source_filename = "inline_bytes.metal"
 
 define void @inline_bytes_constant(ptr addrspace(2) %in, ptr addrspace(1) %out, i32 %gid) {

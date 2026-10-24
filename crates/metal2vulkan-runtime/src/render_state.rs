@@ -2,20 +2,20 @@
 //! refuses, and the state in Vulkan's terms that a draw takes, statically in its pipeline's
 //! graphics key or as dynamic state.
 //!
-//! Metal's answers were measured on an M4 (macOS 27.0.1; RT6 probes 4 and 4b, each case without
-//! and with API validation). "Stops" is the validation layer's assertion, typed `Invalid` here.
+//! Metal's answers were measured on an M4 (macOS 27.0.1, by our Metal probes, each case without and
+//! with API validation). "Stops" is the validation layer's assertion, typed `Invalid` here.
 //!
 //! - **Viewports** (`set_viewport`, `set_viewports`). Metal's defaults cover the render area. A
-//!   count outside 1 to 16 stops, and so does a NaN or infinite field (measured for the origin;
-//!   the other fields by the same rule). Plain Metal draws nothing through a viewport whose
-//!   origin x is NaN (RT6 probe 4's `viewport_nan`), as the encoder does, holding it as a
-//!   viewport of no width; any other field NaN or infinite, unmeasured, is refused. Metal takes a
-//!   viewport past the render area, a negative height (a flip), and a depth range past `[0, 1]`. A
-//!   viewport is Vulkan's with its height negated (`y + height`, `-height`), so framebuffer rows,
-//!   `FragCoord` and derivatives follow Metal's y-up clip space; Metal's own negative height is
-//!   then a positive Vulkan one. A negative width, which mirrors the draw across the viewport's
-//!   origin and flips its facing (a probe), is the Vulkan viewport over the same pixels with the
-//!   vertex stage negating the position's x (`EncoderState::compensation`).
+//!   count outside 1 to 16 stops, and so does a NaN or infinite field (measured for the origin; the
+//!   other fields by the same rule). Plain Metal draws nothing through a viewport whose origin x is
+//!   NaN (Metal probe case `viewport_nan`), as the encoder does, holding it as a viewport of no
+//!   width; any other field NaN or infinite, unmeasured, is refused. Metal takes a viewport past
+//!   the render area, a negative height (a flip), and a depth range past `[0, 1]`. A viewport is
+//!   Vulkan's with its height negated (`y + height`, `-height`), so framebuffer rows, `FragCoord`
+//!   and derivatives follow Metal's y-up clip space; Metal's own negative height is then a positive
+//!   Vulkan one. A negative width, which mirrors the draw across the viewport's origin and flips
+//!   its facing (a probe), is the Vulkan viewport over the same pixels with the vertex stage
+//!   negating the position's x (`EncoderState::compensation`).
 //! - **Depth ranges past `[0, 1]`** (a probe, an M3 Max and an M4 alike, with and without API
 //!   validation). The fragment reads the depth `n + (f - n) z` unclamped, a constant bias included.
 //!   In clip mode a primitive clips at the near and far planes and each depth stored, interpolated
@@ -31,39 +31,42 @@
 //!   the features, and `Unsupported` on MoltenVK, whose rasterizer (Metal's on Apple's GPUs) draws
 //!   the compensated depths about 2e-4 off where Metal's own viewport draws them exactly (a probe,
 //!   `RuntimeDriverDefect::NormalizedDepthPastUnitRange`). A negative width is mirrored there
-//!   still. Metal clamps each vertex's depth before the interpolation (RRS probes 16 and 19b):
-//!   through a range with a negative depth in clip mode, or past `[0, 1]` in clamp mode, a draw of
-//!   lines or triangles takes that clamp in the vertex stage's compensation, natively too
-//!   (`VertexClamp`), announcing the primitives that cross Metal's planes or guard band and the
-//!   draws that cannot take it.
+//!   still. Metal clamps each vertex's depth before the interpolation (Metal probes on the M3 Max
+//!   and an M4): through a range with a negative depth in clip mode, or past `[0, 1]` in clamp
+//!   mode, a draw of lines or triangles takes that clamp in the vertex stage's compensation,
+//!   natively too (`VertexClamp`), announcing the primitives that cross Metal's planes or guard
+//!   band and the draws that cannot take it.
 //! - **The implicit scissor.** Metal clips a draw to the pixels its viewport overlaps: a point
 //!   wider than its viewport is cut there, fractional edges included, and a viewport of no width
 //!   or height draws nothing (measured at an integer origin). Each Vulkan scissor is therefore
 //!   Metal's rectangle clipped to those pixels, which a triangle's own coverage never leaves; a
 //!   viewport of no width or height is a one-pixel Vulkan viewport behind an empty scissor.
 //! - **Scissor rectangles** (`set_scissor_rect`, `set_scissor_rects`). Metal's default is the
-//!   render area. A count outside 1 to 16 stops; an empty rectangle inside the area draws
-//!   nothing. A rectangle past the render area (`x + width` past its width, `y + height` past
-//!   its height) stops Metal's validation, and plain Metal clips it to the area (RT6 probe 4's
-//!   `scissor_past_width`, `scissor_past_height`: only the columns or rows inside are drawn;
+//!   render area. A count outside 1 to 16 stops; an empty rectangle inside the area draws nothing.
+//!   A rectangle past the render area (`x + width` past its width, `y + height` past its height)
+//!   stops Metal's validation, and plain Metal clips it to the area (Metal probe cases
+//!   `scissor_past_width` and `scissor_past_height`: only the columns or rows inside are drawn;
 //!   `scissor_origin_outside`: nothing), as the encoder does. At a draw, a scissor count other than
 //!   1 and the viewport count stops; plain Metal draws a pipeline that selects no viewport through
-//!   the first rectangle (RT6 probe 4 `scissors_two`), and each viewport of one that selects
+//!   the first rectangle (Metal probe case `scissors_two`), and each viewport of one that selects
 //!   through the rectangle of its index, one rectangle serving every viewport, and a viewport past
 //!   two or more rectangles through none (probes `vs_*`, an M4 with macOS 27.0.1: a rectangle past
 //!   the viewports unused, the third of three viewports under two rectangles and the fourth of four
 //!   under three drew nothing), as the encoder draws them.
 //! - **Viewport arrays.** A draw whose vertex function selects a viewport
-//!   (`GraphicsState::writes_viewport_index`) uses as many as the encoder holds, with one
-//!   scissor each (a single scissor repeated); such a pipeline needs `multiViewport`, which its
-//!   compile requires. Any other draw uses the first viewport and scissor only, as Metal's does.
-//!   Measured (RT6 probe 7, an M4 with macOS 27.0.1): each primitive draws through the viewport
-//!   of its index and that viewport's scissor rectangle, or the one rectangle set, up to sixteen
-//!   viewports. An index at or past the encoder's viewport count draws through the first
-//!   viewport and its scissor rectangle, and the fragment function reads the index as written
-//!   (probes 7b and 7c, an M4 and an M3 Max with macOS 27.0.1, with and without API
-//!   validation), where Vulkan leaves the viewport undefined: the draw gives the vertex
-//!   function the count (`BindState::viewport_count`), and it selects viewport 0 there.
+//!   (`GraphicsState::writes_viewport_index`) uses as many as the encoder holds, with one scissor
+//!   each (a single scissor repeated). More than one needs `multiViewport`: on a device without
+//!   it the vertex function stores no index (a draw's one viewport is viewport 0 whatever the
+//!   index, as Metal's past the count), and such a draw while the encoder holds more than one
+//!   viewport is refused, `Unsupported(LayeredRendering)` needing the feature. Any other draw uses
+//!   the first viewport and scissor only, as Metal's does. Measured
+//!   (a Metal probe on an M4 with macOS 27.0.1): each primitive draws through the viewport of its
+//!   index and that viewport's scissor rectangle, or the one rectangle set, up to sixteen
+//!   viewports. An index at or past the encoder's viewport count draws through the first viewport
+//!   and its scissor rectangle, and the fragment function reads the index as written (probes 7b and
+//!   7c, an M4 and an M3 Max with macOS 27.0.1, with and without API validation), where Vulkan
+//!   leaves the viewport undefined: the draw gives the vertex function the count
+//!   (`BindState::viewport_count`), and it selects viewport 0 there.
 //! - **Depth/stencil state** (`set_depth_stencil_state`): Metal's default state is the default
 //!   descriptor's, and nil sets it again. In a pass without a depth attachment, a draw under a
 //!   state that writes depth, or compares other than `Always` and `Never`, stops, and so does one
@@ -103,15 +106,61 @@ use super::render_values::{ScissorRect, Viewport};
 use super::Device;
 use ash::vk;
 use metal2vulkan::bind::{CompensatedViewport, RegionLimits};
-use metal2vulkan::device::{DeviceProfile, DriverFact, EnableSet, VkExtension, VkFeature};
-use metal2vulkan::error::{Feature, RuntimeDriverDefect, Unsupported};
+use metal2vulkan::device::{DeviceProfile, EnableSet, VkExtension, VkFeature};
+use metal2vulkan::error::{Capability, Feature, RuntimeDriverDefect, Unsupported};
 use metal2vulkan::metal::{
     CullMode, DepthClipMode, PixelFormat, StencilOperation, TriangleFillMode, Winding,
 };
-use metal2vulkan::pipeline::{GraphicsState, ViewportCompensation};
+use metal2vulkan::pipeline::{GraphicsState, RuntimeDependency, RuntimeFact, ViewportCompensation};
 
 /// Metal's most viewports and scissor rectangles.
 pub(super) const MAX_VIEWPORTS: usize = 16;
+
+/// A draw's viewports or scissor rectangles, which every draw makes, or an encoder's, which every
+/// render pass starts with: the one most use held in place, so such a draw or pass allocates none
+/// for them, or a list of the others.
+#[derive(Clone, Debug)]
+pub(super) enum ViewportList<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> FromIterator<T> for ViewportList<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(items: I) -> ViewportList<T> {
+        let mut items = items.into_iter();
+        let Some(first) = items.next() else {
+            return ViewportList::Many(Vec::new());
+        };
+        let Some(second) = items.next() else {
+            return ViewportList::One(first);
+        };
+        let mut many = Vec::with_capacity(2 + items.size_hint().0);
+        many.push(first);
+        many.push(second);
+        many.extend(items);
+        ViewportList::Many(many)
+    }
+}
+
+impl<T> std::ops::Deref for ViewportList<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            ViewportList::One(item) => std::slice::from_ref(item),
+            ViewportList::Many(items) => items,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for ViewportList<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            ViewportList::One(item) => std::slice::from_mut(item),
+            ViewportList::Many(items) => items,
+        }
+    }
+}
 
 /// What a viewport, scissor rectangle or depth/stencil setter did wrong.
 #[non_exhaustive]
@@ -133,8 +182,8 @@ pub enum RenderStateProblem {
 pub(super) struct EncoderState {
     /// The render area's width and height.
     extent: [u32; 2],
-    viewports: Vec<Viewport>,
-    scissors: Vec<ScissorRect>,
+    viewports: ViewportList<Viewport>,
+    scissors: ViewportList<ScissorRect>,
     cull_mode: CullMode,
     winding: Winding,
     /// `None` is Metal's default state, the default descriptor's.
@@ -154,15 +203,20 @@ impl EncoderState {
         let [width, height] = extent;
         EncoderState {
             extent,
-            viewports: vec![Viewport::new(
+            viewports: ViewportList::One(Viewport::new(
                 0.0,
                 0.0,
                 f64::from(width),
                 f64::from(height),
                 0.0,
                 1.0,
-            )],
-            scissors: vec![ScissorRect::new(0, 0, u64::from(width), u64::from(height))],
+            )),
+            scissors: ViewportList::One(ScissorRect::new(
+                0,
+                0,
+                u64::from(width),
+                u64::from(height),
+            )),
             cull_mode: CullMode::None,
             winding: Winding::Clockwise,
             depth_stencil: None,
@@ -189,7 +243,7 @@ impl EncoderState {
     ) -> Result<(), Error> {
         check_count(call, viewports.len())?;
         // A NaN origin x draws nothing, as plain Metal's: a viewport of no width.
-        let viewports: Vec<Viewport> = viewports
+        let viewports: ViewportList<Viewport> = viewports
             .iter()
             .map(|v| match v.origin_x.is_nan() {
                 true => Viewport {
@@ -200,7 +254,7 @@ impl EncoderState {
                 false => *v,
             })
             .collect();
-        for v in &viewports {
+        for v in viewports.iter() {
             let fields = [v.origin_x, v.origin_y, v.width, v.height, v.znear, v.zfar];
             if fields.iter().any(|f| !f.is_finite()) {
                 return Err(invalid(
@@ -223,8 +277,8 @@ impl EncoderState {
         call: &'static str,
         scissors: &[ScissorRect],
     ) -> Result<(), Error> {
-        // More than 16 rectangles stop Metal's validation, and plain Metal draws (RT6 probe 4's
-        // `scissors_17`): a draw goes through the rectangles its viewports name
+        // More than 16 rectangles stop Metal's validation, and plain Metal draws (Metal probe case
+        // `scissors_17` on an M4): a draw goes through the rectangles its viewports name
         // (`EncoderState::vk_scissors`). None, unmeasured, is refused.
         if scissors.is_empty() {
             return Err(invalid(
@@ -259,6 +313,21 @@ impl EncoderState {
 
     pub(super) fn set_depth_stencil(&mut self, state: Option<&DepthStencilState>) {
         self.depth_stencil = state.cloned();
+    }
+
+    /// The bound depth/stencil state uses the stencil on either face
+    /// (`DepthStencilState::uses_stencil`; Metal's default state does not).
+    pub(super) fn uses_stencil(&self) -> bool {
+        self.depth_stencil
+            .as_ref()
+            .is_some_and(DepthStencilState::uses_stencil)
+    }
+
+    /// The bound depth/stencil state writes the depth (Metal's default state does not).
+    pub(super) fn depth_writes(&self) -> bool {
+        self.depth_stencil
+            .as_ref()
+            .is_some_and(|s| s.descriptor().depth_write_enabled)
     }
 
     /// The front and back references, saturated at 255 (the module docs).
@@ -335,7 +404,7 @@ impl EncoderState {
         topology: metal2vulkan::vk::PrimitiveTopology,
         profile: &DeviceProfile,
         native: bool,
-    ) -> Result<Vec<Viewport>, Error> {
+    ) -> Result<ViewportList<Viewport>, Error> {
         let used = self.used_viewports(selects);
         let clamps = self.clip_mode == DepthClipMode::Clamp;
         // In clamp mode a range past `[0, 1]` whose one clamp holds one depth stores that depth
@@ -392,8 +461,8 @@ impl EncoderState {
     /// clamps, as Vulkan clamps every viewport's depth to one range.
     ///
     /// A saturated depth `bias` ([`EncoderState::draw_bias`]) in clamp mode clamps to the depth
-    /// Metal stores (RRS probe 15, an M4 with macOS 27.0.1): the range's larger depth, past 1 too
-    /// (1.5 of a range of -0.5 to 1.5), or its smaller one but at least 0, which the draw's
+    /// Metal stores (a Metal probe on an M4 with macOS 27.0.1): the range's larger depth, past 1
+    /// too (1.5 of a range of -0.5 to 1.5), or its smaller one but at least 0, which the draw's
     /// viewports collapse to (`draw_viewports`).
     pub(super) fn depth_range(
         &self,
@@ -448,39 +517,39 @@ impl EncoderState {
     /// device that does not take a depth range past `[0, 1]` natively (`native`), such a range.
     /// `None` where every viewport is Vulkan's (the common case: no variant, no push field).
     ///
-    /// The position becomes `(sx x, y, a w + b z, w)`. A mirror is `sx` -1 with the Vulkan
-    /// viewport at `x + width` of width `-width` (`vk_viewports`), which flips the facing as
-    /// Metal's does. A depth range in clip mode is a Vulkan range of `[0, 1]` with `a` = `n`, `b`
-    /// = `f - n`, so the window depth is Metal's `n + (f - n) z / w`, clip distances `z` and
-    /// `w - z` clipping at Metal's planes, and `depthClamp` (`FixedState::depth_clamp`) both
-    /// replacing Vulkan's own clipping and clamping each depth to `[0, 1]`. In clamp mode the
-    /// Vulkan range is the one clamp `[L, H]` (`clamp_range`), `a` = `(n - L) / (H - L)` and `b`
-    /// = `(f - n) / (H - L)`, and nothing clips. A one clamp of one depth `D` (every one outside
-    /// `[0, 1]` is: 1.5 of a range of 1.5 to 3, 0 of -1 to 0 or of -2 to -1) stores `D` alone,
-    /// whatever the window depth (Metal clamps each vertex's depth to `[0, 1]` and each sample to
-    /// the range, a probe and RRS probes 16 and 20), so its Vulkan range collapses to `[D, D]` with
-    /// no compensation of the depth (`draw_viewports`): where `one_depth` says the fragment
-    /// function reads no depth of its position, which would read `D` where Metal's reads `n + (f -
-    /// n) z`, and the device takes a Vulkan range of `D` (`VK_EXT_depth_range_unrestricted` past
-    /// `[0, 1]`); and, natively too, where the draw's bias moves no sample off `D`
-    /// (`OneDepth::bias_holds`). Refused (`NotImplemented(ViewportDepthRange)`): such a one clamp
-    /// elsewhere, a saturated depth off it `NotImplemented(NonFiniteDepthBias)`; and used viewports
-    /// whose depths need different compensations, as the vertex stage holds one. Used viewports
-    /// that differ in their mirror alone take one compensation of `sx` 1 under
-    /// `ViewportCompensation::mirrors`, bit `i` of `CompensatedViewport::mirrors` set where
-    /// viewport `i` is mirrored, which the vertex stage negates `x` by for the viewport it selects.
+    /// The position becomes `(sx x, y, a w + b z, w)`. A mirror is `sx` -1 with the Vulkan viewport
+    /// at `x + width` of width `-width` (`vk_viewports`), which flips the facing as Metal's does. A
+    /// depth range in clip mode is a Vulkan range of `[0, 1]` with `a` = `n`, `b` = `f - n`, so the
+    /// window depth is Metal's `n + (f - n) z / w`, clip distances `z` and `w - z` clipping at
+    /// Metal's planes, and `depthClamp` (`FixedState::depth_clamp`) both replacing Vulkan's own
+    /// clipping and clamping each depth to `[0, 1]`. In clamp mode the Vulkan range is the one
+    /// clamp `[L, H]` (`clamp_range`), `a` = `(n - L) / (H - L)` and `b` = `(f - n) / (H - L)`, and
+    /// nothing clips. A one clamp of one depth `D` (every one outside `[0, 1]` is: 1.5 of a range
+    /// of 1.5 to 3, 0 of -1 to 0 or of -2 to -1) stores `D` alone, whatever the window depth (Metal
+    /// clamps each vertex's depth to `[0, 1]` and each sample to the range; Metal probes on the M3
+    /// Max and an M4), so its Vulkan range collapses to `[D, D]` with no compensation of the depth
+    /// (`draw_viewports`): where `one_depth` says the fragment function reads no depth of its
+    /// position, which would read `D` where Metal's reads `n + (f - n) z`, and the device takes a
+    /// Vulkan range of `D` (`VK_EXT_depth_range_unrestricted` past `[0, 1]`); and, natively too,
+    /// where the draw's bias moves no sample off `D` (`OneDepth::bias_holds`). Refused
+    /// (`NotImplemented(ViewportDepthRange)`): such a one clamp elsewhere, a saturated depth off it
+    /// `NotImplemented(NonFiniteDepthBias)`; and used viewports whose depths need different
+    /// compensations, as the vertex stage holds one. Used viewports that differ in their mirror
+    /// alone take one compensation of `sx` 1 under `ViewportCompensation::mirrors`, bit `i` of
+    /// `CompensatedViewport::mirrors` set where viewport `i` is mirrored, which the vertex stage
+    /// negates `x` by for the viewport it selects.
     ///
     /// The draw's depth `bias` ([`EncoderState::draw_bias`]), where it saturates or offsets, is
-    /// folded into `a` and `b`, as Metal biases (RRS probes 15 and 20, an M4 with macOS 27.0.1 and
-    /// the M3 Max): each sample is Metal's depth of its vertices clamped (at 0 in clip mode, to
-    /// `[0, 1]` in clamp mode), plus the bias, clamped to `[0, 1]` in clip mode and in clamp mode
-    /// to Metal's clamp of each sample, `[max(min(n, f), 0), max(n, f)]` (`sample_clamp`). In clip
-    /// mode a saturated depth is 1 or 0 (`a` 1 or 0, `b` 0), and an offset `o` adds to the depth
-    /// before the clamp to `[0, 1]` (`a` = `n + o`) through a range of no negative depth, where
-    /// Metal's unbiased depth is the compensation's, and through one with a negative depth after
-    /// the vertex stage's clamp at 0. In clamp mode a saturated depth is the range's larger depth,
-    /// or its smaller one but at least 0 (`a` = `(d - L) / (H - L)`, `b` 0), where the Vulkan range
-    /// `[L, H]` holds it: the one clamp, or Metal's clamp of each sample under
+    /// folded into `a` and `b`, as Metal biases (Metal probes on an M4 with macOS 27.0.1 and the M3
+    /// Max): each sample is Metal's depth of its vertices clamped (at 0 in clip mode, to `[0, 1]`
+    /// in clamp mode), plus the bias, clamped to `[0, 1]` in clip mode and in clamp mode to Metal's
+    /// clamp of each sample, `[max(min(n, f), 0), max(n, f)]` (`sample_clamp`). In clip mode a
+    /// saturated depth is 1 or 0 (`a` 1 or 0, `b` 0), and an offset `o` adds to the depth before
+    /// the clamp to `[0, 1]` (`a` = `n + o`) through a range of no negative depth, where Metal's
+    /// unbiased depth is the compensation's, and through one with a negative depth after the vertex
+    /// stage's clamp at 0. In clamp mode a saturated depth is the range's larger depth, or its
+    /// smaller one but at least 0 (`a` = `(d - L) / (H - L)`, `b` 0), where the Vulkan range `[L,
+    /// H]` holds it: the one clamp, or Metal's clamp of each sample under
     /// `VK_EXT_depth_range_unrestricted` (`one_depth`) on a device that does not take the ranges
     /// natively; and an offset adds to the depth through every range (`a` = `(n + o - L) / (H -
     /// L)`): inside `[0, 1]` through the one clamp, past it after the vertex stage's clamp to `[0,
@@ -766,7 +835,7 @@ impl EncoderState {
         viewports: &[Viewport],
         depth: Option<[f32; 2]>,
         guard: Option<[f64; 2]>,
-    ) -> Vec<vk::Viewport> {
+    ) -> ViewportList<vk::Viewport> {
         viewports
             .iter()
             .map(|v| {
@@ -808,7 +877,7 @@ impl EncoderState {
     /// its index, the one rectangle where the encoder holds one, and an empty one past two or
     /// more (the module docs), each clipped to the pixels its viewport overlaps, Metal's implicit
     /// scissor ([`viewport_pixels`]).
-    pub(super) fn vk_scissors(&self, selects: bool) -> Vec<vk::Rect2D> {
+    pub(super) fn vk_scissors(&self, selects: bool) -> ViewportList<vk::Rect2D> {
         self.each_vk_scissor(selects).collect()
     }
 
@@ -864,9 +933,8 @@ impl EncoderState {
             })
     }
 
-    /// The draw's viewport count. More than one needs `multiViewport`, which a pipeline that
-    /// selects a viewport already required of the device (its `ViewportIndex` output's
-    /// capability).
+    /// The draw's viewport count. More than one needs `multiViewport`, which
+    /// [`EncoderState::fixed`] checks.
     pub(super) fn viewport_count(&self, selects: bool) -> u32 {
         self.used_viewports(selects).len() as u32
     }
@@ -987,12 +1055,45 @@ impl EncoderState {
             .map_err(device_error)
     }
 
+    /// No Vulkan depth bias for a pipeline of `topology`, for a draw whose fragment stage adds
+    /// Metal's bias itself (`RuntimeFact::Depth16Codes`): the bias stays enabled as for any draw,
+    /// its factors 0.
+    pub(super) fn vk_no_depth_bias(
+        topology: metal2vulkan::vk::PrimitiveTopology,
+        profile: &DeviceProfile,
+    ) -> Result<metal2vulkan::metal::state::DepthBias, Error> {
+        metal2vulkan::metal::state::depth_bias(topology, 0.0, 0.0, 0.0, None, profile)
+            .map_err(device_error)
+    }
+
+    /// `Unsupported(LayeredRendering)` needing `multiViewport` on a device without it, for a
+    /// draw that would select among more than one viewport.
+    pub(super) fn needs_viewports(profile: &DeviceProfile) -> Result<(), Error> {
+        match profile
+            .enabled()
+            .features
+            .contains(&VkFeature::MultiViewport)
+        {
+            true => Ok(()),
+            false => Err(Error::Unsupported(Unsupported::needs(
+                Feature::LayeredRendering,
+                Capability::Feature(VkFeature::MultiViewport),
+            ))),
+        }
+    }
+
     /// The state a pipeline takes statically, for `viewports` viewports.
     pub(super) fn fixed(
         &self,
         viewports: u32,
         profile: &DeviceProfile,
     ) -> Result<FixedState, Error> {
+        // A draw that selects among the encoder's viewports on a device without `multiViewport`:
+        // its vertex function stores no `ViewportIndex` there (one viewport is all a draw has),
+        // so the draw is exact only while the encoder holds one.
+        if viewports > 1 {
+            EncoderState::needs_viewports(profile)?;
+        }
         Ok(FixedState {
             cull_mode: match self.cull_mode {
                 CullMode::None => metal2vulkan::vk::CullModeFlags::NONE,
@@ -1015,22 +1116,47 @@ impl EncoderState {
     }
 }
 
-/// Whether the device takes a viewport depth range past `[0, 1]` natively: it enabled
+/// What a device takes of viewport depth ranges past `[0, 1]` ([`native_depth_range`],
+/// [`unrestricted`]): facts of the profile its compile device was made with, which stays the
+/// device's for its life, so read once at its making (`DeviceShared::depth_ranges`) rather than
+/// looked up in the profile's sets at every draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DepthRanges {
+    /// It enabled `VK_EXT_depth_range_unrestricted`, `depthClamp`, `VK_EXT_depth_clip_enable`'s
+    /// `depthClipEnable` and `VK_EXT_depth_clamp_control`'s `depthClampControl`.
+    pub(super) native: bool,
+    /// It enabled `VK_EXT_depth_range_unrestricted`.
+    pub(super) unrestricted: bool,
+}
+
+impl DepthRanges {
+    /// The facts of a device of `profile`.
+    pub(super) fn of(profile: &DeviceProfile) -> DepthRanges {
+        let enabled = profile.enabled();
+        let unrestricted = enabled
+            .extensions
+            .contains(&VkExtension::ExtDepthRangeUnrestricted);
+        let native = unrestricted
+            && [
+                VkFeature::DepthClamp,
+                VkFeature::DepthClipEnable,
+                VkFeature::DepthClampControl,
+            ]
+            .iter()
+            .all(|feature| enabled.features.contains(feature));
+        DepthRanges {
+            native,
+            unrestricted,
+        }
+    }
+}
+
+/// Whether `device` takes a viewport depth range past `[0, 1]` natively: it enabled
 /// `VK_EXT_depth_range_unrestricted`, `depthClamp`, `VK_EXT_depth_clip_enable`'s
 /// `depthClipEnable` and `VK_EXT_depth_clamp_control`'s `depthClampControl`
 /// (`EncoderState::depth_range`).
-pub(super) fn native_depth_range(profile: &DeviceProfile) -> bool {
-    let enabled = profile.enabled();
-    enabled
-        .extensions
-        .contains(&VkExtension::ExtDepthRangeUnrestricted)
-        && [
-            VkFeature::DepthClamp,
-            VkFeature::DepthClipEnable,
-            VkFeature::DepthClampControl,
-        ]
-        .iter()
-        .all(|feature| enabled.features.contains(feature))
+pub(super) fn native_depth_range(device: &Device) -> bool {
+    device.shared().depth_ranges.native
 }
 
 /// Why `device` does not take a viewport depth range past `[0, 1]`, `None` where it does:
@@ -1042,11 +1168,10 @@ pub(super) fn native_depth_range(profile: &DeviceProfile) -> bool {
 /// where the driver draws normalized depths past `[0, 1]` inexactly (MoltenVK,
 /// `driver_defects.rs`).
 pub(super) fn depth_ranges_refused(device: &Device) -> Option<Error> {
-    let profile = device.compile_device().profile();
-    if native_depth_range(profile) {
+    if native_depth_range(device) {
         return None;
     }
-    let features = &profile.enabled().features;
+    let features = &device.compile_device().profile().enabled().features;
     if !(features.contains(&VkFeature::ShaderClipDistance)
         && features.contains(&VkFeature::DepthClamp))
     {
@@ -1072,16 +1197,16 @@ fn outside_depth(viewport: &Viewport) -> bool {
 }
 
 /// Whether Metal's clamp of each vertex's depth before the interpolation differs from a clamp of
-/// each sample through `viewport`, in depth clamp mode where `clamps` (RRS probes 16 and 19b, the
-/// M3 Max and an M4 alike): in clip mode, which clamps each vertex's depth at 0 and each sample
-/// to `[0, 1]`, through a range with a negative depth; in clamp mode, which clamps each vertex's
-/// depth to `[0, 1]` and each sample to the range, through a range past `[0, 1]` whose one clamp
-/// holds two depths (one of one depth stores it alone, `OneDepth`). Inside `[0, 1]` the pieces a
-/// primitive is clipped into at the planes clamp nothing (but a piece past them, which stores
-/// the clamp either way). Under a bias that `offsets` the samples, also a clamp mode range above 1
-/// of two depths: its one clamp is its smaller depth, but Metal adds the offset to each vertex's
-/// depth clamped to `[0, 1]` and clamps the sum to the range (RRS probe 20: 1.75 of 1.5 to 3 under
-/// an offset of 0.75).
+/// each sample through `viewport`, in depth clamp mode where `clamps` (Metal probes on the M3 Max
+/// and an M4 alike): in clip mode, which clamps each vertex's depth at 0 and each sample to `[0,
+/// 1]`, through a range with a negative depth; in clamp mode, which clamps each vertex's depth to
+/// `[0, 1]` and each sample to the range, through a range past `[0, 1]` whose one clamp holds two
+/// depths (one of one depth stores it alone, `OneDepth`). Inside `[0, 1]` the pieces a primitive is
+/// clipped into at the planes clamp nothing (but a piece past them, which stores the clamp either
+/// way). Under a bias that `offsets` the samples, also a clamp mode range above 1 of two depths:
+/// its one clamp is its smaller depth, but Metal adds the offset to each vertex's depth clamped to
+/// `[0, 1]` and clamps the sum to the range (a Metal probe on the M3 Max: 1.75 of 1.5 to 3 under an
+/// offset of 0.75).
 fn clamps_vertices(viewport: &Viewport, clamps: bool, offsets: bool) -> bool {
     match clamps {
         false => viewport.znear.min(viewport.zfar) < 0.0,
@@ -1107,21 +1232,21 @@ fn offsets(bias: Option<DepthBiasEffect>) -> bool {
     }
 }
 
-/// Metal's clamp of each biased sample in depth clamp mode through `viewport`: `[max(min(n, f),
-/// 0), max(n, f)]`, its top at least its bottom, past 1 too (RRS probes 15 and 20; a range below
-/// 0 stores 0).
+/// Metal's clamp of each biased sample in depth clamp mode through `viewport`: `[max(min(n, f), 0),
+/// max(n, f)]`, its top at least its bottom, past 1 too (Metal probes on an M4 and the M3 Max; a
+/// range below 0 stores 0).
 fn sample_clamp(viewport: &Viewport) -> [f64; 2] {
     let low = viewport.znear.min(viewport.zfar).max(0.0);
     [low, viewport.znear.max(viewport.zfar).max(low)]
 }
 
 /// Whether a draw's vertex stage clamps each vertex's depth as Metal does
-/// ([`EncoderState::compensation`]). Metal clamps the depth of each vertex of a primitive, at 0
-/// in depth clip mode and to `[0, 1]` in depth clamp mode, before it interpolates (RRS probes 16
-/// and 19b, the M3 Max and an M4 alike, plain and validated), which differs from a clamp of each
-/// sample through the viewports [`clamps_vertices`] names, for a draw of lines or triangles
-/// whose fragment function writes no depth, under no depth bias, one of factors or an offset (a
-/// saturated depth is one depth). The vertex stage's compensation takes the clamp
+/// ([`EncoderState::compensation`]). Metal clamps the depth of each vertex of a primitive, at 0 in
+/// depth clip mode and to `[0, 1]` in depth clamp mode, before it interpolates (Metal probes on the
+/// M3 Max and an M4 alike, plain and validated), which differs from a clamp of each sample through
+/// the viewports [`clamps_vertices`] names, for a draw of lines or triangles whose fragment
+/// function writes no depth, under no depth bias, one of factors or an offset (a saturated depth is
+/// one depth). The vertex stage's compensation takes the clamp
 /// (`ViewportCompensation::vertex_clamp`), on a device that takes the ranges natively too, but for
 /// a fragment function that reads its position's depth (Metal's unclamped `n + (f - n) z`, which
 /// the clamp would change), a mesh pipeline, which has no vertex function, on a device without
@@ -1129,12 +1254,12 @@ fn sample_clamp(viewport: &Viewport) -> [f64; 2] {
 /// compensation's two: those keep the clamp of each sample, announced once (`sample-depth-clamp`).
 /// Where it takes the clamp, a primitive that crosses Metal's planes or its guard band stores the
 /// interpolation of its own clamped vertices, where Metal clamps the vertices of the pieces it
-/// clips the primitive into first (RRS probe 19b): announced once (`clipped-depth-pieces`,
-/// [`VertexClamp::taken`]). In depth clamp mode under a bias that moves the depth, Metal adds the
-/// bias to each vertex's depth clamped to `[0, 1]` through a range inside `[0, 1]` too (RRS probe
-/// 20: 1.75 of a vertex depth past 1 under an offset of 0.75), where the device adds it before its
-/// clamp of each sample, which a primitive past Metal's near or far plane shows: announced once
-/// there too (`sample-depth-clamp`).
+/// clips the primitive into first (a Metal probe on the M3 Max and an M4): announced once
+/// (`clipped-depth-pieces`, [`VertexClamp::taken`]). In depth clamp mode under a bias that moves
+/// the depth, Metal adds the bias to each vertex's depth clamped to `[0, 1]` through a range inside
+/// `[0, 1]` too (a Metal probe on the M3 Max: 1.75 of a vertex depth past 1 under an offset of
+/// 0.75), where the device adds it before its clamp of each sample, which a primitive past Metal's
+/// near or far plane shows: announced once there too (`sample-depth-clamp`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct VertexClamp {
     /// The vertex stage clamps each vertex's depth through the viewports that need it.
@@ -1142,15 +1267,15 @@ pub(super) struct VertexClamp {
 }
 impl VertexClamp {
     /// The clamp a draw of `topology` and `graphics` (a mesh pipeline's where `meshes`) under
-    /// `bias` through the viewports it uses takes on `device`; announced where `announce` (none
-    /// for an execution's precompile at commit, which draws nothing): `sample-depth-clamp` where
-    /// Metal clamps each vertex's depth and the vertex stage cannot (a mesh pipeline only where
-    /// the device takes the ranges natively: elsewhere its compensation is refused), and
+    /// `bias` through the viewports it uses takes on `device`; announced where `announce` (none for
+    /// an execution's precompile at commit, which draws nothing): `sample-depth-clamp` where Metal
+    /// clamps each vertex's depth and the vertex stage cannot (a mesh pipeline only where the
+    /// device takes the ranges natively: elsewhere its compensation is refused), and
     /// `depth-bias-past-one` for bias factors in depth clamp mode through a range past 1, whose
     /// depths past 1 the Vulkan clamp of at most 1 holds at 1 where Metal clamps them to the
-    /// range's larger depth (RRS probes 15 and 20): where the vertex stage does not clamp or the
-    /// device holds no Vulkan range past 1 (`VK_EXT_depth_range_unrestricted`; the compensation's
-    /// range is then Metal's clamp of each sample).
+    /// range's larger depth (Metal probes on an M4 and the M3 Max): where the vertex stage does not
+    /// clamp or the device holds no Vulkan range past 1 (`VK_EXT_depth_range_unrestricted`; the
+    /// compensation's range is then Metal's clamp of each sample).
     pub(super) fn of(
         device: &Device,
         state: &EncoderState,
@@ -1164,7 +1289,7 @@ impl VertexClamp {
         let clamps = state.clip_mode == DepthClipMode::Clamp;
         let drawn = !graphics.writes_depth && !graphics.rasterizer_discard;
         let factors = matches!(bias, Some(DepthBiasEffect::Factors { .. })) && offsets(bias);
-        let widens = clamp.takes && unrestricted(device.compile_device().profile());
+        let widens = clamp.takes && unrestricted(device);
         if announce && drawn && clamps && factors && !widens {
             let used = state.used_viewports(graphics.writes_viewport_index);
             let past = used.iter().find(|v| {
@@ -1242,7 +1367,7 @@ impl VertexClamp {
             )
         } else if meshes {
             // Without the native range the draw's compensation is refused for a mesh pipeline.
-            native_depth_range(profile)
+            native_depth_range(device)
                 .then_some("a mesh pipeline has no vertex function to clamp the depth")
         } else if !clip_distance {
             Some("the device has no shaderClipDistance for Metal's planes")
@@ -1374,13 +1499,10 @@ impl Compensation {
     }
 }
 
-/// Whether a device of `profile` enabled `VK_EXT_depth_range_unrestricted`: a Vulkan viewport
-/// depth range past `[0, 1]`.
-fn unrestricted(profile: &DeviceProfile) -> bool {
-    profile
-        .enabled()
-        .extensions
-        .contains(&VkExtension::ExtDepthRangeUnrestricted)
+/// Whether `device` enabled `VK_EXT_depth_range_unrestricted`: a Vulkan viewport depth range past
+/// `[0, 1]`.
+fn unrestricted(device: &Device) -> bool {
+    device.shared().depth_ranges.unrestricted
 }
 
 /// What a draw's device and pipeline let a depth clamp mode viewport whose one clamp holds one
@@ -1395,23 +1517,22 @@ pub(super) struct OneDepth {
 }
 
 impl OneDepth {
-    /// A draw of `graphics` on a device of `profile`.
-    pub(super) fn of(profile: &DeviceProfile, graphics: &GraphicsState) -> OneDepth {
+    /// A draw of `graphics` on `device`.
+    pub(super) fn of(device: &Device, graphics: &GraphicsState) -> OneDepth {
         OneDepth {
-            unrestricted: unrestricted(profile),
+            unrestricted: unrestricted(device),
             reads: graphics.reads_position_depth,
         }
     }
 
-    /// Whether a draw's bias factors keep Metal's samples at `viewport`'s one clamp of one depth
-    /// in depth clamp mode: Metal clamps each vertex's depth to `[0, 1]` and each sample, the
-    /// bias's offset added, to the range itself but at least 0 (RRS probe 20, the M3 Max: 1.75
-    /// of a range of 1.5 to 3 under an offset of 0.75), so only factors of no offset (constant
-    /// and slope 0) keep it, or a range whose clamp to itself is one depth (its larger depth at
-    /// most its smaller one but 0: 0 of -1 to 0, 2 of 2 to 2). Refused
-    /// `NotImplemented(ViewportDepthRange)` elsewhere, natively too, whose Vulkan clamp is the
-    /// one depth (`EncoderState::depth_range`). A saturated or offset bias is not factors: the
-    /// caller decides those.
+    /// Whether a draw's bias factors keep Metal's samples at `viewport`'s one clamp of one depth in
+    /// depth clamp mode: Metal clamps each vertex's depth to `[0, 1]` and each sample, the bias's
+    /// offset added, to the range itself but at least 0 (a Metal probe on the M3 Max: 1.75 of a
+    /// range of 1.5 to 3 under an offset of 0.75), so only factors of no offset (constant and slope
+    /// 0) keep it, or a range whose clamp to itself is one depth (its larger depth at most its
+    /// smaller one but 0: 0 of -1 to 0, 2 of 2 to 2). Refused `NotImplemented(ViewportDepthRange)`
+    /// elsewhere, natively too, whose Vulkan clamp is the one depth (`EncoderState::depth_range`).
+    /// A saturated or offset bias is not factors: the caller decides those.
     fn bias_holds(viewport: &Viewport, bias: Option<DepthBiasEffect>) -> Result<(), Error> {
         let (lo, hi) = (
             viewport.znear.min(viewport.zfar),
@@ -1428,12 +1549,12 @@ impl OneDepth {
     }
 
     /// Whether `viewport`'s Vulkan range may collapse to `depth`, its one clamp of one depth in
-    /// depth clamp mode, under the draw's `bias`: Metal stores `depth` alone (a probe and RRS
-    /// probe 20) where the bias's factors keep it (`bias_holds`) or a saturated bias is `depth`,
+    /// depth clamp mode, under the draw's `bias`: Metal stores `depth` alone (Metal probes, one on
+    /// the M3 Max) where the bias's factors keep it (`bias_holds`) or a saturated bias is `depth`,
     /// which a fragment function that reads its position's depth would read in place of Metal's
     /// `n + (f - n) z`, and which the device holds past `[0, 1]` only under
-    /// `VK_EXT_depth_range_unrestricted`. Refused `NotImplemented(ViewportDepthRange)`, a
-    /// saturated depth off it or an offset `NotImplemented(NonFiniteDepthBias)`.
+    /// `VK_EXT_depth_range_unrestricted`. Refused `NotImplemented(ViewportDepthRange)`, a saturated
+    /// depth off it or an offset `NotImplemented(NonFiniteDepthBias)`.
     fn collapses(
         self,
         viewport: &Viewport,
@@ -1569,24 +1690,23 @@ pub(super) fn moves_depth(bias: Option<DepthBiasEffect>) -> bool {
 /// Announce, once (`biased-depth-past-unit-range`), a draw of triangles in depth clip mode under
 /// a depth bias that can move their depth past `[0, 1]` ([`moves_depth`]), on a device that
 /// enabled `VK_EXT_depth_range_unrestricted` but does not take depth ranges natively
-/// ([`native_depth_range`]): such a device stores the biased depth unclamped (RADV and NVIDIA,
-/// EVs DSX-dz2-radv and DSX-dz2-nv5080), where Metal clamps it to `[0, 1]` (EVs DSX-ds3-m4 and
-/// XRR2-dz1b-m4), and without `depthClampControl` and `depthClipEnable` no Vulkan clamp of
-/// `[0, 1]` that keeps the clipping exists. A draw whose vertex stage compensates its depth
-/// clamps it under its own Vulkan range (`compensated`).
+/// ([`native_depth_range`]): such a device stores the biased depth unclamped (RADV and NVIDIA),
+/// where Metal clamps it to `[0, 1]`, and without `depthClampControl` and `depthClipEnable` no
+/// Vulkan clamp of `[0, 1]` that keeps the clipping exists. A draw whose vertex stage compensates
+/// its depth clamps it under its own Vulkan range (`compensated`).
 pub(super) fn announce_unclamped_bias(
     device: &Device,
     state: &EncoderState,
     bias: Option<DepthBiasEffect>,
     compensated: bool,
 ) {
-    let profile = device.compile_device().profile();
-    let unrestricted = profile
-        .enabled()
-        .extensions
-        .contains(&VkExtension::ExtDepthRangeUnrestricted);
     let clip = state.clip_mode == DepthClipMode::Clip;
-    if unrestricted && clip && moves_depth(bias) && !compensated && !native_depth_range(profile) {
+    if unrestricted(device)
+        && clip
+        && moves_depth(bias)
+        && !compensated
+        && !native_depth_range(device)
+    {
         device.degrade(Degradation::BiasedDepthPastUnitRange, || {
             (
                 "a draw of triangles in depth clip mode under a depth bias".to_owned(),
@@ -1685,8 +1805,7 @@ pub(super) fn written_depth_clamp(
     if ranges.iter().any(|other| *other != range) {
         return kept("the draw's viewports clamp to different ranges, and the function reads one");
     }
-    let profile = device.compile_device().profile();
-    if native_depth_range(profile) {
+    if native_depth_range(device) {
         let clamp = [0.0, range[1].max(1.0)];
         return Ok(Some(WrittenDepthClamp {
             range,
@@ -1714,6 +1833,7 @@ pub(super) fn written_depth_clamp(
              outside the compensation's Vulkan range of [0, 1]",
         );
     }
+    let profile = device.compile_device().profile();
     let biased = metal2vulkan::metal::state::depth_bias(topology, 0.0, 0.0, 0.0, None, profile)
         .map_err(device_error)?
         .enable;
@@ -1761,9 +1881,9 @@ pub(super) fn written_depth_clamp(
     }))
 }
 
-/// The depth Metal stores in depth clamp mode under `viewport`'s range for a bias saturated at
-/// the top (`high`) or the bottom: the range's larger depth, or its smaller one but at least 0
-/// (RRS probe 15: 1.5 and 0 of a range of -0.5 to 1.5, 1.5 and 0.5 of 0.5 to 1.5).
+/// The depth Metal stores in depth clamp mode under `viewport`'s range for a bias saturated at the
+/// top (`high`) or the bottom: the range's larger depth, or its smaller one but at least 0 (a Metal
+/// probe on an M4: 1.5 and 0 of a range of -0.5 to 1.5, 1.5 and 0.5 of 0.5 to 1.5).
 fn saturated(viewport: &Viewport, high: bool) -> f64 {
     match high {
         true => viewport.znear.max(viewport.zfar),
@@ -1771,10 +1891,10 @@ fn saturated(viewport: &Viewport, high: bool) -> f64 {
     }
 }
 
-/// The one clamp of Metal's two in depth clamp mode under `viewport`'s range: to `[0, 1]`, then
-/// to the range `[lo, hi]` (a probe). A range that meets `[0, 1]` clamps to their intersection; one
-/// above 1 to its smaller depth; one below 0 to 0, as Metal stores no depth below 0 (RRS probe 20,
-/// the M3 Max, stored 0 through -2 to -1, -1 to -2 and -1 to -1, biased or not, where 484 clamped
+/// The one clamp of Metal's two in depth clamp mode under `viewport`'s range: to `[0, 1]`, then to
+/// the range `[lo, hi]` (a probe). A range that meets `[0, 1]` clamps to their intersection; one
+/// above 1 to its smaller depth; one below 0 to 0, as Metal stores no depth below 0 (a Metal probe
+/// on the M3 Max stored 0 through -2 to -1, -1 to -2 and -1 to -1, biased or not, where 484 clamped
 /// to the range's larger depth).
 fn clamp_range(viewport: &Viewport) -> [f32; 2] {
     let lo = viewport.znear.min(viewport.zfar);
@@ -1789,24 +1909,157 @@ fn clamp_range(viewport: &Viewport) -> [f32; 2] {
     range.map(|z| z as f32)
 }
 
-/// Announce once what a draw of `depth_stencil` under `bias` stores in a `Depth16Unorm` depth
-/// (`depth_format`) where the driver is not measured to store Metal's codes: a constant bias
-/// (`unorm-depth-bias`, without `DriverFact::UnormDepthBiasIsMetals`) and any depth it tests or
-/// writes (`unorm-depth-rounding`, without `DriverFact::Depth16UnormStoresMetals`). Metal biases
-/// by `c + sign(c)` units of 1/65535 as `float`, adds the bias to the depth rounded toward zero,
-/// and stores the sum rounded to nearest, a tie up (probes).
+/// How a draw's fragment stage writes a `Depth16Unorm` depth: its variant's
+/// `RuntimeFact::Depth16Codes` among `dependencies`, `Some(biased)` where the stage writes Metal's
+/// codes itself (`LoweringInputs::depth16_codes`), `biased` where it adds the draw's bias, so the
+/// draw records a Vulkan bias of zero and pushes Metal's (`BindState::depth_bias`). `None` where
+/// the device converts the depth itself.
+pub(super) fn depth16_codes(dependencies: &[RuntimeDependency]) -> Option<bool> {
+    dependencies.iter().find_map(|d| match d.fact {
+        RuntimeFact::Depth16Codes { biased } => Some(biased),
+        _ => None,
+    })
+}
+
+/// Whether a draw whose primitives take `bias` biases their depths by Metal's factors
+/// (`BindState::depth16_biased`): a constant or slope factor other than 0, for triangles whose
+/// viewports take no bias.
+pub(super) fn biases_depth(bias: Option<DepthBiasEffect>) -> bool {
+    matches!(
+        bias,
+        Some(DepthBiasEffect::Factors { constant, slope, .. }) if constant != 0.0 || slope != 0.0
+    )
+}
+
+/// The side of the depth bias a fragment stage that adds it itself takes for a draw whose
+/// primitives take `bias` through the viewports it uses (all where the pipeline `selects` one)
+/// under `compensation` (`BindState::depth16_bias_raises`): Metal's factors of a known side
+/// (`metal::state::depth16_bias_side`), where every Vulkan depth range of the draw lies inside
+/// `[0, 1]`. A used viewport's range inside it is its Vulkan range and gives a Vulkan depth clamp
+/// of `[0, 1]` (`EncoderState::draw_viewports`, `EncoderState::depth_range`); a compensated depth's
+/// Vulkan range must lie inside it too. `None` for any other draw, which keeps the stage that
+/// declares no side.
+pub(super) fn depth16_bias_side(
+    state: &EncoderState,
+    selects: bool,
+    bias: Option<DepthBiasEffect>,
+    compensation: Option<Compensation>,
+) -> Option<bool> {
+    let Some(DepthBiasEffect::Factors {
+        constant,
+        slope,
+        clamp,
+    }) = bias
+    else {
+        return None;
+    };
+    let inside = |z: f32| (0.0..=1.0).contains(&z);
+    let compensated = compensation
+        .and_then(|c| c.depth)
+        .is_some_and(|range| !range.into_iter().all(inside));
+    if compensated || state.used_viewports(selects).iter().any(outside_depth) {
+        return None;
+    }
+    metal2vulkan::metal::state::depth16_bias_side(constant, slope, clamp)
+}
+
+/// The depth bias a fragment stage that adds it itself pushes for a draw whose primitives take
+/// `bias` (`BindState::depth_bias`): Metal's factors (`metal::state::depth16_bias`), and none for
+/// points and lines or a bias the draw's viewports take (saturated or offset), which its
+/// `FragCoord.z` carries.
+pub(super) fn depth16_push_bias(bias: Option<DepthBiasEffect>) -> [f32; 3] {
+    match bias {
+        Some(DepthBiasEffect::Factors {
+            constant,
+            slope,
+            clamp,
+        }) => metal2vulkan::metal::state::depth16_bias(constant, slope, clamp),
+        _ => [0.0; 3],
+    }
+}
+
+/// Whether a draw in depth clamp mode clamps its depth to a range one of whose ends lies inside
+/// `(0, 1)`, among the viewports it uses (`selects`: its vertex function chooses one): the device
+/// clamps a depth there to that end and converts it its own way, past a fragment stage that
+/// writes Metal's code (`announce_unorm_depth`).
+pub(super) fn clamps_inside(state: &EncoderState, selects: bool) -> bool {
+    state.clip_mode == DepthClipMode::Clamp
+        && state
+            .used_viewports(selects)
+            .iter()
+            .flat_map(clamp_range)
+            .any(|end| end > 0.0 && end < 1.0)
+}
+
+/// Announce once what a draw of `depth_stencil` stores in a `Depth16Unorm` depth
+/// (`depth_format`), whose fragment stage writes it as `codes` says ([`depth16_codes`]) under the
+/// Vulkan bias `bias`, Metal's slope factor being nonzero where `sloped`.
+///
+/// Where the fragment stage writes Metal's codes, the draw tests or writes through it
+/// (`shader-unorm-depth`), a biased stage adding a slope takes it from the quad's depths
+/// (`unorm-depth-slope`), and a draw that clamps the depth to a range end inside `(0, 1)`
+/// (`clamped_inside`, [`clamps_inside`]) stores the device's conversion of that end
+/// (`unorm-depth-rounding`).
+///
+/// Elsewhere the device converts the depth: a constant bias, or a slope alone, which brings
+/// Metal's constant unit, stores Metal's codes only where the profile takes
+/// `DriverDeviation::MetalDepth16BiasedStores` (`unorm-depth-bias`), and any depth it tests or
+/// writes only where the profile takes `DriverDeviation::MetalDepth16Stores`
+/// (`unorm-depth-rounding`). A biased draw on a profile that takes the second but not the first
+/// runs the variant whose fragment stage adds the bias (`BindState::depth16_biased`), unless its
+/// fragment stage cannot write the code. Metal biases by `c ± 1` units of 1/65535 as `float`
+/// (`metal::state::depth_bias`), adds the bias to the depth rounded toward zero, and stores the
+/// sum rounded to nearest, a tie up (probes).
 pub(super) fn announce_unorm_depth(
     device: &Device,
     depth_format: Option<PixelFormat>,
     depth_stencil: &metal2vulkan::metal::state::DepthStencilState,
-    bias: &metal2vulkan::metal::state::DepthBias,
+    (bias, sloped): (&metal2vulkan::metal::state::DepthBias, bool),
+    (codes, clamped_inside): (Option<bool>, bool),
 ) {
     use metal2vulkan::metal::state::DepthBiasUnit;
     if depth_format != Some(PixelFormat::Depth16Unorm) {
         return;
     }
-    let facts = &device.properties().driver_facts;
-    if depth_stencil.depth_test_enable && !facts.contains(&DriverFact::Depth16UnormStoresMetals) {
+    if let Some(biased) = codes {
+        if depth_stencil.depth_test_enable {
+            device.degrade(Degradation::ShaderUnormDepth, || {
+                (
+                    "a draw testing or writing a Depth16Unorm depth".to_owned(),
+                    "the device is not measured to store Metal's 16-bit codes".to_owned(),
+                )
+            });
+        }
+        if depth_stencil.depth_test_enable && clamped_inside {
+            device.degrade(Degradation::UnormDepthRounding, || {
+                (
+                    "a draw clamping a Depth16Unorm depth to a viewport depth range in depth \
+                     clamp mode"
+                        .to_owned(),
+                    "the device clamps a depth past the range to its end, an end inside (0, 1), \
+                     and converts that end to its 16-bit code its own way, where Metal rounds it \
+                     to nearest, a tie up"
+                        .to_owned(),
+                )
+            });
+        }
+        if biased && sloped {
+            device.degrade(Degradation::UnormDepthSlope, || {
+                (
+                    "a draw biasing a Depth16Unorm depth by a slope".to_owned(),
+                    "the fragment stage takes the depth's slope from the depths of its 2x2 quad, \
+                     where Metal takes the triangle's own: a biased depth near a code's midpoint \
+                     can store the code next to Metal's"
+                        .to_owned(),
+                )
+            });
+        }
+        return;
+    }
+    use metal2vulkan::error::DriverDeviation::{MetalDepth16BiasedStores, MetalDepth16Stores};
+    let profile = device.compile_device().profile();
+    let stores = profile.takes_driver_deviation(MetalDepth16Stores);
+    if depth_stencil.depth_test_enable && !stores {
         device.degrade(Degradation::UnormDepthRounding, || {
             let object = "a draw testing or writing a Depth16Unorm depth".to_owned();
             let reason = "the device converts the depth to its 16-bit code its own way, where \
@@ -1818,17 +2071,20 @@ pub(super) fn announce_unorm_depth(
         });
     }
     if !bias.enable
-        || bias.constant_factor == 0.0
-        || facts.contains(&DriverFact::UnormDepthBiasIsMetals)
+        || (bias.constant_factor == 0.0 && bias.slope_factor == 0.0)
+        || profile.takes_driver_deviation(MetalDepth16BiasedStores)
     {
         return;
     }
     device.degrade(Degradation::UnormDepthBias, || {
-        let object = "a draw biasing a Depth16Unorm depth by a constant".to_owned();
+        let object = "a draw biasing a Depth16Unorm depth by a constant, or by a slope that \
+                      brings Metal's constant unit"
+            .to_owned();
         let reason = match bias.unit {
             DepthBiasUnit::Device => "the device lacks VK_EXT_depth_bias_control's \
                                       depthBiasExact, so the bias counts its own unit, up to \
-                                      twice 2^-16, where Metal's is c + sign(c) units of 1/65535"
+                                      twice 2^-16, where Metal's is c + 1 units of 1/65535 for c \
+                                      of 0 or more (a slope alone brings one) and c - 1 below"
                 .to_owned(),
             _ => "the device adds Metal's bias to the depth and converts the sum in its own \
                   rounding, where Metal adds it rounding toward zero: a biased depth near a \
@@ -1977,8 +2233,8 @@ pub(super) enum DepthBiasEffect {
 }
 
 /// Metal's depth bias of `constant`, `slope` and `clamp` factors (`setDepthBias:slopeScale:clamp:`)
-/// as measured (CRF probes 2 to 4, an Apple M3 Max on macOS 26.7 and an Apple M4 on 27.0.1, each
-/// case plain and validated, alike):
+/// as measured (Metal probes on an Apple M3 Max on macOS 26.7 and an Apple M4 on 27.0.1, each case
+/// plain and validated, alike):
 /// - a NaN constant factor biases as +inf does, and a NaN or infinite clamp clamps nothing;
 /// - a triangle of depth slope `m` is biased `constant * r + slope * m` in IEEE arithmetic, so an
 ///   infinite slope factor on a flat triangle (`m` 0), or opposite infinities, give NaN;
@@ -2024,12 +2280,11 @@ pub(super) fn depth_bias_effect(constant: f32, slope: f32, clamp: f32) -> Option
     (flat == sloped).then_some(flat)
 }
 
-/// The pixels of `viewport` inside a render area of `extent`, per axis `[first, end)`: every
-/// pixel its rectangle overlaps, and none for a viewport of no width or height. Metal clips to
-/// them (RT6 probes 4b and 4c on an M4): a 4-pixel point is cut to the pixels its viewport
-/// overlaps, fractional edges included ((4.5, 0, 1, 8) keeps columns 4 and 5), and a viewport of
-/// no width or height (at an integer origin) draws nothing. A triangle's own coverage never
-/// leaves them.
+/// The pixels of `viewport` inside a render area of `extent`, per axis `[first, end)`: every pixel
+/// its rectangle overlaps, and none for a viewport of no width or height. Metal clips to them
+/// (Metal probes on an M4): a 4-pixel point is cut to the pixels its viewport overlaps, fractional
+/// edges included ((4.5, 0, 1, 8) keeps columns 4 and 5), and a viewport of no width or height (at
+/// an integer origin) draws nothing. A triangle's own coverage never leaves them.
 fn viewport_pixels(viewport: &Viewport, extent: [i64; 2]) -> [[i64; 2]; 2] {
     let empty = viewport.width == 0.0 || viewport.height == 0.0;
     let axis = |origin: f64, size: f64, limit: i64| {
@@ -2075,6 +2330,21 @@ fn device_error(error: metal2vulkan::error::Error) -> Error {
 mod tests {
     use super::*;
 
+    /// A draw's one viewport or scissor rectangle is held in place, more in a list in order, and
+    /// none is an empty list; a refusal among them is the list's.
+    #[test]
+    fn viewport_lists_hold_one_in_place() {
+        let none: ViewportList<u32> = std::iter::empty().collect();
+        assert!(none.is_empty());
+        let one: ViewportList<u32> = [7].into_iter().collect();
+        assert!(matches!(one, ViewportList::One(7)));
+        let mut three: ViewportList<u32> = [1, 2, 3].into_iter().collect();
+        three[2] = 4;
+        assert_eq!(&*three, &[1, 2, 4]);
+        let refused: Result<ViewportList<u32>, ()> = [Ok(1), Err(()), Ok(3)].into_iter().collect();
+        assert!(refused.is_err());
+    }
+
     /// Metal's defaults cover the render area, and a viewport is Vulkan's with its height
     /// negated; Metal's own negative height is a positive Vulkan one.
     #[test]
@@ -2093,10 +2363,12 @@ mod tests {
             )),
             vec![[0.0, 4.0, 8.0, -4.0, 0.0, 1.0]]
         );
-        state.viewports = vec![
+        state.viewports = [
             Viewport::new(0.0, 4.0, 4.0, -4.0, 0.0, 1.0),
             Viewport::new(2.0, 0.0, 2.0, 2.0, 0.0, 1.0),
-        ];
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             fields(&EncoderState::vk_viewports(
                 state.used_viewports(false),
@@ -2127,7 +2399,7 @@ mod tests {
             ),
         ] {
             assert_eq!(set(&mut state, &[given]), Ok(()), "{given:?}");
-            assert_eq!(state.scissors, [kept], "{given:?}");
+            assert_eq!(*state.scissors, [kept], "{given:?}");
         }
         assert_eq!(
             set(&mut state, &[]),
@@ -2136,7 +2408,7 @@ mod tests {
                 Problem::RenderState(RenderStateProblem::Count { count: 0 })
             ))
         );
-        // More than 16, as plain Metal takes them (RT6 probe 4's `scissors_17`).
+        // More than 16, as plain Metal takes them (Metal probe case `scissors_17`).
         assert_eq!(set(&mut state, &[ScissorRect::new(0, 0, 1, 1); 17]), Ok(()));
     }
 
@@ -2161,14 +2433,18 @@ mod tests {
         assert_eq!(pixels(4.5, 0.0, 1.0, 8.0)[0], [4, 6], "probe 4c");
         assert_eq!(pixels(3.25, 2.75, 1.5, 2.5), [[3, 5], [2, 6]], "probe 4c");
         let mut state = EncoderState::metal_defaults([8, 8]);
-        state.viewports = vec![Viewport::new(4.0, 0.0, 0.0, 8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(4.0, 0.0, 0.0, 8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.vk_scissors(false)[0].extent.width, 0);
         assert_eq!(
             EncoderState::vk_viewports(state.used_viewports(false), None, None)[0].width,
             1.0
         );
-        state.viewports = vec![Viewport::new(2.0, 2.0, 4.0, 4.0, 0.0, 1.0)];
-        state.scissors = vec![ScissorRect::new(3, 0, 5, 8)];
+        state.viewports = [Viewport::new(2.0, 2.0, 4.0, 4.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
+        state.scissors = [ScissorRect::new(3, 0, 5, 8)].into_iter().collect();
         let clipped = state.vk_scissors(false)[0];
         assert_eq!(
             (
@@ -2198,7 +2474,9 @@ mod tests {
             ),
             Ok(None)
         );
-        state.viewports = vec![Viewport::new(4.0, 0.0, -4.0, 4.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(4.0, 0.0, -4.0, 4.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         let mirror = state
             .compensation(
                 false,
@@ -2214,7 +2492,9 @@ mod tests {
         assert_eq!(mirror.depth, None);
         let vk = EncoderState::vk_viewports(state.used_viewports(false), mirror.depth, None);
         assert_eq!([vk[0].x, vk[0].width, vk[0].min_depth], [0.0, 4.0, 0.0]);
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0)]
+            .into_iter()
+            .collect();
         let clip = state
             .compensation(
                 false,
@@ -2254,7 +2534,9 @@ mod tests {
             .unwrap();
         assert_eq!(clamp.viewport.values, [1.0, 0.0, 3.0, 0.0]);
         assert_eq!(clamp.depth, Some([0.5, 1.0]));
-        state.viewports = vec![Viewport::new(4.0, 0.0, -4.0, 4.0, 2.0, -1.0)];
+        state.viewports = [Viewport::new(4.0, 0.0, -4.0, 4.0, 2.0, -1.0)]
+            .into_iter()
+            .collect();
         let both = state
             .compensation(
                 false,
@@ -2270,7 +2552,9 @@ mod tests {
         // One depth past `[0, 1]` without `VK_EXT_depth_range_unrestricted` (one inside it, 0 of
         // a range below 0 included, collapses: `one_depth_clamps_collapse_the_vulkan_range`).
         for (znear, zfar) in [(1.5, 3.0), (2.0, 2.0)] {
-            state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, znear, zfar)];
+            state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, znear, zfar)]
+                .into_iter()
+                .collect();
             assert_eq!(
                 state.compensation(
                     false,
@@ -2285,7 +2569,9 @@ mod tests {
         }
         state.clip_mode = DepthClipMode::Clip;
         let whole = Viewport::new(0.0, 0.0, 4.0, 4.0, 0.0, 1.0);
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0), whole];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0), whole]
+            .into_iter()
+            .collect();
         assert!(
             state
                 .compensation(
@@ -2312,7 +2598,7 @@ mod tests {
         // Mirrored and unmirrored viewports: `sx` 1 under the mirrors' variant, viewport 0's bit
         // set; the first alone where the pipeline selects none.
         let mirrored = Viewport::new(4.0, 0.0, -4.0, 4.0, 0.0, 1.0);
-        state.viewports = vec![mirrored, whole];
+        state.viewports = [mirrored, whole].into_iter().collect();
         let mixed = state
             .compensation(
                 true,
@@ -2347,7 +2633,9 @@ mod tests {
         );
         // One compensated depth through both, viewport 1's bit set.
         let range = Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0);
-        state.viewports = vec![range, Viewport::new(4.0, 0.0, -4.0, 4.0, 0.5, 2.0)];
+        state.viewports = [range, Viewport::new(4.0, 0.0, -4.0, 4.0, 0.5, 2.0)]
+            .into_iter()
+            .collect();
         let both = state
             .compensation(
                 true,
@@ -2367,7 +2655,7 @@ mod tests {
             ([1.0, 0.5, 1.5, 1.0], 0b10, Some([0.0, 1.0]))
         );
         // Mirrors beside different depths stay refused.
-        state.viewports = vec![range, mirrored];
+        state.viewports = [range, mirrored].into_iter().collect();
         assert_eq!(
             state.compensation(
                 true,
@@ -2380,11 +2668,11 @@ mod tests {
         );
     }
 
-    /// In depth clamp mode a one clamp of one depth takes no compensation of the depth: the
-    /// draw's Vulkan range collapses to it (0 for a range below 0, RRS probe 20), past `[0, 1]`
-    /// only under `VK_EXT_depth_range_unrestricted`, where the fragment function reads no depth
-    /// of its position and the bias moves no sample off it, natively too; a mirror keeps its
-    /// `sx`; natively the range stays and the clamp is the one depth.
+    /// In depth clamp mode a one clamp of one depth takes no compensation of the depth: the draw's
+    /// Vulkan range collapses to it (0 for a range below 0, a Metal probe on the M3 Max), past `[0,
+    /// 1]` only under `VK_EXT_depth_range_unrestricted`, where the fragment function reads no depth
+    /// of its position and the bias moves no sample off it, natively too; a mirror keeps its `sx`;
+    /// natively the range stays and the clamp is the one depth.
     #[test]
     fn one_depth_clamps_collapse_the_vulkan_range() {
         use metal2vulkan::vk::PrimitiveTopology as T;
@@ -2432,7 +2720,7 @@ mod tests {
             ((1.5, 3.0), 1.5),
             ((2.0, 2.0), 2.0),
         ] {
-            state.viewports = at(znear, zfar);
+            state.viewports = at(znear, zfar).into_iter().collect();
             let case = format!("{znear} {zfar}");
             let want = match depth <= 1.0 {
                 true => Ok(None),
@@ -2489,7 +2777,7 @@ mod tests {
                 VertexClamp::default(),
             )
         };
-        state.viewports = at(1.5, 3.0);
+        state.viewports = at(1.5, 3.0).into_iter().collect();
         assert_eq!(with(&state, false, factors), range());
         assert_eq!(with(&state, true, factors), range(), "natively");
         assert_eq!(with(&state, false, none), Ok(None));
@@ -2502,12 +2790,14 @@ mod tests {
         assert_eq!(with(&state, true, Saturated { high: true }), Ok(None));
         assert_eq!(with(&state, false, Offset(0.25)), bias_gap());
         for (znear, zfar) in [(-1.0, 0.0), (2.0, 2.0)] {
-            state.viewports = at(znear, zfar);
+            state.viewports = at(znear, zfar).into_iter().collect();
             assert_eq!(with(&state, false, factors), Ok(None), "{znear} {zfar}");
             assert_eq!(with(&state, true, factors), Ok(None), "{znear} {zfar}");
         }
         // A mirror keeps its `sx` beside the collapsed depth.
-        state.viewports = vec![Viewport::new(4.0, 0.0, -4.0, 4.0, 1.5, 3.0)];
+        state.viewports = [Viewport::new(4.0, 0.0, -4.0, 4.0, 1.5, 3.0)]
+            .into_iter()
+            .collect();
         let mirror = state
             .compensation(false, false, None, unrestricted, VertexClamp::default())
             .unwrap()
@@ -2519,15 +2809,15 @@ mod tests {
         assert_eq!(depths(&state, false), Ok([1.5, 1.5]));
         // Clip mode clamps no range to one depth.
         state.clip_mode = DepthClipMode::Clip;
-        state.viewports = at(1.5, 3.0);
+        state.viewports = at(1.5, 3.0).into_iter().collect();
         assert_eq!(depths(&state, false), Ok([1.5, 3.0]));
     }
 
-    /// A bias's offset through a range whose vertices Metal clamps adds after the clamp (RRS probes
-    /// 15 and 20): in clip mode after the vertex stage's clamp at 0; in clamp mode through Metal's
-    /// clamp of each sample where the device holds a Vulkan range past 1; inside `[0, 1]` in clamp
-    /// mode without a vertex clamp. Bias factors take the same range, and a saturated depth past
-    /// the one clamp the range up to it.
+    /// A bias's offset through a range whose vertices Metal clamps adds after the clamp (Metal
+    /// probes on an M4 and the M3 Max): in clip mode after the vertex stage's clamp at 0; in clamp
+    /// mode through Metal's clamp of each sample where the device holds a Vulkan range past 1;
+    /// inside `[0, 1]` in clamp mode without a vertex clamp. Bias factors take the same range, and
+    /// a saturated depth past the one clamp the range up to it.
     #[test]
     fn offsets_add_after_the_vertex_clamp() {
         use DepthBiasEffect::{Factors, Offset, Saturated};
@@ -2566,7 +2856,7 @@ mod tests {
         // Clip mode through -0.5 to 1.5: `a` is `n + o`, each vertex's depth plus `o` at least
         // `o`, natively too.
         let mut state = EncoderState::metal_defaults([4, 4]);
-        state.viewports = vec![viewport(-0.5, 1.5)];
+        state.viewports = [viewport(-0.5, 1.5)].into_iter().collect();
         for native in [false, true] {
             assert_eq!(
                 of(&state, native, Offset(0.25), narrow, takes),
@@ -2625,7 +2915,7 @@ mod tests {
         assert_eq!(of(&state, false, up, narrow, unclamped), gap);
         // Clamp mode through 1.5 to 3, whose one clamp is 1.5: biased, its vertices clamped to
         // `[0, 1]`, `z / w` to [-1, -1/3], through [1.5, 3]; without the extension refused.
-        state.viewports = vec![viewport(1.5, 3.0)];
+        state.viewports = [viewport(1.5, 3.0)].into_iter().collect();
         assert_eq!(
             of(&state, false, factors, wide, takes),
             Ok(Some((
@@ -2641,7 +2931,7 @@ mod tests {
         );
         // Clamp mode inside [0, 1]: no vertex clamp, the offset folded through the range,
         // natively too; one depth alone where the range is one.
-        state.viewports = vec![viewport(0.25, 0.75)];
+        state.viewports = [viewport(0.25, 0.75)].into_iter().collect();
         for (native, clamp) in [(false, unclamped), (true, takes)] {
             assert_eq!(
                 of(&state, native, Offset(0.25), narrow, clamp),
@@ -2654,7 +2944,7 @@ mod tests {
                 "{native}"
             );
         }
-        state.viewports = vec![viewport(0.5, 0.5)];
+        state.viewports = [viewport(0.5, 0.5)].into_iter().collect();
         assert_eq!(
             of(&state, false, Offset(0.25), narrow, takes),
             Ok(Some((
@@ -2668,10 +2958,10 @@ mod tests {
         assert_eq!(of(&state, false, factors, narrow, takes), Ok(None));
     }
 
-    /// A saturated or offset depth bias folds into a compensated depth as Metal biases (RRS probe
-    /// 15): in clip mode at 1 or 0, an offset through a range of no negative depth; in clamp mode
-    /// at the larger depth, or the smaller but at least 0, where the one clamp holds it; the rest
-    /// refused, and factors left to Vulkan's bias.
+    /// A saturated or offset depth bias folds into a compensated depth as Metal biases (a Metal
+    /// probe on an M4): in clip mode at 1 or 0, an offset through a range of no negative depth; in
+    /// clamp mode at the larger depth, or the smaller but at least 0, where the one clamp holds it;
+    /// the rest refused, and factors left to Vulkan's bias.
     #[test]
     fn saturated_and_offset_biases_fold_into_the_compensation() {
         use DepthBiasEffect::{Factors, Offset, Saturated};
@@ -2688,7 +2978,9 @@ mod tests {
                 .map(|c| c.map(|c| c.viewport.values))
         };
         let mut state = EncoderState::metal_defaults([4, 4]);
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 1.5)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 1.5)]
+            .into_iter()
+            .collect();
         let up = Saturated { high: true };
         let down = Saturated { high: false };
         assert_eq!(values(&state, up), Ok(Some([1.0, 1.0, 0.0, 1.0])));
@@ -2701,7 +2993,9 @@ mod tests {
             values(&state, Offset(-0.25)),
             Ok(Some([1.0, 0.25, 1.0, 1.0]))
         );
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, -0.5, 1.5)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, -0.5, 1.5)]
+            .into_iter()
+            .collect();
         assert_eq!(values(&state, up), Ok(Some([1.0, 1.0, 0.0, 1.0])));
         assert_eq!(values(&state, Offset(0.25)), gap, "a negative depth");
         // The one clamp is [0, 1]: the larger depth, 1.5, is past it; the smaller is 0.
@@ -2710,7 +3004,9 @@ mod tests {
         assert_eq!(values(&state, down), Ok(Some([1.0, 0.0, 0.0, 0.0])));
         assert_eq!(values(&state, Offset(0.25)), gap, "an offset in clamp mode");
         // The one clamp is [0, 0.5]: the larger depth is its top.
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, -0.5)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, -0.5)]
+            .into_iter()
+            .collect();
         assert_eq!(values(&state, up), Ok(Some([1.0, 1.0, 0.0, 0.0])));
         let factors = Factors {
             constant: 1.0,
@@ -2735,12 +3031,12 @@ mod tests {
         );
     }
 
-    /// Metal's clamp of each vertex's depth (RRS probes 16 and 19b): the viewports it differs
-    /// through ([`clamps_vertices`]), and the compensation that takes it, natively too: at 0 in
-    /// clip mode (`z / w` to `[0, +inf]` in a Vulkan range of `[0, 1]`), to `[0, 1]` in clamp mode
-    /// (`z / w` of the one clamp `[L, H]` to `[-L / (H - L), (1 - L) / (H - L)]`); none where the
-    /// draw does not take it, through a range it does not differ through, or under a saturated
-    /// bias; viewports of different clamped depths refused, mirrors alone kept.
+    /// Metal's clamp of each vertex's depth (Metal probes on the M3 Max and an M4): the viewports
+    /// it differs through ([`clamps_vertices`]), and the compensation that takes it, natively too:
+    /// at 0 in clip mode (`z / w` to `[0, +inf]` in a Vulkan range of `[0, 1]`), to `[0, 1]` in
+    /// clamp mode (`z / w` of the one clamp `[L, H]` to `[-L / (H - L), (1 - L) / (H - L)]`); none
+    /// where the draw does not take it, through a range it does not differ through, or under a
+    /// saturated bias; viewports of different clamped depths refused, mirrors alone kept.
     #[test]
     fn vertex_clamps_clamp_each_vertexs_depth() {
         let viewport = |n, f| Viewport::new(0.0, 0.0, 4.0, 4.0, n, f);
@@ -2777,7 +3073,7 @@ mod tests {
         let plain = OneDepth::default();
         let unclamped = VertexClamp::default();
         let mut state = EncoderState::metal_defaults([4, 4]);
-        state.viewports = vec![viewport(-0.5, 1.5)];
+        state.viewports = [viewport(-0.5, 1.5)].into_iter().collect();
         for native in [false, true] {
             let c = state
                 .compensation(false, native, None, plain, takes)
@@ -2823,7 +3119,7 @@ mod tests {
         // Clamp mode: the one clamp [0.5, 1] of 0.5 to 2, `z / w` to [-1, 1]; [0, 1] of -0.5 to
         // 1.5, `z / w` to [0, 1].
         state.clip_mode = DepthClipMode::Clamp;
-        state.viewports = vec![viewport(0.5, 2.0)];
+        state.viewports = [viewport(0.5, 2.0)].into_iter().collect();
         let c = state
             .compensation(false, true, None, plain, takes)
             .unwrap()
@@ -2831,7 +3127,7 @@ mod tests {
         assert_eq!(c.viewport.values, [1.0, 0.0, 3.0, 0.0]);
         assert_eq!(c.viewport.vertex_clamp, [-1.0, 1.0]);
         assert_eq!(c.depth, Some([0.5, 1.0]));
-        state.viewports = vec![viewport(-0.5, 1.5)];
+        state.viewports = [viewport(-0.5, 1.5)].into_iter().collect();
         let c = state
             .compensation(false, false, None, plain, takes)
             .unwrap()
@@ -2840,7 +3136,7 @@ mod tests {
         assert_eq!(c.viewport.vertex_clamp, [0.0, 1.0]);
         // Clip mode through 0.5 to 2, no negative depth: nothing to clamp, and none natively.
         state.clip_mode = DepthClipMode::Clip;
-        state.viewports = vec![viewport(0.5, 2.0)];
+        state.viewports = [viewport(0.5, 2.0)].into_iter().collect();
         assert_eq!(
             state.compensation(false, true, None, plain, takes),
             Ok(None)
@@ -2852,7 +3148,9 @@ mod tests {
         assert!(!c.viewport.compensation.vertex_clamp);
         // Viewports of different clamped depths: refused, natively too, where the caller keeps
         // the device's ranges unclamped.
-        state.viewports = vec![viewport(-0.5, 1.5), viewport(-1.0, 1.0)];
+        state.viewports = [viewport(-0.5, 1.5), viewport(-1.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(
             state.compensation(true, true, None, plain, takes),
             Err(Error::NotImplemented(RuntimeGap::ViewportDepthRange))
@@ -2863,7 +3161,7 @@ mod tests {
         );
         // Mirrored and unmirrored viewports of one range keep the clamp's bounds.
         let mirrored = Viewport::new(4.0, 0.0, -4.0, 4.0, -0.5, 1.5);
-        state.viewports = vec![viewport(-0.5, 1.5), mirrored];
+        state.viewports = [viewport(-0.5, 1.5), mirrored].into_iter().collect();
         let c = state
             .compensation(true, true, None, plain, takes)
             .unwrap()
@@ -2888,28 +3186,42 @@ mod tests {
             [-4.0, 12.0, 16.0, -16.0]
         );
         // A one-pixel column: 1 + 2 / 1 needs 4; a quarter pixel's 9 needs 16.
-        state.viewports = vec![Viewport::new(4.5, 0.0, 1.0, 8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(4.5, 0.0, 1.0, 8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.point_guard(false, &limits), Some([4.0, 2.0]));
         let vk = EncoderState::vk_viewports(state.used_viewports(false), None, Some([4.0, 2.0]));
         assert_eq!([vk[0].x, vk[0].width], [3.0, 4.0]);
         assert_eq!(vk[0].x + vk[0].width / 2.0, 5.0, "the center stays");
-        state.viewports = vec![Viewport::new(4.0, 0.0, 0.25, 8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(4.0, 0.0, 0.25, 8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.point_guard(false, &limits), Some([16.0, 2.0]));
         // Mirrored and flipped viewports widen alike.
-        state.viewports = vec![Viewport::new(8.0, 8.0, -8.0, -8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(8.0, 8.0, -8.0, -8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.point_guard(false, &limits), Some([2.0, 2.0]));
         // Past the device's dimensions or bounds, or an origin no `float` holds.
-        state.viewports = vec![Viewport::new(0.0, 0.0, 16384.0, 8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(0.0, 0.0, 16384.0, 8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.point_guard(false, &limits), None);
-        state.viewports = vec![Viewport::new(30000.0, 0.0, 4000.0, 8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(30000.0, 0.0, 4000.0, 8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.point_guard(false, &limits), None);
-        state.viewports = vec![Viewport::new(0.1, 0.0, 64.0, 8.0, 0.0, 1.0)];
+        state.viewports = [Viewport::new(0.1, 0.0, 64.0, 8.0, 0.0, 1.0)]
+            .into_iter()
+            .collect();
         assert_eq!(state.point_guard(false, &limits), None);
         // Every viewport a selecting pipeline uses takes the widest scale.
-        state.viewports = vec![
+        state.viewports = [
             Viewport::new(0.0, 0.0, 8.0, 8.0, 0.0, 1.0),
             Viewport::new(4.0, 4.0, 1.0, 2.0, 0.0, 1.0),
-        ];
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(state.point_guard(true, &limits), Some([4.0, 2.0]));
     }
 
@@ -2923,8 +3235,8 @@ mod tests {
         assert_eq!(state.stencil_reference(), [0xff, 0xff]);
     }
 
-    /// Metal's measured answers for NaN and infinite factors (CRF probes 2 to 4, an M3 Max and
-    /// an M4 alike), each `(constant, slope, clamp)` with the effect Metal's stored depths show, or
+    /// Metal's measured answers for NaN and infinite factors (Metal probes on an M3 Max and an M4
+    /// alike), each `(constant, slope, clamp)` with the effect Metal's stored depths show, or
     /// `None` where flat and sloped triangles differ.
     #[test]
     fn non_finite_depth_biases_take_metal_s_measured_effect() {
@@ -3025,7 +3337,9 @@ mod tests {
         .unwrap();
         let profile = device.profile();
         let mut state = EncoderState::metal_defaults([4, 4]);
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.75, 0.25)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.75, 0.25)]
+            .into_iter()
+            .collect();
         let depths = |state: &EncoderState, topology| {
             state
                 .draw_viewports(false, topology, profile, false)
@@ -3058,9 +3372,13 @@ mod tests {
             clamp: [0.0f32, 1.0].map(f32::to_bits),
         };
         assert_eq!(native(&state), (Ok([1.125, 0.625]), Ok(Some(clipped))));
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, -0.25, 0.25)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, -0.25, 0.25)]
+            .into_iter()
+            .collect();
         assert_eq!(native(&state).0, gap, "a negative depth clamps at 0 first");
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.75, 0.25)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.75, 0.25)]
+            .into_iter()
+            .collect();
         state.clip_mode = DepthClipMode::Clamp;
         state.set_depth_bias(f32::INFINITY, 0.0, 0.0).unwrap();
         assert_eq!(depths(&state, T::TRIANGLE_LIST), Ok([0.75, 0.75]));
@@ -3108,7 +3426,9 @@ mod tests {
         let gap = Err(Error::NotImplemented(RuntimeGap::ViewportDepthRange));
         let mut state = EncoderState::metal_defaults([4, 4]);
         state.clip_mode = DepthClipMode::Clamp;
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.25, 0.75)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.25, 0.75)]
+            .into_iter()
+            .collect();
         let range = |state: &EncoderState, compensated, returned| {
             state.shader_tests_range(
                 false,
@@ -3122,7 +3442,9 @@ mod tests {
         assert_eq!(range(&state, false, true), Ok([0.25, 0.75]));
         assert_eq!(range(&state, true, false), gap, "the window depth");
         assert_eq!(range(&state, true, true), Ok([0.25, 0.75]), "returned");
-        state.viewports = vec![Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0)];
+        state.viewports = [Viewport::new(0.0, 0.0, 4.0, 4.0, 0.5, 2.0)]
+            .into_iter()
+            .collect();
         assert_eq!(range(&state, true, true), gap, "past [0, 1]");
     }
 }

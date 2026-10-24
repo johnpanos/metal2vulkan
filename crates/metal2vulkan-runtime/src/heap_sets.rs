@@ -1,5 +1,5 @@
 //! Set 1, the heap, and the texture table, device-wide (residency part C): every live texture is at
-//! its resource ID for every command, as Metal's textures are (the M4 probe RFL-res-m4: a texture
+//! its resource ID for every command, as Metal's textures are (the M4 probe: a texture
 //! read through its ID in an argument buffer is reached with no encoder naming it, and through a
 //! later encoder's `use_resource`).
 //!
@@ -20,7 +20,13 @@
 //!   each image array holds the texture at ID `i` as the array's class takes it
 //!   (`bind::heap_element`: its view where it fits the class, else the neutral), written as the
 //!   texture takes the slot ([`place`]), for each set that lives then, and by a set made later
-//!   for each texture that lives then. A texture the class fits that it cannot view (a format
+//!   for each texture that lives then. A batch holds those writes from its first work's take
+//!   until its submission was made ([`hold`]): one asked meanwhile is made then, before the next
+//!   submission takes its first work, so no texture registered after the take, whose move is
+//!   not the batch's, is in its sets or table in `UNDEFINED` (`texture/first_move.rs`), and its
+//!   making waits for no submission. A rebind or a detach of host pages writes again the
+//!   elements of the textures whose images or texel views lie in those bytes ([`renew_over`]),
+//!   and of no other texture (`WorkCounts::heap_slots_rewritten`). A texture the class fits that it cannot view (a format
 //!   the device cannot sample or store formatless, or that needs its function's decode) is the
 //!   neutral, announced ([`Degradation::UnnamedTextureUnviewable`]); one whose usage the class
 //!   lacks is the neutral, as Metal's contract leaves the read undefined. A shadowed texture's
@@ -124,6 +130,11 @@ pub(super) struct DeviceHeaps {
     /// What a rebind or a detach replaced ([`retire`]), which waits for the command buffers
     /// committed before it.
     replaced: Retirement<Keeper>,
+    /// The batches holding the texture slots' writes ([`hold`]): while one is, a write waits in
+    /// `deferred`.
+    holds: usize,
+    /// The slot writes asked while a batch held them, in order, made as the last hold ends.
+    deferred: VecDeque<Slots>,
 }
 
 /// A texture the table and the heap sets hold: its slot's generation and hold serial when it
@@ -135,6 +146,9 @@ struct Placed {
     flags: u32,
     /// Whether a heap write stores the device's conversion of a NaN in it ([`NanResidue::of`]).
     residue: [bool; 2],
+    /// The key of the buffer whose bytes its images and texel views lie in
+    /// (`Texture::bytes_key`), whose rebind or detach writes its elements again ([`renew_over`]).
+    bytes: Option<ResourceKey>,
     texture: Weak<TextureShared>,
 }
 
@@ -359,8 +373,39 @@ impl DeviceHeaps {
             .ok_or_else(|| internal("a texture table not made"))
     }
 
+    /// Write `slots` ([`sync`]): the slots that failed, each with its error, their entries the
+    /// neutral's. Their holders go to `held`, to drop once the lock is free.
+    fn write_slots(
+        &mut self,
+        device: &Device,
+        slots: Slots,
+        held: &mut Vec<Texture>,
+        notes: &mut Notes,
+    ) -> Vec<(u64, Error)> {
+        let (ids, force): (Vec<u64>, bool) = match slots {
+            Slots::Changed(id) => (vec![id], false),
+            Slots::All => (self.textures.keys().copied().collect(), true),
+            Slots::Over(key) => {
+                let over = self.textures.iter();
+                let over = over.filter(|(_, placed)| placed.bytes == Some(key));
+                (over.map(|(&id, _)| id).collect(), true)
+            }
+        };
+        if force {
+            device.shared().counts.heap_slots_rewritten(ids.len());
+        }
+        let mut failed = Vec::new();
+        for id in ids {
+            if let Err(error) = self.sync(device, id, force, held, notes) {
+                let cleared = self.clear(device, id);
+                failed.push((id, cleared.err().unwrap_or(error)));
+            }
+        }
+        failed
+    }
+
     /// Write texture slot `id` into the table and every heap set where its holder changed since
-    /// (every slot where `force`, a rebind's): its holder's elements, or the neutral's entry where
+    /// (whatever changed where `force`, a rebind's): its holder's elements, or the neutral's entry where
     /// it has none. The holder goes to `held`, to drop once the lock is free.
     fn sync(
         &mut self,
@@ -392,6 +437,7 @@ impl DeviceHeaps {
         let facts = texture.facts();
         let flags = handle_entry_flags(&facts);
         let residue = NanResidue::of(&facts);
+        let bytes = texture.bytes_key();
         // The neutral's entry until every set holds the texture.
         if let Some(table) = &self.table {
             table.put(id, 0, 0);
@@ -413,6 +459,7 @@ impl DeviceHeaps {
                 serial,
                 flags,
                 residue,
+                bytes,
                 texture: weak,
             },
         );
@@ -836,13 +883,9 @@ impl Notes {
 
     /// `texture` placed, into a set where `in_set`.
     fn placed(&mut self, texture: &Texture, in_set: bool) {
-        if in_set && self.unreadable.is_none() {
-            let blocks = texture
-                .image_plan()
-                .is_ok_and(super::pvrtc::holds_for_copies);
-            if blocks {
-                self.unreadable = Some(texture.clone());
-            }
+        let held = || super::pvrtc::held_for_copies(texture).is_some();
+        if in_set && self.unreadable.is_none() && held() {
+            self.unreadable = Some(texture.clone());
         }
     }
 
@@ -917,7 +960,7 @@ impl RawLayout {
         {
             return Err(internal("a heap set with an immutable sampler"));
         }
-        let raw = super::pipeline::create_set_layout(device, layout, &[])?;
+        let raw = super::pipeline::create_set_layout(device, layout, &[], false)?;
         Ok(RawLayout {
             device: device.clone(),
             raw,
@@ -1067,33 +1110,87 @@ pub(crate) fn heap_set(
 /// heap set (the module docs). A failure to write it leaves the ID's entry the neutral's,
 /// announced.
 pub(super) fn place(device: &Device, texture: &Texture) {
-    sync(device, texture.gpu_resource_id().0, false);
+    sync(device, Slots::Changed(texture.gpu_resource_id().0));
 }
 
-/// Write texture slot `id` where its holder changed (every slot's where `force`, `id` then
-/// ignored).
-fn sync(device: &Device, id: u64, force: bool) {
+/// The texture slots a [`sync`] writes.
+enum Slots {
+    /// One, where its holder changed since it was written.
+    Changed(u64),
+    /// Every live texture's.
+    All,
+    /// Those of the live textures whose images and texel views lie in the bytes of the buffer of
+    /// a key (`Texture::bytes_key`).
+    Over(ResourceKey),
+}
+
+/// Write `slots`: a changed one where its holder changed, the others whatever changed. While a
+/// batch holds the slots' writes ([`hold`]), they wait for it.
+fn sync(device: &Device, slots: Slots) {
     let mut held = Vec::new();
     let mut notes = Notes::default();
     let failed = {
         let mut heaps = lock(&device.shared().heaps);
-        let ids: Vec<u64> = match force {
-            true => heaps.textures.keys().copied().collect(),
-            false => vec![id],
-        };
-        let mut failed = None;
-        for id in ids {
-            if let Err(error) = heaps.sync(device, id, force, &mut held, &mut notes) {
-                let cleared = heaps.clear(device, id);
-                failed = Some((id, cleared.err().unwrap_or(error)));
+        match heaps.holds {
+            0 => heaps.write_slots(device, slots, &mut held, &mut notes),
+            _ => {
+                heaps.deferred.push_back(slots);
+                device.shared().counts.heap_slot_writes_deferred();
+                Vec::new()
             }
         }
-        failed
     };
     drop(held);
     notes.announce(device);
-    if let Some((id, error)) = failed {
+    for (id, error) in failed {
         failed_write(device, id, &error);
+    }
+}
+
+/// A batch's hold of the device's texture slots' writes ([`hold`]), from before its first work's
+/// take until its submission was made or the work given back (`texture/first_move.rs`'s
+/// `Taken`). The writes asked meanwhile ([`place`], [`renew_over`], [`renew`]) are made as the
+/// last hold ends, before the batch lets go of its place in the first work's order: so no
+/// texture's elements reach the table or a heap set between the take and the `vkQueueSubmit`
+/// (a texture registered after the take, whose move the batch did not take, would be in them in
+/// `UNDEFINED`), and every later batch, which takes its place after, finds them written.
+pub(super) struct HeldSlots {
+    device: Device,
+}
+
+/// Hold `device`'s texture slots' writes for a batch taking its first work (the module docs): only
+/// on a device whose heap sets take writes while a command buffer that binds them is pending, as
+/// the writes made as it ends reach the sets the batch's commands bound, which it is by then
+/// (`texture/first_move.rs` takes no hold elsewhere).
+pub(super) fn hold(device: &Device) -> HeldSlots {
+    lock(&device.shared().heaps).holds += 1;
+    HeldSlots {
+        device: device.clone(),
+    }
+}
+
+impl Drop for HeldSlots {
+    fn drop(&mut self) {
+        let device = &self.device;
+        let mut held = Vec::new();
+        let mut notes = Notes::default();
+        let failed = {
+            let mut heaps = lock(&device.shared().heaps);
+            heaps.holds -= 1;
+            let mut failed = Vec::new();
+            while heaps.holds == 0 {
+                let Some(slots) = heaps.deferred.pop_front() else {
+                    break;
+                };
+                failed.extend(heaps.write_slots(device, slots, &mut held, &mut notes));
+            }
+            failed
+        };
+        drop(held);
+        notes.announce(device);
+        for (id, error) in failed {
+            failed_write(device, id, &error);
+        }
     }
 }
 
@@ -1114,11 +1211,21 @@ pub(super) fn tickets_out(device: &Device) -> bool {
     !heaps.retirement.out.is_empty() || !heaps.replaced.out.is_empty()
 }
 
-/// Write every live texture's elements again: a rebind remade their images or views
-/// (`buffer_descriptor.rs`), whose caller commits no command that uses the bytes meanwhile, so
-/// no pending command buffer reads the elements rewritten.
+/// Write every live texture's elements again: a change of storage form swapped images in
+/// (`texture/storage_form.rs`) while no command buffer that may read the elements is pending.
 pub(super) fn renew(device: &Device) {
-    sync(device, 0, true);
+    sync(device, Slots::All);
+}
+
+/// Write again the elements of the live textures whose images and texel views lie in the bytes
+/// of the buffer of `key` (`Texture::bytes_key`; a heap's own buffer for its textures and those
+/// over its buffers), and no other's: a rebind or a detach of those bytes remade their images or
+/// views, or made them present stand-ins or their own images again (`buffer_descriptor.rs`,
+/// `detach.rs`); its caller commits no command that uses the bytes meanwhile, so no pending
+/// command buffer reads the elements rewritten. Every other texture's images and views stay
+/// what its elements were written with.
+pub(super) fn renew_over(device: &Device, key: ResourceKey) {
+    sync(device, Slots::Over(key));
 }
 
 /// A program's texture at `id`, of hold serial `serial`, went: its entry is the neutral's where
@@ -1147,7 +1254,7 @@ pub(super) fn gone(device: &Device, id: u64, serial: u64, keeper: Option<Keeper>
 }
 
 /// Keep `kept`, what the sets' elements named until they were written again without it
-/// (`renew`): the views and images of textures a detach or a reattach of their bytes replaced
+/// (`renew_over`): the views and images of textures a detach or a reattach of their bytes replaced
 /// (`detach.rs`, `buffer_descriptor.rs`). It waits for the command buffers committed before it,
 /// which may read it (the module docs).
 pub(super) fn retire(device: &Device, kept: Keeper) {

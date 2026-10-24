@@ -27,7 +27,7 @@ use crate::pipeline::interface::PushLoc;
 use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
 use crate::pipeline::testing::{
     compile, compile_kept, engine_dir, link_and_validate, llvm_assemble, profile, typed_module,
-    AssembleError,
+    AssembleError, Scratch,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
@@ -258,12 +258,14 @@ fn expected(kernel: &str, t: u32) -> u32 {
             up + down * 1000 + rot * 1_000_000
         }
         "quad_dynamic_k" => (t ^ ((t >> 2) & 3)) + (qb + 3) * 1000,
+        // Metal's backend speculates the branch's arm (`air::canon::speculate`), so every lane of
+        // the quad votes, one that skips the arm too: the M3 Max (macOS 27.0.1) answers 95 on
+        // thread 0 (its mask 0xF) and 159 on thread 8 (lane 9 in the mask and the `any`).
         "quad_ballot_k" => {
-            let active = |u: u32| u % 7 != 2;
-            if !active(t) {
+            if t % 7 == 2 {
                 return 99;
             }
-            let quad: Vec<u32> = (qb..qb + 4).filter(|&u| active(u)).collect();
+            let quad: Vec<u32> = (qb..qb + 4).collect();
             let mask = quad.iter().fold(0u32, |a, &u| a | (1 << (u & 3)));
             let first = quad.first().copied() == Some(t);
             u32::from(first)
@@ -311,7 +313,7 @@ fn run_kernels(p: &DeviceProfile, tier: Tier, lanes: SubgroupSize, locals: &[[u3
         assert_eq!(
             plan.dispatch.as_ref().map(|d| d.local_size),
             Some(LocalSizeForm::Flat),
-            "{kernel}: flattened (D3)"
+            "{kernel}: flattened"
         );
         for &local in locals {
             let out = run_all(&plan, &m, local, lanes);
@@ -875,12 +877,11 @@ fn compute_derivatives_with_a_simd_operation_are_refused() {
     let decls = "\ndeclare float @air.dfdx.f32(float)\n\
                  declare i32 @air.simd_shuffle.u.i32(i32, i16)\n\nattributes #0";
     let text = text.replacen("\nattributes #0", decls, 1);
-    let dir = std::env::temp_dir().join(format!("m2v-engine-simd-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new("m2v-engine-simd");
+    let dir = scratch.path();
     let path = dir.join("kernel.ll");
     std::fs::write(&path, text).expect("write");
     let bc = llvm_assemble(&path);
-    let _ = std::fs::remove_dir_all(&dir);
     let bc = match bc {
         Ok(b) => b,
         Err(AssembleError::Missing(why)) => {
@@ -945,12 +946,11 @@ fn sixty_four_bit_group_operations_are_not_metal() {
         let body = format!("  {call}\n  ret void\n}}");
         let text = text.replacen("  ret void\n}", &body, 1);
         let text = text.replacen("\nattributes #0", &format!("\n{decl}\n\nattributes #0"), 1);
-        let dir = std::env::temp_dir().join(format!("m2v-engine-simd64-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = Scratch::new("m2v-engine-simd64");
+        let dir = scratch.path();
         let path = dir.join("kernel.ll");
         std::fs::write(&path, text).expect("write");
         let bc = llvm_assemble(&path);
-        let _ = std::fs::remove_dir_all(&dir);
         let bc = match bc {
             Ok(b) => b,
             Err(AssembleError::Missing(why)) => {
@@ -1035,12 +1035,11 @@ fn uniform_kernel(tag: &str, body: &str) -> Option<Vec<u8>> {
          !13 = !{{i32 1, !\"air.thread_index_in_threadgroup\", !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"t\"}}\n\
          !17 = !{{i32 2, i32 8, i32 0}}\n!18 = !{{!\"Metal\", i32 4, i32 0, i32 0}}\n"
     );
-    let dir = std::env::temp_dir().join(format!("m2v-engine-uniform-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new(&format!("m2v-engine-uniform-{tag}"));
+    let dir = scratch.path();
     let path = dir.join("kernel.ll");
     std::fs::write(&path, text).expect("write");
     let bc = llvm_assemble(&path);
-    let _ = std::fs::remove_dir_all(&dir);
     match bc {
         Ok(b) => Some(b),
         Err(AssembleError::Missing(why)) => {
@@ -1131,7 +1130,9 @@ fn mask_expected(kernel: &str, n: u32, t: u32) -> u32 {
     match kernel {
         "mask_quad_ballot_k" => ballot(&|_| true),
         "mask_quad_ballot_divergent_k" if t % 7 == 2 => 99,
-        "mask_quad_ballot_divergent_k" => ballot(&|u| u % 7 != 2),
+        // Metal's backend speculates the branch's arm (`air::canon::speculate`): a lane that skips
+        // it votes too (the M3 Max, macOS 27.0.1, answers 2 on thread 8, the skipping lane 9's).
+        "mask_quad_ballot_divergent_k" => ballot(&|_| true),
         "mask_simd_active_k" => mask(&|_| true),
         "mask_simd_active_divergent_k" if t & 31 < 3 => 1,
         "mask_simd_active_divergent_k" => mask(&|u| u & 31 >= 3),
@@ -1364,15 +1365,11 @@ fn float_group_kernel(tag: &str, call: &str, flags: &str, extra: &str) -> Option
          !13 = !{{i32 1, !\"air.thread_index_in_threadgroup\", !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"t\"}}\n\
          !17 = !{{i32 2, i32 8, i32 0}}\n!18 = !{{!\"Metal\", i32 4, i32 0, i32 0}}\n"
     );
-    let dir = std::env::temp_dir().join(format!(
-        "m2v-engine-float-group-{}-{tag}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new(&format!("m2v-engine-float-group-{tag}"));
+    let dir = scratch.path();
     let path = dir.join("kernel.ll");
     std::fs::write(&path, text).expect("write");
     let bc = llvm_assemble(&path);
-    let _ = std::fs::remove_dir_all(&dir);
     match bc {
         Ok(b) => Some(b),
         Err(AssembleError::Missing(why)) => {

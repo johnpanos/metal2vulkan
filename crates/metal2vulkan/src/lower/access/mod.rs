@@ -842,6 +842,24 @@ pub struct Declared {
     /// The stage's view of the command buffer's `ExecutionStatus` buffer, where it binds the
     /// buffer ([`absent::declare`]).
     pub status: Option<View>,
+    /// The `RangeAtBindOffset` specialization of each slot read through a uniform view, by
+    /// memory-plan slot index: where it holds, an access reads the view at the Metal offset alone
+    /// ([`range_at_bind_offset`]).
+    pub at_bind: Vec<Option<SValue>>,
+}
+
+/// Slot `slot`'s `RangeAtBindOffset` specialization: a `bool`, false by default, fixed at pipeline
+/// creation, true where the binder starts the slot's descriptor range at its bind offset, so its
+/// `SlotBindOffset` residual is 0 and an access reads the Metal offset alone: a constant for a
+/// constant member, which a driver can push ahead of the shader.
+fn range_at_bind_offset(mb: &mut ModuleBuilder, slot: SlotRef) -> BResult<SValue> {
+    let b = mb.ty(SType::Bool)?;
+    let c = mb.spec(
+        crate::pipeline::sym::SpecKey::RangeAtBindOffset(slot),
+        b,
+        ConstBits(0),
+    )?;
+    mb.const_value(c)
 }
 
 /// The module's routines the access family's strategies call, each charged once to the census: the
@@ -1711,6 +1729,12 @@ pub fn declare(
             _ => None,
         };
         d.views.push(view);
+        d.at_bind.push(match (s, view.map(|v| v.kind)) {
+            (Some(c), Some(ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. })) => {
+                Some(range_at_bind_offset(mb, c.slot)?)
+            }
+            _ => None,
+        });
         let units = plan
             .families
             .access
@@ -2002,9 +2026,11 @@ fn access_with_leaf(
 
 /// A `air.{load,store}.{device,system}_coherent` access through a static-root buffer pointer: the
 /// plain leaf access with `NonPrivatePointer` and `MakePointerVisible` (a load) or
-/// `MakePointerAvailable` (a store) at `Device` scope, which selects the Vulkan memory model.
-/// System coherence is `Device` scope, the widest of one logical device (the reading of Metal's
-/// all-devices scope). A coherent access of another memory is not implemented.
+/// `MakePointerAvailable` (a store) at `Device` scope, which selects the Vulkan memory model, on a
+/// profile with that model and its device scope; elsewhere the plain access through `Coherent`
+/// resources under `GLSL450` (`sync::memory_model::coherent_access`). System coherence is `Device`
+/// scope, the widest of one logical device (the reading of Metal's all-devices scope). A coherent
+/// access of another memory is not implemented.
 fn select_coherent(
     cx: &mut SelectCx<'_>,
     inst: &Inst,
@@ -2039,9 +2065,8 @@ fn select_coherent(
         .abi_align(ty)
         .and_then(crate::air::ir::Align::from_bytes);
     let mut a = select_access(cx, ptr, value, ty, align, m)?;
-    a.coherence = Some(Coherence::Device);
+    a.coherence = Some(crate::lower::sync::memory_model::coherent_access(cx));
     a.volatile = c.volatile;
-    crate::lower::sync::memory_model::require_vulkan(cx);
     Ok(match c.kind {
         AccessKind::Load => AccessStrategy::Load(a),
         AccessKind::Store => AccessStrategy::Store(a),

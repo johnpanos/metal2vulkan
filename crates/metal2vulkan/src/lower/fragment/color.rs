@@ -14,10 +14,10 @@
 //! Vulkan orders an input-attachment read so only with rasterization-order color attachment
 //! access. Without it, a device with `fragmentShaderPixelInterlock` reads (and writes) the
 //! attachment as a storage image inside the ordered interlock where the pipeline's state lets
-//! that be exact (`fetch`). Everywhere else the policy decides: `RequireOrdered` refuses, naming
-//! what either ordered form needs (`Unsupported{FramebufferFetch, ...}`; the storage form's own
-//! reason where it alone was blocked), and `AcceptUnordered` reads unordered and records
-//! `PrecisionNote::UnorderedFramebufferFetch`. The function states
+//! that be exact (`fetch`). Everywhere else the function is refused, naming what either ordered
+//! form needs (`Unsupported{FramebufferFetch, ...}`; the storage form's own reason where it alone
+//! was blocked): an unordered read could see the attachment before an earlier overlapping
+//! fragment's write, which Metal never shows. The function states
 //! `RuntimeFact::FramebufferFetch{color}` for every index it reads as an input attachment, so
 //! link can set the pipeline's rasterization-order flags and the render pass can provide the
 //! self-dependency.
@@ -52,6 +52,12 @@
 //! fetch lane checks on every byte. The interface records the color (`StageIo::srgb_fetches`),
 //! which link holds the pipeline's to.
 //!
+//! **An `A8Unorm` attachment whose image holds Metal's alpha in red** (`R8_UNORM` on a device
+//! without `A8_UNORM`, `LoweringInputs::alpha_in_red_colors`) reads `(r, 0, 0, 1)` through its
+//! input attachment, which the read turns into Metal's `(0, 0, 0, r)` ([`alpha_in_red`]); the
+//! interface records the color (`StageIo::alpha_in_red_colors`), which link holds the pipeline's
+//! to.
+//!
 //! A color input in a raster order group is read like any other: the family runs the whole body
 //! inside the interlock, and the read's ordering against other fragments' color writes is still the
 //! ordering policy's (the interlock orders shader invocations, not the attachment writes that
@@ -64,7 +70,6 @@ use std::collections::BTreeMap;
 use crate::air::abi::{AbiInt, OutputRole, ParamBinding, ParamRole};
 use crate::air::intrinsics::{PackDir, PackFormat};
 use crate::air::ir::{ArgIdx, TypeId as AirTypeId, Value};
-use crate::device::profile::FramebufferFetchPolicy;
 use crate::device::requirements::VkFeature;
 use crate::error::{Attachment, Capability, DescriptorError, Error, Feature, Unsupported};
 use crate::lower::arith::legal::{form_on, refuse_int64_interface};
@@ -72,7 +77,6 @@ use crate::lower::arith::{extended_range, math, narrow, ops, srgb, Form, Held};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
 use crate::metal::format::ExtendedRange;
-use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
@@ -101,6 +105,9 @@ pub struct ColorInput {
     /// an input attachment's read snaps the device's decode back to its byte and decodes that by
     /// Metal's table.
     pub srgb: bool,
+    /// The attachment's image holds Metal's alpha in red (`LoweringInputs::alpha_in_red_colors`,
+    /// `A8Unorm` in `R8_UNORM`): a read, `(r, 0, 0, 1)` from the image, is Metal's `(0, 0, 0, r)`.
+    pub alpha_red: bool,
 }
 
 /// An upper estimate of the words one input attachment declares (type, variable, decorations).
@@ -148,6 +155,11 @@ pub(super) fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<Co
     };
     let form = param_form(cx, b)?;
     let extended = cx.inputs.extended_range_colors.get(&color).copied();
+    // A word attachment's input reads the word, whose decode is not built.
+    if cx.inputs.word_colors.contains_key(&color) {
+        let refused = Unsupported::not_implemented(Feature::Format);
+        return Err(refused.at_attachment(Attachment::Color(color)).into());
+    }
     // A fetch of a bfloat attachment is unmeasured (its draws are built; what a fetch reads of the
     // `half`s Metal's tile holds is not).
     if extended.is_some_and(|e| e.form.bfloat()) {
@@ -159,22 +171,17 @@ pub(super) fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<Co
         form,
         extended: extended.map(|e| e.form),
         srgb: cx.inputs.srgb_fetches.contains(&color),
+        alpha_red: cx.inputs.alpha_in_red_colors.contains(&color),
     };
     // The interlocked storage form `fetch::plan` chose.
     if super::fetch::is_storage(cx, color) {
         super::fetch::select_read(cx, input)?;
         return Ok(input);
     }
+    // On a device with the pixel interlock `fetch::plan` refused a blocked attachment already;
+    // here neither ordered form exists.
     if !frag.rasterization_order_color_access {
-        match cx.profile.fields().framebuffer_fetch {
-            FramebufferFetchPolicy::AcceptUnordered => {
-                cx.precision
-                    .insert(PrecisionNote::UnorderedFramebufferFetch);
-            }
-            // On a device with the pixel interlock `fetch::plan` refused a blocked attachment
-            // already; here neither ordered form exists.
-            FramebufferFetchPolicy::RequireOrdered => return Err(unordered(cx, color)),
-        }
+        return Err(unordered(cx, color));
     }
     // Two reads of one attachment must agree on its numeric class (one image declaration).
     let known = &cx.families.fragment.colors;
@@ -227,6 +234,21 @@ pub(super) fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<Co
         }
         cx.families.arith.srgb.get_or_insert(PackDir::Unpack);
         cx.families.stage_io.interface.srgb_fetches.insert(color);
+    }
+    // An attachment whose image holds Metal's alpha in red reads the red as Metal's alpha: a float
+    // (an integer read is Metal's pipeline error). The interface records the attachment, which
+    // link holds the pipeline's to (`color_writes::check`).
+    if input.alpha_red {
+        if !form.is_float() {
+            return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+                index: color,
+            }));
+        }
+        cx.families
+            .stage_io
+            .interface
+            .alpha_in_red_colors
+            .insert(color);
     }
     super::fetch::plan_sample(cx)?;
     Ok(input)
@@ -296,6 +318,9 @@ pub(super) fn words(cx: &SelectCx<'_>, colors: &[ColorInput]) -> u64 {
     let srgb: Vec<ColorInput> = colors.iter().filter(|c| c.srgb).copied().collect();
     let snaps = self::uses(cx, &srgb);
     let snap = u64::from(3 * srgb::SEARCH_WORDS + 3 * srgb::STEP_WORDS) + 400;
+    // An alpha-in-red attachment's read moves its red to alpha: a shuffle and its zero.
+    let red: Vec<ColorInput> = colors.iter().filter(|c| c.alpha_red).copied().collect();
+    let moves = self::uses(cx, &red);
     let mut attachments: Vec<u32> = colors.iter().map(|c| c.color).collect();
     attachments.sort_unstable();
     attachments.dedup();
@@ -304,19 +329,26 @@ pub(super) fn words(cx: &SelectCx<'_>, colors: &[ColorInput]) -> u64 {
         .saturating_add(READ_WORDS.saturating_mul(uses))
         .saturating_add(u64::from(extended_range::DECODE_WORDS + 120).saturating_mul(decodes))
         .saturating_add(snap.saturating_mul(snaps))
+        .saturating_add(ALPHA_IN_RED_WORDS.saturating_mul(moves))
 }
+
+/// An upper estimate of the words [`alpha_in_red`] adds: the shuffle, and the zero vector's
+/// constant and type.
+pub(super) const ALPHA_IN_RED_WORDS: u64 = 16;
 
 /// Declare one input attachment per color index the plan reads, multisampled for a per-sample
 /// function (`multisampled`), or its storage image in the interlocked storage form (`fetch`), which
 /// holds the samples as its view states; the storage image of every other attachment in that form
-/// (one the function only writes); and the input attachment of every extended-range attachment
-/// whose blend the function computes over it (`input_blend`).
+/// (one the function only writes); the input attachment of every extended-range attachment whose
+/// blend the function computes over it (`input_blend`); and that of every word attachment whose
+/// word the function merges into the texel's (`word_input`), of `uint` texels.
 pub(super) fn declare(
     mb: &mut ModuleBuilder,
     colors: &[ColorInput],
-    (storage, blends): (
+    (storage, blends, merges): (
         &BTreeMap<u32, super::fetch::StorageColor>,
         &BTreeMap<u32, super::InputBlend>,
+        &BTreeMap<u32, u32>,
     ),
     multisampled: bool,
 ) -> BResult<BTreeMap<u32, GlobalId>> {
@@ -340,7 +372,11 @@ pub(super) fn declare(
             e.insert(super::fetch::declare(mb, color, sc)?);
         }
     }
-    for (&color, _) in blends.iter().filter(|(_, ib)| ib.blend.is_some()) {
+    let blended = blends
+        .iter()
+        .filter(|(_, ib)| ib.blend.is_some())
+        .map(|(&c, _)| c);
+    for color in blended.chain(merges.keys().copied()) {
         if let std::collections::btree_map::Entry::Vacant(e) = out.entry(color) {
             e.insert(input_attachment(mb, color, false, multisampled)?);
         }
@@ -411,6 +447,8 @@ pub(super) fn value(
             let byte = math::pack(fb, PackFormat::Unorm4x8Srgb, f4, texel, Some(table), test)?;
             math::unpack(fb, PackFormat::Unorm4x8Srgb, f4, byte, Some(table))?
         }
+        // The image's red, Metal's alpha: `(0, 0, 0, r)`.
+        None if c.alpha_red => alpha_in_red(fb, texel)?,
         None => texel,
     };
     let x = match c.form.lanes {
@@ -423,6 +461,18 @@ pub(super) fn value(
     };
     let x = ops::mask(fb, c.form, x)?;
     narrow::round(fb, c.form, x)
+}
+
+/// Metal's texel of an `A8Unorm` attachment whose image holds Metal's alpha in red, from the
+/// image's `texel` (a `vec4`, `(r, 0, 0, 1)`): `(0, 0, 0, r)`, as Metal reads such an attachment
+/// (probe `a8`'s uses on an M3 Max under macOS 27.0.1: a fetch of the byte 153 is
+/// `(0, 0, 0, 0.6)`, a scalar or two-lane fetch its leading lanes).
+pub(super) fn alpha_in_red(fb: &mut FunctionBuilder<'_>, texel: SValue) -> BResult<SValue> {
+    let f32_ = fb.module().ty(SType::Float { width: 32 })?;
+    let vec4 = fb.module().ty(SType::Vector { elem: f32_, len: 4 })?;
+    let zero = fb.module().constant(Constant::Null { ty: vec4 })?;
+    let zero = fb.module().const_value(zero)?;
+    fb.vector_shuffle(zero, texel, &[0, 1, 2, 4])
 }
 
 /// The texel of color `color`'s input attachment, as the image reads it: at the calling

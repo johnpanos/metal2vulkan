@@ -888,7 +888,7 @@ fn products_record_their_precision() {
 /// Every matrix kernel compiles, links, relocates, and passes L3 on every committed profile
 /// exactly where its cross-lane class (a shuffle with a product, the lane alone for blocks) has
 /// a compute tier, and elsewhere is refused as that tier is (`matrix_mixed`'s five buffers fit
-/// `vk12-bare`'s four storage buffers per stage through a uniform view). The plan's size estimate
+/// `vk12-floor`'s four storage buffers per stage through a uniform view). The plan's size estimate
 /// bounds the emitted words.
 #[test]
 fn matrix_kernels_compile_or_refuse_with_the_tier() {
@@ -1394,7 +1394,7 @@ fn matrices_held_as_fragments_count_their_two_elements() {
 /// `n = load(b0, 8)`, `r = m·n + 1`, `store(r, tg, 8)`, `q = load(tg, 8, (1, 2), transposed)`,
 /// `store(q, b1, s, (ox, oy))` and `store(r, b1 + 64, 16, (3, 1), transposed)`. With `legacy`,
 /// each block operation is the AIR 2.7 call `xcrun metal` 32023.921 writes for macOS 15
-/// (`-std=metal3.0`); without, the AIR 2.8 operands it writes for macOS 26 (EV `GSM-probe1-m4`).
+/// (`-std=metal3.0`); without, the AIR 2.8 operands it writes for macOS 26.
 fn legacy_pair_kernel(name: &str, legacy: bool) -> String {
     let p1 = "ptr addrspace(1)";
     let p3 = "ptr addrspace(3)";

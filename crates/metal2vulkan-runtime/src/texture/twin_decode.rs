@@ -8,14 +8,17 @@
 //! **The thread.** One per device, started with its first job ([`TwinDecodes::start`]), takes
 //! the jobs in the order they were queued, so a later write's texels land in a twin after an
 //! earlier one's. Each job decodes its region in bands of at most [`BAND_BYTES`] of texels, each
-//! band's block rows split over up to [`THREADS`] threads ([`decode_band`]), and copies each band
+//! band's rows split over up to [`THREADS`] threads ([`decode_band`]; a PVRTC image's bands read
+//! all of its blocks, `TwinDecode::whole_levels`), and copies each band
 //! into the twin as the twin's copies go (on the host, or on the staging queue, waited for). A
 //! new texture's start, the zero blocks' decode, is a constant fill there.
 //!
 //! **Who waits.** The scheduler holds each batch whose footprint names a texture with a job
 //! queued or running until its jobs finished (`Scheduler::decode_queued`), so the first GPU work
 //! that may read the twin waits, and nothing else; a job of an untracked texture, whose uses no
-//! footprint names, holds every batch. The call waits for nothing but room (the owner's rule:
+//! footprint names, holds every batch. A job's end opens a trail (`trails.rs`) that closes once
+//! the thread dropped the job, which holds the image and so the device: a wait for a command
+//! buffer that read the twin returns only then. The call waits for nothing but room (the owner's rule:
 //! Metal's `replaceRegion` is an unsynchronized CPU write and never waits for GPU work): a batch
 //! already submitted that reads the texture reads the twin as the thread's copies stand when it
 //! runs. A CPU read of the texture reads its blocks and waits for nothing.
@@ -27,8 +30,8 @@ use super::super::copy_plan::ImageRegion;
 use super::super::device::lock;
 use super::super::error::{Error, MemoryKind};
 use super::super::exit_guard;
+use super::decoded_twin::TwinDecode;
 use super::Image;
-use metal2vulkan::bind::BlockDecode;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -192,12 +195,12 @@ fn run(shared: &Shared) {
             shared.done.notify_all();
             return;
         };
-        match covered {
-            true => job.image.skip_twin_decode(),
-            false => job
-                .image
-                .finish_twin_decode(&job.region, job.blocks.as_deref()),
+        if !covered {
+            job.image
+                .finish_twin_decode(&job.region, job.blocks.as_deref());
         }
+        // The batches that wait for it may go; the trail closes once the job went.
+        let trail = job.image.twin_decoded();
         drop(busy);
         {
             let mut queue = lock(&shared.queue);
@@ -205,48 +208,48 @@ fn run(shared: &Shared) {
         }
         shared.done.notify_all();
         // Last: it may be the image's last hold, and with it the device's, whose drop stops this
-        // thread.
+        // thread; then the trail.
         drop(job);
+        drop(trail);
     }
 }
 
-/// Decode `blocks`, the block rows of a band `width` x `height` texels of one image, into
-/// `texels` (exactly its texels), split over up to [`THREADS`] threads of at least
-/// [`ROWS_PER_THREAD`] block rows each; this thread takes its share. A thread the host does not
-/// start leaves its share to the others.
+/// Decode rows `first` to `first + rows` of one image `width` x `height` texels, whose blocks
+/// are `blocks` (all of the image's), into `texels` (exactly the rows' texels), split over up to
+/// [`THREADS`] threads of at least [`ROWS_PER_THREAD`] block rows each (`TwinDecode::decode_rows`:
+/// a block decode's shares start at a block row, as `first` does); this thread takes its share. A
+/// thread the host does not start leaves its share to the others.
 pub(super) fn decode_band(
-    decode: BlockDecode,
+    decode: TwinDecode,
     blocks: &[u8],
-    [width, height]: [u32; 2],
+    size: [u32; 2],
+    [first, rows]: [u32; 2],
     texels: &mut [u8],
 ) {
-    let down = height.div_ceil(4) as usize;
-    let across = width.div_ceil(4) as usize;
-    let block = decode.block_bytes() as usize;
-    let row = width as usize * decode.texel_bytes() as usize;
+    let bh = decode.block_extent()[1];
+    let row = size[0] as usize * decode.texel_bytes() as usize;
     let host = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let down = rows.div_ceil(bh) as usize;
     let threads = host.min(THREADS).min(down / ROWS_PER_THREAD).max(1);
     if threads == 1 {
-        decode.decode_into(blocks, [width, height, 1], texels);
+        decode.decode_rows(blocks, size, [first, rows], texels);
         return;
     }
-    // Each share: its block rows' blocks, its texel rows' bytes, and its height.
-    let per = down.div_ceil(threads);
+    // Each share: its first row, its texel rows' bytes, and its rows, whole block rows.
+    let per = (down.div_ceil(threads) as u32) * bh;
     let mut shares = Vec::with_capacity(threads);
     let mut rest = texels;
-    for first in (0..down).step_by(per) {
-        let rows = per.min(down - first);
-        let h = (rows * 4).min(height as usize - first * 4);
-        let (mine, after) = rest.split_at_mut(h * row);
+    for at in (0..rows).step_by(per as usize) {
+        let h = per.min(rows - at);
+        let (mine, after) = rest.split_at_mut(h as usize * row);
         rest = after;
-        let span = first * across * block..(first + rows) * across * block;
-        shares.push(Mutex::new(Some((&blocks[span], mine, h as u32))));
+        shares.push(Mutex::new(Some((first + at, mine, h))));
     }
     let next = AtomicUsize::new(0);
     let work = || {
         while let Some(share) = shares.get(next.fetch_add(1, Ordering::Relaxed)) {
-            if let Some((blocks, texels, h)) = lock(share).take() {
-                decode.decode_into(blocks, [width, h, 1], texels);
+            if let Some((y, texels, h)) = lock(share).take() {
+                decode.decode_rows(blocks, size, [y, h], texels);
             }
         }
     };

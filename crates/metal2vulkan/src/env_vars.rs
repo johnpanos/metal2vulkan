@@ -40,8 +40,24 @@ pub const REGISTRY: &[EnvVar] = &[
         effect: "metal2vulkan-runtime's diagnostics: one line per render VkPipeline a device \
                  makes, through the device's message sink or on stderr: its state, its key, the \
                  key's fields that differ from the state's closest earlier pipeline, and the \
-                 creation's time, split by MoltenVK's activities where its performance tracking \
-                 is on (MVK_CONFIG_PERFORMANCE_TRACKING=1); set to anything but empty or 0",
+                 creation's time, split by the making's parts (the digests, each library made \
+                 with its record loaded or missed or another caller's, the link) and by \
+                 MoltenVK's activities where its performance tracking is on \
+                 (MVK_CONFIG_PERFORMANCE_TRACKING=1); and once per reason, why a draw \
+                 that reads its own pass's color attachment after a barrier took the split rather \
+                 than a snapshot, and how many such draws the snapshot's area rule weighed at each \
+                 share of their colors' pixels and texel bytes; set to anything but empty or 0",
+    },
+    EnvVar {
+        name: "METAL2VULKAN_LOG_MEMORY",
+        default: "unset (off)",
+        effect: "metal2vulkan-runtime's diagnostics: one line per VkDeviceMemory a device \
+                 allocates, imports or frees, through the device's message sink or on stderr: \
+                 its kind, handle, memory type, bytes, host address (an import's) and device \
+                 address range, to place a GPU fault's address; and one line per placement of \
+                 4 MiB or more in a pooled block as it is placed and returned: image or buffer, \
+                 its memory class (placed), bytes, offset and block, to show what makes and \
+                 frees blocks; set to anything but empty or 0",
     },
 ];
 
@@ -73,6 +89,15 @@ pub fn lane_validation() -> Option<OsString> {
 /// neither empty nor `0`. A default-off diagnostic: it changes no pipeline, only what is printed.
 pub fn log_pipelines() -> bool {
     std::env::var_os("METAL2VULKAN_LOG_PIPELINES")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Whether metal2vulkan-runtime logs each `VkDeviceMemory` a device allocates, imports or frees,
+/// and each placement of 4 MiB or more in a pooled block (`REGISTRY`): set, and neither empty nor
+/// `0`. A default-off diagnostic: it changes no
+/// allocation, only what is printed.
+pub fn log_memory() -> bool {
+    std::env::var_os("METAL2VULKAN_LOG_MEMORY")
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 

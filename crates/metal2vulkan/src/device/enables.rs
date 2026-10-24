@@ -29,7 +29,7 @@ use crate::device::derive::Device;
 use crate::device::description::DeviceDescription;
 use crate::device::policy::{ContainmentPolicy, DevicePolicy};
 use crate::device::requirements::{
-    ApiVersion, Requirements, StageCreateFlag, VkExtension, VkFeature,
+    ApiVersion, Requirements, StageCreateFlag, VkExtension, VkFeature, WITHOUT_FORMAT_CAPABILITIES,
 };
 use crate::error::{Capability, DescriptorError, Error};
 use crate::vk;
@@ -205,12 +205,13 @@ exposures! {
         ShaderUniformBufferArrayDynamicIndexing, ShaderSampledImageArrayDynamicIndexing,
         ShaderStorageBufferArrayDynamicIndexing, ShaderStorageImageArrayDynamicIndexing,
         MultiViewport, DepthBiasClamp, ShaderResourceResidency, OcclusionQueryPrecise,
-        FullDrawIndexUint32,
+        FullDrawIndexUint32, ShaderTessellationAndGeometryPointSize,
     ];
     // `VkPhysicalDeviceVulkan11Features`.
     Core(v(1)) => [
         StorageBuffer16BitAccess, UniformAndStorageBuffer16BitAccess, StoragePushConstant16,
         StorageInputOutput16, Multiview, ShaderDrawParameters, MultiviewTessellationShader,
+        MultiviewGeometryShader,
     ];
     // `VkPhysicalDeviceVulkan12Features`.
     Core(v(2)) => [
@@ -280,10 +281,12 @@ exposures! {
     ];
     Extension(&[E::KhrShaderMaximalReconvergence]) => [ShaderMaximalReconvergence];
     Extension(&[E::KhrShaderQuadControl]) => [ShaderQuadControl];
+    Extension(&[E::ExtAttachmentFeedbackLoopLayout]) => [AttachmentFeedbackLoopLayout];
+    Extension(&[E::ExtExtendedDynamicState3]) => [ExtendedDynamicState3ColorWriteMask];
     Extension(&[E::KhrShaderSubgroupUniformControlFlow]) => [ShaderSubgroupUniformControlFlow];
     Extension(DERIVATIVES) => [ComputeDerivativeGroupQuads, ComputeDerivativeGroupLinear];
     Extension(&[E::KhrMaintenance8]) => [Maintenance8];
-    Extension(&[E::KhrShaderFma]) => [ShaderFmaFloat32];
+    Extension(&[E::KhrShaderFma]) => [ShaderFmaFloat16, ShaderFmaFloat32];
     Extension(BORDER_SWIZZLE) => [BorderColorSwizzle, BorderColorSwizzleFromImage];
     Extension(&[E::ExtDepthBiasControl]) => [DepthBiasControl, FloatRepresentation, DepthBiasExact];
     Extension(&[E::ExtDepthClipEnable]) => [DepthClipEnable];
@@ -347,6 +350,8 @@ fn facts(ext: VkExtension) -> ExtensionFacts {
         | E::ExtDepthClampControl
         | E::ExtSampleLocations
         | E::ExtPrimitiveTopologyListRestart
+        | E::ExtAttachmentFeedbackLoopLayout
+        | E::ExtExtendedDynamicState3
         | E::ImgFormatPvrtc
         | E::KhrPortabilitySubset
         | E::ExtShaderAtomicFloat => fact(true, None, &[]),
@@ -364,6 +369,9 @@ fn facts(ext: VkExtension) -> ExtensionFacts {
         | E::KhrMaintenance4
         | E::KhrSynchronization2
         | E::ExtTextureCompressionAstcHdr => fact(true, Some(3), &[]),
+        // The core reads it directly: a storage access without a format by the format's own bits
+        // (`DeviceProfile::without_format_by_format_bits`).
+        E::KhrFormatFeatureFlags2 => fact(true, Some(3), &[]),
         E::KhrDynamicRenderingLocalRead | E::KhrMaintenance5 => {
             fact(true, Some(4), DYNAMIC_RENDERING_BELOW_1_3)
         }
@@ -480,6 +488,11 @@ pub const FEATURE_NEEDS: &[(VkFeature, VkFeature, &str)] = &[
         VkFeature::MultiviewTessellationShader,
         VkFeature::Multiview,
         "VUID-VkPhysicalDeviceMultiviewFeatures-multiviewTessellationShader-00581",
+    ),
+    (
+        VkFeature::MultiviewGeometryShader,
+        VkFeature::Multiview,
+        "VUID-VkPhysicalDeviceMultiviewFeatures-multiviewGeometryShader-00580",
     ),
 ];
 
@@ -721,7 +734,9 @@ impl DeviceDescription {
     /// member (stage create flags add theirs), each one's exposing extension below its core
     /// version, the required extensions, the extension exposing each required format below its
     /// core version, `VK_KHR_portability_subset` where the description lists it, and every
-    /// extension those require.
+    /// extension those require. A storage capability without a format (`Requirements` lists it
+    /// without a feature) takes `shaderStorageImage{Read,Write}WithoutFormat` where the
+    /// description lists it, nothing at Vulkan 1.3, else `VK_KHR_format_feature_flags2`.
     ///
     /// Errors: the first capability the description lacks (the API version, a feature, or an
     /// extension, the one a missing exposure or requirement names first). Properties, limits,
@@ -753,6 +768,24 @@ impl DeviceDescription {
             out.extensions.extend(pick(x.extensions_at(api)));
             if x.has_member(api) {
                 out.features.insert(f);
+            }
+        }
+        for (capability, feature) in WITHOUT_FORMAT_CAPABILITIES {
+            if !requirements.spirv_capabilities.contains(&capability) {
+                continue;
+            }
+            if self.has(feature) {
+                let x = feature.exposure();
+                out.extensions.extend(pick(x.extensions_at(api)));
+                if x.has_member(api) {
+                    out.features.insert(feature);
+                }
+            } else if api < ApiVersion::V1_3 {
+                let flags2 = VkExtension::KhrFormatFeatureFlags2;
+                if !self.extensions.contains(&flags2) {
+                    return Err(Capability::Feature(feature));
+                }
+                out.extensions.insert(flags2);
             }
         }
         out.extensions

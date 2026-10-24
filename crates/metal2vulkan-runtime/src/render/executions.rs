@@ -3,8 +3,8 @@
 //!
 //! - **When.** As a compute encoder's (`indirect_execute.rs`), an execution runs the records as
 //!   they stand when the command buffer is committed: Metal's sees CPU writes made after the
-//!   call and before commit (probe `RT7-icb-probe6`), and the GPU's writes before it where an
-//!   encoder made the buffer resident for writing. So the call records nothing for the commands:
+//!   call and before commit, and the GPU's writes before it where an encoder made the buffer
+//!   resident for writing. So the call records nothing for the commands:
 //!   the instance it is encoded in ends its secondary command buffer there and goes on in a new
 //!   one, the execution's own secondary standing between the two ([`Piece`](super::Piece)).
 //!   A secondary command buffer must be recorded before a primary executes it, so a pass with an
@@ -61,35 +61,34 @@
 //!   counted in the execution report), and an unset buffer reads zero, as Metal's did. A command
 //!   with no draw, no pipeline state, no vertices, indices, patches or instances runs nothing, and
 //!   its neighbours run.
-//! - **Indexed and patch draws** (probe `RT7-icb-probe7-m4`). Their index, patch index
-//!   and tessellation factor buffers are addresses too, resolved as the buffers are, so one of
-//!   its own that no encoder made resident draws, as Metal drew from an index buffer it did not
-//!   hold resident; a miss runs nothing and counts. Indices past the index buffer draw as the
-//!   encoder's. A patch draw takes its own factor buffer, never the encoder's, and its pipeline's
-//!   control points whatever the record holds, as Metal's did.
+//! - **Indexed and patch draws**. Their index, patch index and tessellation factor buffers are
+//!   addresses too, resolved as the buffers are, so one of its own that no encoder made resident
+//!   draws, as Metal drew from an index buffer it did not hold resident; a miss runs nothing and
+//!   counts. Indices past the index buffer draw as the encoder's. A patch draw takes its own factor
+//!   buffer, never the encoder's, and its pipeline's control points whatever the record holds, as
+//!   Metal's did.
 //! - **Control-point indices** (probes, an M4). An indexed patch draw reads them as the encoder's
 //!   `draw_indexed_patches` does, of its pipeline's index type, from its control-point index
 //!   buffer, an address resolved as the others are; as Metal's did, an index past that buffer's end
 //!   reads 0, and so does every index without a buffer (a null one, or a plain patch draw on a
 //!   pipeline with an index type); an indexed patch draw on a pipeline without one draws the
 //!   patches' own control points. An offset that is not a multiple of the index size is read from
-//!   the offset rounded down to one, as Metal reads it (EVs ICBV-ipatch2-m3 and -m4; probe 9b's
-//!   offsets read out of the control points' range so).
-//! - **A patch draw's factor scale** (probe `RT7-icb-probe8-m4`, an M4). Metal multiplies
-//!   the factors by a kernel's scale whatever the pipeline, though a state made with
-//!   `supportIndirectCommandBuffers` never enables the scale: 2 drew what factors of 2 draw, 0.5
-//!   what factors of 0.5 draw (integer partitioning rounds it up to 1), and 0, -1 and NaN drew
-//!   nothing. Metal rounds the scale to `half` first (EVs ICBV-scale-m3 and -m4, the M3 Max and
-//!   the M4 alike): 1.0004 drew what 1 draws, 1.3 and 2.0005 what 2 draws, a scale subnormal as a
-//!   `half` what its product draws, one infinite as a `half` (70000, `+∞`) what the maximum factor
-//!   draws, and one that is 0 as a `half` (2^-30) nothing. So a scale that is not positive, or is
-//!   0 as a `half`, runs nothing, and one that is another `half` than 1 draws on the state's
-//!   factor-scaling twin (`GraphicsState::factor_scaling`) with the encoder's scale the
+//!   the offset rounded down to one, as Metal reads it (probe 9b's offsets read out of the control
+//!   points' range so).
+//! - **A patch draw's factor scale** (an M4). Metal multiplies the factors by a kernel's scale
+//!   whatever the pipeline, though a state made with `supportIndirectCommandBuffers` never enables
+//!   the scale: 2 drew what factors of 2 draw, 0.5 what factors of 0.5 draw (integer partitioning
+//!   rounds it up to 1), and 0, -1 and NaN drew nothing. Metal rounds the scale to `half` first
+//!   (the M3 Max and the M4 alike): 1.0004 drew what 1 draws, 1.3 and 2.0005 what 2 draws, a scale
+//!   subnormal as a `half` what its product draws, one infinite as a `half` (70000, `+∞`) what the
+//!   maximum factor draws, and one that is 0 as a `half` (2^-30) nothing. So a scale that is not
+//!   positive, or is 0 as a `half`, runs nothing, and one that is another `half` than 1 draws on
+//!   the state's factor-scaling twin (`GraphicsState::factor_scaling`) with the encoder's scale the
 //!   command's, as the encoder's scale multiplies the factors (the binder rounds it to `half`);
 //!   the twin is made the first time a command asks for it.
-//! - **Visibility results** (EVs RFL-visprobe2-m3 and -m4). Metal counts the commands' draws in the
-//!   mode set at the call, as the encoder's draws (`Boolean` 1, `Counting` their samples, nothing
-//!   while `Disabled`). The call ends the active query in the secondary before the execution's and
+//! - **Visibility results**. Metal counts the commands' draws in the mode set at the call, as the
+//!   encoder's draws (`Boolean` 1, `Counting` their samples, nothing while `Disabled`). The call
+//!   ends the active query in the secondary before the execution's and
 //!   begins a continuation of its offset in the one after it, and lends the execution a third query
 //!   of the same offset (`visibility::Lent`), which its recording begins in its secondary before
 //!   the first command and ends after the last; the three combine as any continuations do. A
@@ -99,15 +98,14 @@
 //!   fragment without Metal's depth attachment, every command of the buffer for a range read from
 //!   one. The recording begins and ends each spare it takes as the encoder's own continuations, and
 //!   every other one empty after the last command, counting nothing.
-//! - **One start, two lengths** (EVs RFL-execprobe, -execprobe2 and -execprobe3, on an Apple M3 Max
-//!   and an Apple M4). Where an encoder executes one buffer's commands from a command it executed
-//!   them from before with another length, ranges given or read from a buffer alike, Metal's
-//!   executions do not each run their own range: one may run the other's length, and the commands
-//!   that run change from run to run of the same program. No stable answer exists, so each
-//!   execution runs its own range, as Metal documents, and the device announces it once
-//!   (`Degradation::RepeatedExecutionStart`), naming the buffer, the command and both lengths:
-//!   at the call for two ranges given, at the host step for a range read from a buffer. A
-//!   compute encoder's executions run their own ranges on Metal too.
+//! - **One start, two lengths** (on an Apple M3 Max and an Apple M4). Where an encoder executes one
+//!   buffer's commands from a command it executed them from before with another length, ranges
+//!   given or read from a buffer alike, Metal's executions do not each run their own range: one may
+//!   run the other's length, and the commands that run change from run to run of the same program.
+//!   No stable answer exists, so each execution runs its own range, as Metal documents, and the
+//!   device announces it once (`Degradation::RepeatedExecutionStart`), naming the buffer, the
+//!   command and both lengths: at the call for two ranges given, at the host step for a range read
+//!   from a buffer. A compute encoder's executions run their own ranges on Metal too.
 //! - **Tile threadgroup memory** (`render/tile_memory.rs`). A command whose fragment function reads
 //!   its threadgroup arguments reaches the pass's buffer of every tile's memory, with the arguments
 //!   the encoder set at the call, as the encoder's draws do; the pass's buffer moves into the
@@ -119,18 +117,17 @@
 //!   call) is given the passes of such runs as it ends (`RunPasses`), and the encoder's draws that
 //!   reach the memory after the call record into a new instance. A memoryless attachment keeps its
 //!   texels across the runs (below).
-//! - **A command's barrier** (EV RFC-probe3-m4, an M4). Plain Metal orders a command whose barrier
-//!   is set after the draws before it, their writes visible to it, where its validation stops
-//!   `setBarrier` on a buffer without mesh draws. Such a command's draw records into the
-//!   execution's next run, as one ordered after a draw that reached the tile memory does, where the
-//!   CPU set a barrier of the buffer before the encoder ended (the instance then has its
-//!   `RunPasses`); a barrier set later refuses the commit `NotImplemented(IndirectRenderCommands)`.
-//!   The barrier does not order the earlier draws' fragments before the command's vertex, object
-//!   and mesh functions (EVs IRX-fgeo-m3 and -m4, the M3 Max and an M4): those read the buffers of
-//!   their tables from before the pass where a fragment stage of it wrote them, from a copy the
-//!   recording takes before the pass (`render/pass_start_reads.rs`), starting from what the
-//!   encoder's draws before the call noted.
-//! - **An emulated mesh command after a draw it depends on** (EV IRX-mfrag-m4, an M4). On a device
+//! - **A command's barrier** (an M4). Plain Metal orders a command whose barrier is set after the
+//!   draws before it, their writes visible to it, where its validation stops `setBarrier` on a
+//!   buffer without mesh draws. Such a command's draw records into the execution's next run, as one
+//!   ordered after a draw that reached the tile memory does, where the CPU set a barrier of the
+//!   buffer before the encoder ended (the instance then has its `RunPasses`); a barrier set later
+//!   refuses the commit `NotImplemented(IndirectRenderCommands)`. The barrier does not order the
+//!   earlier draws' fragments before the command's vertex, object and mesh functions (the M3 Max
+//!   and an M4): those read the buffers of their tables from before the pass where a fragment stage
+//!   of it wrote them, from a copy the recording takes before the pass
+//!   (`render/pass_start_reads.rs`), starting from what the encoder's draws before the call noted.
+//! - **An emulated mesh command after a draw it depends on** (an M4). On a device
 //!   that emulates mesh draws (`render/mesh.rs`), a command's object and mesh functions run as
 //!   compute dispatches, recorded before the pass, as Metal runs them before the fragments of every
 //!   earlier draw of the pass: they read none of those fragments' writes, behind the command's
@@ -142,7 +139,7 @@
 //!   other stages touched without the command's barrier (unordered on Metal, or ordered by a
 //!   barrier of the encoder the execution does not see) or beside reading an earlier fragment's
 //!   write.
-//! - **A command of another instance's shape** (EVs RFL-inst-m3 and -m4: Metal draws a command that
+//! - **A command of another instance's shape** (Metal draws a command that
 //!   fetches its color attachment, writes the stencil in the shader, reaches a fragment imageblock,
 //!   or is amplified, as the encoder's own draw of it). The execution's instance is one of no
 //!   fetched attachments, shader-side stencil or views. A command whose draw leaves attachments it
@@ -165,7 +162,7 @@
 //!   several taking a framebuffer of it. Where the pass reads such an attachment past its instances
 //!   (its sample planes, a color resolve drawn after the pass, a depth/stencil resolve), the commit
 //!   is refused `NotImplemented(IndirectRenderCommands)`.
-//! - **A fetched attachment's stand-in or sample planes** (EVs RFL-inst-m3 and -m4). A run whose
+//! - **A fetched attachment's stand-in or sample planes**. A run whose
 //!   draws read and write attachments in the pixel interlock elsewhere than the pass's instances
 //!   render them has its steps around it (`RunSteps`), as the encoder's instances of such draws do
 //!   (`render/pass_steps.rs`): the copies from the image the instances render such an attachment
@@ -177,7 +174,7 @@
 //!   between barriers, so the run reads what the draws before it rendered and the draws after it
 //!   read what it wrote. The scratch and planes a command's draw made are held until the command
 //!   buffer completes and announced as the encoder's (`fetch-through-scratch`, `sample-planes`).
-//! - **A fetched attachment's stand-in through input attachments** (EVs RFL-inst-m3 and -m4 for
+//! - **A fetched attachment's stand-in through input attachments** (for
 //!   Metal's answer). Where the device reads fetched attachments as input attachments (lavapipe), a
 //!   command whose draw reads one whose image takes no input attachment usage (a caller's image,
 //!   `texture/wrapped.rs`) makes a stand-in that has it, as the encoder's draw does, which makes
@@ -185,27 +182,25 @@
 //!   framebuffer holds the stand-in in place of the image the pass's instances render
 //!   (`Run::framed`), copied from that image before the run and back after it between barriers
 //!   (`RunSteps`), as around a run of the pixel interlock's scratch.
-//! - **Metal's hidden depth and stencil** (EVs IRX-hidden6-m4, an M4, and IRX-hidden7-m3, an M3
-//!   Max, commands alone). In a pass without a depth or a stencil attachment, a command's draw
-//!   tests and writes the hidden depth and stencil Metal gives such a pass under the encoder's
-//!   state at the call, as the encoder's own draw then would: shared with the encoder's draws
-//!   before and after it, each command's write seen by the next. Plain Metal draws every order so,
-//!   and its validation stops the encoder's draws among them, not the commands. Where the state at
-//!   the call needs them, the call gives the pass them, so the execution's instance holds them;
-//!   where the pass can take none (an attachment of the other aspect, no color attachment, a rate
-//!   map), a command's draw that needs them is refused `NotImplemented(HiddenDepthStencil)`, as the
-//!   encoder's would be.
-//! - **A shader-side stencil** (EVs RFL-inst-m3 and -m4: Metal draws a command that writes
-//!   `[[stencil]]` as the encoder's own draw). On a device without `VK_EXT_shader_stencil_export`
-//!   such a draw tests and writes a shadow of the stencil in the shader (`shadow_stencil.rs`), in
-//!   an instance of its own. Such a command records into the execution's next run, as one of
-//!   another shape does, and the next of the instance's kind begins another; the pass copies the
-//!   stencil into the shadow before the run and back after it, as around an encoder's instance of
-//!   such draws. The shadow is the encoder's, or one a command's draw made, whose copies' uses the
-//!   pass then gains, held until the command buffer completes and announced
-//!   (`shader-side-stencil`). Such a run is never its instance's first or last: the execution's
-//!   first run and what follows it in the instance bound it.
-//! - **A fragment imageblock** (EVs RFL-inst-m3 and -m4: Metal draws a command that reaches it as
+//! - **Metal's hidden depth and stencil** (an M4, and an M3 Max, commands alone). In a pass without
+//!   a depth or a stencil attachment, a command's draw tests and writes the hidden depth and
+//!   stencil Metal gives such a pass under the encoder's state at the call, as the encoder's own
+//!   draw then would: shared with the encoder's draws before and after it, each command's write
+//!   seen by the next. Plain Metal draws every order so, and its validation stops the encoder's
+//!   draws among them, not the commands. Where the state at the call needs them, the call gives the
+//!   pass them, so the execution's instance holds them; where the pass can take none (an attachment
+//!   of the other aspect, no color attachment, a rate map), a command's draw that needs them is
+//!   refused `NotImplemented(HiddenDepthStencil)`, as the encoder's would be.
+//! - **A shader-side stencil** (Metal draws a command that writes `[[stencil]]` as the encoder's
+//!   own draw). On a device without `VK_EXT_shader_stencil_export` such a draw tests and writes a
+//!   shadow of the stencil in the shader (`shadow_stencil.rs`), in an instance of its own. Such a
+//!   command records into the execution's next run, as one of another shape does, and the next of
+//!   the instance's kind begins another; the pass copies the stencil into the shadow before the run
+//!   and back after it, as around an encoder's instance of such draws. The shadow is the encoder's,
+//!   or one a command's draw made, whose copies' uses the pass then gains, held until the command
+//!   buffer completes and announced (`shader-side-stencil`). Such a run is never its instance's
+//!   first or last: the execution's first run and what follows it in the instance bound it.
+//! - **A fragment imageblock** (Metal draws a command that reaches it as
 //!   the encoder's own draw). A command whose fragment function reaches the fragment imageblock
 //!   draws in the run it falls in, over the pass's storage (`fragment_imageblock.rs`): the
 //!   encoder's, or one an earlier command's draw made, which the pass clears before its first
@@ -229,9 +224,9 @@
 //!   which the encoder's `draw_patches` refuses (Metal's GPU-written command reads past it:
 //!   unmeasured), runs nothing (`RECORD`). An index buffer, a patch index buffer and a
 //!   control-point index buffer at an offset that is not a multiple of its index size (4 for patch
-//!   indices) are read from the offset rounded down to one, as Metal reads them (probe
-//!   `RT7-icb-probe7-m4`). A range read from a buffer whose location lies past the size, or that
-//!   passes `2^32 - 1`, runs nothing (`RANGE`): Metal's GPU faults the command buffer.
+//!   indices) are read from the offset rounded down to one, as Metal reads them. A range read from
+//!   a buffer whose location lies past the size, or that passes `2^32 - 1`, runs nothing (`RANGE`):
+//!   Metal's GPU faults the command buffer.
 //! - **What is refused.** At the call (`Invalid`): a buffer of another device, a range past the
 //!   size, an inherited pipeline state that is unset or made without
 //!   `supportIndirectCommandBuffers` (Metal's validation stops each), and a range read from a
@@ -254,6 +249,7 @@ use super::bound::Bound;
 use super::mesh::MeshGrid;
 use super::pass_start_reads::{PassStartReads, PassStartTables};
 use super::pass_steps::PassSteps;
+use super::pending_tile::TilePipelines;
 use super::shadows::InstanceShadows;
 use super::tile_memory::TileMemory;
 use super::RenderCall;
@@ -269,6 +265,7 @@ use crate::blit::reads;
 use crate::buffer::Buffer;
 use crate::command_buffer::CommandBuffer;
 use crate::degradation::{Degradation, SplitCauses};
+use crate::device::functions::Vk;
 use crate::device::lock;
 use crate::encoder::{EncoderCore, RecordedSegment};
 use crate::error::{internal, invalid, vulkan, Error, Problem, RuntimeGap};
@@ -277,20 +274,24 @@ use crate::fragment_imageblock::PassImageblock;
 use crate::indirect_command_buffer::{IndirectCommandBuffer, IndirectCommandBufferProblem, Reader};
 use crate::indirect_dispatch;
 use crate::indirect_execute::{self, ExecutionRange};
+use crate::pipeline::budget::Urgency;
 use crate::pipeline::RenderPipelineState;
 use crate::pipeline::Settled;
 use crate::pipeline::{BufferForms, FixedState, GraphicsKey, RawPipeline, RenderVariant};
 use crate::rate_mapped_pass::RateMappedPass;
 use crate::render_pass::{ColorTarget, PassLayout, Target};
 use crate::render_state::EncoderState;
-use crate::render_target::{self, PassShape, Position, RenderPassObject};
+use crate::render_target::{self, Feedback, PassShape, Position, RenderPassObject};
 use crate::residency::{every_render_stage, Residency};
 use crate::resource::ResourceKey;
 use crate::sample_planes::{PlanesCommands, PlanesStep};
+use crate::sampler::ArgumentSamplers;
 use crate::shadow::{self, ShadowUse};
 use crate::shadow_stencil::ShadowStencil;
 use crate::tessellation::{FactorBuffer, Factors};
-use crate::tracker::{Barrier, EncoderUses, Summary, UnorderedWrites, Use};
+use crate::tracker::{
+    Barrier, EncoderUses, GeometryWrites, IndirectReads, Summary, UnorderedWrites, Use,
+};
 use crate::visibility::{Lent, Visibility};
 use crate::Device;
 use ahead::Ahead;
@@ -334,19 +335,16 @@ impl RenderCommandEncoder {
     ///
     /// Refused, changing nothing (`Invalid`): a buffer of another device, a range that ends past
     /// its size (`IndirectCommandBufferProblem::Range`), and, for a range that is not empty, an
-    /// inherited pipeline state that is unset (`NoPipelineState`), at which Metal's process ends
-    /// (EV IRX-xfault2-m4 `fixed_one_nopipeline`). For a range that is not empty, an inherited
-    /// state made without `supportIndirectCommandBuffers` faults Metal's GPU at the encoder (EVs
-    /// CFR-probe1-m4 `fixed_one_reset_nosupport`, IRX-xfault1-m4 `fixed_one_nosupport`): the call
-    /// is taken, the encoder runs nothing, not even its load, clear or store actions, and the
-    /// command buffer completes with
-    /// [`CommandBufferError::PageFault`](crate::CommandBufferError::PageFault), the other encoders run
-    /// and every event signal fires. A buffer of no command types, or of dispatches beside draws of
-    /// primitives, runs nothing, as plain Metal's (EV RFC-probe2-m4 `t0_exec_render`,
-    /// `mixed_exec_render`); one of dispatches alone, or beside other draws (unmeasured in a pass),
-    /// is `NotImplemented(IndirectRenderCommands)`. An empty range runs nothing, whatever the
-    /// encoder's pipeline state, as plain Metal's (EV CFR-probe1-m4 `fixed_empty_nosupport`,
-    /// `fixed_empty_at_size_nosupport`, `fixed_empty_nopipeline`). What a command's draw would be
+    /// inherited pipeline state that is unset (`NoPipelineState`), at which Metal's process ends.
+    /// For a range that is not empty, an inherited state made without
+    /// `supportIndirectCommandBuffers` faults Metal's GPU at the encoder: the call is taken, the
+    /// encoder runs nothing, not even its load, clear or store actions, and the command buffer
+    /// completes with [`CommandBufferError::PageFault`](crate::CommandBufferError::PageFault), the
+    /// other encoders run and every event signal fires. A buffer of no command types, or of
+    /// dispatches beside draws of primitives, runs nothing, as plain Metal's; one of dispatches
+    /// alone, or beside other draws (unmeasured in a pass), is
+    /// `NotImplemented(IndirectRenderCommands)`. An empty range runs nothing, whatever the
+    /// encoder's pipeline state, as plain Metal's. What a command's draw would be
     /// refused refuses the commit ([`CommandBuffer::commit`]). Where a visibility result mode is
     /// set, the commands' draws count in it (the module docs).
     pub fn execute_commands_in_buffer(
@@ -369,6 +367,8 @@ impl RenderCommandEncoder {
         if range.is_empty() {
             return Ok(());
         }
+        // Not in a pass of several color groups (`render/color_groups.rs`).
+        self.check_group_execution()?;
         let pipeline = match self.inherited_pipeline(CALL, icb)? {
             Inherited::Faults => return Ok(()),
             Inherited::Commands => None,
@@ -393,17 +393,15 @@ impl RenderCommandEncoder {
     ///
     /// Refused, changing nothing: what
     /// [`execute_commands_in_buffer`](Self::execute_commands_in_buffer) refuses but a range (an
-    /// unset inherited state whatever the range, EV IRX-xfault2-m4 `indirect_empty_nopipeline`); a
-    /// range buffer of another device, and a range Metal's reading of is not defined (`Invalid`,
-    /// `IndirectCommandBufferProblem::RangeBuffer`): an offset that is not a multiple of 4 bytes,
-    /// at which Metal's GPU faulted, or 8 bytes that run past `range_buffer`, which Metal reads
-    /// from whatever follows it. A range a draw of the encoder
-    /// before the call may write is `NotImplemented(IndirectRenderCommands)`: Metal's execution
-    /// reads that draw's write, where the runtime's copy, made before the pass, would not; as for
-    /// the index bounds pass, an untracked buffer's writes are not seen. Under an inherited state
-    /// made without `supportIndirectCommandBuffers`, whatever the range, `{0, 0}` included, the
-    /// encoder faults as `execute_commands_in_buffer`'s does (EVs CFR-probe1-m4,
-    /// IRX-xfault1-m4 `indirect_empty_nosupport`, `indirect_one_nosupport`).
+    /// unset inherited state whatever the range); a range buffer of another device, and a range
+    /// Metal's reading of is not defined (`Invalid`, `IndirectCommandBufferProblem::RangeBuffer`):
+    /// an offset that is not a multiple of 4 bytes, at which Metal's GPU faulted, or 8 bytes that
+    /// run past `range_buffer`, which Metal reads from whatever follows it. A range a draw of the
+    /// encoder before the call may write is `NotImplemented(IndirectRenderCommands)`: Metal's
+    /// execution reads that draw's write, where the runtime's copy, made before the pass, would
+    /// not; as for the index bounds pass, an untracked buffer's writes are not seen. Under an
+    /// inherited state made without `supportIndirectCommandBuffers`, whatever the range, `{0, 0}`
+    /// included, the encoder faults as `execute_commands_in_buffer`'s does.
     pub fn execute_commands_in_buffer_indirect(
         &mut self,
         icb: &IndirectCommandBuffer,
@@ -419,6 +417,8 @@ impl RenderCommandEncoder {
             return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
         }
         indirect_execute::check_range_buffer(CALL_INDIRECT, range_buffer.length(), offset)?;
+        // Not in a pass of several color groups (`render/color_groups.rs`).
+        self.check_group_execution()?;
         let pipeline = match self.inherited_pipeline(CALL_INDIRECT, icb)? {
             Inherited::Faults => return Ok(()),
             Inherited::Commands => None,
@@ -443,9 +443,9 @@ impl RenderCommandEncoder {
     /// The pipeline state an execution of `icb` here runs with (`Inherited`). Where the
     /// encoder's, which `icb` inherits, was made without `supportIndirectCommandBuffers`,
     /// Metal's GPU faults the encoder, which runs nothing, and the command buffer completes with
-    /// `CommandBufferError::PageFault` (EVs CFR-probe1-m4, IRX-xfault1-m4): the encoder is
-    /// marked so (`EncoderCore::fault`). Refused (`Invalid`) for `call`: an inherited state that
-    /// is unset (`NoPipelineState`), at which Metal's process ends (EV IRX-xfault2-m4).
+    /// `CommandBufferError::PageFault`: the encoder is marked so (`EncoderCore::fault`). Refused
+    /// (`Invalid`) for `call`: an inherited state that is unset (`NoPipelineState`), at which
+    /// Metal's process ends.
     fn inherited_pipeline(
         &mut self,
         call: &'static str,
@@ -494,12 +494,20 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         self.sync_heaps();
         // An execution rewrites an extended-range or padded attachment as a draw does, of reset
-        // commands too (EV XRR2-x6j).
-        self.degrade_unused_bits();
+        // commands too, and a signed normalized one's minimum codes, and an
+        // `RGB9E5Float` one's words.
+        self.degrade_kept_attachments();
         self.rewrites_unused_bits = true;
         self.degrade_extended_range_execution();
         // Its commands write the extended-range colors' codes alone: the shadows end.
         self.end_extended_shadows();
+        // Commands that set their own depth/stencil states may write the depth: a depth over its
+        // magnitude stand-in is merged back (`texture/signed_depth.rs`).
+        self.depth_writes |= !icb.descriptor().inherit_depth_stencil_state;
+        // And its commands hand the device's pass the states they draw under: their own, which
+        // may write the depth, or the encoder's.
+        self.drew_depth_writes |=
+            !icb.descriptor().inherit_depth_stencil_state || self.state.depth_writes();
         // Where a visibility result mode is set, the commands' draws count in a query of their
         // own that continues the active offset, and the encoder's draws after them in another.
         let device = self.core.device().clone();
@@ -523,27 +531,47 @@ impl RenderCommandEncoder {
         let queries = self.visibility.lend(&device, spares)?;
         // The commands' draws test and write Metal's hidden depth and stencil under the state at
         // the call, as the encoder's own draw now would, shared with the encoder's draws before
-        // and after them (EV IRX-hidden6-m4): where the state needs them, the call gives the pass
+        // and after them: where the state needs them, the call gives the pass
         // them, so the execution's instance holds them. Where the pass can take none, the call
         // gives none, and a command's draw that needs them is refused as before
         // (`hidden_depth_stencil`); an execution of no such draw runs.
         let hidden = self.needed_hidden().ok().flatten();
+        // The draws before it are a piece of the instance it joins, or of the one it follows:
+        // the current one's secondary begins where the pass left it unbegun (`Instance::draws`).
+        self.begin_current_draws()?;
         // The commands draw into an instance of no fetched attachments, shader-side stencil or
         // views: the current one where it is such an instance and no tile dispatch or memory
         // barrier follows it, else a new one, as a draw of such a pipeline records.
-        let (next, stood) = self.next_instance(
+        // Not an instance recorded inline, which runs no secondary (`render/inline_first.rs`):
+        // a new one that continues it, where it would have taken them. Nor one whose colors are
+        // in the feedback loop layout, which runs as one render pass instance and whose
+        // descriptors of those colors name that layout (`render/snapshot.rs`): the commands read
+        // the attachments in place, in `GENERAL`.
+        let continues = self.current.inline
+            && self.takes_current(
+                (&[], &[], &[]),
+                (false, false),
+                ViewSetup::default(),
+                hidden.is_some(),
+            );
+        let apart = self.current.inline || self.current.feedback != Feedback::NONE;
+        let (mut next, stood) = self.next_instance(
             (&[], None),
             (false, false),
             ViewSetup::default(),
-            false,
+            apart,
             hidden,
             &[],
             &[],
         )?;
+        if let Next::New { instance, .. } = &mut next {
+            instance.continues = continues;
+        }
         let continuation = match &next {
             Next::New { split: true, .. } => self.visibility.continuation(&device)?,
             Next::New { .. } | Next::Current => None,
         };
+        self.begin_new_draws(&mut next)?;
         self.install(next, stood, continuation);
         let draws = self
             .core
@@ -606,6 +634,8 @@ impl RenderCommandEncoder {
             compatible: Arc::clone(&self.current.compatible),
             tile_memory: self.tile_memory.arguments(),
             tile_memory_reached: self.current.tile_memory,
+            indirect_reads: self.current.indirect_reads.clone(),
+            geometry_writes: self.current.geometry_writes.clone(),
             drawn: self.core.uses().tracked_in(PASS_DRAW_STAGES),
             pass_start: self.pass_start.notes(),
         };
@@ -634,11 +664,12 @@ impl RenderCommandEncoder {
                     overwrites: false,
                     kept: false,
                     area: None,
+                    loads: None,
                 };
                 shadow::join(&mut shadows, &used);
             }
         }
-        self.current.shadows.add(&shadows, &[]);
+        self.gathering().add(&shadows, &[]);
         // The bytes the commands may reach, so the copies between the pass's instances and as
         // the encoder ends keep what they read and write (`render/shadows.rs`): the resident
         // buffers and heaps, writing where their usage may, and the encoder's buffers where the
@@ -653,7 +684,7 @@ impl RenderCommandEncoder {
         .flat_map(|table| table.buffers.values())
         .map(|(buffer, _)| (buffer, true));
         for (buffer, write) in snapshot.residency.buffers_written().chain(bound) {
-            self.current.shadows.add_bytes(buffer, write);
+            self.gathering().add_bytes(buffer, write);
         }
         self.core.retain(icb.clone());
         self.executions.push(RenderExecution {
@@ -736,6 +767,12 @@ struct Snapshot {
     tile_memory: TileMemory,
     /// A draw of the instance before the call reached the tile threadgroup memory.
     tile_memory_reached: bool,
+    /// What the draws of the instance before the call read as their indirect arguments: a
+    /// command's draw that writes any of it records after a barrier from those reads.
+    indirect_reads: IndirectReads<ResourceKey>,
+    /// What the draws of the instance before the call wrote before their fragments: a command's
+    /// draw whose fragment shader touches any of it records after a barrier from those writes.
+    geometry_writes: GeometryWrites<ResourceKey>,
     /// The tracked uses of the encoder's draws before the call, in the stages a draw runs in
     /// inside its pass: an emulated mesh command's dispatches, recorded before the pass, must not
     /// touch them but as Metal orders them (`RenderCommandEncoder::drawn_before`).
@@ -1059,7 +1096,7 @@ impl RunSteps {
     /// `command_buffer` is recording outside a render pass, and only the caller records it; the
     /// images and the steps' objects are live until it completes, and every image rests in
     /// `GENERAL`.
-    unsafe fn before(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer) {
+    unsafe fn before(&self, raw: &Vk, command_buffer: vk::CommandBuffer) {
         // SAFETY: the caller's contract.
         unsafe {
             if let Some(into) = &self.into {
@@ -1076,7 +1113,7 @@ impl RunSteps {
     /// # Safety
     ///
     /// As for [`RunSteps::before`].
-    unsafe fn after(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer) {
+    unsafe fn after(&self, raw: &Vk, command_buffer: vk::CommandBuffer) {
         // SAFETY: the caller's contract.
         unsafe {
             if let Some(planes) = &self.planes {
@@ -1352,10 +1389,9 @@ impl Asked {
     }
 }
 
-/// What a patch command's factor scale does (probe `RT7-icb-probe8-m4`, an M4: Metal multiplies
-/// the factors by a kernel's scale whatever the pipeline, which `supportIndirectCommandBuffers`
-/// keeps from enabling the scale itself; EVs ICBV-scale-m3 and -m4, the M3 Max and the M4 alike:
-/// it rounds the scale to `half` first).
+/// What a patch command's factor scale does (an M4: Metal multiplies the factors by a kernel's
+/// scale whatever the pipeline, which `supportIndirectCommandBuffers` keeps from enabling the scale
+/// itself; the M3 Max and the M4 alike: it rounds the scale to `half` first).
 #[derive(Debug, PartialEq)]
 enum Scale {
     /// 1 as a `half`: the factors as they stand (1.0001 and 1.0004 drew what 1 draws).
@@ -1387,7 +1423,7 @@ fn patch_scale(bits: u32) -> Scale {
 impl Draw<u64> {
     /// The draw, each address resolved against `residency`'s resources: an index buffer's and a
     /// patch index buffer's offset rounded down to a multiple of the index size or of 4, as Metal
-    /// reads a command's indices where its validation stops the call (probe `RT7-icb-probe7-m4`),
+    /// reads a command's indices where its validation stops the call,
     /// and a factor buffer's at any byte, whose factors the binder reads from the offset rounded
     /// down to a multiple of 2 and each instance's at the stride rounded down to a multiple of 4,
     /// as plain Metal reads them; a patch draw's control-point indices as its pipeline's index size
@@ -1420,9 +1456,8 @@ impl Draw<u64> {
                     (_, None) => Ok(PointIndices::Own),
                     (PointIndices::Own | PointIndices::Zero, Some(_)) => Ok(PointIndices::Zero),
                     // Metal reads the indices from the offset rounded down to a multiple of
-                    // the index size (EVs ICBV-ipatch-m3, -m4, ICBV-ipatch2-m3 and -m4: 32-bit
-                    // indices at offsets 1, 2, 3, 6 and 7, 16-bit at 1, 3 and 5; its validation
-                    // does not stop the offset).
+                    // the index size (32-bit indices at offsets 1, 2, 3, 6 and 7, 16-bit at 1, 3
+                    // and 5; its validation does not stop the offset).
                     (PointIndices::Buffer(address), Some(size)) => {
                         rounded(address, size).map(PointIndices::Buffer)
                     }
@@ -1465,11 +1500,8 @@ impl Draw<u64> {
 /// them (`None` elsewhere).
 fn pipeline_control_points(pipeline: &RenderPipelineState) -> Option<u32> {
     match pipeline.kind() {
-        RenderStateKind::Graphics(state) => state
-            .base()
-            .graphics
-            .tessellation
-            .map(|t| t.control_points)
+        RenderStateKind::Graphics(state) => crate::tessellation::patches(&state.base().graphics)
+            .map(|p| p.control_points)
             .filter(|&points| points != 0),
         RenderStateKind::Tile(_) => None,
     }
@@ -1482,7 +1514,7 @@ fn pipeline_point_index_size(pipeline: &RenderPipelineState) -> Option<u64> {
     let RenderStateKind::Graphics(state) = pipeline.kind() else {
         return None;
     };
-    match state.base().graphics.tessellation?.control_point_index_type {
+    match crate::tessellation::patches(&state.base().graphics)?.control_point_index_type {
         T::UInt16 => Some(2),
         T::UInt32 => Some(4),
         _ => None,
@@ -1527,7 +1559,7 @@ impl RenderCommandEncoder {
             return;
         };
         let vertex = state.descriptor().vertex();
-        if state.base().graphics.tessellation.is_some()
+        if crate::tessellation::patches(&state.base().graphics).is_some()
             || vertex.is_none()
             || self.check_pipeline(CALL, pipeline).is_err()
         {
@@ -1575,7 +1607,7 @@ impl RenderCommandEncoder {
     ) -> Result<SettledDraw, Error> {
         let assembly = Assembly::Primitives(primitive_type);
         let settings = self.draw_settings(CALL, state, assembly, false)?;
-        let mut argument_samplers = self.core.device().argument_samplers();
+        let mut argument_samplers = ArgumentSamplers::taken(self.core.device());
         let function_tables = state.function_tables();
         let live = Arc::clone(&self.live);
         let settled = self.settle_draw(
@@ -1583,12 +1615,12 @@ impl RenderCommandEncoder {
             (state, &settings),
             &PassStartTables::default(),
             (&mut argument_samplers, &mut None),
-            &function_tables,
+            (&function_tables, &mut None),
         )?;
         let Settled { variant, plan, .. } = settled;
-        self.core
-            .device()
-            .degrade_argument_pixel_samplers(&variant.pipeline().stages, &argument_samplers);
+        let device = self.core.device();
+        let stages = &variant.pipeline().stages;
+        device.degrade_argument_pixel_samplers(stages, argument_samplers.take(device));
         // The neutrals the plan binds, which the step makes none of (`neutral.rs`). One not made
         // here (the device out of memory) leaves the variant settled: the step refuses the
         // neutral where it binds it, typed (`CommandBufferError::HostStepObject`).
@@ -1607,7 +1639,7 @@ impl RenderCommandEncoder {
             || graphics.shadow_stencil.is_some()
             || graphics.shader_tests.is_some()
             || plan.views != ViewSetup::default()
-            || self.current.shape.locations != settings.routing.locations
+            || *self.current.shape.locations != *settings.routing.locations
             || own_strides
         {
             return Ok((variant, None));
@@ -1812,6 +1844,11 @@ impl RenderExecution {
             };
             encoder.factors.scale = scale;
             encoder.check_pipeline(CALL, &pipeline)?;
+            // An object function's threadgroup memory arguments: which lengths a command's mesh
+            // draw takes, its own or the encoder's, is not measured.
+            if super::mesh::reads_object_threadgroup_memory(&pipeline) {
+                return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            }
             let control_points = pipeline_control_points(&pipeline);
             encoder.pipeline = Some(pipeline);
             if !inherited {
@@ -1865,7 +1902,7 @@ impl RenderExecution {
                     scale: _,
                 } => {
                     // Metal draws a command's patches with its pipeline's control points, whatever
-                    // the record holds (measured, probe `RT7-icb-probe7-m4`).
+                    // the record holds (measured).
                     draw.control_points = control_points.unwrap_or(draw.control_points);
                     let (buffer, offset) = factors.buffer;
                     encoder.factors.buffer = Some(FactorBuffer {
@@ -1964,7 +2001,7 @@ impl RenderExecution {
         }
         for run in &runs {
             // SAFETY: only this recording records the secondary command buffers.
-            unsafe { device.shared().vk().end_command_buffer(run.draws) }.map_err(vulkan)?;
+            unsafe { core.command_buffer().end_raw(run.draws) }.map_err(vulkan)?;
         }
         Ok(Recorded {
             core,
@@ -2009,7 +2046,13 @@ impl RenderExecution {
                 imageblock: true,
                 // So may they have written the instance's interlocked colors.
                 interlocked_writes: InterlockedStorage::ALL,
+                // And read as their indirect arguments what the commands' draws may write.
+                indirect_reads: snapshot.indirect_reads.clone(),
+                // And wrote before their fragments what the commands' fragments may touch.
+                geometry_writes: snapshot.geometry_writes.clone(),
                 tile_memory: snapshot.tile_memory_reached,
+                // Its commands read an attachment in place (`texture/attached_reads.rs`).
+                barriers: false,
                 views: ViewSetup::default(),
                 pieces: Vec::new(),
                 shadows,
@@ -2018,6 +2061,13 @@ impl RenderExecution {
                 positioned: None,
                 rerecord: None,
                 bound: Bound::default(),
+                drawn: crate::clear_reach::DrawnArea::default(),
+                inline: false,
+                continues: false,
+                kept: None,
+                planned: false,
+                feedback: Feedback::NONE,
+                storage_colors: 0,
             },
             layout,
             passes: vec![(snapshot.shape.clone(), Arc::clone(&snapshot.compatible))],
@@ -2029,6 +2079,8 @@ impl RenderExecution {
             fragment: snapshot.fragment.clone(),
             object: snapshot.object.clone(),
             mesh: snapshot.mesh.clone(),
+            // No command's draw takes them: one whose object function reads them is refused.
+            object_threadgroup_lengths: BTreeMap::new(),
             visibility,
             tile: ArgumentTable::default(),
             dispatches: Vec::new(),
@@ -2059,6 +2111,7 @@ impl RenderExecution {
             executions: Vec::new(),
             pending: Vec::new(),
             draw_calls: 0,
+            tile_dispatch_calls: 0,
             replaying: true,
             rerouting: false,
             keeping: super::capture::Keeping::Stopped,
@@ -2074,6 +2127,8 @@ impl RenderExecution {
             reaches_unnamed: true,
             reload_at: std::collections::BTreeSet::new(),
             called: true,
+            depth_writes: false,
+            drew_depth_writes: false,
             drew: true,
             drawn: crate::clear_reach::DrawnArea::unbounded(),
             coverage: crate::linear_attachment::Coverage::unbounded(),
@@ -2083,19 +2138,24 @@ impl RenderExecution {
             // The encoder that executes the commands records the pass's load pass
             // (`defer_execution`); this one records only the commands' draws.
             rewrites_unused_bits: false,
+            kept_attachments: None,
             // The executing encoder announces for the execution (`defer_execution`).
             extended_written: BTreeSet::new(),
             // The commands' draws hold no shadow: the execution ended the pass's.
             extended: super::ExtendedShadows::none(),
             pass_start: snapshot.pass_start.notes(),
-            // An execution's draws restart at the all-ones index whatever the encoder's call
-            // (EV RFX-probe5-m4's `icb_*`).
+            // An execution's draws restart at the all-ones index whatever the encoder's call.
             restart: None,
             live: Arc::default(),
             log: None,
             quiet_bound_values: None,
             bind_memo: crate::binding::BindMemo::default(),
             last_retained: Default::default(),
+            inline: super::inline_first::Inline::Never,
+            held_bound: Default::default(),
+            // No pass of several color groups executes render commands
+            // (`render/color_groups.rs`).
+            grouped: None,
         }
     }
 
@@ -2216,6 +2276,17 @@ impl RenderExecution {
 /// docs): each instance's begin, the secondaries its subpass runs, and its end.
 pub(crate) struct DeferredPass {
     instances: Vec<PassInstance>,
+    /// The index among the pass's instances of the first of `instances`: the count of those the
+    /// encoder recorded inline (`held`), else 0. The steps name instances by that index.
+    first: usize,
+    /// The command buffer the encoder recorded the pass's leading instances inline in, and the
+    /// steps after the last of them but its tile dispatches (which the segment records, once their
+    /// pipelines are made, `render/pending_tile.rs`), ended and handed over
+    /// (`render/inline_first.rs`, `render/inline_splits.rs`, `EncoderCore::hand_over_pass`): the
+    /// segment places it after what it records before the pass (the executions' copies and
+    /// dispatches before it, a fragment imageblock's clear) and before the later instances, where
+    /// the first instance runs in a segment that records it (`EncoderCore::cut_before`).
+    held: Option<vk::CommandBuffer>,
     /// The steps around its instances, as the encoder's own pass records them
     /// (`render/pass_steps.rs`): the shadowed textures' copies, the sample planes', the
     /// shader-side stencil's copies, the draws' steps before their instances, the tile
@@ -2287,9 +2358,11 @@ impl DeferredPass {
     /// The pass of `instances`, whose pieces name `executions` and `pending` draws by index,
     /// with `steps` around them, with the attachments' and the steps' `uses`, its `storage`
     /// where the encoder made it, and its `layout` as the encoder ended it with that layout
-    /// without its hidden depth and stencil (`bare`).
+    /// without its hidden depth and stencil (`bare`); `held` the command buffer of its leading
+    /// instances where the encoder recorded those inline, and their count, and `instances` the
+    /// later ones (the field's docs).
     pub(super) fn new(
-        instances: Vec<PassInstance>,
+        (instances, held): (Vec<PassInstance>, Option<(vk::CommandBuffer, usize)>),
         steps: PassSteps,
         uses: Vec<Use<ResourceKey>>,
         (executions, pending): (Vec<RenderExecution>, Vec<PendingDraw>),
@@ -2299,6 +2372,8 @@ impl DeferredPass {
     ) -> DeferredPass {
         DeferredPass {
             instances,
+            first: held.map_or(0, |(_, inlined)| inlined),
+            held: held.map(|(held, _)| held),
             steps,
             uses,
             executions,
@@ -2332,15 +2407,18 @@ impl DeferredPass {
             .any(|execution| execution.icb.gpu_written() || execution.range.indirect())
     }
 
-    /// Whether a pipeline one of its draws records is still being made.
+    /// Whether a pipeline one of its draws or tile dispatches records is still being made.
     pub(crate) fn making(&self) -> bool {
         self.pending.iter().any(|draw| !draw.made())
+            || self.steps.tile_pipelines().any(TilePipelines::making)
     }
 
     /// Whether the making of a pipeline one of its draws records failed: its recording fails
-    /// the command buffer, which a host step does (`render/pending.rs`).
+    /// the command buffer, which a host step does (`render/pending.rs`); or one of its tile
+    /// dispatches', which its recording makes again (`render/pending_tile.rs`).
     pub(crate) fn failed(&self) -> bool {
         self.pending.iter().any(PendingDraw::failed)
+            || self.steps.tile_pipelines().any(TilePipelines::failed)
     }
 
     /// Whether it executes render commands whose records the CPU writes, which its recording
@@ -2368,29 +2446,37 @@ impl DeferredPass {
         Some(uses.finish())
     }
 
-    /// Wait until every pipeline its draws record is made, or failed, each making hastened
-    /// first (`pipeline/pool.rs`).
+    /// Wait until every pipeline its draws and tile dispatches record is made, or failed, each
+    /// making hastened first (`pipeline/pool.rs`).
     pub(crate) fn wait_made(&self) {
-        self.hasten();
+        self.hasten(Urgency::Committed);
         for draw in &self.pending {
             // Its outcome is the recording's to read.
             drop(draw.pipeline.wait());
         }
+        self.steps.tile_pipelines().for_each(TilePipelines::wait);
     }
 
-    /// Run the makings of the pipelines its draws record before the device's pool's pieces that
-    /// nothing waits for: a submission waits for them.
-    pub(crate) fn hasten(&self) {
+    /// Run the makings of the pipelines its draws and tile dispatches record before the
+    /// device's pool's pieces of a lower rank than `urgency`: a submission waits for them.
+    pub(crate) fn hasten(&self, urgency: Urgency) {
         for draw in &self.pending {
-            draw.pipeline.hasten();
+            draw.pipeline.hasten(urgency);
+        }
+        for tile in self.steps.tile_pipelines() {
+            tile.hasten(urgency);
         }
     }
 
-    /// Run `waker` each time the making of a pipeline its draws record finishes: at once for one
-    /// finished already (none is skipped, so no finish goes unannounced).
+    /// Run `waker` each time the making of a pipeline its draws or tile dispatches record
+    /// finishes: at once for one finished already (none is skipped, so no finish goes
+    /// unannounced).
     pub(crate) fn when_made(&self, waker: &(impl Fn() + Clone + Send + 'static)) {
         for draw in &self.pending {
             draw.when_made(waker.clone());
+        }
+        for tile in self.steps.tile_pipelines() {
+            tile.when_made(waker);
         }
     }
 
@@ -2443,6 +2529,9 @@ impl DeferredPass {
         {
             return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
         }
+        // Its tile dispatches' pipelines, waiting for those being made; a failed one fails the
+        // command buffer (`render/pending_tile.rs`).
+        let tiles = self.steps.tiles_made(command_buffer)?;
         let mut core = EncoderCore::segment(command_buffer, false)?;
         let mut found = Found::default();
         let mut recorded = Vec::with_capacity(self.executions.len());
@@ -2622,8 +2711,17 @@ impl DeferredPass {
                         (passes.at(at, count), instance.framebuffer)
                     }
                     (None, _, Some((passes, framebuffer))) => (passes.at(at, count), *framebuffer),
+                    // An instance of several runs holds an execution, so it holds every attachment
+                    // in `GENERAL` (`render_target::depth_layout`), as its runs' passes do.
                     (None, None, _) if !backed => {
-                        let pass = render_target::final_pass(device, own, shape, position)?;
+                        let pass = render_target::final_pass(
+                            device,
+                            own,
+                            shape,
+                            position,
+                            Feedback::NONE,
+                            vk::ImageLayout::GENERAL,
+                        )?;
                         let raw = pass.raw;
                         made.0.push(pass);
                         (raw, instance.framebuffer)
@@ -2635,8 +2733,11 @@ impl DeferredPass {
                         let framed = of.map_or(&[][..], |of| &of.framed[..]);
                         let framed = framed_layout(own, framed);
                         let own = &*framed;
-                        let pass = render_target::final_pass(device, own, shape, position)?;
-                        let framebuffer = render_target::framebuffer(device, &pass, own, views)?;
+                        let (none, general) = (Feedback::NONE, vk::ImageLayout::GENERAL);
+                        let pass =
+                            render_target::final_pass(device, own, shape, position, none, general)?;
+                        let framebuffer =
+                            render_target::framebuffer(device, &pass, own, shape, views, none)?;
                         let raw = (pass.raw, framebuffer.raw);
                         made.0.push(pass);
                         made.1.push(framebuffer);
@@ -2656,7 +2757,13 @@ impl DeferredPass {
         if let Some(ahead) = ahead {
             core.retain(Arc::clone(ahead));
         }
+        // The first instance the encoder recorded inline: after what the segment recorded before
+        // the pass, as it runs where the segment records it.
+        if let Some(held) = self.held {
+            core.cut_before(held)?;
+        }
         let steps = &self.steps;
+        let first = self.first;
         let shadow_copies = shadow_copies.as_ref();
         core.command(render_target::ATTACHMENT_STAGES, &uses, |raw, cb| {
             // SAFETY: the segment's command buffer is recording outside a render pass; the
@@ -2671,6 +2778,12 @@ impl DeferredPass {
             // run past an execution's first are held with the runs, each recorded between barriers
             // outside a render pass.
             unsafe {
+                // The tile dispatches after the instances the encoder recorded inline, which the
+                // command buffer it handed over, placed before these, leaves out
+                // (`render/pending_tile.rs`).
+                if let Some(last) = first.checked_sub(1) {
+                    steps.dispatches_after(raw, cb, last, &tiles);
+                }
                 let runs = instances.iter().enumerate().flat_map(|(at, runs)| {
                     let last = runs.len() - 1;
                     runs.iter()
@@ -2689,7 +2802,7 @@ impl DeferredPass {
                     }
                     // Its steps before its first run, and after its last (`render/pass_steps.rs`).
                     if run_index == 0 {
-                        steps.before(raw, cb, at);
+                        steps.before(raw, cb, at + first);
                     }
                     let copies = shadow_copies.filter(|_| shadowed);
                     if let Some(copies) = copies {
@@ -2701,9 +2814,10 @@ impl DeferredPass {
                     if let Some(run_steps) = run_steps {
                         run_steps.before(raw, cb);
                     }
-                    steps.begin(raw, cb, at, pass, framebuffer);
+                    steps.begin(raw, cb, at + first, pass, framebuffer);
                     raw.cmd_execute_commands(cb, run);
                     raw.cmd_end_render_pass(cb);
+                    steps.ended(raw, cb, at + first);
                     if let Some(run_steps) = run_steps {
                         run_steps.after(raw, cb);
                     }
@@ -2711,7 +2825,7 @@ impl DeferredPass {
                         copies.record_out(raw, cb);
                     }
                     if last_run {
-                        steps.after(raw, cb, at);
+                        steps.after(raw, cb, at + first, &tiles);
                     }
                 }
                 steps.end(raw, cb);
@@ -2732,9 +2846,10 @@ impl DeferredPass {
                 device.degrade_planes(layout);
             }
         }
-        // The runs' steps' objects (the sample planes' descriptor sets and framebuffers), held
-        // until the command buffer completes.
+        // The runs' steps' objects (the sample planes' descriptor sets and framebuffers), and the
+        // tile dispatches' pipelines, held until the command buffer completes.
         core.retain(recorded);
+        core.retain(tiles);
         let mut segment = core.end_segment()?;
         segment.resident_misses = found.misses;
         segment.faults = found.faults;
@@ -2811,9 +2926,9 @@ impl DeferredPass {
 mod tests {
     use super::{patch_scale, Scale};
 
-    /// What each scale does, as Metal rounds it to `half` (EVs ICBV-scale-m3 and -m4): 1 nothing
-    /// to the factors, another positive `half` multiplies them, and what is not positive or is 0
-    /// as a `half` culls (probe `RT7-icb-probe8-m4`'s 0, -1 and NaN among them).
+    /// What each scale does, as Metal rounds it to `half`: 1 nothing to the factors, another
+    /// positive `half` multiplies them, and what is not positive or is 0 as a `half` culls (the
+    /// probe's 0, -1 and NaN among them).
     #[test]
     fn patch_scales_are_classified_as_metal_measured_them() {
         let cases = [

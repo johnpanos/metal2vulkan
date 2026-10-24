@@ -7,8 +7,7 @@
 //! queue's order. A wait there for a transition still to come in the same queue would wait for
 //! itself.
 //!
-//! Metal's answers (measured on an M4 with macOS 27.0.1, with and without API validation, EVs
-//! `RT4-metal-selfwait`, `-selfwait2`, `-selfwait3` and `RT4-metal-order`):
+//! Metal's answers (measured on an M4 with macOS 27.0.1, with and without API validation):
 //! - a deallocator run as Metal releases a buffer returns from its wait for the completion of the
 //!   command buffer that held it; the runtime returns too;
 //! - a completed handler returns from its wait for its command buffer's scheduling; so does the
@@ -24,12 +23,12 @@
 //!   close a cycle of such waits, or leave its device's pool with no thread that is not blocked
 //!   so (`contexts::block`).
 //!
-//! A submission handler (a runtime extension, Metal has none) runs on the thread that submitted its
-//! command buffer's last batch, and that command buffer's transition to `Scheduled`, with every
-//! later transition of its queue, waits for it. On the scheduler thread, the device's later
-//! submissions wait for it too. So any wait there for what has not happened (a command buffer's
-//! scheduling or completion, a slot of a full queue no uncommitted command buffer holds) is refused
-//! at once (`DeadlockCause::SubmissionHandler`); one for what happened returns.
+//! A submission handler (a runtime extension, Metal has none) runs on the thread that took its
+//! command buffer's last batch for its queue, and that command buffer's transition to `Scheduled`,
+//! with every later transition of its queue, waits for it. On the scheduler thread, the device's
+//! later submissions wait for it too. So any wait there for what has not happened (a command
+//! buffer's scheduling or completion, a slot of a full queue no uncommitted command buffer holds)
+//! is refused at once (`DeadlockCause::SubmissionHandler`); one for what happened returns.
 
 use crate::error::DeadlockCause;
 use std::cell::Cell;
@@ -43,7 +42,7 @@ pub(crate) enum Step {
     CompletedHandlers,
     /// The release of what it retained (a no-copy buffer's deallocator may run here).
     Release,
-    /// Its submission handlers, on the thread that submitted its last batch (the scheduler's,
+    /// Its submission handlers, on the thread that took its last batch (the scheduler's,
     /// or a committing one, which may be a handler thread): its transition to `Scheduled`, and
     /// so every later transition of its queue, waits for them.
     SubmissionHandlers,
@@ -163,7 +162,7 @@ pub(crate) fn scheduled_wait(marker: Option<Marker>, target: Target, scheduled: 
 ///
 /// A committed command buffer gives its slot back only in its queue's context, after its
 /// completed handlers. In that context, then, no committed command buffer can give one back:
-/// Metal's make never returns there (RT10-qlprobe3: a completed handler's make on its own full
+/// Metal's make never returns there (a completed handler's make on its own full
 /// queue). The runtime refuses it, unless an uncommitted command buffer may still be dropped.
 pub(crate) fn slot_wait(marker: Option<Marker>, queue: Context, open: bool) -> Answer {
     let Some(marker) = marker else {

@@ -1,10 +1,10 @@
 //! The gate lanes of the driver deviations translation relies on, on the device the cfg selects,
 //! under the validation layer. A deviation is a driver's measured answer where Vulkan leaves the
 //! answer to it, keyed on the driver's release (`device::driver_facts`): MoltenVK 1.4.1 on Apple's
-//! GPUs has nineteen. A profile takes each at a measured release, and past the last measured one
-//! with a notice (`DeviceProfile::takes_driver_deviation`). Each test here runs what relies on one
-//! deviation and compares the device's answer with Metal's, so a venue whose driver release changes
-//! the deviation fails at the gate. The sampler's deviation has its own lanes (`depth_compares`,
+//! GPUs has twenty-three. A profile takes each at a measured release, and past the last measured
+//! one with a notice (`DeviceProfile::takes_driver_deviation`). Each test here runs what relies on
+//! one deviation and compares the device's answer with Metal's, so a venue whose driver release
+//! changes the deviation fails at the gate. The sampler's deviation has its own lanes (`depth_compares`,
 //! `mip_levels`, `nearest_positions`, `border_swizzles`), and the color writes theirs
 //! (`color_writes`); these are the others, the cube route's in both stages:
 //!
@@ -19,16 +19,20 @@
 //!   deviation, every word of a function the translation hands to the device's instruction is
 //!   Metal's (`PRECISE_DEVICE_WORDS`, `FAST_DEVICE_WORDS`). Elsewhere the translation's routines
 //!   answer within Apple's bound, and C3 compares them; the test prints how many words match.
-//! - **The cube routes** (`GraphicsCubeGradientRoute` and `CubeGradientRoute`): the owned fixture
-//!   `rtl_cube_grad_fragment` samples a cube and a cube array with explicit gradients through an
-//!   anisotropic constexpr sampler in a fragment function, over the inputs of the committed kernel
-//!   cases `anisotropic-cube-gradients-along-face-rows` and `-columns`, which run too. Where the
-//!   profile takes a route's deviation, each pixel or kernel lane is the Metal kernel's sample of
-//!   its lane on the Apple M3 Max, the lane's Metal environment. MoltenVK's graphics route is
-//!   measured on the M3 Max under macOS 26.7 alone (MoltenVK's device ID is the macOS release and
-//!   the GPU family), so on the M4, and on the M3 Max under macOS 27, the fragment's pipeline is
-//!   refused, naming the unmeasured deviation. Elsewhere the
-//!   sample is a near-equivalent (`CubeGradientFootprint`) or refused; the test prints which.
+//! - **The cube routes** (`GraphicsCubeGradientRoute`, `GraphicsCubeGradientTangents` and
+//!   `CubeGradientRoute`): the owned fixture `rtl_cube_grad_fragment` samples a cube and a cube
+//!   array with explicit gradients through an anisotropic constexpr sampler in a fragment function,
+//!   over the inputs of the committed kernel cases `anisotropic-cube-gradients-along-face-rows` and
+//!   `-columns`, which run too. Where the profile takes a route's deviation, each pixel or kernel
+//!   lane is the Metal kernel's sample of its lane on the Apple M3 Max, the lane's Metal
+//!   environment; where it takes `GraphicsCubeGradientTangents` (MoltenVK under macOS 27, whose
+//!   cube-gradient swizzle loses a `y` face's `z` gradient), so are the lanes on the `x` and `z`
+//!   faces, and the `y` faces' are a near-equivalent (`CubeGradientFootprint`) the test prints.
+//!   MoltenVK's graphics route is measured on the M3 Max under macOS 26.7 and under macOS 27.0.1
+//!   (MoltenVK's device ID is the macOS release and the GPU family, which the M4 under macOS 27
+//!   shares); under any other, the fragment's pipeline is refused, naming the unmeasured deviation
+//!   `GraphicsCubeGradientRoute`. Elsewhere the sample is a near-equivalent
+//!   (`CubeGradientFootprint`) or refused; the test prints which.
 //! - **The `half` fused multiply-add** (`MetalHalfFma`): the committed cases of a probe
 //!   (`fmx_fma_precise`, `fmx_fma_fast`), whose half word is a `half` `fma` and a `half` `a * b +
 //!   c` that Metal fuses, over 300 triples whose `float` sum lands on a `half` midpoint, 200 where
@@ -102,7 +106,7 @@ use crate::observation::MetalObservation;
 use crate::store::CorpusStore;
 use base64::Engine as _;
 use metal2vulkan::cache::VariantKey;
-use metal2vulkan::device::{VkFeature, VkProperty};
+use metal2vulkan::device::{FloatControl, FloatWidth, VkFeature, VkProperty};
 use metal2vulkan::error::{Capability, DriverDeviation, Error as CompileError, Feature, Needs};
 use metal2vulkan::library::Library;
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
@@ -173,7 +177,7 @@ fn in_lockstep(words: &mut [u32], mut step: impl FnMut(usize, u32, &[u32]) -> Op
 
 /// Metal's answer of `rtl_lockstep_divergent_loop`: thread t's word after `counts[t]` iterations
 /// of `words[t] = words[t ^ 16] * 3 + i + 1`, the reads of an iteration before its writes.
-/// Measured on the Apple M3 Max and the Apple M4 (EVs RTL-probe-m3 and RTL-probe-m4).
+/// Measured on the Apple M3 Max and the Apple M4.
 fn lockstep_divergent_loop() -> Vec<u32> {
     let counts = counts();
     let mut words: Vec<u32> = (0..THREADS as u32).collect();
@@ -520,6 +524,10 @@ fn fragment_samples(device: &Device, case: &PublicCase) -> Result<Vec<u8>, Runti
         .collect())
 }
 
+/// The blocks of 12 lanes on a `y` face: each case's lanes take the faces in blocks of 12, in the
+/// order `+X`, `-X`, `+Y`, `-Y`, `+Z`, `-Z`.
+const Y_FACE_BLOCKS: [usize; 2] = [2, 3];
+
 /// The samples of `samples` that differ from `metal` (16 bytes each), and how many per block of
 /// 12 lanes (two samples a lane: each case's lanes take the faces in blocks of 12).
 fn differing_samples(samples: &[u8], metal: &[u8]) -> (Vec<usize>, Vec<usize>) {
@@ -537,9 +545,11 @@ fn differing_samples(samples: &[u8], metal: &[u8]) -> (Vec<usize>, Vec<usize>) {
 
 /// Where the profile takes each route's deviation, the fragment function's samples (the graphics
 /// route, `GraphicsCubeGradientRoute`) and the committed kernel's (the compute route,
-/// `CubeGradientRoute`) are the Metal kernel's of the same lanes on the Apple M3 Max. On MoltenVK
-/// where the graphics route is unmeasured (any Apple GPU and macOS release but the M3 Max under
-/// macOS 26.7: MoltenVK's device ID is both), the fragment's pipeline is refused naming it. Every
+/// `CubeGradientRoute`) are the Metal kernel's of the same lanes on the Apple M3 Max. Where it
+/// takes `GraphicsCubeGradientTangents` instead, the fragment's samples on the `x` and `z` faces
+/// are; its `y` faces' are printed. On MoltenVK where a route is unmeasured (any Apple GPU and
+/// macOS release but the M3 Max's under macOS 26.7 and 27: MoltenVK's device ID is both), the
+/// function emulates Metal's footprint, and its pipeline is made: its samples are printed. Every
 /// case and route is measured and printed before any is judged.
 #[test]
 fn cube_gradients_through_an_anisotropic_sampler_answer_as_metal() {
@@ -550,62 +560,44 @@ fn cube_gradients_through_an_anisotropic_sampler_answer_as_metal() {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
         let name = device.name().to_owned();
         let graphics = takes(&device, DriverDeviation::GraphicsCubeGradientRoute);
+        let tangents = takes(&device, DriverDeviation::GraphicsCubeGradientTangents);
         let compute = takes(&device, DriverDeviation::CubeGradientRoute);
         let moltenvk = device.properties().description.driver_id == Some(DriverId::MOLTENVK);
         let environment = METAL_ENVIRONMENT;
         for case_name in CUBE_CASES {
             let case = public_case(case_name).unwrap();
             let metal = metal_row(&case, environment);
-            let fragment = fragment_samples(&device, &case).map_err(|error| {
-                let refused = matches!(
-                    &error,
-                    RuntimeError::Compile(CompileError::Unsupported(u))
-                        | RuntimeError::Unsupported(u)
-                        if u.needs == Needs::UnmeasuredDeviation(
-                            DriverDeviation::GraphicsCubeGradientRoute
-                        )
-                );
-                (format!("{error}"), refused)
-            });
-            let kernel = run_case(&device, &case)
-                .map(|run| run.output)
-                .map_err(|why| (why, false));
-            for (stage, taken, answer) in [
-                ("fragment", graphics, fragment),
-                ("kernel", compute, kernel),
+            let fragment = fragment_samples(&device, &case).map_err(|error| format!("{error}"));
+            let kernel = run_case(&device, &case).map(|run| run.output);
+            for (stage, taken, y_faces_near, answer) in [
+                ("fragment", graphics || tangents, tangents, fragment),
+                ("kernel", compute, false, kernel),
             ] {
                 let verdict = match answer {
                     Ok(samples) => {
                         let (differ, per_block) = differing_samples(&samples, &metal);
                         eprintln!(
                             "cube route {stage} {case_name} on {name} (the measured route: \
-                             {taken}): {} of {} samples differ from {environment}'s kernel, per \
-                             12 lanes {per_block:?}: {differ:?}",
+                             {taken}, the y faces near: {y_faces_near}): {} of {} samples differ \
+                             from {environment}'s kernel, per 12 lanes {per_block:?}: {differ:?}",
                             differ.len(),
                             metal.len() / 16
                         );
-                        match (taken, stage, moltenvk) {
-                            (true, ..) if !differ.is_empty() => {
-                                Some(format!("samples {differ:?} differ"))
-                            }
-                            (false, "fragment", true) => {
-                                Some("made where the route is unmeasured".to_owned())
-                            }
-                            _ => None,
+                        let judged: Vec<usize> = differ
+                            .into_iter()
+                            .filter(|t| !(y_faces_near && Y_FACE_BLOCKS.contains(&(t / 24))))
+                            .collect();
+                        match taken && !judged.is_empty() {
+                            true => Some(format!("samples {judged:?} differ")),
+                            false => None,
                         }
                     }
-                    Err((why, refused)) => {
+                    Err(why) => {
                         eprintln!(
                             "cube route {stage} {case_name} on {name} (the measured route: \
                              {taken}): {why}"
                         );
-                        match (taken, stage, moltenvk) {
-                            (true, ..) => Some(why),
-                            (false, "fragment", true) if !refused => {
-                                Some(format!("refused otherwise than unmeasured: {why}"))
-                            }
-                            _ => None,
-                        }
+                        (taken || moltenvk).then_some(why)
                     }
                 };
                 if let Some(why) = verdict {
@@ -649,6 +641,17 @@ fn requires_property(device: &Device, case: &PublicCase, property: VkProperty) -
         .requirements()
         .properties
         .contains(&property)
+}
+
+/// Whether `case`'s kernel rounds to `half` under the float controls that make the device's
+/// conversion Metal's: it declares `DenormPreserve` for 16 bits, which no other form declares, and
+/// so requires that property.
+fn rounds_under_float_controls(device: &Device, case: &PublicCase) -> bool {
+    requires_property(
+        device,
+        case,
+        VkProperty::FloatControl(FloatControl::DenormPreserve, FloatWidth::F16),
+    )
 }
 
 /// Where the profile takes the deviation, both cases' kernels take the device's 16-bit `Fma`
@@ -885,9 +888,10 @@ const HALF_EDGE_CASES: [&str; 6] = [
 /// `0xFBFF` in either half, or the `float` 65504 of either sign) is the Metal row's of the same
 /// chip on every profile: the device's conversion to 16 bits and back where the profile takes
 /// `DriverDeviation::MetalHalfConversion` (the kernels then require
-/// `VkProperty::MetalHalfConversion` and hold no quantize), else the device's quantize where the
-/// profile takes `MetalHalfQuantize` (the kernels then require `VkProperty::MetalHalfQuantize`),
-/// integer arithmetic elsewhere.
+/// `VkProperty::MetalHalfConversion` and hold no quantize), else that conversion under the float
+/// controls that make it Metal's where the profile has them (the kernels then declare them and
+/// require neither fact), else the device's quantize where the profile takes `MetalHalfQuantize`
+/// (the kernels then require `VkProperty::MetalHalfQuantize`), integer arithmetic elsewhere.
 #[test]
 fn half_quantize_rounds_as_metal_at_the_edge() {
     let messages = Messages::default();
@@ -910,11 +914,16 @@ fn half_quantize_rounds_as_metal_at_the_edge() {
         let mut failures = Vec::new();
         for case_name in HALF_EDGE_CASES {
             let case = public_case(case_name).unwrap();
+            let controlled = rounds_under_float_controls(&device, &case);
+            assert!(
+                !(converts && controlled),
+                "{case_name} on {name}: the measured conversion takes no float controls"
+            );
             assert_eq!(
                 requires_property(&device, &case, VkProperty::MetalHalfQuantize),
-                metals,
+                metals && !controlled,
                 "{case_name} on {name}: the kernel takes the device's quantize alone exactly \
-                 where the profile takes the deviation"
+                 where the profile takes the deviation and has not the float controls"
             );
             assert_eq!(
                 requires_property(&device, &case, VkProperty::MetalHalfConversion),
@@ -935,7 +944,8 @@ fn half_quantize_rounds_as_metal_at_the_edge() {
                 .collect();
             eprintln!(
                 "half quantize {case_name} on {name} (the device's: {metals}, the device's \
-                 conversion: {converts}): {} of {} edge words differ from Metal",
+                 conversion: {converts}, under float controls: {controlled}): {} of {} edge \
+                 words differ from Metal",
                 differ.len(),
                 edge.len()
             );
@@ -993,7 +1003,8 @@ const DFL_TRIG_CASE: &str = "precise-trigonometric-functions-at-nan-operands-und
 /// [`DFL_DENORMAL_ROWS`] and the special lanes of [`DFL_ROOT_ROWS`], the kernels requiring
 /// `VkProperty::MetalFloatDenormals` exactly where the profile takes the deviation; in the `half`
 /// edge cases every word, the kernels requiring `VkProperty::MetalHalfConversion` exactly where the
-/// profile takes that one, else `VkProperty::MetalHalfQuantize` exactly where it takes that one;
+/// profile takes that one, else neither where they round under the float controls, else
+/// `VkProperty::MetalHalfQuantize` exactly where the profile takes that one;
 /// and in [`DFL_TRIG_CASE`] every word whose Metal answer is a NaN (the functions' other words are
 /// the math library's precision, not their NaNs). The test prints how many words of the other rows
 /// differ, by row.
@@ -1056,11 +1067,16 @@ fn owned_float_fixtures_answer_metal() {
         let quantize = takes(&device, DriverDeviation::MetalHalfQuantize) && !converts;
         for case_name in DFL_HALF_EDGE_CASES {
             let case = public_case(case_name).unwrap();
+            let controlled = rounds_under_float_controls(&device, &case);
+            assert!(
+                !(converts && controlled),
+                "{case_name} on {name}: the measured conversion takes no float controls"
+            );
             assert_eq!(
                 requires_property(&device, &case, VkProperty::MetalHalfQuantize),
-                quantize,
+                quantize && !controlled,
                 "{case_name} on {name}: the kernel takes the device's quantize alone exactly \
-                 where the profile takes the deviation"
+                 where the profile takes the deviation and has not the float controls"
             );
             assert_eq!(
                 requires_property(&device, &case, VkProperty::MetalHalfConversion),
@@ -1073,7 +1089,8 @@ fn owned_float_fixtures_answer_metal() {
             let differ = differing_of(&run.output, &metal, 16, &(0..16).collect::<Vec<_>>());
             eprintln!(
                 "owned half edge {case_name} on {name} (the device's quantize: {quantize}, \
-                 conversion: {converts}): {} of {} words differ from Metal",
+                 conversion: {converts}, under float controls: {controlled}): {} of {} words \
+                 differ from Metal",
                 differ.len(),
                 metal.len() / 4
             );
@@ -1358,8 +1375,8 @@ fn whole_block_lane(x: usize, y: usize) -> u32 {
 
 /// Metal's lanes of the partial triangle, one string a row of the target: `.` where the triangle
 /// does not reach, else the lane in base 32. Metal compiled the fixture's MSL at run time and drew
-/// it on the M3 Max (macOS 26.7, EV `GSM2-flanes-m3`) and the M4 (macOS 27.0.1, EV
-/// `GSM2-flanes-m4`), the same lanes on both, for each of the fixture's three forms of the lane.
+/// it on the M3 Max (macOS 26.7) and the M4 (macOS 27.0.1), the same lanes on both, for each of the
+/// fixture's three forms of the lane.
 const PARTIAL_LANES: [&str; LANE_SIDE] = [
     "................................",
     "................................",

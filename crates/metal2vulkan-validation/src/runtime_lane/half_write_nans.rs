@@ -2,7 +2,7 @@
 //! layer: the bits each format stores.
 //!
 //! What plain Metal does (the M3 Max under macOS 26.7, measured by the consumer, and the M4
-//! under macOS 27.0.1, EV SID-nan1-m4, alike: `Shared` and `Private`, `write` and `read_write`):
+//! under macOS 27.0.1, alike: `Shared` and `Private`, `write` and `read_write`):
 //! a 16-bit float texel stores the half's own bits, a signalling NaN's included (`0x7d49` stays
 //! `0x7d49`); a 32-bit float texel stores the half's exact widening, but `0x7fc00000` for every
 //! NaN; an `RG11B10Float` texel stores [`METAL_RG11B10`], each NaN channel the format's
@@ -18,7 +18,7 @@
 //! `VkProperty::MetalHalfTexelWrites`; and a pipeline whose stores differ announces
 //! `device-nan-encoding`.
 
-use super::degrade_notices::{counts, on_device};
+use super::degrade_notices::{counts, on_device_with};
 use super::{buffer_with, read_buffer, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::device::VkProperty;
@@ -50,7 +50,7 @@ fn texel(x: usize) -> [u16; 4] {
     std::array::from_fn(|c| V[(x + c) % V.len()])
 }
 
-/// Metal's `RG11B10Float` words of the texels [`texel`] writes, as EV SID-nan1-m4 stored them
+/// Metal's `RG11B10Float` words of the texels [`texel`] writes, as our probe stored them
 /// (`write` and `read_write`, `Shared` and `Private`, and the `float` write of each half
 /// widened by the shader, identical).
 const METAL_RG11B10: [u32; 25] = [
@@ -67,7 +67,7 @@ fn kernels(access: &str) -> String {
         return HELD.to_owned();
     }
     format!(
-        r#"; Owned synthetic kernel (WP-SID, DESIGN D714).
+        r#"; Owned synthetic kernel.
 source_filename = "half_write_nans.metal"
 
 define void @k(ptr addrspace(1) %v, ptr addrspace(1) %t, i32 %gid) {{
@@ -99,7 +99,7 @@ declare void @air.write_texture_2d.v4f16(ptr addrspace(1), <2 x i32>, <4 x half>
 }
 
 /// The `held` kernel: the texture an argument buffer holds.
-const HELD: &str = r#"; Owned synthetic kernel (WP-SID, DESIGN D714).
+const HELD: &str = r#"; Owned synthetic kernel.
 source_filename = "half_write_nans.metal"
 
 define void @k(ptr addrspace(1) %v, ptr addrspace(2) %held, i32 %gid) {
@@ -324,71 +324,88 @@ fn stored(
 #[test]
 fn half_writes_store_their_nans_as_metal_or_announce() {
     let mut report = Vec::new();
-    for access in ["write", "read_write", "held"] {
-        for f in &FORMATS {
-            on_device(|device, messages| {
-                let state = kernel(device, access);
-                let texels = stored(device, (&state, access), f);
-                let announced = counts(&messages.take_notices());
-                let keeps = device
-                    .compile_device()
-                    .profile()
-                    .enabled()
-                    .properties
-                    .contains(&VkProperty::MetalHalfTexelWrites);
-                let mut differ = Vec::new();
-                for (x, words) in texels.iter().enumerate() {
-                    for (c, &got) in words.iter().enumerate() {
-                        let want = metal(f, x, c);
-                        if want != got {
-                            let h = texel(x)[c];
-                            differ.push(format!("{h:04x}->{got:x} (Metal {want:x})"));
+    // Every case on one device. A device announces a kind once unless its options ask for each
+    // occurrence: with `device-nan-encoding` announced at each dispatch that binds a variant
+    // taking it, each case reads its own notices as on a device of its own, and its validation
+    // messages fail it by name.
+    on_device_with(
+        |options| {
+            options.announce_each.insert(Degradation::DeviceNanEncoding);
+        },
+        |device, messages| {
+            for access in ["write", "read_write", "held"] {
+                for f in &FORMATS {
+                    {
+                        let state = kernel(device, access);
+                        let texels = stored(device, (&state, access), f);
+                        let announced = counts(&messages.take_notices());
+                        let keeps = device
+                            .compile_device()
+                            .profile()
+                            .enabled()
+                            .properties
+                            .contains(&VkProperty::MetalHalfTexelWrites);
+                        let mut differ = Vec::new();
+                        for (x, words) in texels.iter().enumerate() {
+                            for (c, &got) in words.iter().enumerate() {
+                                let want = metal(f, x, c);
+                                if want != got {
+                                    let h = texel(x)[c];
+                                    differ.push(format!("{h:04x}->{got:x} (Metal {want:x})"));
+                                }
+                            }
                         }
-                    }
-                }
-                differ.sort();
-                differ.dedup();
-                let line = texels
-                    .iter()
-                    .map(|w| {
-                        w.iter()
-                            .map(|v| format!("{v:x}"))
+                        differ.sort();
+                        differ.dedup();
+                        let line = texels
+                            .iter()
+                            .map(|w| {
+                                w.iter()
+                                    .map(|v| format!("{v:x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
                             .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                eprintln!("half write {access} {}: {line}", f.name);
-                eprintln!(
-                    "half write {access} {}: {} lanes differ from Metal's: {differ:?}",
-                    f.name,
-                    differ.len()
-                );
-                let noted = announced.contains_key(&Degradation::DeviceNanEncoding);
-                assert!(
-                    differ.is_empty() || noted,
-                    "{access} {}: {} lanes differ from Metal's unannounced",
-                    f.name,
-                    differ.len()
-                );
-                // A 32-bit float channel (not the packed word) takes `0x7fc00000` as it is.
-                let float32 = f.word_bytes == 4 && f.format != PixelFormat::RG11B10Float;
-                if float32 || keeps {
-                    assert!(
-                        differ.is_empty(),
-                        "{access} {}: {} lanes differ from Metal's",
-                        f.name,
-                        differ.len()
+                            .join(" ");
+                        eprintln!("half write {access} {}: {line}", f.name);
+                        eprintln!(
+                            "half write {access} {}: {} lanes differ from Metal's: {differ:?}",
+                            f.name,
+                            differ.len()
+                        );
+                        let noted = announced.contains_key(&Degradation::DeviceNanEncoding);
+                        assert!(
+                            differ.is_empty() || noted,
+                            "{access} {}: {} lanes differ from Metal's unannounced",
+                            f.name,
+                            differ.len()
+                        );
+                        // A 32-bit float channel (not the packed word) takes `0x7fc00000` as it is.
+                        let float32 = f.word_bytes == 4 && f.format != PixelFormat::RG11B10Float;
+                        if float32 || keeps {
+                            assert!(
+                                differ.is_empty(),
+                                "{access} {}: {} lanes differ from Metal's",
+                                f.name,
+                                differ.len()
+                            );
+                        }
+                        report.push(format!(
+                            "{access} {}: {} differ, device-nan-encoding {}",
+                            f.name,
+                            differ.len(),
+                            if noted { "announced" } else { "not announced" }
+                        ));
+                    }
+                    assert_eq!(
+                        messages.take(),
+                        Vec::new(),
+                        "{access} {}: the validation layer reported",
+                        f.name
                     );
                 }
-                report.push(format!(
-                    "{access} {}: {} differ, device-nan-encoding {}",
-                    f.name,
-                    differ.len(),
-                    if noted { "announced" } else { "not announced" }
-                ));
-            });
-        }
-    }
+            }
+        },
+    );
     eprintln!("half write NaNs: {report:#?}");
 }

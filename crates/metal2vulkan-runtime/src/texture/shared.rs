@@ -5,9 +5,9 @@
 //! over the same image, as Metal's does. Cross-process export is not built (not scheduled). Metal's
 //! answers, measured on an Apple M3 Max (macOS 26.7, plain and under API validation):
 //! - only a `Private` texture is made shareable: any other storage mode answers nil, and API
-//!   validation stops it ("Requested storage mode is not allowed for Shared Textures"); a
-//!   texture buffer and a multisample texture are made, and a texture opened from a texture
-//!   buffer's handle reads what a kernel wrote through the texture buffer (CRF probe 2);
+//!   validation stops it ("Requested storage mode is not allowed for Shared Textures"); a texture
+//!   buffer and a multisample texture are made, and a texture opened from a texture buffer's handle
+//!   reads what a kernel wrote through the texture buffer (a Metal probe on the M3 Max and an M4);
 //! - a texture made otherwise, a texture over a buffer, and a view of a shareable texture are
 //!   not shareable, and their handle is nil;
 //! - each open answers a new texture object, shareable, with the texture's properties (its
@@ -67,8 +67,7 @@ impl Device {
     pub fn new_shared_texture(&self, descriptor: &TextureDescriptor) -> Result<Texture, Error> {
         const CALL: &str = "new_shared_texture";
         // Plain Metal makes a shareable texture without `framebufferOnly`, whatever the
-        // descriptor says, so a rotated one asserts as one without it does (EV
-        // ZCI2-rotprobe3-m4's `shared`).
+        // descriptor says, so a rotated one asserts as one without it does.
         let descriptor = &TextureDescriptor {
             framebuffer_only: false,
             ..self.take_texture_options(CALL, descriptor)
@@ -87,7 +86,7 @@ impl Device {
         // descriptor it stops (a width of 0, a side past the largest, too many levels, a swizzle
         // with writes, one sample in a multisample type: nil in `Shared`, `Managed` and
         // `Memoryless` storage, a stop in `Private`; an M3 Max under macOS 26.7 and an M4 under
-        // 27.0.1, EVs GSM2-nil-m3 and GSM2-nil-m4).
+        // 27.0.1).
         if storage != StorageMode::Private {
             return Err(nil(CALL, Problem::StorageMode));
         }
@@ -116,7 +115,6 @@ impl Device {
         if let Owner::Runtime { shareable, .. } = &mut image.owner {
             *shareable = true;
         }
-        self.degrade_optimized_layout(descriptor, &layout);
         let image = self.with_decoded_twin(image, &layout, descriptor, true)?;
         let record = ViewRecord::of_descriptor(&layout, descriptor);
         let storage = Storage::Image(image.shared());

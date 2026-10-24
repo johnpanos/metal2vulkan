@@ -1,18 +1,18 @@
 //! Device tests of visibility results (its third part) on the device the cfg selects, under the
 //! validation layer.
 //!
-//! Each pass is one RT6 Metal probes 1 and 5 measured (an M4 with macOS 27.0.1, each case with and
-//! without Metal's API validation), drawn with the owned fixture `rt6_render_state` into a 4²
-//! target: the fullscreen triangle covers every pixel, and the same draw from vertex 3 covers
-//! none. Each visibility buffer starts as 0xaa bytes, and its words after the command buffer are
-//! compared with the ones Metal wrote: `Boolean` writes 1 or 0 at each offset the encoder set,
-//! `Counting` the samples that passed (16 for the fullscreen triangle, 48 for three instances of
-//! it, 64 at 4x), an offset set with no draw after it gets 0, an offset never set keeps its
-//! bytes, a later pass rewrites only its own offsets, and an offset taken again in its mode, which
-//! Metal's validation stops, adds the draws since to its result. An offset that is not a multiple of 8,
-//! which Metal's validation stops, lands at the offset rounded down to 8, where plain Metal writes
-//! it. What else Metal's validation stops, the runtime refuses typed; a device without precise
-//! occlusion queries refuses `Counting` (`Unsupported`, naming `occlusionQueryPrecise`), printed.
+//! Each pass is one that Metal probes measured (an M4 with macOS 27.0.1, each case with and without
+//! Metal's API validation), drawn with the owned fixture `rt6_render_state` into a 4² target: the
+//! fullscreen triangle covers every pixel, and the same draw from vertex 3 covers none. Each
+//! visibility buffer starts as 0xaa bytes, and its words after the command buffer are compared with
+//! the ones Metal wrote: `Boolean` writes 1 or 0 at each offset the encoder set, `Counting` the
+//! samples that passed (16 for the fullscreen triangle, 48 for three instances of it, 64 at 4x), an
+//! offset set with no draw after it gets 0, an offset never set keeps its bytes, a later pass
+//! rewrites only its own offsets, and an offset taken again in its mode, which Metal's validation
+//! stops, adds the draws since to its result. An offset that is not a multiple of 8, which Metal's
+//! validation stops, lands at the offset rounded down to 8, where plain Metal writes it. What else
+//! Metal's validation stops, the runtime refuses typed; a device without precise occlusion queries
+//! refuses `Counting` (`Unsupported`, naming `occlusionQueryPrecise`), printed.
 
 use std::collections::BTreeSet;
 
@@ -589,12 +589,11 @@ type CountedCase<'a> = (
 );
 
 /// An execution's draws count in the visibility result mode set at it, which refused it before, as
-/// Metal's did (EVs RFL-visprobe2-m3 and -m4 and RFL-visprobe3-m4, the M3 Max and the M4 alike;
-/// their 8² target's 64 samples per covering draw are the probe's 4² target's 16 here). Each pass
-/// is one of their cases: `Boolean` writes 1 for a command's draw, `Counting` sums every command's
-/// samples with the encoder's draws before and after the execution, nothing counts while
-/// `Disabled`, and an offset set between two executions, or between a draw and an execution, counts
-/// the draws after it alone.
+/// Metal's did (the M3 Max and the M4 alike; their 8² target's 64 samples per covering draw are the
+/// probe's 4² target's 16 here). Each pass is one of their cases: `Boolean` writes 1 for a
+/// command's draw, `Counting` sums every command's samples with the encoder's draws before and
+/// after the execution, nothing counts while `Disabled`, and an offset set between two executions,
+/// or between a draw and an execution, counts the draws after it alone.
 #[test]
 fn executions_count_in_the_mode_set_at_them() {
     use VisibilityResultMode::{Boolean, Counting, Disabled};
@@ -710,9 +709,8 @@ fn executions_count_in_the_mode_set_at_them() {
         ),
         // A command at offset 0, then two from the same command at 8: each execution runs its
         // own range, as Metal documents, where Metal's GPU runs other commands, not the same
-        // ones from run to run (EVs RFL-execprobe-m3 and -m4, RFL-execprobe2-m3 and -m4; sw_a
-        // drew [32, 32] on the M3 Max and [16, 16] on the M4 at this case's sizes), which the
-        // device announces once.
+        // ones from run to run (sw_a drew [32, 32] on the M3 Max and [16, 16] on the M4 at this
+        // case's sizes), which the device announces once.
         (
             "sw_a",
             2,
@@ -757,7 +755,7 @@ pub(super) const REPEATED_STARTS: [Degradation; 1] = [Degradation::RepeatedExecu
 
 /// `sw_a` with its ranges read from a buffer (`execute_commands_in_buffer_indirect`): each
 /// execution runs its own range, as Metal documents, where Metal's GPU runs other commands, not
-/// the same ones from run to run (EV RFL-execprobe3-m4: commands 0..1 then 0..2 so read ran
+/// the same ones from run to run (commands 0..1 then 0..2 so read ran
 /// command 1 twice in each of three runs), which the host step announces once.
 #[test]
 fn executions_of_ranges_read_from_a_buffer_run_their_own_ranges() {

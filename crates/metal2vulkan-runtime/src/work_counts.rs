@@ -2,28 +2,56 @@
 //! work the runtime once repeated at every commit or every change, so a lane fails when it is
 //! repeated again; and the textures that took their storage form, which a lane holds to once each;
 //! and the buffers made with the device-address usage, which every encoder that reads pointers made
-//! resident one by one on MoltenVK. Not part of the API.
+//! resident one by one on MoltenVK; and the completion waits that missed their wake, which a test
+//! holds to none. Not part of the API.
 
+use super::buffer::{KeptBecause, ReadApart};
+use super::command_buffer::GroupEnd;
 use super::degradation::Degradation;
 use super::device::lock;
+use super::recorder::{CommandsReplayed, ReplayCounts};
+use super::shadow::{Backing, CopyCause, Lost, ShadowCopy, ShadowSource};
 use super::Device;
 use ash::vk;
+use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// The texels of a texture over an IOSurface's plane from which its shadow's copies in count
+/// apart (`WorkCounts::shadow_texels_first_copied_in_large_surfaces`,
+/// `shadow_texels_recopied_in_large_surfaces`): 2^20, which a 1920x1080 framebuffer's exceed.
+const LARGE_SURFACE_TEXELS: u64 = 1 << 20;
 
 /// A device's counters (`DeviceShared::counts`), each only ever added to.
 #[derive(Default)]
 pub(crate) struct Counters {
     command_pools_made: AtomicU64,
+    command_buffers_deferred: AtomicU64,
+    spare_command_pools_taken: AtomicU64,
+    spare_command_pools_reset: AtomicU64,
     live_tables_uploaded: AtomicU64,
     timeline_waits: AtomicU64,
+    missed_completion_wakes: AtomicU64,
+    completed_where_seen: AtomicU64,
+    scheduled_where_submitted: AtomicU64,
     timestamp_slots_taken: AtomicU64,
+    timestamp_slots_reset_on_host: AtomicU64,
+    calibrations: AtomicU64,
+    calibration_readings: AtomicU64,
+    calibration_deviation_most: AtomicU64,
+    calibration_disagreements: AtomicU64,
     storage_forms_taken: AtomicU64,
     addressable_buffers_made: AtomicU64,
     mipmap_first_levels_fetched: AtomicU64,
     pipelines_pooled: AtomicU64,
+    residual_form_draws: AtomicU64,
+    residual_form_makings: AtomicU64,
     shader_modules_made: AtomicU64,
     shader_modules_shared: AtomicU64,
+    pipeline_layouts_made: AtomicU64,
+    pipeline_layouts_shared: AtomicU64,
     variant_pipelines_made: AtomicU64,
+    flights_followed: AtomicU64,
     variants_taken_back: AtomicU64,
     unlisted_argument_sampler_failures: AtomicU64,
     host_step_sampler_sets_made: AtomicU64,
@@ -33,8 +61,14 @@ pub(crate) struct Counters {
     sampler_sets_shared: AtomicU64,
     sampler_sets_destroyed: AtomicU64,
     ahead_render_passes_made: AtomicU64,
+    render_passes_made: AtomicU64,
     ahead_framebuffers_made: AtomicU64,
     kept_backings_made: AtomicU64,
+    pooled_backings_made: AtomicU64,
+    storage_placeholders_made: AtomicU64,
+    storage_placeholder_attachments: AtomicU64,
+    color_resolve_passes_made: AtomicU64,
+    color_resolve_passes_kept: AtomicU64,
     ahead_nanos: AtomicU64,
     unused_bits_load_passes: AtomicU64,
     unused_bits_load_texels: AtomicU64,
@@ -49,6 +83,8 @@ pub(crate) struct Counters {
     stand_in_bytes: AtomicU64,
     stale_detached_reaches: AtomicU64,
     detached_storage_reaches: AtomicU64,
+    heap_slots_rewritten: AtomicU64,
+    heap_slot_writes_deferred: AtomicU64,
     heap_textures_tiled: AtomicU64,
     heap_texture_lossless_layouts: AtomicU64,
     heap_texture_block_compressed_layouts: AtomicU64,
@@ -63,8 +99,46 @@ pub(crate) struct Counters {
     internal_submissions: AtomicU64,
     queue_submissions: AtomicU64,
     command_buffers_submitted: AtomicU64,
+    batch_submit_nanos: AtomicU64,
     command_buffers_begun: AtomicU64,
+    encoder_command_buffers_begun: AtomicU64,
+    command_buffers_begun_by: [AtomicU64; Begun::COUNT],
+    encoder_primaries_begun_ahead: AtomicU64,
+    primaries_begun_ahead: AtomicU64,
     barrier_buffers_kept: AtomicU64,
+    stamped_buffers_kept: AtomicU64,
+    stamped_buffers_reused: AtomicU64,
+    finales_folded: AtomicU64,
+    finales_apart: AtomicU64,
+    grouped_submissions: AtomicU64,
+    batches_grouped: AtomicU64,
+    /// By `GroupEnd`, in its order.
+    group_ends: [AtomicU64; 7],
+    /// Batches submitted, by how many earlier batches of their `VkQueue` were pending then: none,
+    /// one, two or three, four or more.
+    batches_by_pending: [AtomicU64; 4],
+    groups_kept_pending: AtomicU64,
+    groups_sent_for_waits: AtomicU64,
+    command_buffer_wakes: AtomicU64,
+    command_buffer_wakes_spared: AtomicU64,
+    event_wakes: AtomicU64,
+    event_wakes_spared: AtomicU64,
+    slot_returns: AtomicU64,
+    slot_return_nanos: AtomicU64,
+    slot_waits: AtomicU64,
+    slot_wait_nanos: AtomicU64,
+    completed_waits: AtomicU64,
+    event_waits_met: AtomicU64,
+    bare_starts: AtomicU64,
+    prefixed_starts: AtomicU64,
+    unrun_instances_ended: AtomicU64,
+    untouched_passes_skipped: AtomicU64,
+    inline_passes: AtomicU64,
+    inline_passes_split: AtomicU64,
+    inline_split_instances: AtomicU64,
+    inline_memoryless_write_splits: AtomicU64,
+    passes_not_inline: [AtomicU64; NotInline::COUNT],
+    passes_not_inline_actions_by: [AtomicU64; ActionsRefused::COUNT],
     commits_handed_off: AtomicU64,
     images_started_on_the_host: AtomicU64,
     host_texel_copies: AtomicU64,
@@ -72,31 +146,142 @@ pub(crate) struct Counters {
     uncached_host_images: AtomicU64,
     cpu_block_decodes: AtomicU64,
     block_decode_passes: AtomicU64,
+    second_twins: AtomicU64,
+    second_twin_checks: AtomicU64,
+    second_twin_decodes: AtomicU64,
     queue_drains: AtomicU64,
     stand_in_copies_made: AtomicU64,
     stand_in_copies_made_at_draws: AtomicU64,
     draw_shapes_made: AtomicU64,
+    draw_shapes_found: AtomicU64,
+    argument_samplers_taken: AtomicU64,
+    bind_views_worked_out: AtomicU64,
+    stage_tables_read: AtomicU64,
+    no_copy_lies_read: AtomicU64,
+    commands_noted_as_before: AtomicU64,
     draws_settled: AtomicU64,
+    depth16_sided_draws: AtomicU64,
+    two_plane_draws: AtomicU64,
     bound_notices_made: AtomicU64,
     argument_tables_retained: AtomicU64,
     graphics_pipelines_looked_up: AtomicU64,
     linear_passes_in_place: AtomicU64,
     linear_passes_through_copies: AtomicU64,
     kept_bytes_passes: AtomicU64,
+    signed_depth_switch_ons: AtomicU64,
+    magnitude_stand_in_passes: AtomicU64,
+    magnitude_write_backs: AtomicU64,
+    sign_strips: AtomicU64,
+    color_group_passes: AtomicU64,
+    color_group_twins: AtomicU64,
+    color_group_draws_skipped: AtomicU64,
     draw_states_recorded: AtomicU64,
+    draws_pushing_set_zero: AtomicU64,
+    set_zero_writes_pushed: AtomicU64,
+    set_zero_equal_shape_switches: AtomicU64,
+    set_zero_writes_on_equal_shape_switches: AtomicU64,
+    set_zero_writes_if_shapes_shared: AtomicU64,
+    dispatches_pushing_set_zero: AtomicU64,
+    baked_sampler_dispatches_apart: AtomicU64,
     host_deallocators_delayed: AtomicU64,
+    host_import_releases_posted: AtomicU64,
+    host_import_releases_pending: AtomicU64,
+    host_keep_alives_kept: AtomicU64,
+    host_keep_alives_covered: AtomicU64,
+    host_mappings_queried: AtomicU64,
     dma_buf_imports: AtomicU64,
+    dma_buf_memories_live: AtomicU64,
+    dma_buf_image_memories_live: AtomicU64,
+    host_imports_released: AtomicU64,
+    host_imports_reimported: AtomicU64,
+    host_imports_resident: AtomicU64,
+    host_imports_lost: AtomicU64,
+    host_import_fds_kept: AtomicU64,
+    host_imports_kept_for_fds: AtomicU64,
+    host_imports_used: AtomicU64,
+    host_imports_read_apart: AtomicU64,
+    host_imports_read_apart_by: [AtomicU64; ReadApart::COUNT],
+    host_imports_kept_by: [AtomicU64; KeptBecause::COUNT],
+    host_imports_rebound_unlisted: AtomicU64,
+    host_rebind_imports_made: AtomicU64,
+    host_rebind_imports_covered: AtomicU64,
+    host_remaps_reported: AtomicU64,
+    host_remaps_over_imports: AtomicU64,
+    host_imports_remapped: AtomicU64,
+    host_pointer_imports_made: AtomicU64,
+    host_pointer_import_bytes_made: AtomicU64,
     dma_buf_sparse_buffers: AtomicU64,
     dma_buf_images: AtomicU64,
     dma_buf_image_fallbacks: AtomicU64,
-    pitched_host_images: AtomicU64,
-    pitched_host_image_refusals: AtomicU64,
-    pitched_host_image_refusals_recalled: AtomicU64,
     modifier_feature_queries: AtomicU64,
     shadowed_textures: AtomicU64,
     shadows_zeroed: AtomicU64,
     shadow_copies: AtomicU64,
+    shadow_texels_copied_in: AtomicU64,
+    shadow_texels_first_copied_in: AtomicU64,
+    shadow_texels_first_copied_in_images: AtomicU64,
+    shadow_texels_first_copied_in_private_buffers: AtomicU64,
+    shadow_texels_first_copied_in_mapped_buffers: AtomicU64,
+    shadow_texels_first_copied_in_host_pages: AtomicU64,
+    shadow_texels_first_copied_in_aliased_host_pages: AtomicU64,
+    shadow_texels_first_copied_in_surfaces: AtomicU64,
+    shadow_texels_first_copied_in_large_surfaces: AtomicU64,
+    shadow_texels_first_copied_in_again: AtomicU64,
+    shadow_texels_copied_in_images: AtomicU64,
+    shadow_texels_recopied_beyond_held: AtomicU64,
+    shadow_texels_recopied_after_changes: AtomicU64,
+    shadow_texels_recopied_after_other_shadows: AtomicU64,
+    shadow_texels_recopied_after_two_ways_merges: AtomicU64,
+    shadow_texels_recopied_after_writes: AtomicU64,
+    shadow_texels_recopied_after_writes_within: AtomicU64,
+    shadow_texels_recopied_after_dropped_writes: AtomicU64,
+    shadow_texels_bounded_copied_in: AtomicU64,
+    shadow_texels_recopied_in_images: AtomicU64,
+    shadow_texels_recopied_in_private_buffers: AtomicU64,
+    shadow_texels_recopied_in_mapped_buffers: AtomicU64,
+    shadow_texels_recopied_in_host_pages: AtomicU64,
+    shadow_texels_recopied_in_aliased_host_pages: AtomicU64,
+    shadow_texels_recopied_in_surfaces: AtomicU64,
+    shadow_texels_recopied_in_large_surfaces: AtomicU64,
     shadow_texels_copied_back: AtomicU64,
+    shadow_copies_back_dispatched: AtomicU64,
+    shadow_copies_in_dispatched: AtomicU64,
+    shadow_merge_copies_dispatched: AtomicU64,
+    shadow_merge_scratches_reused: AtomicU64,
+    shadow_merge_scratches_zeroed: AtomicU64,
+    row_copies: AtomicU64,
+    row_copy_regions: AtomicU64,
+    row_copy_regions_most: AtomicU64,
+    row_copies_dispatched: AtomicU64,
+    shadow_merges_fetched: AtomicU64,
+    shadow_merges_kept_in_images: AtomicU64,
+    shadow_merge_kept_images_made: AtomicU64,
+    shadow_merge_kept_images_followed: AtomicU64,
+    shadow_merge_kept_images_live: AtomicU64,
+    shadow_attachment_passes: AtomicU64,
+    shadow_attachment_textures: AtomicU64,
+    shadow_attachment_loads_within: AtomicU64,
+    shadow_attachment_loads_whole: AtomicU64,
+    shadow_attachment_clears: AtomicU64,
+    shadow_attachment_clears_in_part: AtomicU64,
+    shadow_attachment_loads_untouched: AtomicU64,
+    shadow_attachment_tiles_covered: AtomicU64,
+    shadow_attachment_tiles_bounded: AtomicU64,
+    shadows_sharing_truth: AtomicU64,
+    owned_descriptor_pools: AtomicU64,
+    shadow_texels_kept: AtomicU64,
+    bounded_shadow_copies: AtomicU64,
+    views_through_swizzle: AtomicU64,
+    view_shadows: AtomicU64,
+    attachment_reads_through_copies: AtomicU64,
+    attachment_read_splits: AtomicU64,
+    reading_draws_snapshotted: AtomicU64,
+    snapshot_inline_splits: AtomicU64,
+    feedback_loop_alias_images: AtomicU64,
+    depth_attachments_moved: AtomicU64,
+    depth_instances_held: AtomicU64,
+    held_depths_released: AtomicU64,
+    own_pixel_reads: AtomicU64,
     replay_logs_kept: AtomicU64,
     replay_log_bytes: AtomicU64,
     encoders_reencoded: AtomicU64,
@@ -105,6 +290,134 @@ pub(crate) struct Counters {
     fragment_shader_libraries_made: AtomicU64,
     pipelines_linked: AtomicU64,
     dispatch_pipelines_pooled: AtomicU64,
+    tile_pipelines_pooled: AtomicU64,
+    upload_chunks_in_device_memory: AtomicU64,
+    tile_dispatches_recorded: AtomicU64,
+}
+
+/// How a render pass took a shadowed texture as a color attachment
+/// (`WorkCounts::shadow_attachment_loads_within` and kin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColorTaken {
+    /// Loaded, its copies cut to the rectangle bounding the draws' scissors.
+    LoadedWithin,
+    /// Loaded (or neither loaded nor cleared), its every texel copied in.
+    Loaded,
+    /// Cleared over the whole texture: no copy in.
+    Cleared,
+    /// Cleared over part of the texture: its every texel copied in.
+    ClearedInPart,
+    /// Loaded in a pass that reaches no tile: no copy in or back.
+    Untouched,
+}
+
+/// What a `VkCommandBuffer` the runtime began was for (`WorkCounts::command_buffers_begun` and
+/// its parts, `command_buffers_begun_encoders` and kin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Begun {
+    /// An encoder's own, as it opened (or begun ahead in its spare pool, as it took it).
+    Encoder,
+    /// A segment's at the commit, an untracked segment's, or an ended encoder's encoded again.
+    Segment,
+    /// One an encoder went on in after a segment or a pass's end (`EncoderCore::continuation`).
+    Continuation,
+    /// A render encoder's draws' secondary.
+    Secondary,
+    /// A batch's work of its own as it is submitted: a sparse binding's mappings, the first work.
+    BatchWork,
+    /// A batch's barriers (and transitions and timestamps) as it is submitted.
+    BatchBarriers,
+    /// A barrier command buffer recorded to keep (`kept_barriers.rs`).
+    KeptBarriers,
+    /// The device's own submissions' (`device/submit.rs`) and staging submissions'
+    /// (`device/staging.rs`).
+    Internal,
+}
+
+impl Begun {
+    /// How many there are.
+    pub(crate) const COUNT: usize = 8;
+}
+
+/// What kept a render pass's first instance from recording inline (`render/inline_first.rs`): the
+/// first check it failed, in this order. Counted (`WorkCounts::passes_not_inline_encoders` and
+/// kin), so a run names what sends its passes' draws to secondary command buffers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NotInline {
+    /// The encoder encodes an ended encoder's calls again, or the pass has several color groups.
+    Encoders,
+    /// The pass's layout: no color attachment, or more than one layer or sample, a depth or
+    /// stencil attachment, a visibility buffer, custom sample positions, a rasterization-rate map,
+    /// or extended-range shadows that keep its draws.
+    Layouts,
+    /// A memoryless color attachment not loaded and stored `DontCare`, or resolved.
+    Memoryless,
+    /// A color attachment's actions, the first ruled out ([`ActionsRefused`]).
+    Actions(ActionsRefused),
+    /// A color attachment that is a texture over a buffer the pass does not render through an
+    /// image over the buffer's bytes.
+    BufferTextures,
+    /// Another color attachment kind: a stand-in, planes, a clear made apart, an extended-range
+    /// format, or a bound linear image.
+    Attachments,
+    /// The pass's layout allowed it, and its first draw that records reads or writes a color
+    /// attachment as storage (a fetch in the pixel interlock leaves it out of the subpass).
+    Storage,
+    /// The pass's layout allowed it, and a stand-in arrives with its first draw that records (a
+    /// fetched attachment's scratch or backing).
+    StandIn,
+    /// The pass's layout allowed it, and its first draw that records writes a memoryless color
+    /// attachment, which no instance recorded inline writes.
+    MemorylessWrites,
+    /// The pass's layout allowed it, and its first draw that records did not otherwise.
+    Draws,
+}
+
+impl NotInline {
+    /// The kinds.
+    const COUNT: usize = 10;
+    /// [`Actions`](Self::Actions)' index.
+    const ACTIONS: usize = 3;
+
+    /// Its kind's index among the [`COUNT`](Self::COUNT), in the order of the checks.
+    fn index(self) -> usize {
+        match self {
+            NotInline::Encoders => 0,
+            NotInline::Layouts => 1,
+            NotInline::Memoryless => 2,
+            NotInline::Actions(_) => Self::ACTIONS,
+            NotInline::BufferTextures => 4,
+            NotInline::Attachments => 5,
+            NotInline::Storage => 6,
+            NotInline::StandIn => 7,
+            NotInline::MemorylessWrites => 8,
+            NotInline::Draws => 9,
+        }
+    }
+}
+
+/// The color attachment action that kept a render pass's first instance from recording inline
+/// ([`NotInline::Actions`]): the first ruled out, color by color in index order, and of one color
+/// in this order. Counted (`WorkCounts::passes_not_inline_actions_dont_care_load` and kin).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ActionsRefused {
+    /// Loaded `DontCare`.
+    DontCareLoad,
+    /// Reaching past the render area as another attachment does not: cleared where Metal's clear
+    /// of whole tiles (`clear_reach.rs`) reaches another extent than another color's, or loaded,
+    /// or a memoryless color smaller, where another's clear reaches past the render area.
+    UnequalReach,
+    /// Cleared to a NaN whose bits the device's clear would not keep (`clear_value::nan_texel`).
+    NanClear,
+    /// Resolved, into a resolve attachment or by a copy after the pass.
+    Resolve,
+    /// Stored other than by `Store`, or late (`storeActionOptions` set after the encoder).
+    Store,
+}
+
+impl ActionsRefused {
+    /// The kinds: the last's index and one.
+    const COUNT: usize = ActionsRefused::Store as usize + 1;
 }
 
 /// A command the runtime records that MoltenVK 1.4.1 encodes on Apple's GPUs through a pipeline it
@@ -154,15 +467,54 @@ impl Counters {
         self.command_pools_made.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An encoder took a deferred command buffer, which the device's recorder replays
+    /// (`recorder`).
+    pub(crate) fn command_buffer_deferred(&self) {
+        self.command_buffers_deferred
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A command buffer took one of the device's spare command pools (`spares.rs`).
+    pub(crate) fn spare_command_pool_taken(&self) {
+        self.spare_command_pools_taken
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A command buffer took a spare command pool that one of its command buffers may still be
+    /// recording in, and reset it first (`spares.rs`).
+    pub(crate) fn spare_command_pool_reset(&self) {
+        self.spare_command_pools_reset
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The live buffers' table was uploaded to a buffer made for it, no spare reused.
     pub(crate) fn live_table_uploaded(&self) {
         self.live_tables_uploaded.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The completion thread waited for a timeline's value, not at a fence
+    /// A queue's waiter waited for a timeline's value, not at a fence
     /// (`command_buffer/completion.rs`).
     pub(crate) fn timeline_wait(&self) {
         self.timeline_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A completion waiter's wait ran out its slice although what it waited for was signaled when
+    /// the waiter looked again (`command_buffer/completion.rs`).
+    pub(crate) fn missed_completion_wake(&self) {
+        self.missed_completion_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A command buffer's transition to `Completed` or `Error` ran on the queue waiter that saw
+    /// it complete (`CommandBufferShared::finish_here`).
+    pub(crate) fn completed_where_seen(&self) {
+        self.completed_where_seen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A command buffer's transition to `Scheduled` ran on the scheduler's thread as its last
+    /// batch went (`CommandBufferShared::schedule`).
+    pub(crate) fn scheduled_where_submitted(&self) {
+        self.scheduled_where_submitted
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A committed command buffer took a slot of one of the device's timestamp pools, to write
@@ -171,9 +523,39 @@ impl Counters {
         self.timestamp_slots_taken.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A slot of one of the device's timestamp pools was reset on the host as a command buffer
+    /// took it (`gpu_time.rs`).
+    pub(crate) fn timestamp_slot_reset_on_host(&self) {
+        self.timestamp_slots_reset_on_host
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A calibration pair was taken of `readings` readings, its deviation `deviation`
+    /// nanoseconds (`gpu_time.rs`, `Timing::pair`).
+    pub(crate) fn calibrated(&self, readings: u32, deviation: u64) {
+        self.calibrations.fetch_add(1, Ordering::Relaxed);
+        self.calibration_readings
+            .fetch_add(u64::from(readings), Ordering::Relaxed);
+        self.calibration_deviation_most
+            .fetch_max(deviation, Ordering::Relaxed);
+    }
+
+    /// A command buffer's calibrated GPU times fell outside its life, and it was placed by its
+    /// completion (`gpu_time.rs`, `GpuClock::span`).
+    pub(crate) fn calibration_disagreed(&self) {
+        self.calibration_disagreements
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A texture took its storage form (`texture/storage_form.rs`).
     pub(crate) fn storage_form_taken(&self) {
         self.storage_forms_taken.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The textures that took their storage form so far, as [`Device::work_counts`] reads it.
+    #[cfg(test)]
+    pub(crate) fn storage_forms_taken(&self) -> u64 {
+        self.storage_forms_taken.load(Ordering::Relaxed)
     }
 
     /// A `VkBuffer` of `usage` was made: counted where the usage names device addresses.
@@ -197,6 +579,18 @@ impl Counters {
         self.pipelines_pooled.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A draw whose key's `VkPipeline` was not made took its residual form's
+    /// (`pipeline/render/residual.rs`).
+    pub(crate) fn residual_form_drawn(&self) {
+        self.residual_form_draws.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw that began its key's making took its residual form's `VkPipeline` meanwhile
+    /// (`pipeline/render/residual.rs`).
+    pub(crate) fn residual_form_making(&self) {
+        self.residual_form_makings.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A pipeline state's variant made a `VkShaderModule` (`pipeline/objects.rs`).
     pub(crate) fn shader_module_made(&self) {
         self.shader_modules_made.fetch_add(1, Ordering::Relaxed);
@@ -208,10 +602,27 @@ impl Counters {
         self.shader_modules_shared.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A pipeline state's variant made a `VkPipelineLayout` and its set layouts
+    /// (`pipeline/shared_layouts.rs`).
+    pub(crate) fn pipeline_layout_made(&self) {
+        self.pipeline_layouts_made.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pipeline state's variant took the device's `VkPipelineLayout` of its layout's definition
+    /// (`pipeline/shared_layouts.rs`).
+    pub(crate) fn pipeline_layout_shared(&self) {
+        self.pipeline_layouts_shared.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A pipeline state's variant made a `VkPipeline` (`pipeline/objects.rs`,
     /// `pipeline/graphics.rs`).
     pub(crate) fn variant_pipeline_made(&self) {
         self.variant_pipelines_made.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A variant's making waited for its twin's in the air before its own (`pipeline/flight.rs`).
+    pub(crate) fn flight_followed(&self) {
+        self.flights_followed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A graphics pipeline library of `part` was made (`pipeline/libraries.rs`).
@@ -227,6 +638,25 @@ impl Counters {
     /// (`pipeline/dispatch_making.rs`).
     pub(crate) fn dispatch_pipeline_pooled(&self) {
         self.dispatch_pipelines_pooled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render encoder recorded a tile dispatch (`render/tile_dispatch.rs`).
+    pub(crate) fn tile_dispatch_recorded(&self) {
+        self.tile_dispatches_recorded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render encoder's tile dispatch handed the making of a region's `VkPipeline` to the
+    /// device's pool and went on (`render/pending_tile.rs`).
+    pub(crate) fn tile_pipeline_pooled(&self) {
+        self.tile_pipelines_pooled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A command buffer's upload arena opened a chunk in device-local memory of a device without
+    /// unified memory (`upload.rs`).
+    pub(crate) fn upload_chunk_in_device_memory(&self) {
+        self.upload_chunks_in_device_memory
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -297,6 +727,39 @@ impl Counters {
         self.kept_backings_made.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A pass made a backing for a memoryless color attachment, which its queue keeps
+    /// (`attachment_stand_in::pooled_backing`).
+    pub(crate) fn pooled_backing_made(&self) {
+        self.pooled_backings_made.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The device made a placeholder image for the colors render pass instances leave out of
+    /// their subpass for the pixel interlock (`storage_placeholder.rs`).
+    pub(crate) fn storage_placeholder_made(&self) {
+        self.storage_placeholders_made
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A framebuffer took a placeholder's view for a color its render pass instance leaves out
+    /// of its subpass for the pixel interlock (`storage_placeholder.rs`).
+    pub(crate) fn storage_placeholder_attachment(&self) {
+        self.storage_placeholder_attachments
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pass made the objects of its exact color resolves (`color_resolve.rs`).
+    pub(crate) fn color_resolve_pass_made(&self) {
+        self.color_resolve_passes_made
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pass took the objects of its exact color resolves that an image kept
+    /// (`color_resolve::KeptResolves`).
+    pub(crate) fn color_resolve_pass_kept(&self) {
+        self.color_resolve_passes_kept
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// An encoder recorded the load pass of an extended-range or padded color attachment over a
     /// region of `texels` texels (`render/unused_bits_load.rs`).
     pub(crate) fn unused_bits_load_recorded(&self, texels: u64) {
@@ -346,9 +809,37 @@ impl Counters {
         (self.command_buffers_submitted).fetch_add(command_buffers as u64, Ordering::Relaxed);
     }
 
-    /// A `VkCommandBuffer` was begun (`vkBeginCommandBuffer`).
-    pub(crate) fn command_buffer_begun(&self) {
+    /// A batch's `vkQueueSubmit` (or a group's, or a command buffer's fence's) spent `nanos`
+    /// nanoseconds in the driver (`device/relay.rs`).
+    pub(crate) fn batch_submitted_in(&self, nanos: u64) {
+        self.batch_submit_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// A `VkCommandBuffer` was begun (`vkBeginCommandBuffer`) for `what`.
+    pub(crate) fn command_buffer_begun(&self, what: Begun) {
         self.command_buffers_begun.fetch_add(1, Ordering::Relaxed);
+        self.command_buffers_begun_by[what as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An encoder began a `VkCommandBuffer` as it recorded (`vkBeginCommandBuffer`) for `what`:
+    /// its own, a segment's, one it went on in, or a render encoder's draws' secondary.
+    pub(crate) fn encoder_command_buffer_begun(&self, what: Begun) {
+        self.command_buffer_begun(what);
+        (self.encoder_command_buffers_begun).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An encoder took its own `VkCommandBuffer` begun ahead in its spare command pool
+    /// (`spares.rs`), counted as begun too ([`encoder_command_buffer_begun`]).
+    ///
+    /// [`encoder_command_buffer_begun`]: Self::encoder_command_buffer_begun
+    pub(crate) fn encoder_primary_begun_ahead(&self) {
+        (self.encoder_primaries_begun_ahead).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A spare command pool's primary was begun ahead, and the pool kept among the spares again
+    /// (`spares.rs`).
+    pub(crate) fn primary_begun_ahead(&self) {
+        self.primaries_begun_ahead.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A batch's barrier command buffer was recorded to be kept and submitted again
@@ -357,8 +848,171 @@ impl Counters {
         self.barrier_buffers_kept.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A commit found another thread making the scheduler's pass and left its batches to it
-    /// (`scheduler/inbox.rs`).
+    /// A batch's barrier command buffer that writes a command buffer's timestamps was recorded
+    /// to be kept for its slot and submitted again (`command_buffer/kept_barriers.rs`).
+    pub(crate) fn stamped_buffer_kept(&self) {
+        self.stamped_buffers_kept.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A batch took such a kept command buffer again (`command_buffer/kept_barriers.rs`).
+    pub(crate) fn stamped_buffer_reused(&self) {
+        self.stamped_buffers_reused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A batch with work was submitted with its end in its last command buffer
+    /// (`command_buffer/submit.rs`).
+    pub(crate) fn finale_folded(&self) {
+        self.finales_folded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A batch with work was submitted with its end in a command buffer of its own.
+    pub(crate) fn finale_apart(&self) {
+        self.finales_apart.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `vkQueueSubmit` submitted `batches` batches, more than one, only the last signalling
+    /// (`command_buffer/group.rs`).
+    pub(crate) fn batches_grouped(&self, batches: usize) {
+        self.grouped_submissions.fetch_add(1, Ordering::Relaxed);
+        (self.batches_grouped).fetch_add(batches as u64, Ordering::Relaxed);
+    }
+
+    /// A batch was submitted, or held in a group, while `pending` earlier batches of its
+    /// `VkQueue` were submitted or held and not seen complete (`command_buffer/submit.rs`).
+    pub(crate) fn batch_submitted_behind(&self, pending: u64) {
+        let bucket = match pending {
+            0 => 0,
+            1 => 1,
+            2 | 3 => 2,
+            _ => 3,
+        };
+        self.batches_by_pending[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A group of batches held for one kernel submission went, sent by `end`
+    /// (`command_buffer/group.rs`).
+    pub(crate) fn group_ended(&self, end: GroupEnd) {
+        self.group_ends[end as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A group of batches stayed held past the pass that found no batch ready, for the work its
+    /// `VkQueue` still ran (`command_buffer/group.rs`); once per group.
+    pub(crate) fn group_kept_pending(&self) {
+        self.groups_kept_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Such a group went at once because a thread waits for one of its command buffers.
+    pub(crate) fn group_sent_for_wait(&self) {
+        self.groups_sent_for_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A command buffer's change woke the threads sleeping on it where `parked`, else spared the
+    /// notify (`command_buffer/mod.rs`).
+    pub(crate) fn command_buffer_wake(&self, parked: bool) {
+        match parked {
+            true => &self.command_buffer_wakes,
+            false => &self.command_buffer_wakes_spared,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An event's rise woke the host waits sleeping on it where `parked`, else spared the notify
+    /// (`event.rs`).
+    pub(crate) fn event_wake(&self, parked: bool) {
+        match parked {
+            true => &self.event_wakes,
+            false => &self.event_wakes_spared,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A completed command buffer gave its queue's slot back `nanos` nanoseconds after its last
+    /// completed handler returned (`command_buffer/mod.rs`).
+    pub(crate) fn slot_returned(&self, nanos: u64) {
+        self.slot_returns.fetch_add(1, Ordering::Relaxed);
+        self.slot_return_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// A new command buffer waited `nanos` nanoseconds for a slot of its full queue (`queue.rs`).
+    pub(crate) fn slot_waited(&self, nanos: u64) {
+        self.slot_waits.fetch_add(1, Ordering::Relaxed);
+        self.slot_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// A batch with work was submitted waiting for `waits` timelines at values the host saw them
+    /// reach (`command_buffer/submit.rs`).
+    pub(crate) fn completed_waited(&self, waits: usize) {
+        self.completed_waits
+            .fetch_add(waits as u64, Ordering::Relaxed);
+    }
+
+    /// A batch went (submitted, or held in a group) with `waits` of its event waits for values
+    /// the scheduler found reached as it took the batch, so it waits for none of them
+    /// (`scheduler/mod.rs`).
+    pub(crate) fn event_waits_met(&self, waits: usize) {
+        self.event_waits_met
+            .fetch_add(waits as u64, Ordering::Relaxed);
+    }
+
+    /// A batch with work was submitted with no command buffer of barriers before its first
+    /// encoder.
+    pub(crate) fn bare_start(&self) {
+        self.bare_starts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A timed command buffer's first batch was submitted with its start written by its first
+    /// encoder's own command buffer (`gpu_time.rs`, `command_buffer/submit.rs`).
+    pub(crate) fn prefixed_start(&self) {
+        self.prefixed_starts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass's first instance began inline in a primary command buffer of its encoder's
+    /// (`render/inline_first.rs`).
+    pub(crate) fn inline_pass(&self) {
+        self.inline_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass's first instance did not record inline, for `why` (`NotInline`).
+    pub(crate) fn pass_not_inline(&self, why: NotInline) {
+        self.passes_not_inline[why.index()].fetch_add(1, Ordering::Relaxed);
+        if let NotInline::Actions(action) = why {
+            self.passes_not_inline_actions_by[action as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A render pass whose first instance recorded inline ended with more than one instance.
+    pub(crate) fn inline_pass_split(&self) {
+        self.inline_passes_split.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass instance after a split of such a pass began inline in the same primary
+    /// command buffer (`render/inline_splits.rs`).
+    pub(crate) fn inline_split_instance(&self) {
+        self.inline_split_instances.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pass whose first instance recorded inline split before a draw that writes a memoryless
+    /// color attachment, which no instance recorded inline writes (`render/inline_first.rs`).
+    pub(crate) fn inline_memoryless_write_split(&self) {
+        self.inline_memoryless_write_splits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass instance its pass replaced or gave up before running it had its draws
+    /// recording given up (`render.rs`, `RenderCommandEncoder::end_unrun`): never replayed where
+    /// deferred, else ended.
+    pub(crate) fn unrun_instance_ended(&self) {
+        self.unrun_instances_ended.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass that changes no texel ended without recording anything
+    /// (`render/untouched.rs`).
+    pub(crate) fn untouched_pass_skipped(&self) {
+        self.untouched_passes_skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A commit left its batches to the scheduler's thread (`scheduler/inbox.rs`).
     pub(crate) fn commit_handed_off(&self) {
         self.commits_handed_off.fetch_add(1, Ordering::Relaxed);
     }
@@ -385,6 +1039,24 @@ impl Counters {
         self.block_decode_passes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An ASTC carrier's second decoded twin was made (`Image::make_second_twin`).
+    pub(crate) fn second_twin(&self) {
+        self.second_twins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A submission checked `n` blit writes into ASTC carriers for second twins' decodes
+    /// (`command_buffer/submit.rs`).
+    pub(crate) fn second_twin_checks(&self, n: usize) {
+        self.second_twin_checks
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// A submission recorded `n` decodes into second decoded twins.
+    pub(crate) fn second_twin_decodes(&self, n: usize) {
+        self.second_twin_decodes
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
     /// The device's queues were drained before a failed wait's command buffers let go of what
     /// they used (`Device::drain_queues`).
     pub(crate) fn queue_drain(&self) {
@@ -407,9 +1079,62 @@ impl Counters {
         self.draw_shapes_made.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A draw found the bind shape of its bind state among those its drawing state settled
+    /// lately (`LiveBind::shape`).
+    pub(crate) fn draw_shape_found(&self) {
+        self.draw_shapes_found.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw took the device's live sampler states to list (`sampler::ArgumentSamplers`).
+    pub(crate) fn argument_samplers_taken(&self) {
+        self.argument_samplers_taken.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The runtime made a render pass (`render_target::create`).
+    pub(crate) fn render_pass_made(&self) {
+        self.render_passes_made.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render encoder's bind worked out a texture slot's view that its bind memo did not keep
+    /// (`binding::BindMemo`).
+    pub(crate) fn bind_view_worked_out(&self) {
+        self.bind_views_worked_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw read a stage's table into its encoder's kept bind state
+    /// (`ArgumentTable::refresh_reading`).
+    pub(crate) fn stage_table_read(&self) {
+        self.stage_tables_read.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A look at where a no-copy buffer's bytes lie, which takes its pages' lock
+    /// (`buffer::HostCell`).
+    pub(crate) fn no_copy_lie_read(&self) {
+        self.no_copy_lies_read.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw's uses were noted already: the last command its encoder noted had them
+    /// (`noted_apart.rs`).
+    pub(crate) fn command_noted_as_before(&self) {
+        self.commands_noted_as_before
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A draw settled its variant and plan from its bind shape (`GraphicsState::settle_shape`).
     pub(crate) fn draw_settled(&self) {
         self.draws_settled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw ran the variant whose fragment stage declares its `Depth16Unorm` depth bias's side
+    /// (`VariantKey::depth16_bias_raises`).
+    pub(crate) fn depth16_sided_draw(&self) {
+        self.depth16_sided_draws.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw ran a variant that takes a slot bound to a two-plane extended-range texture
+    /// (`VariantKey::extended_range`).
+    pub(crate) fn two_plane_draw(&self) {
+        self.two_plane_draws.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A bind of a variant made the notices it announces at every occurrence
@@ -447,6 +1172,47 @@ impl Counters {
         self.kept_bytes_passes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A render target's 32-bit float depth was switched on to render over its magnitude
+    /// stand-in, or to have its words stripped of their signs (`texture/signed_depth.rs`): once
+    /// per texture image.
+    pub(crate) fn signed_depth_switch_on(&self) {
+        self.signed_depth_switch_ons.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pass rendered a depth over its magnitude stand-in (`texture/signed_depth.rs`), and
+    /// wrote what it changed back into the depth where `written_back`.
+    pub(crate) fn magnitude_stand_in_pass(&self, written_back: bool) {
+        self.magnitude_stand_in_passes
+            .fetch_add(1, Ordering::Relaxed);
+        if written_back {
+            self.magnitude_write_backs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A depth's words were stored without their signs after a pass with depth writes whose
+    /// stores the device's pass left signed (`texture/signed_depth.rs`, `SignStrip`).
+    pub(crate) fn sign_strip(&self) {
+        self.sign_strips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render encoder drew one of its pass's later color groups (`render/color_groups.rs`).
+    pub(crate) fn color_group_pass(&self) {
+        self.color_group_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pass of several color groups made the twin of its depth/stencil attachment its later
+    /// groups render against (`render/color_groups.rs`).
+    pub(crate) fn color_group_twin(&self) {
+        self.color_group_twins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A later color group recorded nothing for a draw that writes none of its colors, no depth
+    /// and no stencil (`render/color_groups.rs`).
+    pub(crate) fn color_group_draw_skipped(&self) {
+        self.color_group_draws_skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Draws recorded `count` state commands into their secondary command buffers
     /// (`render::Recording::record`).
     pub(crate) fn draw_states_recorded(&self, count: u64) {
@@ -456,11 +1222,105 @@ impl Counters {
         }
     }
 
-    /// A no-copy buffer's deallocator, given no keep-alive, waits past its release for the
-    /// import of its pages, which something else still holds (`buffer.rs`).
+    /// A draw recorded with its set 0 pushed (`pipeline::objects::pushes_set_zero`).
+    pub(crate) fn draw_pushing_set_zero(&self) {
+        self.draws_pushing_set_zero.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A dispatch encoded with its set 0 pushed (`pipeline::objects::pushes_set_zero`).
+    pub(crate) fn dispatch_pushing_set_zero(&self) {
+        self.dispatches_pushing_set_zero
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A dispatch of a variant that bakes samplers, its pipelines made, recorded in a
+    /// `VkCommandBuffer` of its own (`RuntimeDriverDefect::ImmutableSamplersLostAfterCopies`).
+    pub(crate) fn baked_sampler_dispatch_apart(&self) {
+        self.baked_sampler_dispatches_apart
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Draws' pushes of their set 0 carried `count` writes (`render/bound.rs`).
+    pub(crate) fn set_zero_writes_pushed(&self, count: u64) {
+        if count > 0 {
+            self.set_zero_writes_pushed
+                .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// `switches` draws' pushes carried their set 0 whole with another layout of the shape set 0
+    /// was last pushed with: `carried` writes, where `if_shared` would do if the layouts were one
+    /// (`render/bound.rs`).
+    pub(crate) fn set_zero_equal_shape_switches(
+        &self,
+        switches: u64,
+        carried: u64,
+        if_shared: u64,
+    ) {
+        if switches > 0 {
+            self.set_zero_equal_shape_switches
+                .fetch_add(switches, Ordering::Relaxed);
+            self.set_zero_writes_on_equal_shape_switches
+                .fetch_add(carried, Ordering::Relaxed);
+            self.set_zero_writes_if_shapes_shared
+                .fetch_add(if_shared, Ordering::Relaxed);
+        }
+    }
+
+    /// A no-copy buffer's deallocator waits past its release: given no keep-alive, for the import
+    /// of its pages, which something else still holds, or for the batches in flight as that
+    /// import's memory is freed (`freed_memory.rs`); or for a live buffers' table that lists its
+    /// pages, which a command buffer holds (`buffer.rs`).
     pub(crate) fn host_deallocator_delayed(&self) {
         self.host_deallocators_delayed
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A host import's free, and what waits for it, posted to a handler thread as the import
+    /// went (a keep-alive alone waiting for the free), pending until it ran
+    /// ([`host_import_release_done`](Self::host_import_release_done)).
+    pub(crate) fn host_import_release_posted(&self) {
+        self.host_import_releases_posted
+            .fetch_add(1, Ordering::Relaxed);
+        self.host_import_releases_pending
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A posted host import's free, and what waited for it, ran
+    /// ([`host_import_release_posted`](Self::host_import_release_posted)).
+    pub(crate) fn host_import_release_done(&self) {
+        self.host_import_releases_pending
+            .fetch_sub(1, Ordering::Release);
+    }
+
+    /// A no-copy buffer's keep-alive is kept past its release by the import of its pages, which
+    /// something else still holds and no other buffer lies in (`buffer.rs`).
+    pub(crate) fn host_keep_alive_kept(&self) {
+        self.host_keep_alives_kept.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The import that kept a keep-alive was freed, and dropped it.
+    pub(crate) fn host_keep_alive_freed(&self) {
+        self.host_keep_alives_kept.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// A no-copy buffer's keep-alive was dropped at its release: another buffer lying in the
+    /// import of its pages, or the keep-alive the import keeps, keeps them mapped until it is
+    /// freed (`buffer.rs`).
+    pub(crate) fn host_keep_alive_covered(&self) {
+        self.host_keep_alives_covered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The kernel was asked about `mappings` of the process's mappings, for their write
+    /// permission, before an import of host pages (`host_memory.rs`'s `refuse_unwritable`, which
+    /// asks only on Linux).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn host_mappings_queried(&self, mappings: u64) {
+        if mappings > 0 {
+            self.host_mappings_queried
+                .fetch_add(mappings, Ordering::Relaxed);
+        }
     }
 
     /// `chunks` chunks of host pages a caller's source made were imported as dma-buf memory, and
@@ -468,6 +1328,148 @@ impl Counters {
     pub(crate) fn dma_buf_imported(&self, chunks: usize) {
         self.dma_buf_imports
             .fetch_add(chunks as u64, Ordering::Relaxed);
+    }
+
+    /// A `VkDeviceMemory` was imported from a dma-buf of a caller's source and is held: an
+    /// image's dedicated import where `of_image`, else a chunk of a buffer's pages (`dma_buf.rs`).
+    pub(crate) fn dma_buf_memory_imported(&self, of_image: bool) {
+        self.dma_buf_live(of_image).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` such imports were freed.
+    pub(crate) fn dma_buf_memories_freed(&self, of_image: bool, count: usize) {
+        (self.dma_buf_live(of_image)).fetch_sub(count as u64, Ordering::Relaxed);
+    }
+
+    /// The live gauge of dma-buf imports of images where `of_image`, else of buffers' chunks.
+    fn dma_buf_live(&self, of_image: bool) -> &AtomicU64 {
+        match of_image {
+            true => &self.dma_buf_image_memories_live,
+            false => &self.dma_buf_memories_live,
+        }
+    }
+
+    /// A releasable import was released while idle (`host_residency.rs`).
+    pub(crate) fn host_import_released(&self) {
+        self.host_imports_released.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A released import was imported again.
+    pub(crate) fn host_import_reimported(&self) {
+        self.host_imports_reimported.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A releasable import holds its memory from now on (`resident`), or no longer.
+    pub(crate) fn host_import_resident(&self, resident: bool) {
+        match resident {
+            true => self.host_imports_resident.fetch_add(1, Ordering::Relaxed),
+            false => self.host_imports_resident.fetch_sub(1, Ordering::Relaxed),
+        };
+    }
+
+    /// A committed command buffer's commands use `count` host imports (`Buffer::distinct_host_imports`).
+    pub(crate) fn commit_used_host_imports(&self, count: u64) {
+        self.host_imports_used.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// A live host import was first read other than by a blit (`read_apart`), or such an import
+    /// went.
+    pub(crate) fn host_import_read_apart(&self, read_apart: bool) {
+        match read_apart {
+            true => self.host_imports_read_apart.fetch_add(1, Ordering::Relaxed),
+            false => self.host_imports_read_apart.fetch_sub(1, Ordering::Relaxed),
+        };
+    }
+
+    /// A live host import was first read apart for `reason` (`read_apart`), or such an import
+    /// went.
+    pub(crate) fn host_import_read_apart_for(&self, reason: ReadApart, read_apart: bool) {
+        let gauge = &self.host_imports_read_apart_by[reason as usize];
+        match read_apart {
+            true => gauge.fetch_add(1, Ordering::Relaxed),
+            false => gauge.fetch_sub(1, Ordering::Relaxed),
+        };
+    }
+
+    /// A rebind's import that no live buffers' table listed yet was made (`unlisted`), or was
+    /// first listed, or went unlisted.
+    pub(crate) fn host_import_rebound_unlisted(&self, unlisted: bool) {
+        let gauge = &self.host_imports_rebound_unlisted;
+        match unlisted {
+            true => gauge.fetch_add(1, Ordering::Relaxed),
+            false => gauge.fetch_sub(1, Ordering::Relaxed),
+        };
+    }
+
+    /// A rebind imported its new pages, where bytes buffers over host pages lay over already held
+    /// them (`covered`) or not.
+    pub(crate) fn host_rebind_import_made(&self, covered: bool) {
+        self.host_rebind_imports_made
+            .fetch_add(1, Ordering::Relaxed);
+        if covered {
+            (self.host_rebind_imports_covered).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The caller reported a remap of host addresses (`Device::host_range_remapped`) whose pages
+    /// `imports` live imports have a page among.
+    pub(crate) fn host_range_remapped(&self, imports: usize) {
+        self.host_remaps_reported.fetch_add(1, Ordering::Relaxed);
+        if imports > 0 {
+            self.host_remaps_over_imports
+                .fetch_add(1, Ordering::Relaxed);
+            (self.host_imports_remapped).fetch_add(imports as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The device imported `bytes` of host pages by their pointer (`Memory::import_host`).
+    pub(crate) fn host_pointer_import_made(&self, bytes: u64) {
+        (self.host_pointer_imports_made).fetch_add(1, Ordering::Relaxed);
+        (self.host_pointer_import_bytes_made).fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A host import the device never releases while idle, for `because`, was made (`kept`), or
+    /// went.
+    pub(crate) fn host_import_kept(&self, because: KeptBecause, kept: bool) {
+        let gauge = &self.host_imports_kept_by[because as usize];
+        match kept {
+            true => gauge.fetch_add(1, Ordering::Relaxed),
+            false => gauge.fetch_sub(1, Ordering::Relaxed),
+        };
+    }
+
+    /// A read found a released import that the device could not import again: the device is
+    /// lost.
+    pub(crate) fn host_import_lost(&self) {
+        self.host_imports_lost.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Keep `count` more descriptors of dma-bufs for imports the device may release, where the
+    /// kept ones stay within `limit`: whether they do (counted then).
+    pub(crate) fn host_import_fds_keep(&self, count: u64, limit: u64) -> bool {
+        let kept = &self.host_import_fds_kept;
+        let fits = |held: u64| held.checked_add(count).filter(|after| *after <= limit);
+        kept.fetch_update(Ordering::AcqRel, Ordering::Acquire, fits)
+            .is_ok()
+    }
+
+    /// `count` such descriptors were closed.
+    pub(crate) fn host_import_fds_closed(&self, count: u64) {
+        self.host_import_fds_kept
+            .fetch_sub(count, Ordering::Relaxed);
+    }
+
+    /// A no-copy buffer's own import of dma-bufs is kept imported from now on, as the
+    /// descriptors to import it again did not fit (`kept`), or such an import went.
+    pub(crate) fn host_import_kept_for_fds(&self, kept: bool) {
+        match kept {
+            true => self
+                .host_imports_kept_for_fds
+                .fetch_add(1, Ordering::Relaxed),
+            false => self
+                .host_imports_kept_for_fds
+                .fetch_sub(1, Ordering::Relaxed),
+        };
     }
 
     /// A no-copy buffer's (or heap's, or rebind's) `VkBuffer` was assembled from several chunks'
@@ -482,33 +1484,10 @@ impl Counters {
         self.dma_buf_images.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A texture over dma-buf pages that such an image would alias took the path of a texture
-    /// over memory no image aliases instead: the device made no such image of it (`dma_buf.rs`).
+    /// A texture placed in a heap over dma-buf pages that such an image would alias is a shadow of
+    /// the heap's bytes instead: the device made no such image of it (`texture/heap.rs`).
     pub(crate) fn dma_buf_image_fell_back(&self) {
         self.dma_buf_image_fallbacks.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A texture's image over a no-copy buffer's host pages imported by their pointer was made a
-    /// `DRM_FORMAT_MOD_LINEAR` image at Metal's row pitch and bound there (`texture.rs`'s
-    /// `host_pitched_image`).
-    pub(crate) fn pitched_host_image_made(&self) {
-        self.pitched_host_images.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// The driver refused a `DRM_FORMAT_MOD_LINEAR` image at Metal's row pitch (`texture.rs`'s
-    /// `host_pitched_image`).
-    #[cfg(unix)]
-    pub(crate) fn pitched_host_image_refused(&self) {
-        self.pitched_host_image_refusals
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A texture's image at Metal's row pitch was not asked of the driver, which refused the same
-    /// image before (`texture/pitch_refusals.rs`).
-    #[cfg(unix)]
-    pub(crate) fn pitched_host_image_refusal_recalled(&self) {
-        self.pitched_host_image_refusals_recalled
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// The driver was asked a format's `DRM_FORMAT_MOD_LINEAR` tiling features (`dma_buf.rs`'s
@@ -529,11 +1508,291 @@ impl Counters {
     }
 
     /// An encoder planned `n` copies between shadowed textures' truths and their shadows
-    /// (`shadow.rs`), whose copies back of buffers' textures' images move `texels_back` texels.
-    pub(crate) fn shadow_copies_planned(&self, n: usize, texels_back: u64) {
+    /// (`shadow.rs`), whose copies in and back of buffers' textures' images move `texels_in` and
+    /// `texels_back` texels.
+    pub(crate) fn shadow_copies_planned(&self, n: usize, texels_in: u64, texels_back: u64) {
         self.shadow_copies.fetch_add(n as u64, Ordering::Relaxed);
+        self.shadow_texels_copied_in
+            .fetch_add(texels_in, Ordering::Relaxed);
         self.shadow_texels_copied_back
             .fetch_add(texels_back, Ordering::Relaxed);
+    }
+
+    /// An encoder planned `copy`, a copy in of a shadowed texture: its texels
+    /// (`shadow::ShadowCopy::texels_copied_in`) counted by why it is made
+    /// (`shadow::ShadowCopy::cause`, a change of the truth by its reason), by what holds the truth (`shadow::Backing`), apart where
+    /// the truth is an IOSurface's plane under a texture of at least [`LARGE_SURFACE_TEXELS`]
+    /// texels, and apart where the shadow is an image's, copied image to image. Nothing for any
+    /// other step.
+    pub(crate) fn shadow_copy_in_planned<M>(&self, copy: &ShadowCopy<M>) {
+        let Some(cause) = copy.cause else {
+            return;
+        };
+        let texels = copy.texels_copied_in();
+        let add = |counter: &AtomicU64| {
+            counter.fetch_add(texels, Ordering::Relaxed);
+        };
+        let copies = &copy.copies;
+        if matches!(copies.source, ShadowSource::Image { .. }) {
+            add(&self.shadow_texels_copied_in_images);
+        }
+        let large = copies.backing == Backing::Surface && copies.texels() >= LARGE_SURFACE_TEXELS;
+        let first = cause == CopyCause::First;
+        match cause {
+            CopyCause::First => add(&self.shadow_texels_first_copied_in),
+            CopyCause::BeyondHeld => add(&self.shadow_texels_recopied_beyond_held),
+            CopyCause::Changed(lost) => {
+                add(&self.shadow_texels_recopied_after_changes);
+                add(match lost {
+                    Lost::OtherShadow => &self.shadow_texels_recopied_after_other_shadows,
+                    Lost::TwoWays => &self.shadow_texels_recopied_after_two_ways_merges,
+                    Lost::Written => &self.shadow_texels_recopied_after_writes,
+                    Lost::Within => &self.shadow_texels_recopied_after_writes_within,
+                    Lost::Dropped => &self.shadow_texels_recopied_after_dropped_writes,
+                });
+            }
+            CopyCause::Bounded => add(&self.shadow_texels_bounded_copied_in),
+        }
+        add(match (first, copies.backing) {
+            (true, Backing::Image) => &self.shadow_texels_first_copied_in_images,
+            (true, Backing::PrivateBuffer) => &self.shadow_texels_first_copied_in_private_buffers,
+            (true, Backing::MappedBuffer) => &self.shadow_texels_first_copied_in_mapped_buffers,
+            (true, Backing::HostPages) => &self.shadow_texels_first_copied_in_host_pages,
+            (true, Backing::AliasedHostPages) => {
+                &self.shadow_texels_first_copied_in_aliased_host_pages
+            }
+            (true, Backing::Surface) => &self.shadow_texels_first_copied_in_surfaces,
+            (false, Backing::Image) => &self.shadow_texels_recopied_in_images,
+            (false, Backing::PrivateBuffer) => &self.shadow_texels_recopied_in_private_buffers,
+            (false, Backing::MappedBuffer) => &self.shadow_texels_recopied_in_mapped_buffers,
+            (false, Backing::HostPages) => &self.shadow_texels_recopied_in_host_pages,
+            (false, Backing::AliasedHostPages) => {
+                &self.shadow_texels_recopied_in_aliased_host_pages
+            }
+            (false, Backing::Surface) => &self.shadow_texels_recopied_in_surfaces,
+        });
+        match (large, first) {
+            (true, true) => add(&self.shadow_texels_first_copied_in_large_surfaces),
+            (true, false) => add(&self.shadow_texels_recopied_in_large_surfaces),
+            (false, _) => {}
+        }
+    }
+
+    /// An encoder planned `n` copies in of the texels only writes within a rectangle changed
+    /// since a shadowed texture's copy in (`shadow.rs`, `shadow::Within`).
+    pub(crate) fn bounded_shadow_copies_planned(&self, n: usize) {
+        self.bounded_shadow_copies
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// An encoder recorded a shadowed texture's copy back as a dispatch
+    /// (`shadow_copy_back.rs`).
+    pub(crate) fn shadow_copy_back_dispatched(&self) {
+        self.shadow_copies_back_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An encoder recorded a merged shadowed texture's copy in and keep as one dispatch
+    /// (`shadow_copy_in.rs`).
+    pub(crate) fn shadow_copy_in_dispatched(&self) {
+        self.shadow_copies_in_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An encoder recorded a copy of `regions` rows between two buffers (`row_copies.rs`), as one
+    /// dispatch where `dispatched`.
+    pub(crate) fn row_copy(&self, regions: usize, dispatched: bool) {
+        let regions = regions as u64;
+        self.row_copies.fetch_add(1, Ordering::Relaxed);
+        self.row_copy_regions.fetch_add(regions, Ordering::Relaxed);
+        self.row_copy_regions_most
+            .fetch_max(regions, Ordering::Relaxed);
+        if dispatched {
+            self.row_copies_dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// An encoder planned `n` keeps and merges of shadowed textures whose copies of the shadow
+    /// into the merge's scratch are dispatches (`shadow_merge.rs`, `ShadowMerge::dispatches`).
+    pub(crate) fn shadow_merge_copies_dispatched(&self, n: usize) {
+        self.shadow_merge_copies_dispatched
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// A merge of a shadowed texture took its scratch from its shadow's spares (`shadow_merge.rs`,
+    /// `ScratchSpares`).
+    pub(crate) fn shadow_merge_scratch_reused(&self) {
+        self.shadow_merge_scratches_reused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A merge of a shadowed texture made its scratch zero (`shadow_merge.rs`): one not cut.
+    pub(crate) fn shadow_merge_scratch_zeroed(&self) {
+        self.shadow_merge_scratches_zeroed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A merge of a shadowed texture fetches the texels after the commands through its shadow's
+    /// unsigned-integer view (`shadow_merge.rs`).
+    pub(crate) fn shadow_merge_fetched(&self) {
+        self.shadow_merges_fetched.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A merge of a shadowed texture keeps the texels before the commands in an image, `made`
+    /// where its queue kept none it could take, else `followed` where a command buffer not yet
+    /// completed holds the one it took (`shadow_merge.rs`, `texture/kept_image.rs`).
+    pub(crate) fn shadow_merge_kept_in_image(&self, made: bool, followed: bool) {
+        self.shadow_merges_kept_in_images
+            .fetch_add(1, Ordering::Relaxed);
+        if made {
+            self.shadow_merge_kept_images_made
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if followed {
+            self.shadow_merge_kept_images_followed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A merge's kept image was made (`texture/kept_image.rs`).
+    pub(crate) fn shadow_merge_kept_image_made(&self) {
+        self.shadow_merge_kept_images_live
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A merge's kept image went.
+    pub(crate) fn shadow_merge_kept_image_gone(&self) {
+        self.shadow_merge_kept_images_live
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// An ended encoder's pass took `passes` shadowed textures as attachments, `first` of them
+    /// taken by no pass of its command buffer before (`render/shadows.rs`).
+    pub(crate) fn shadow_attachments(&self, passes: usize, first: usize) {
+        self.shadow_attachment_passes
+            .fetch_add(passes as u64, Ordering::Relaxed);
+        self.shadow_attachment_textures
+            .fetch_add(first as u64, Ordering::Relaxed);
+    }
+
+    /// A render pass took a shadowed texture as a color attachment so (`render/shadows.rs`).
+    pub(crate) fn shadow_color_taken(&self, taken: ColorTaken) {
+        let counter = match taken {
+            ColorTaken::LoadedWithin => &self.shadow_attachment_loads_within,
+            ColorTaken::Loaded => &self.shadow_attachment_loads_whole,
+            ColorTaken::Cleared => &self.shadow_attachment_clears,
+            ColorTaken::ClearedInPart => &self.shadow_attachment_clears_in_part,
+            ColorTaken::Untouched => &self.shadow_attachment_loads_untouched,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass took a shadowed texture as a color attachment it loads, its copies cut to the
+    /// rectangle bounding its draws' scissors: of the `bounded` 32-pixel tiles that rectangle
+    /// reaches, the rectangles themselves reach `covered` (`render/shadows.rs`,
+    /// `clear_reach::DrawnArea::covered_tiles`).
+    pub(crate) fn shadow_attachment_tiles(&self, covered: u64, bounded: u64) {
+        self.shadow_attachment_tiles_covered
+            .fetch_add(covered, Ordering::Relaxed);
+        self.shadow_attachment_tiles_bounded
+            .fetch_add(bounded, Ordering::Relaxed);
+    }
+
+    /// An ended encoder's first copies in of shadowed textures moved `texels` texels of textures
+    /// an earlier encoder of its command buffer copied in too (`shadow.rs`).
+    pub(crate) fn shadow_texels_first_copied_in_again(&self, texels: u64) {
+        self.shadow_texels_first_copied_in_again
+            .fetch_add(texels, Ordering::Relaxed);
+    }
+
+    /// An ended encoder used `n` shadowed textures whose truth one it used before shares
+    /// (`shadow.rs`).
+    pub(crate) fn shadows_sharing_truth(&self, n: usize) {
+        self.shadows_sharing_truth
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// A command made a descriptor pool for its dispatches of one of the runtime's own kernels
+    /// (`owned_kernel.rs`).
+    pub(crate) fn owned_descriptor_pool(&self) {
+        self.owned_descriptor_pools.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An encoder planned keeps of shadowed textures that copy `texels` texels into their merges'
+    /// scratch (`shadow_merge.rs`).
+    pub(crate) fn shadow_texels_kept(&self, texels: u64) {
+        self.shadow_texels_kept.fetch_add(texels, Ordering::Relaxed);
+    }
+
+    /// A texture view was made the image itself to its bindings, through a swizzle over the
+    /// image's own format (`texture/view_shadow.rs`, `ViewRecord::read_as`).
+    pub(crate) fn view_through_swizzle_made(&self) {
+        self.views_through_swizzle.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A texture view's shadow image was made (`texture/view_shadow.rs`): the view's own, or
+    /// the render shadow of a view its bindings present through a swizzle.
+    pub(crate) fn view_shadow_made(&self) {
+        self.view_shadows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw that samples, at a slot, a texture that presents a color attachment of its render
+    /// pass read the texture's copy, where its shadow is served (`texture/attached_reads.rs`).
+    pub(crate) fn attachment_read_through_copy(&self) {
+        self.attachment_reads_through_copies
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw that samples a color attachment's texture after a memory barrier of its render
+    /// pass recorded into a new instance (`texture/attached_reads.rs`).
+    pub(crate) fn attachment_read_split(&self) {
+        self.attachment_read_splits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw that samples a color attachment's texture after a memory barrier of its render
+    /// pass read it through a snapshot inside its instance (`render/snapshot.rs`).
+    pub(crate) fn reading_draw_snapshotted(&self) {
+        self.reading_draws_snapshotted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw read through a snapshot recorded into a new instance, as its own was recorded
+    /// inline (`render/snapshot.rs`).
+    pub(crate) fn snapshot_inline_split(&self) {
+        self.snapshot_inline_splits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The device made a linear image aliasing a buffer's bytes with feedback loop usage
+    /// (`Device::storage_over_buffer`, `texture::feedback_candidate`).
+    pub(crate) fn feedback_loop_alias_image(&self) {
+        self.feedback_loop_alias_images
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass instance holds its multisampled depth/stencil attachment in the attachment
+    /// layout (`render_target::depth_layout`).
+    pub(crate) fn depth_attachment_moved(&self) {
+        self.depth_attachments_moved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A render pass instance renders its multisampled depth/stencil attachment in the layout
+    /// its encoder holds it in, with no move around it (`texture/held_depth.rs`).
+    pub(crate) fn depth_instance_held(&self) {
+        self.depth_instances_held.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A batch moved `count` held depths out of the attachment layout (`texture/held_depth.rs`).
+    pub(crate) fn held_depths_released(&self, count: usize) {
+        if count > 0 {
+            (self.held_depths_released).fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// A draw that samples a color attachment's texture reads it at its fragments' own pixels
+    /// alone, and its copy in moves the texels around its scissors alone
+    /// (`texture/attached_reads.rs`).
+    pub(crate) fn own_pixel_read(&self) {
+        self.own_pixel_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A command buffer kept an ended encoder's log of `bytes` bytes (`replay.rs`).
@@ -588,6 +1847,19 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `count` texture slots of the device's heap were written again whatever changed
+    /// (`heap_sets::renew_over`, `heap_sets::renew`).
+    pub(crate) fn heap_slots_rewritten(&self, count: usize) {
+        if count > 0 {
+            (self.heap_slots_rewritten).fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// A write of texture slots waited for a batch's hold of them to end (`heap_sets::hold`).
+    pub(crate) fn heap_slot_writes_deferred(&self) {
+        (self.heap_slot_writes_deferred).fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A texture in a heap over host pages was made tiled as Metal lays it out
     /// (`texture/heap_tiled.rs`).
     pub(crate) fn heap_texture_tiled(&self) {
@@ -625,22 +1897,168 @@ impl Counters {
     }
 }
 
+/// How many places [`WorkCounts::copy_sites`] holds.
+pub(crate) const COPY_SITES: usize = 32;
+
+/// The places in the runtime that recorded copy commands through a device's functions
+/// (`device/functions.rs`), each with what it recorded: the first [`COPY_SITES`] they met; a
+/// place past them goes uncounted. With the `vkCmdCopyBuffer` regions those functions split.
+#[derive(Default)]
+pub(crate) struct CopySites(Mutex<Vec<CopySite>>, AtomicU64);
+
+impl CopySites {
+    /// Count a call of `command` of `regions` regions made at `at`.
+    pub(crate) fn count(&self, command: &'static str, at: &Location<'static>, regions: usize) {
+        let regions = regions as u64;
+        let (file, line) = (at.file(), at.line());
+        let mut sites = lock(&self.0);
+        let same =
+            |site: &CopySite| site.line == line && site.command == command && site.file == file;
+        match sites.iter().position(same) {
+            Some(at) => {
+                let site = &mut sites[at];
+                site.calls += 1;
+                site.regions += regions;
+                site.most = site.most.max(regions);
+            }
+            None if sites.len() < COPY_SITES => sites.push(CopySite {
+                command,
+                file,
+                line,
+                calls: 1,
+                regions,
+                most: regions,
+            }),
+            None => {}
+        }
+    }
+
+    /// Count `regions` regions split in two (`device/functions.rs`).
+    pub(crate) fn split(&self, regions: usize) {
+        self.1.fetch_add(regions as u64, Ordering::Relaxed);
+    }
+
+    /// The regions split so far.
+    pub(crate) fn regions_split(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    /// The places so far, in the order they were met, then empty entries.
+    pub(crate) fn read(&self) -> [CopySite; COPY_SITES] {
+        let mut read = [CopySite::default(); COPY_SITES];
+        for (into, site) in read.iter_mut().zip(lock(&self.0).iter()) {
+            *into = *site;
+        }
+        read
+    }
+}
+
+/// A place in the runtime that recorded copy commands, and what it recorded there
+/// (`WorkCounts::copy_sites`), for the lanes and benches: no Metal counterpart, not part of the
+/// API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopySite {
+    /// The command: `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`, `vkCmdCopyImageToBuffer` or
+    /// `vkCmdCopyImage`; empty in an entry no place took.
+    pub command: &'static str,
+    /// The runtime's source file that called it.
+    pub file: &'static str,
+    /// The line there.
+    pub line: u32,
+    /// The calls made there.
+    pub calls: u64,
+    /// Their regions.
+    pub regions: u64,
+    /// The most regions one of them had.
+    pub most: u64,
+}
+
 /// What a device's commit path did so far (`Device::work_counts`), for the lanes: not part of the
 /// API.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkCounts {
     /// `VkCommandPool`s made for command buffers, where no spare one was free.
     pub command_pools_made: u64,
+    /// The command buffers encoders took that the program's thread logged and the device's
+    /// recorder replays into `VkCommandBuffer`s once their command buffer is committed
+    /// (`recorder`): every encoder's, on a device with a recorder.
+    pub command_buffers_deferred: u64,
+    /// Those the recorder's thread replayed.
+    pub command_buffers_replayed: u64,
+    /// Those another thread replayed itself where the recorder's had not yet reached them: one
+    /// that submits them, or that releases, rebinds or detaches host pages their commands name.
+    pub command_buffers_replayed_inline: u64,
+    /// The commands their replays called, by kind, on whichever thread replayed them
+    /// (`recorder`): one per call made into a `VkCommandBuffer`, the begins and ends among them.
+    pub commands_replayed: CommandsReplayed,
+    /// The places in the runtime that recorded `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`,
+    /// `vkCmdCopyImageToBuffer` and `vkCmdCopyImage` through the device's functions, as encoders
+    /// and the runtime's own work recorded them (whichever thread replays them later): the first
+    /// 32 places met, each with its calls, their regions and the most regions one had. What
+    /// names the copy behind a recorder's time on a driver that records each region as an
+    /// operation of its own (`row_copies.rs`).
+    pub copy_sites: [CopySite; 32],
+    /// The `vkCmdCopyBuffer` regions over 16 KiB whose size is no multiple of 4 KiB that the
+    /// device's functions recorded as two, the bytes up to the last whole multiple of 4 KiB and
+    /// the rest (`device/functions.rs`), as a driver may record such a region slowly (ANV).
+    pub copy_regions_split: u64,
+    /// Spare `VkCommandPool`s command buffers took, made by earlier ones. The pool is not reset
+    /// where the command buffer that gave it back completed and ended every command buffer of it
+    /// it was handed: each is reset as it is begun again.
+    pub spare_command_pools_taken: u64,
+    /// The spare `VkCommandPool`s among those taken that were reset first, as one of their
+    /// command buffers may still have been recording: the command buffer that gave the pool back
+    /// failed, was dropped unsubmitted, or left a command buffer of it unended (a recording it did
+    /// not use).
+    pub spare_command_pools_reset: u64,
     /// Buffers made to upload a live buffers' table to, where no spare one held it.
     pub live_tables_uploaded: u64,
-    /// The completion thread's waits for a timeline's value, where the batch it waited for had
+    /// The queues' waiters' waits for a timeline's value, where the batch one waited for had
     /// no fence.
     pub timeline_waits: u64,
+    /// The completion waiters' waits that ran out their 100 ms slice although the fence or the
+    /// timeline value they waited for was signaled when the waiter looked again: a wake the wait
+    /// missed, which finishes its batch a slice late (MoltenVK 1.4.1's wait for any of several
+    /// timelines lost them; `command_buffer/completion.rs`), or a signal in the slice's last
+    /// moment.
+    pub missed_completion_wakes: u64,
+    /// Command buffers whose transition to `Completed` or `Error` ran on the queue waiter that
+    /// saw their work complete, with no handler thread woken: those with no completed handler, no
+    /// pass that captured its tiles' reach, and no earlier transition of their queue that runs
+    /// the program's code or runs on a handler thread then, while the runtime held none of the
+    /// program's objects a release drops or runs (`command_buffer/completion.rs`).
+    pub completed_where_seen: u64,
+    /// Command buffers whose transition to `Scheduled` ran on the scheduler's thread as their last
+    /// batch went, with no handler thread woken: those with no scheduled handler and no
+    /// submission handler, whose queue's context held nothing and ran on no thread then
+    /// (`CommandBufferShared::schedule`).
+    pub scheduled_where_submitted: u64,
     /// Command buffers that took a slot of the device's timestamp pools: only those that encoded
     /// work, on a device that times them by GPU timestamps.
     pub timestamp_slots_taken: u64,
+    /// Of `timestamp_slots_taken`, the slots reset on the host as they were taken
+    /// (`vkResetQueryPool`), on a device that enables `hostQueryReset` (every device the runtime
+    /// creates): no command buffer the GPU runs resets their queries.
+    pub timestamp_slots_reset_on_host: u64,
+    /// Calibration pairs the device took to place its command buffers' GPU times on the host's
+    /// clock (one a commit at most every 100 ms, on a device with calibrated timestamps).
+    pub calibrations: u64,
+    /// The `vkGetCalibratedTimestampsKHR` calls those pairs took: each pair is read again while
+    /// each reading halves the deviation the one before it stated, and while the smallest so far
+    /// states more than 20 us, four readings at most.
+    pub calibration_readings: u64,
+    /// The largest deviation, in nanoseconds, of the pairs taken: how far apart the GPU and host
+    /// values of the pair that placed the times may stand, as its call stated.
+    pub calibration_deviation_most: u64,
+    /// Command buffers whose calibration pair placed a GPU time outside their life (before their
+    /// first batch's submission began, or after their completion was seen) by more than the
+    /// pair's stated deviation and the clocks' drift allow: a pair that disagrees with the
+    /// device's own timestamps. Each was placed by its completion, as on an uncalibrated device.
+    pub calibration_disagreements: u64,
     /// Textures that took their storage form: a fetched render target's image made again with
-    /// `STORAGE`, once per texture (`texture/storage_form.rs`).
+    /// `STORAGE`, once per texture (`texture/storage_form.rs`). Counted by the time the
+    /// committing command buffer is scheduled, and by the time a command buffer made meanwhile
+    /// is returned.
     pub storage_forms_taken: u64,
     /// `VkBuffer`s made with the device-address usage: one per memory block a buffer with an
     /// address is placed in (`memory.rs`), and one per buffer that takes its own address (a
@@ -653,15 +2071,37 @@ pub struct WorkCounts {
     /// Draws that handed the making of their `VkPipeline` to the device's pool and went on,
     /// rather than make it at the draw.
     pub pipelines_pooled: u64,
+    /// Draws whose key's `VkPipeline` was not made, which drew at once with the made one of its
+    /// residual form, each of the key's uniform-view slots read at its residual (which reads the
+    /// same bytes at every bind offset): none waited for its key's making.
+    pub residual_form_draws: u64,
+    /// Of the makings draws began, those whose draw took its key's residual form meanwhile:
+    /// makings on the device's pool that nothing waits for.
+    pub residual_form_makings: u64,
+    /// The pieces the device's pipeline pool holds as the counts are read, waiting or running:
+    /// not a count of events, but the pool's state then. A making a draw that took its key's
+    /// residual form began may outlast the draw's command buffer, which does not wait for it: a
+    /// lane counting what later draws make waits until this is 0.
+    pub pipeline_pool_busy: u64,
     /// `VkShaderModule`s pipeline states' variants made: none for a state made again whose
     /// released variant's objects were kept (`pipeline/kept.rs`).
     pub shader_modules_made: u64,
     /// Variants' stages that took the device's `VkShaderModule` of their SPIR-V, made before by
     /// another variant or state.
     pub shader_modules_shared: u64,
+    /// `VkPipelineLayout`s, each with its set layouts, pipeline states' variants made: none for a
+    /// state made again whose released variant's objects were kept (`pipeline/kept.rs`).
+    pub pipeline_layouts_made: u64,
+    /// Variants that took the device's `VkPipelineLayout` of their layout's exact definition, made
+    /// before by another variant or state: their draws keep what the draws before them bound and
+    /// pushed with it (`render/bound.rs`).
+    pub pipeline_layouts_shared: u64,
     /// `VkPipeline`s pipeline states' variants made (compute regions and their emulated mesh
     /// stages, indirect-bindable replays, and draws): none for one a released variant kept.
     pub variant_pipelines_made: u64,
+    /// Of those, the makings that waited for a twin's making in the air, of the same functions
+    /// and specialization, to land before their own (`pipeline/flight.rs`).
+    pub flights_followed: u64,
     /// Variants made again that took back a released variant's objects and `VkPipeline`s.
     pub variants_taken_back: u64,
     /// Command buffers committed whose commands' plans could not list the sampler states live
@@ -693,9 +2133,14 @@ pub struct WorkCounts {
     /// it (a sweep or a settle). A set whose creation failed part way was never made, and
     /// counts in neither.
     pub sampler_sets_destroyed: u64,
-    /// Render passes commits made ahead for their render passes' host steps: the runs' passes
-    /// of instances the encoder gave none, and those of instances over memoryless backings.
+    /// Render passes commits took ahead for their render passes' host steps (made, or kept by
+    /// the device: `render_passes_made` counts those made): the runs' passes of instances the
+    /// encoder gave none, and those of instances over memoryless backings.
     pub ahead_render_passes_made: u64,
+    /// Render passes the runtime made (`vkCreateRenderPass2`): a device keeps each it makes, by
+    /// its shape, operations and layouts, so a pass an encoder begins as one before it makes
+    /// none (`render_target::KeptRenderPasses`, up to its count).
+    pub render_passes_made: u64,
     /// Framebuffers commits made ahead so: one per instance over memoryless backings.
     pub ahead_framebuffers_made: u64,
     /// Backings memoryless attachments' textures made and keep, one per texture, subresource
@@ -703,12 +2148,36 @@ pub struct WorkCounts {
     /// memoryless attachment costs here where its passes run as several, which Metal's costs
     /// none.
     pub kept_backings_made: u64,
+    /// Backings passes made for memoryless color attachments they render into images of their
+    /// own (a framebuffer fetch through the pixel interlock reads one, or the pass splits), which
+    /// each queue keeps for its later passes of the attachment's shape, a few of them, whatever the
+    /// texture (`attachment_stand_in::pooled_backing`): one per shape a queue renders so (and per
+    /// attachment of a pass that renders several of one shape so), not one per pass.
+    pub pooled_backings_made: u64,
+    /// Placeholder images the device made for the color attachments render pass instances leave
+    /// out of their subpass for the pixel interlock, which their framebuffers hold in place of
+    /// the images the draws read and write as storage images (`storage_placeholder.rs`): one per
+    /// format and sample count, and another only where a larger framebuffer, or one of more
+    /// layers, needs it, not one per pass.
+    pub storage_placeholders_made: u64,
+    /// Framebuffer attachments that took a placeholder's view (`storage_placeholder.rs`): one per
+    /// left-out color of each framebuffer of a render pass instance whose draws read and write
+    /// colors in the pixel interlock.
+    pub storage_placeholder_attachments: u64,
+    /// Passes that made the descriptor sets and framebuffers of their exact color resolves
+    /// (`color_resolve.rs`).
+    pub color_resolve_passes_made: u64,
+    /// Passes that took the descriptor sets and framebuffers of their exact color resolves from
+    /// the image they resolve into, which a pass of the same views made
+    /// (`color_resolve::KeptResolves`).
+    pub color_resolve_passes_kept: u64,
     /// Nanoseconds commits spent making ahead for their render passes' host steps, kept
     /// backings included.
     pub ahead_nanos: u64,
-    /// Load passes render encoders recorded: one per extended-range or padded 10-bit color
-    /// attachment that a pass which draws loads and stores, whose unused bits a dispatch made
-    /// canonical in the tiles the pass's draws reach before the pass, as Metal's pass does
+    /// Load passes render encoders recorded: one per extended-range, padded 10-bit or bfloat
+    /// color attachment (and under `TileStorePolicy::Exact` signed normalized or `RGB9E5Float`
+    /// one) that a pass which draws loads and stores, whose words a dispatch rewrote in the tiles
+    /// the pass's draws reach before the pass, as Metal's tile store leaves them
     /// (`render/unused_bits_load.rs`).
     pub unused_bits_load_passes: u64,
     /// The texels of those passes' regions (the render area rounded up to 32 texels a side,
@@ -749,10 +2218,23 @@ pub struct WorkCounts {
     pub memory_blocks_live: u64,
     /// Its live pooled blocks with no placement, kept for the next.
     pub empty_memory_blocks_live: u64,
+    /// The pooled blocks it made so far (`memory.rs`), each a `vkAllocateMemory`.
+    pub pooled_memory_blocks_made: u64,
+    /// The pooled blocks it freed so far: emptied while its pool kept as many empty ones as it
+    /// keeps, kept empty past their quiet period, or freed for a block of their type that
+    /// failed to be made (`memory.rs`'s `KEPT_EMPTY_BLOCKS`).
+    pub pooled_memory_blocks_freed: u64,
     /// Its live dedicated blocks: a placement larger than half a block, or one placed apart.
     pub dedicated_memory_blocks_live: u64,
     /// Its live imports of the caller's host memory, a block each (`Memory::import_host`).
     pub host_imports_live: u64,
+    /// Its blocks that went while batches submitted before were in flight, on a device whose
+    /// driver fails pending work as memory a device-address buffer lay in is freed
+    /// (`RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork`): each block's memory waited
+    /// for those batches to complete before it was freed (`freed_memory.rs`). 0 elsewhere.
+    pub freed_memory_parked: u64,
+    /// Of those, the blocks whose memory waits now.
+    pub freed_memory_waiting: u64,
     /// Stand-ins made for textures over detached bytes (`texture/stand_in.rs`): one per distinct
     /// image plan among the textures detached at once.
     pub stand_ins_made: u64,
@@ -764,6 +2246,22 @@ pub struct WorkCounts {
     /// Textures of storage usage over detached bytes that a later commit could reach unnamed,
     /// each counted once (`Degradation::DetachedStorageKeepsWrites`).
     pub detached_storage_reaches: u64,
+    /// Texture slots of the device's heap (its texture table and heap sets) written again by a
+    /// rebind or a detach of host pages, or by a change of storage form: for a rebind or a
+    /// detach, one for each live texture whose images or texel views lie in those bytes (in a
+    /// no-copy heap or over one of its buffers, for the heap's), and none for any other texture.
+    pub heap_slots_rewritten: u64,
+    /// Writes of texture slots of the device's heap (a new texture's, or those a rebind, a detach
+    /// or a change of storage form writes again) that waited for a batch: asked between its
+    /// first work's take and its `vkQueueSubmit`, they were made once its submission was made,
+    /// before the next batch took its first work. So a texture's making waits for no batch's
+    /// submission. A device whose heap sets take no writes while a command buffer is pending
+    /// defers none: there a texture's registration waits for the batch instead.
+    pub heap_slot_writes_deferred: u64,
+    /// Uses of a buffer over host pages that looked up by address the ranges of host bytes their
+    /// bytes meet (`host_aliases.rs`): a use of a range met by no more ranges than the classes of
+    /// length that lookup visits reads those its range keeps instead.
+    pub host_range_lookups: u64,
     /// Textures made in heaps over host pages laid out as Metal tiles them, each a shadow of its
     /// elements in the heap's bytes (`texture/heap_tiled.rs`).
     pub heap_textures_tiled: u64,
@@ -809,19 +2307,288 @@ pub struct WorkCounts {
     pub queue_submissions: u64,
     /// The `VkCommandBuffer`s those calls submitted.
     pub command_buffers_submitted: u64,
+    /// Nanoseconds the batches' `vkQueueSubmit` calls spent in the driver, from the call to its
+    /// return with the `VkQueue` taken (`device/relay.rs`): each batch's or group's one call, and
+    /// a command buffer's fence submitted with no work. The thread that submits waits there for
+    /// the driver, so a lane that times the scheduler thread's take-up of later commits leaves it
+    /// out (`runtime_lane::queue_order`).
+    pub batch_submit_nanos: u64,
     /// `VkCommandBuffer`s the runtime began once the device was made: each encoder's, a render
     /// encoder's draws' secondary ones, segments', a batch's barrier and first-work ones, internal
     /// and staging submissions'. A driver may clear a command buffer's state as it begins one
-    /// (ANV, Mesa 26.2.4: `anv_cmd_state_init` at each begin after a reset).
+    /// (ANV, Mesa 26.2.4: `anv_cmd_state_init` at each begin after a reset). An encoder's own
+    /// begun ahead in its spare command pool counts as the encoder takes it
+    /// (`encoder_primaries_begun_ahead`).
     pub command_buffers_begun: u64,
+    /// Of `command_buffers_begun`, those encoders began as they recorded: each encoder's own, a
+    /// segment's, one an encoder went on in, and a render encoder's draws' secondaries. The others
+    /// are begun as batches are submitted (their barriers and ends), on whichever thread submits
+    /// them, and by the device's own submissions; a lane that reads its encoding thread's steps
+    /// counts these alone there.
+    pub encoder_command_buffers_begun: u64,
+    /// Of `command_buffers_begun`, the encoders' own (begun as they opened, or begun ahead in
+    /// their spare pools).
+    pub command_buffers_begun_encoders: u64,
+    /// Of `command_buffers_begun`, segments' at the commit, untracked segments', and ended
+    /// encoders' encoded again.
+    pub command_buffers_begun_segments: u64,
+    /// Of `command_buffers_begun`, those encoders went on in after a segment or a pass's end.
+    pub command_buffers_begun_continuations: u64,
+    /// Of `command_buffers_begun`, render encoders' draws' secondaries: the only secondaries the
+    /// runtime begins once the device is made.
+    pub command_buffers_begun_secondaries: u64,
+    /// Of `command_buffers_begun`, batches' work of their own as they are submitted (a sparse
+    /// binding's mappings, the first work).
+    pub command_buffers_begun_batch_work: u64,
+    /// Of `command_buffers_begun`, batches' barriers, transitions and timestamps as they are
+    /// submitted.
+    pub command_buffers_begun_batch_barriers: u64,
+    /// Of `command_buffers_begun`, barrier command buffers recorded to keep.
+    pub command_buffers_begun_kept_barriers: u64,
+    /// Of `command_buffers_begun`, the device's own submissions' and staging submissions'.
+    pub command_buffers_begun_internal: u64,
+    /// Of `encoder_command_buffers_begun`, the encoders' own `VkCommandBuffer`s begun ahead: a
+    /// settled spare command pool's primary, begun by the thread that completed the command
+    /// buffer that gave it back where no thread waited for that one, which the first encoder of
+    /// the command buffer that takes the pool records into, begun no more on its thread (on a
+    /// device with a recorder, the first encoder's replay, `recorder`).
+    pub encoder_primaries_begun_ahead: u64,
+    /// The spare command pools' primaries begun ahead (`encoder_primaries_begun_ahead`), taken
+    /// by an encoder or not yet: not among `command_buffers_begun` until one is taken. Each is
+    /// counted once its pool is among the spares again, so a command buffer made after the count
+    /// moved can take it.
+    pub primaries_begun_ahead: u64,
     /// Barrier command buffers of batches recorded once, kept, and submitted again by later
     /// batches once the batch that last took one completed (`command_buffer/kept_barriers.rs`):
     /// each is among `command_buffers_begun` once.
     pub barrier_buffers_kept: u64,
-    /// Commits that found another thread submitting for the device's scheduler (a pass of the
-    /// scheduler's thread, or another commit's) and returned at once, their batches left to that
-    /// thread, which submits them in commit order as soon as its pass ends
-    /// (`scheduler/inbox.rs`). Each other commit made the pass itself.
+    /// Of a batch's barrier command buffers, those that also write a timed command buffer's
+    /// timestamps (the start after resetting its slot, or the end), recorded once per list of
+    /// barriers and slot of the device's timestamp pools and kept: each is among
+    /// `command_buffers_begun` once.
+    pub stamped_buffers_kept: u64,
+    /// The times a batch took such a kept command buffer again, for a later command buffer
+    /// holding the same slot, once the batch that last took it completed and the slot's
+    /// timestamps were read: no command buffer begun for it.
+    pub stamped_buffers_reused: u64,
+    /// Batches with work submitted with their end (the barrier to the host, and in a timed
+    /// command buffer's last batch its end timestamp) recorded into their last command buffer as
+    /// they ended, the end's own command buffer saved (`command_buffer/submit.rs`).
+    pub finales_folded: u64,
+    /// Batches with work submitted with their end in a command buffer of its own: one whose
+    /// event signal waits for another `VkQueue`'s earlier one, leaves its submission a segment or
+    /// sparse update, names a texture over the caller's image that moves between layouts, or
+    /// whose last command buffer does not go to the queue as recorded.
+    pub finales_apart: u64,
+    /// `vkQueueSubmit` calls that submitted more than one batch, of command buffers committed on
+    /// one queue and found ready together, only the last signalling its queue's timeline
+    /// (`CompletionPolicy::Grouped`, `command_buffer/group.rs`): one kernel submission for them all
+    /// on Mesa's drivers.
+    pub grouped_submissions: u64,
+    /// The batches those calls submitted.
+    pub batches_grouped: u64,
+    /// Groups of batches held for one kernel submission (`CompletionPolicy::Grouped`) that went
+    /// holding the most they may (four), each group counted once by what sent it; with the six
+    /// fields after this one, every group. Their spread says why a device's groups hold fewer.
+    pub group_ends_full: u64,
+    /// Groups that went before a batch that waits for an event value a batch they held signals,
+    /// which only the group's end meets, or in the call of a batch that waits for anything else
+    /// not seen complete, submitted after them: a batch with a wait leads a group, never joins one.
+    pub group_ends_wait: u64,
+    /// Groups that went before a batch that may not wait in one (it signals a binary semaphore,
+    /// takes a fence, binds a sparse update, or moves bytes that wait for every submission) or
+    /// is of another `VkQueue`.
+    pub group_ends_apart: u64,
+    /// Groups that went in the call of a batch that could join but did first work or names a
+    /// texture over the caller's image, submitted last.
+    pub group_ends_first_work: u64,
+    /// Groups that went when the scheduler found no batch left to submit.
+    pub group_ends_drained: u64,
+    /// Groups that went when the scheduler found no batch ready, with submission checks or host
+    /// steps left for its thread to run.
+    pub group_ends_checks: u64,
+    /// Groups that went when the scheduler found no batch ready, the rest held for events'
+    /// values, host steps' gates, binary semaphores or texture decodes.
+    pub group_ends_held: u64,
+    /// Batches submitted (each held in a group counted as it is held) while no earlier batch of
+    /// their `VkQueue` was pending: every one submitted before them the host had seen complete
+    /// (their queue's timeline at their values). With the three fields after this one, every
+    /// batch, by how far its queue's work ran behind its submission.
+    pub batches_with_none_pending: u64,
+    /// Batches submitted while one earlier batch of their `VkQueue` was pending.
+    pub batches_with_one_pending: u64,
+    /// Batches submitted while two or three earlier batches of their `VkQueue` were pending.
+    pub batches_with_two_or_three_pending: u64,
+    /// Batches submitted while four or more earlier batches of their `VkQueue` were pending.
+    pub batches_with_four_or_more_pending: u64,
+    /// Groups of batches held for one kernel submission that stayed held past the pass that found
+    /// no batch ready, while two or more earlier submissions of their `VkQueue` were not seen
+    /// complete, until one was left or the group filled (`command_buffer/group.rs`); each group
+    /// counted once, then by what sent it among the group ends.
+    pub groups_kept_pending: u64,
+    /// Of those, the groups that went at once because a thread began to wait for one of their
+    /// command buffers' completion (`CommandBuffer::wait_until_completed`).
+    pub groups_sent_for_waits: u64,
+    /// Registrations of a new resource's first work (as a texture or buffer is made) that found
+    /// a submission holding its place in the submissions' order and waited until that submission
+    /// was made: only on a device whose heap sets take no writes while a command buffer that binds
+    /// them is pending (no `descriptorBindingUpdateUnusedWhilePending`), where a submission holds
+    /// the order from its take of the first work, after replaying its encoders' deferred command
+    /// buffers, to its `vkQueueSubmit` (`texture/first_move.rs`). Elsewhere a registration takes
+    /// no place, and this stays 0.
+    pub registrations_waited: u64,
+    /// Times the scheduler's thread found no work and slept (`scheduler/mod.rs`), each until it
+    /// was woken or [`scheduler_sleep_slices`](Self::scheduler_sleep_slices) says it timed out.
+    pub scheduler_sleeps: u64,
+    /// Times a commit woke the scheduler's thread, which slept: it left its batches to the
+    /// thread. Each waking here is a notify of its condition variable, or a signal of its nudge
+    /// where it slept on the GPU, made only where it slept.
+    pub scheduler_wakes_commit: u64,
+    /// Times a completion woke it: what a head waited for from the GPU (its gate's values
+    /// completed, an event value its checks wait for landed) was met, seen by a completion turn or
+    /// by its own wait on the GPU, or the device was lost.
+    pub scheduler_wakes_completion: u64,
+    /// Times a host signal woke it: an event's value set by the host, a pipeline a host step waits
+    /// for made, a texture decode finished, a command buffer encoded again after a rebind, a lost
+    /// device.
+    pub scheduler_wakes_host: u64,
+    /// Sleeps that ended at the thread's longest wait with nothing having woken it.
+    pub scheduler_sleep_slices: u64,
+    /// Of `scheduler_sleeps`, those on the GPU: in one wait for the event values every head's
+    /// checks wait for to land, or for the scheduler's nudge, which a commit, a host signal or a
+    /// stop signals (`scheduler/mod.rs`; not on MoltenVK). A value landed wakes it as a
+    /// completion, counted in `scheduler_wakes_completion`.
+    pub scheduler_gpu_waits: u64,
+    /// Notifies of the queue waiters' condition variable (a batch watched, a turn's finish, a
+    /// value reached), each a system call: made only where a waiter slept on it
+    /// (`command_buffer/completion.rs`).
+    pub wakes_completion_waiters: u64,
+    /// Notifies of the handler threads' condition variable (a transition or release posted to a
+    /// queue's context): made only where a thread slept on it and a context was ready
+    /// (`contexts/mod.rs`).
+    pub wakes_handler_threads: u64,
+    /// Notifies of a command buffer's condition variable (its submission handlers ran, its
+    /// scheduled handlers ran, it completed): made only where a thread slept on it.
+    pub wakes_command_buffer_waiters: u64,
+    /// Notifies of an event's condition variable (its value rose): made only where a host wait
+    /// slept on it (`event.rs`).
+    pub wakes_event_waiters: u64,
+    /// The notifies those four and the scheduler's wakers spared, as no thread slept on the
+    /// condition variable (or, for the handler threads, no context was ready).
+    pub wakes_spared: u64,
+    /// Committed command buffers that gave their queue's slot back as they completed.
+    pub slot_returns: u64,
+    /// Nanoseconds from the return of their last completed handler to their slot's return, as
+    /// Metal's comes back once the handlers ran, before what the commands used is released (a
+    /// no-copy buffer's deallocator runs after it: `queue.rs`).
+    pub slot_return_nanos: u64,
+    /// Makes of a command buffer that waited for a slot of their full queue
+    /// (`CommandQueue::command_buffer`).
+    pub slot_waits: u64,
+    /// Nanoseconds those makes waited.
+    pub slot_wait_nanos: u64,
+    /// The waits batches with work made for timelines at values the host had seen them reach,
+    /// which make what completed work wrote visible to them: one per timeline whose completed
+    /// value moved since a batch of the same `VkQueue` last waited for it.
+    pub completed_waits: u64,
+    /// Event waits (`encode_wait_for_event`) for values the scheduler found reached as it took
+    /// their batch, submitting it or holding it in a group (`scheduler/mod.rs`): by a signal
+    /// seen complete, or the host's. Their batch waits for none of them, so it may join a group
+    /// (`CompletionPolicy::Grouped`) as a batch with no wait does; the others' waits make it lead
+    /// one or go alone (`group_ends_wait`).
+    pub event_waits_met: u64,
+    /// Batches with work submitted with no command buffer of barriers before their first
+    /// encoder: nothing planned before it, and no start timestamp to write there (none, or one
+    /// its first encoder wrote, `WorkCounts::prefixed_starts`).
+    pub bare_starts: u64,
+    /// Timed command buffers whose first batch took the start its first encoder's own command
+    /// buffer wrote as it opened, with no command buffer of barriers before that encoder for the
+    /// timestamp (`gpu_time.rs`): those batches start bare where nothing else is planned.
+    pub prefixed_starts: u64,
+    /// Render pass instances a pass replaced or gave up before running them (a draw that needed
+    /// another shape before any draw recorded, a reroute's instance left behind, a capture that
+    /// recorded nothing, a first instance whose draws record inline instead), whose draws
+    /// recording the runtime gave up: never replayed where deferred (`recorder`), else ended, so
+    /// their command pool goes back to the device's spares unreset
+    /// (`WorkCounts::spare_command_pools_reset` counts the others). A pass's first instance that
+    /// may record inline begins its draws' secondary only where a command records into it, so
+    /// one replaced or recording inline before then began none, ended none, and is not counted.
+    pub unrun_instances_ended: u64,
+    /// Render passes that changed no texel and ended without recording anything: no draw call,
+    /// no clear, resolve or visibility result buffer, no depth/stencil state with depth writes
+    /// set, every attachment loaded with `Load` or `DontCare` and stored with `Store` or
+    /// `DontCare`, which Metal's pass leaves as it was (`render/untouched.rs`).
+    pub untouched_passes_skipped: u64,
+    /// Render passes whose first render pass instance recorded its draws inline in a primary
+    /// command buffer of its encoder's, begun at its first draw, in place of a secondary
+    /// (`render/inline_first.rs`).
+    pub inline_passes: u64,
+    /// Those of them that ended with more than one instance.
+    pub inline_passes_split: u64,
+    /// The instances after a split of such passes that recorded their draws inline too, in the
+    /// same primary command buffer after the instance before, in place of a secondary
+    /// (`render/inline_splits.rs`); the others record in secondaries, after them.
+    pub inline_split_instances: u64,
+    /// The splits of passes whose first instance recorded inline before a draw that writes a
+    /// memoryless color attachment, which no instance recorded inline writes: the draw records
+    /// in a secondary, after them (`render/inline_first.rs`).
+    pub inline_memoryless_write_splits: u64,
+    /// Render passes whose first instance did not record inline, its draws in a secondary command
+    /// buffer, by the first check that ruled it out (`render/inline_first.rs`), counted as the pass
+    /// opens or at its first draw that records: here, the encoder encodes an ended encoder's calls
+    /// again, or the pass has several color groups.
+    pub passes_not_inline_encoders: u64,
+    /// Of them, those of a layout of no color attachment, or of more than one layer or sample, a
+    /// depth or stencil attachment, a visibility buffer, custom sample positions, a
+    /// rasterization-rate map, or extended-range shadows that keep their draws.
+    pub passes_not_inline_layouts: u64,
+    /// Of them, those with a memoryless color attachment not loaded and stored `DontCare`, or
+    /// resolved.
+    pub passes_not_inline_memoryless: u64,
+    /// Of them, those with a color attachment loaded `DontCare`, reaching past the render area as
+    /// another attachment does not, cleared to a NaN the device clears apart, resolved, or stored
+    /// other than `Store` or late; each counted once more below, by the first such action, color
+    /// by color in index order.
+    pub passes_not_inline_actions: u64,
+    /// Of those, the ones where that action is a `DontCare` load.
+    pub passes_not_inline_actions_dont_care_load: u64,
+    /// Of those, the ones where it is a reach past the render area that the pass's attachments do
+    /// not share: Metal's clear of whole 32-pixel tiles reaches past the render area on one color
+    /// attachment, and another is loaded, cleared to another extent (a smaller texture's), or a
+    /// smaller memoryless texture. A pass whose attachments share the reach records its first
+    /// instance inline over it.
+    pub passes_not_inline_actions_unequal_reach: u64,
+    /// Of those, the ones where it is a clear to a NaN whose bits the device's clear would not
+    /// keep.
+    pub passes_not_inline_actions_nan_clear: u64,
+    /// Of those, the ones where it is a resolve, into a resolve attachment or by a copy after the
+    /// pass.
+    pub passes_not_inline_actions_resolve: u64,
+    /// Of those, the ones where it is a store other than `Store`, or a late one.
+    pub passes_not_inline_actions_store: u64,
+    /// Of them, those with a color attachment that is a texture over a buffer they do not render
+    /// through an image over the buffer's bytes.
+    pub passes_not_inline_buffer_textures: u64,
+    /// Of them, those with a color attachment of another kind: a stand-in, planes, a clear made
+    /// apart, an extended-range format, or a bound linear image (`linear_attachment.rs`).
+    pub passes_not_inline_attachments: u64,
+    /// Of them, those whose layout allowed it and whose first draw that records reads or writes a
+    /// color attachment as storage: a fetch in the pixel interlock, which leaves it out of the
+    /// instance's subpass.
+    pub passes_not_inline_storage: u64,
+    /// Of them, those whose layout allowed it and with whose first draw that records a stand-in
+    /// arrives: a fetched attachment's scratch, or a memoryless one's backing.
+    pub passes_not_inline_stand_ins: u64,
+    /// Of them, those whose layout allowed it and whose first draw that records writes a
+    /// memoryless color attachment, which no instance recorded inline writes.
+    pub passes_not_inline_memoryless_writes: u64,
+    /// Of them, those whose layout allowed it and whose first draw that records did not
+    /// otherwise: a draw whose pipeline is being made, a shadow arriving with it, work the end
+    /// records inside the instance pending, a feedback loop, a split.
+    pub passes_not_inline_draws: u64,
+    /// Commits that left their batches to the device's scheduler thread and returned at once,
+    /// which submits them in commit order at its next pass (`scheduler/inbox.rs`): every commit,
+    /// as no commit submits anything itself.
     pub commits_handed_off: u64,
     /// New `Shared` and `Managed` textures' images moved to `GENERAL` and zeroed on the host, with
     /// no submission (`texture/host_copy.rs`).
@@ -847,6 +2614,17 @@ pub struct WorkCounts {
     /// a blit's or a copy's into a BC texture, a heap texture's start, a write through
     /// submissions. None for a twin that takes CPU copies, whose texels only the CPU decodes.
     pub block_decode_passes: u64,
+    /// ASTC textures' second decoded twins made (`texture/decoded_twin.rs`): one at a texture's
+    /// first view in its other colour space (an `_sRGB` texture's as its LDR form, or the other
+    /// way), which reads Metal's decode of the blocks in that form.
+    pub second_twins: u64,
+    /// Blit commands' writes into an ASTC texture's blocks that a submission checked for a
+    /// second twin's decode: each such write, whether or not the texture had one.
+    pub second_twin_checks: u64,
+    /// Decodes into ASTC textures' second decoded twins that submissions recorded: a new twin's
+    /// whole decode, a host write's, and a blit write's where the texture had one as the write was
+    /// encoded. None where no texture has a second twin.
+    pub second_twin_decodes: u64,
     /// Drains of the device's queues: one each time a wait for command buffers' work failed (a
     /// lost device), before those command buffers let go of what they used, so that the
     /// driver's own completion of the work, which can still read their pools, has run
@@ -861,9 +2639,49 @@ pub struct WorkCounts {
     /// Bind shapes draws made of their bind states: none for a draw whose bound slots keep their
     /// shapes and whose other bind state is its encoder's last draw's.
     pub draw_shapes_made: u64,
+    /// Bind shapes draws found among those their drawing states settled lately, compared with
+    /// their bind states in place: none for a draw whose bound slots keep their shapes and whose
+    /// other bind state's shape is its encoder's last draw's (values no shape reads, such as the
+    /// depth/stencil state, the stencil references or the blend color, may differ).
+    pub draw_shapes_found: u64,
+    /// Draws (and commands of other encoders that settle as draws do) that took the device's
+    /// live sampler states to list as their argument samplers: none for a draw whose kept bind
+    /// state lists them at the count of their slots' changes that still holds, whose variant has
+    /// no set-1 arrays and names no state in a notice (`sampler::ArgumentSamplers`).
+    pub argument_samplers_taken: u64,
+    /// Texture slot views render encoders' binds worked out: none for a bind of a texture, as a
+    /// view, that a bind of the same or an earlier encoder of the device bound, while no image of
+    /// the device let its views go (`binding::BindMemo`).
+    pub bind_views_worked_out: u64,
+    /// Stage tables (vertex, fragment, object, mesh) that draws, and commands of other encoders
+    /// that settle as draws do, read into their encoder's kept bind state: four a draw at most,
+    /// none for a table no call changed since a draw read it through the same drawing state's
+    /// interface, with the same samplers' address-mode maps, while no no-copy buffer was rebound
+    /// or detached (`live_bind::ReadFrom`).
+    pub stage_tables_read: u64,
+    /// Looks at where a no-copy buffer's bytes lie, each of which takes its pages' lock
+    /// (`buffer::HostCell`): a draw's read of a table binding one takes one for the binding, its
+    /// base and device address read together (`argument_table::bound_buffer`), and a descriptor
+    /// written for it one for its `VkBuffer` and its space's start (`Buffer::space`).
+    pub no_copy_lies_read: u64,
+    /// Draws whose uses their encoder did not note again: the last command it noted had the same
+    /// uses, with the same uses of host aliases added, into the same part, with the same images
+    /// held in their attachment layout, and none of them reached through the resident set alone
+    /// (`noted_apart.rs`).
+    pub commands_noted_as_before: u64,
     /// Draws that settled their variant and plan from their bind shapes: none for a draw whose
     /// bind shape is one of the latest its pipeline state settled in the same buffer forms.
     pub draws_settled: u64,
+    /// Draws that ran the variant whose fragment stage adds a `Depth16Unorm` depth's bias itself
+    /// and declares its side (`DepthGreater` or `DepthLess`), where the bias's side is known: the
+    /// device may then test the depth before the stage runs, which a stage that writes its depth
+    /// otherwise keeps it from.
+    pub depth16_sided_draws: u64,
+    /// Draws that ran a variant taking a texture slot bound to a two-plane extended-range texture
+    /// (`RGB10A8_2P_XR10` or its sRGB twin), read or sampled: the variant's function reads the
+    /// slot's raw texels and decodes them, and filters each linear sample of the slot itself over
+    /// four of them, where a draw of another texture samples through the device's sampler.
+    pub two_plane_draws: u64,
     /// Notices of a variant's that a bind announces at every occurrence
     /// (`DeviceOptions::announce_each`), made for a bind: once per variant until the
     /// specializations or the formats its notices name change; each bind announces them.
@@ -872,7 +2690,8 @@ pub struct WorkCounts {
     /// unchanged since its encoder's last command retained it.
     pub argument_tables_retained: u64,
     /// Draws that looked their `VkPipeline` up in their variant's memo by key: none for a draw
-    /// whose key is the one its pipeline state's last draw found made, while that entry stays.
+    /// whose key is one of those its pipeline state's last draws found made, while that entry
+    /// stays.
     pub graphics_pipelines_looked_up: u64,
     /// Passes over color attachments the device renders linear only under
     /// `VK_NV_linear_color_attachment`'s rule (bound ones, `linear_attachment.rs`) that rendered
@@ -885,50 +2704,240 @@ pub struct WorkCounts {
     /// (`DontCare`, `MultisampleResolve`), through the image its texture keeps, so that the buffer
     /// keeps its bytes (`kept_bytes.rs`).
     pub kept_bytes_passes: u64,
+    /// Render targets' 32-bit float depths switched on to render over their magnitude stand-in,
+    /// or to have their words stripped of their signs after a pass with depth writes whose stores
+    /// the device's pass leaves signed: a write that may store a negative value, a NaN, or a
+    /// denormal the device's depth test compares as zero, once per texture image
+    /// (`texture/signed_depth.rs`). None where no such write was made: every other pass renders
+    /// its depth in place.
+    pub signed_depth_switch_ons: u64,
+    /// Passes that loaded such a depth and rendered over its magnitude stand-in: its words copied
+    /// out, their stand-ins written by a dispatch and copied into the stand-in before the pass.
+    pub magnitude_stand_in_passes: u64,
+    /// Those written back into the depth, a pass that stores it and may have written it (a
+    /// depth/stencil state with depth writes, or an indirect command buffer's own states):
+    /// the stand-in copied out after the pass, merged into the depth's words by a dispatch, and
+    /// copied back.
+    pub magnitude_write_backs: u64,
+    /// Passes after which such a depth, rendered in place or through another image copied back
+    /// into it, not over its magnitude stand-in, was stored without its signs, as Metal stores
+    /// it: the pass set a depth/stencil state with depth writes, and the device's pass left the
+    /// words signed (every such pass, or, on a device whose depth test and stores are Metal's
+    /// own, one that drew under none). A single-sample depth's words copied out, stripped by a
+    /// dispatch and copied back; a multisampled one's samples copied out, stripped by a
+    /// sample-rate draw of each layer and copied back, or copied out and drawn back stripped.
+    pub sign_strips: u64,
+    /// Passes a render encoder drew past its first for a pass of more color attachments than the
+    /// device draws at once, one per later color group, each of that group's colors over a twin
+    /// of the depth and stencil (`render/color_groups.rs`).
+    pub color_group_passes: u64,
+    /// The twins of a depth/stencil attachment such passes made: one per pass of more groups
+    /// with a depth/stencil attachment, loaded by a copy or a clear.
+    pub color_group_twins: u64,
+    /// Draws a later color group recorded nothing for: they write none of its colors, no depth
+    /// and no stencil.
+    pub color_group_draws_skipped: u64,
     /// State commands draws recorded into their secondary command buffers: pipeline binds,
     /// descriptor set binds, their push constants, vertex and index buffer binds, and dynamic
     /// states. None for a command that sets what its command buffer already holds from an
     /// earlier draw there.
     pub draw_states_recorded: u64,
-    /// No-copy buffers and heaps released with a deallocator and no keep-alive whose deallocator
-    /// waited past the release for the import of their pages, which something else held (a
-    /// command buffer submitted before a texture over them went, through the texture's image):
-    /// it runs once the import is freed (`host-deallocator-delayed`). With a keep-alive the
-    /// deallocator runs at the release, and none is counted.
+    /// Draws recorded with their set 0 pushed (`vkCmdPushDescriptorSet`) rather than allocated
+    /// from their command buffer's pools, written and bound: those of a render variant whose set 0
+    /// a push descriptor set layout can hold, on a device of Vulkan 1.4 or
+    /// `VK_KHR_push_descriptor`. The same descriptors at the same bindings either way.
+    pub draws_pushing_set_zero: u64,
+    /// The writes those draws' pushes carried: a push carries only the writes that differ from
+    /// what set 0 holds where it holds the same bindings, pushed with the same layout
+    /// (`render/bound.rs`), and none is recorded where none differs.
+    pub set_zero_writes_pushed: u64,
+    /// Of those draws, the ones whose push carried set 0 whole although set 0 held the
+    /// descriptors of another layout of the same shape: equal set-0 layouts (each binding's
+    /// number, type, count, stages, baked sampler and flags) and equal push-constant ranges, which
+    /// Vulkan holds compatible for set 0 where the layouts are identically defined. Variants share
+    /// a layout only where it is identically defined whole (`pipeline/shared_layouts.rs`), so a
+    /// switch between layouts of the same shape that differ in a later set, or bake a host step's
+    /// own samplers, carries set 0 whole (`render/bound.rs`). Measured, not acted on.
+    pub set_zero_equal_shape_switches: u64,
+    /// The writes those pushes carried.
+    pub set_zero_writes_on_equal_shape_switches: u64,
+    /// The writes those pushes would carry if the layouts were one: those that differ from what
+    /// set 0 held, and at least one after a pipeline bind where the driver's pushed descriptors go
+    /// stale across one (`RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds`).
+    pub set_zero_writes_if_shapes_shared: u64,
+    /// Dispatches encoded with their set 0 pushed (`vkCmdPushDescriptorSet`) at the compute bind
+    /// point rather than allocated from their command buffer's pools, written and bound: those of
+    /// a kernel's variant whose set 0 a push descriptor set layout can hold, on a device of Vulkan
+    /// 1.4 or `VK_KHR_push_descriptor`. Every dispatch pushes all of its set's writes.
+    pub dispatches_pushing_set_zero: u64,
+    /// Dispatches of a kernel's variant whose layout bakes immutable samplers (constexpr
+    /// samplers'), their pipelines made, recorded in a `VkCommandBuffer` of their own, as a
+    /// dispatch whose pipeline is still being made is (`pending_dispatch.rs`): on a device whose
+    /// driver loses baked samplers after a copy in the same `VkCommandBuffer`
+    /// (`RuntimeDriverDefect::ImmutableSamplersLostAfterCopies`, every lavapipe release). Zero
+    /// elsewhere.
+    pub baked_sampler_dispatches_apart: u64,
+    /// No-copy buffers and heaps released with a deallocator whose deallocator waited past the
+    /// release (`host-deallocator-delayed`), counted at each wait: given no keep-alive, for the
+    /// import of their pages, which something else held (a command buffer submitted before a
+    /// texture over them went, through the texture's image), until the import is freed, or, on a
+    /// device whose driver has `RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork`, for the
+    /// batches submitted before the import's memory went, until they completed (with a keep-alive
+    /// it runs at the release there); or, given none, for a live buffers' table that listed their
+    /// pages, which a command buffer that may reach them unnamed held, until it let go of it
+    /// (`live_buffers.rs`; with a keep-alive it runs at the release there too).
     pub host_deallocators_delayed: u64,
+    /// Imports of host pages (no-copy buffers' and heaps') whose free, with the keep-alive that
+    /// waits for it, went to one of the device's handler threads as their last buffer was
+    /// released, the release returning at once: where a keep-alive alone waits for the free. A
+    /// deallocator waiting for it runs in the release, after it, as Metal runs it there.
+    pub host_import_releases_posted: u64,
+    /// Those not yet run: their memory not yet freed (or parked, `freed_memory.rs`), their
+    /// keep-alives not yet dropped. A program that waits for a keep-alive's drop after its release
+    /// waits until this falls to 0.
+    pub host_import_releases_pending: u64,
+    /// Keep-alives of no-copy buffers and heaps (`KeepAlive`) held now past their release: each
+    /// by the import of its pages, whose last buffer it was while something else (a texture's
+    /// image a submitted command buffer may still read) held the import, or that a live buffers'
+    /// table a command buffer that may reach them unnamed holds listed as it was released, until
+    /// the import is freed. One per import at most: a later keep-alive over the same import is
+    /// dropped at its release (`host_keep_alives_covered`).
+    pub host_keep_alives_kept: u64,
+    /// Keep-alives dropped at their buffer's release, after its deallocator ran, because the
+    /// import of its pages stays mapped without them: another no-copy buffer made over the same
+    /// bytes lies in it, or it keeps another's keep-alive already.
+    pub host_keep_alives_covered: u64,
+    /// The process's mappings the kernel was asked about, for their write permission, before a
+    /// no-copy buffer's, heap's or rebind's own import of host pages, on Linux (one `PROCMAP_QUERY`
+    /// each, or one line of `/proc/self/maps` where the kernel predates the query): one per mapping
+    /// the import's pages lie in, a view of scattered pages one per run, at each such import. A
+    /// buffer made over the same bytes as a live one, which lies in its import, asks about none.
+    /// None off Linux.
+    pub host_mappings_queried: u64,
     /// Chunks of host pages imported as dma-buf memory from a caller's source
     /// (`HostMemory::with_dma_buf`), where the device refused the pages' pointer: no-copy
     /// buffers', heaps' and rebinds' alike, one per chunk. None where every pointer was imported.
     pub dma_buf_imports: u64,
+    /// Those chunks' imports live now: each a `VkDeviceMemory` the device holds until the last
+    /// buffer, texture or command buffer over its pages lets go. RADV lists each, as every
+    /// imported memory, in every kernel submission of the device (Mesa 26.2.4's global BO list),
+    /// and amdgpu's work per submission grows with them (`runtime_lane::submit_per_import`).
+    pub dma_buf_memories_live: u64,
+    /// The dedicated dma-buf imports of images over such memory live now (`dma_buf_images`): one
+    /// per live image, listed in every kernel submission as those above.
+    pub dma_buf_image_memories_live: u64,
+    /// No-copy buffers' imports of dma-bufs released while idle, their `VkBuffer` destroyed and
+    /// their memory freed, the dma-bufs kept: a runtime-internal residency, which nothing of
+    /// Metal's observes (`HostMemory::with_dma_buf` documents it). Their chunks leave
+    /// `dma_buf_memories_live`.
+    pub host_imports_released: u64,
+    /// Released imports imported again from the dma-bufs kept, each at the first blit that read
+    /// the buffer after its release (on the encoding thread).
+    pub host_imports_reimported: u64,
+    /// The imports the device may release that hold their memory now.
+    pub host_imports_resident: u64,
+    /// Reads other than a blit's that found an import released and the device unable to import
+    /// it again: the device was lost then. None but out of memory.
+    pub host_imports_lost: u64,
+    /// The descriptors of dma-bufs the device keeps open now to import released imports again: at
+    /// most a quarter of the process's descriptor limit.
+    pub host_import_fds_kept: u64,
+    /// The live no-copy buffers' own imports of dma-bufs that the device would release while idle
+    /// but keeps imported, as the descriptors to import them again did not fit: past the quarter
+    /// of the process's `RLIMIT_NOFILE` soft limit the devices keep, or the host gave no duplicate.
+    /// Each stays in every kernel submission's list while it lives. A soft limit raised at startup
+    /// (`setrlimit`; the runtime reads it once, at the process's first such import) lets more go;
+    /// the runtime never changes the limit.
+    pub host_imports_kept_for_fds: u64,
+    /// The host imports each committed command buffer's commands use (a binding, a blit's operand,
+    /// `use_resource`, a texture over the bytes), each import counted once per command buffer
+    /// however many of its buffers lie in it, summed over command buffers: its change over a frame,
+    /// against `host_imports_live`, is how many of the imports every kernel submission lists the
+    /// frame's commands name. Counted at the commit, on the committing thread.
+    pub host_imports_used: u64,
+    /// The live host imports some read other than a blit's took (their Metal address or
+    /// `VkBuffer` handed out, a binding, a texture over the bytes, a second buffer lying in the
+    /// import): those a release while idle could never take, as the device keeps a releasable
+    /// import for good after such a read. Of imports of any kind.
+    pub host_imports_read_apart: u64,
+    /// Of those, the ones whose buffer's Metal address was handed out: `gpu_address` (a heap's
+    /// over the import's bytes too), or written for the caller into an argument buffer or an
+    /// indirect command buffer. Each of these six counts an import once for its reason, so an
+    /// import read apart for several reasons counts in each.
+    pub host_imports_read_apart_address: u64,
+    /// Of those, the ones whose buffer's `VkBuffer` was handed out (`Buffer::vk_buffer`).
+    pub host_imports_read_apart_vk_buffer: u64,
+    /// Of those, the ones a command read other than by a blit's copy: a binding (a buffer
+    /// argument, a vertex or index buffer, an argument table's entry, `use_resource`), and the
+    /// copies of a texture over the bytes that a command reads it through.
+    pub host_imports_read_apart_binding: u64,
+    /// Of those, the ones a texture over the bytes was made over: an image bound to the import's
+    /// memory, or a texel view or a shadow's copies over its `VkBuffer`.
+    pub host_imports_read_apart_texture: u64,
+    /// Of those, the ones a second no-copy buffer lies in (`host_aliases.rs`), or that a buffer
+    /// made over the same host memory shares its range with (`BufferDescriptor::range_of`).
+    pub host_imports_read_apart_second_buffer: u64,
+    /// Of those, the releasable ones kept imported because the host could start no thread to
+    /// release them.
+    pub host_imports_read_apart_unreleased: u64,
+    /// The caller's reports of host addresses whose pages it replaced
+    /// (`Device::host_range_remapped`), whatever lies over them.
+    pub host_remaps_reported: u64,
+    /// Of those, the reports with a page of a live host import among the addresses, rounded out
+    /// to the import's unit: a driver's import by pointer (ANV's userptr on i915) over a page
+    /// replaced takes its pages anew, all of them, at its next submission.
+    pub host_remaps_over_imports: u64,
+    /// The live host imports those reports touched, summed over the reports: each a range of
+    /// bytes no-copy buffers or a no-copy heap lie over (two imports only where buffers of two
+    /// memory classes lie over the same bytes).
+    pub host_imports_remapped: u64,
+    /// The host imports the device made by pointer (`VK_EXT_external_memory_host`): no-copy
+    /// buffers', heaps', rebinds' and releasable ones' made again. A driver takes an import's
+    /// pages at its first submission (ANV's userptr on i915).
+    pub host_pointer_imports_made: u64,
+    /// Their bytes: whole pages, rounded out to the import's unit.
+    pub host_pointer_import_bytes_made: u64,
+    /// The live host imports the device never releases while idle as a heap's own import (a
+    /// no-copy heap's). With the next three and `host_imports_kept_for_fds`, they are every live
+    /// no-copy import the device keeps imported whatever reads it.
+    pub host_imports_kept_of_heap: u64,
+    /// The live host imports a rebind gave a buffer (`rebind.rs`): never released while idle.
+    pub host_imports_kept_rebound: u64,
+    /// Of those, the ones no live buffers' table listed yet (`live_buffers.rs`): no command
+    /// buffer committed since the rebind used a buffer lying in them, so no command reaches them
+    /// unnamed, as Metal reaches a rebound buffer only once a command buffer used it again.
+    pub host_imports_rebound_unlisted: u64,
+    /// The imports rebinds made of their new pages (`Device::rebind_host_pages`): not those that
+    /// lie in the import of a live buffer made over the same bytes (`host_aliases.rs`).
+    pub host_rebind_imports_made: u64,
+    /// Of those, the ones whose pages, rounded out to the import's unit, lay within the bytes,
+    /// rounded out likewise, that a buffer over host pages lay over already (a no-copy buffer
+    /// made or rebound there, the rebound buffer itself included, or a no-copy heap's own
+    /// buffer): an import alive then held each of their pages.
+    pub host_rebind_imports_covered: u64,
+    /// The live no-copy buffers' imports of host pages by their pointer, never released while
+    /// idle as the device's driver is not measured to read the pages mapped at the pointer at
+    /// each submission (`DriverFact::PointerImportsFollowTheirAddress`), or off Unix.
+    pub host_imports_kept_pointer: u64,
+    /// The live no-copy buffers' imports the device would release while idle, but keeps, as it
+    /// could make no stand-in buffer for a read of a released one.
+    pub host_imports_kept_no_stand_in: u64,
     /// Of those buffers, heaps and rebinds, the ones whose `VkBuffer` is a sparse buffer
     /// assembled from several chunks.
     pub dma_buf_sparse_buffers: u64,
-    /// Images of textures over such dma-buf memory (over a no-copy buffer, placed in a no-copy
-    /// heap, a view of either), each a `DRM_FORMAT_MOD_LINEAR` image bound to a dedicated import
-    /// of a dma-buf of its own pages from the caller's source, aliasing the buffer's bytes: one per
-    /// image made, a rebind's too. Not counted in `dma_buf_imports`.
+    /// Images of textures placed in a no-copy heap over such dma-buf memory (or a view of one),
+    /// each a `DRM_FORMAT_MOD_LINEAR` image bound to a dedicated import of a dma-buf of its own
+    /// pages from the caller's source, aliasing the heap's bytes: one per image made, a rebind's
+    /// too. Not counted in `dma_buf_imports`. A texture over a no-copy buffer's pages takes no such
+    /// image: it is a shadow (`shadowed-texture`).
     pub dma_buf_images: u64,
-    /// Textures over such dma-buf memory that such an image would alias but the device made none
+    /// Textures placed in such a heap that such an image would alias but the device made none
     /// (the source failed, the format, usage, extent or plane layout is not supported, or the
-    /// driver refused the import): each takes the path of a texture over memory no image aliases
+    /// driver refused the import): each is a shadow of the heap's bytes in memory of its own
     /// (`shadowed-texture`).
     pub dma_buf_image_fallbacks: u64,
-    /// Images of textures over no-copy buffers' host pages imported by their pointer made
-    /// `DRM_FORMAT_MOD_LINEAR` images at Metal's row pitch, where the driver's own linear image
-    /// lays the rows out otherwise (ANV packs them tight), each bound in the buffer's import and
-    /// aliasing its bytes: one per image made, a rebind's too.
-    pub pitched_host_images: u64,
-    /// Images at Metal's row pitch the driver refused (with
-    /// `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`, by laying the plane out at another
-    /// offset or pitch, or by asking a dedicated allocation of it): one per image asked of the
-    /// driver, and a texture asks up to two (with a usage it did not declare, then without).
-    pub pitched_host_image_refusals: u64,
-    /// Images at Metal's row pitch not asked of the driver, which refused the same image (format,
-    /// extent, usage, flags, view formats and row pitch) before (`texture/pitch_refusals.rs`).
-    pub pitched_host_image_refusals_recalled: u64,
     /// Formats whose `DRM_FORMAT_MOD_LINEAR` tiling features the driver was asked, for an image
-    /// over dma-bufs or one at Metal's row pitch over host pages: each format once at most, as
-    /// the answer is kept.
+    /// over dma-bufs: each format once at most, as the answer is kept.
     pub modifier_feature_queries: u64,
     /// Textures over a buffer's bytes (a 2D texture or array over a buffer, a no-copy buffer or an
     /// IOSurface plane, or a view of another layout of one) that no image aliases, each an image
@@ -941,13 +2950,259 @@ pub struct WorkCounts {
     pub shadows_zeroed: u64,
     /// Copies between a shadowed texture's truth and its shadow that encoders planned
     /// (`shadow.rs`): copies in before a command, copies back after one or as the encoder ends,
-    /// and the keeps and merges of a command that writes the bytes two ways. Each is a command of
-    /// its encoder over the texture's texels.
+    /// and the keeps and merges of a command that writes the bytes two ways or writes through a
+    /// texture that merges back (`shadow_merge.rs`). Each is a command of its encoder over the
+    /// texture's texels.
     pub shadow_copies: u64,
+    /// The texels those copies in move from a 2D texture's buffer's bytes to its image (a texture
+    /// over a buffer, a no-copy buffer or an IOSurface plane): every texel, or those inside the
+    /// rectangle bounding a pass's draws' scissors over an attachment it loads and takes in no
+    /// other way.
+    pub shadow_texels_copied_in: u64,
+    /// The texels every copy in of an image's shadow moves, image to image (a texture's own
+    /// image's, `texture/usage_shadow.rs`, or a view's, `texture/view_shadow.rs`): each region's,
+    /// or those inside a rectangle where the copy is cut as a buffer's texture's is. Those are not
+    /// among `shadow_texels_copied_in`.
+    pub shadow_texels_copied_in_images: u64,
+    /// The texels each encoder's first copy in of a texture moves: before the first command of the
+    /// encoder that uses it, or the first after work the encoder records apart. Those of a
+    /// buffer's texture are among `shadow_texels_copied_in`, those of an image's shadow among
+    /// `shadow_texels_copied_in_images`. Every other copy in is a later one, counted by why it is
+    /// made (`shadow_texels_recopied_beyond_held`, `shadow_texels_recopied_after_changes`,
+    /// `shadow_texels_bounded_copied_in`, which with this sum to both kinds' copies in). The six
+    /// counts after it split it by what holds the texture's truth.
+    pub shadow_texels_first_copied_in: u64,
+    /// Of `shadow_texels_first_copied_in`, those of a truth that is an image: a texture's own
+    /// (the shadow a binding beyond its usage or a read of its own pass's attachment takes,
+    /// `texture/usage_shadow.rs`), or the one a view presents (`texture/view_shadow.rs`).
+    pub shadow_texels_first_copied_in_images: u64,
+    /// Those of the bytes of a buffer of private or memoryless storage the device made.
+    pub shadow_texels_first_copied_in_private_buffers: u64,
+    /// Those of the bytes of a buffer of shared or managed storage the device made, which the
+    /// CPU maps.
+    pub shadow_texels_first_copied_in_mapped_buffers: u64,
+    /// Those of host pages a no-copy buffer imported (or the memory of the caller's `VkBuffer`)
+    /// that only the shadow's own image is copied from.
+    pub shadow_texels_first_copied_in_host_pages: u64,
+    /// Those of host pages that the texture's own image lies in too (an aliasing image, a
+    /// pitched host image among them).
+    pub shadow_texels_first_copied_in_aliased_host_pages: u64,
+    /// Those of an IOSurface's plane (`Buffer::new_texture_with_iosurface_plane`).
+    pub shadow_texels_first_copied_in_surfaces: u64,
+    /// Of `shadow_texels_first_copied_in_surfaces`, those under a texture of 2^20 texels or more
+    /// (a 1920x1080 framebuffer's among them).
+    pub shadow_texels_first_copied_in_large_surfaces: u64,
+    /// Of `shadow_texels_first_copied_in`, those of a texture an earlier encoder of the same
+    /// command buffer copied in too, counted as each encoder ends (not an indirect command
+    /// buffer's segment): the copies in a shadow kept across a command buffer's encoders could
+    /// leave out, at most.
+    pub shadow_texels_first_copied_in_again: u64,
+    /// The texels later copies in move (not an encoder's first) before a command that needs
+    /// texels outside the rectangle the shadow's last copy in moved (a pass's read at its own
+    /// pixels, then a read anywhere), the truth unchanged outside it or not.
+    pub shadow_texels_recopied_beyond_held: u64,
+    /// The texels later copies in move after the truth changed since the shadow's copy in, other
+    /// than by writes within a rectangle that left it stale there alone. The five counts after it
+    /// split it by the change that came first.
+    pub shadow_texels_recopied_after_changes: u64,
+    /// Of `shadow_texels_recopied_after_changes`, those after a copy back or merge of another
+    /// shadowed texture over the same truth.
+    pub shadow_texels_recopied_after_other_shadows: u64,
+    /// Those after the texture's own merge, after a command that wrote its truth two ways.
+    pub shadow_texels_recopied_after_two_ways_merges: u64,
+    /// Those after a command wrote the truth another way (a pass that clears it, a storage
+    /// write, a copy).
+    pub shadow_texels_recopied_after_writes: u64,
+    /// Those after a render pass instance's writes within a rectangle that left the image stale
+    /// nowhere alone: the attachment has no shadow laid out as this one, or this one was
+    /// written through or kept.
+    pub shadow_texels_recopied_after_writes_within: u64,
+    /// Those after a command wrote through the texture where Metal drops the writes.
+    pub shadow_texels_recopied_after_dropped_writes: u64,
+    /// The texels the copies of `bounded_shadow_copies` move: those inside the rectangle bounding
+    /// where writes within rectangles changed the truth since the shadow's copy in.
+    pub shadow_texels_bounded_copied_in: u64,
+    /// The texels of those later copies in (`shadow_texels_recopied_beyond_held`,
+    /// `shadow_texels_recopied_after_changes` and `shadow_texels_bounded_copied_in` together) of
+    /// a truth that is an image, split by what holds the truth as the first copies are.
+    pub shadow_texels_recopied_in_images: u64,
+    /// Those of the bytes of a buffer of private or memoryless storage the device made.
+    pub shadow_texels_recopied_in_private_buffers: u64,
+    /// Those of the bytes of a buffer of shared or managed storage the device made.
+    pub shadow_texels_recopied_in_mapped_buffers: u64,
+    /// Those of host pages a no-copy buffer imported (or the memory of the caller's `VkBuffer`).
+    pub shadow_texels_recopied_in_host_pages: u64,
+    /// Those of host pages that the texture's own image lies in too.
+    pub shadow_texels_recopied_in_aliased_host_pages: u64,
+    /// Those of an IOSurface's plane.
+    pub shadow_texels_recopied_in_surfaces: u64,
+    /// Of `shadow_texels_recopied_in_surfaces`, those under a texture of 2^20 texels or more.
+    pub shadow_texels_recopied_in_large_surfaces: u64,
     /// The texels those copies back move from a 2D texture's image to its buffer's bytes (a
     /// texture over a buffer, a no-copy buffer or an IOSurface plane): every texel, or those
     /// inside the rectangle bounding a pass's draws' scissors over an attachment it loads.
     pub shadow_texels_copied_back: u64,
+    /// Of those copies back, the ones recorded as a compute dispatch that stores the texels'
+    /// words, where the device runs one faster than its copy
+    /// (`DriverFact::ShadowCopyBackDispatchFaster`): the same bytes either way.
+    pub shadow_copies_back_dispatched: u64,
+    /// Of the copies in among `shadow_copies`, those recorded with their texture's keep after
+    /// them (one of `shadow_merge_copies_dispatched`) as one dispatch that stores the texels in
+    /// the shadow and in the merge's scratch, where the device runs them faster so
+    /// (`DriverFact::ShadowCopyInDispatchFaster`): the same bytes either way.
+    pub shadow_copies_in_dispatched: u64,
+    /// Of the keeps and merges among `shadow_copies`, those whose copy of the shadow's texels into
+    /// the merge's scratch is the dispatch a copy back takes, where the device runs one faster
+    /// than its copy (`DriverFact::ShadowCopyBackDispatchFaster`): the same bytes either way.
+    pub shadow_merge_copies_dispatched: u64,
+    /// The merges of shadowed textures whose scratch was a buffer their shadow kept from an
+    /// earlier merge whose command buffers completed (`shadow_merge.rs`): no buffer made.
+    pub shadow_merge_scratches_reused: u64,
+    /// The merges of shadowed textures whose scratch was made zero, as their kernel reads bytes
+    /// no copy writes (those between the texture's rows): a merge not cut to rows of whole words,
+    /// through a copy or of rows that start or end inside a word. A cut merge's copies write
+    /// every byte its kernel reads, so its scratch is not zeroed.
+    pub shadow_merge_scratches_zeroed: u64,
+    /// Copies of rows of bytes between two buffers (`row_copies.rs`): a blit between a buffer and
+    /// a texture over a buffer or between two textures over buffers, and a buffer-texture copy's
+    /// rows through its staging buffer. Each is one `vkCmdCopyBuffer` of a region per row (rows
+    /// contiguous in both buffers one region), or one dispatch.
+    pub row_copies: u64,
+    /// The regions of those copies.
+    pub row_copy_regions: u64,
+    /// The most regions of one of them.
+    pub row_copy_regions_most: u64,
+    /// Of `row_copies`, those recorded as one compute dispatch that stores the same bytes, on a
+    /// device that runs it faster (`DriverFact::RowCopiesDispatchFaster`): at least 2 equal rows
+    /// of 4-byte words, each the same distance after the one before.
+    pub row_copies_dispatched: u64,
+    /// The merges of shadowed textures that fetch the texels after the commands from the shadow
+    /// through its unsigned-integer view, comparing them with the kept texels, in place of a copy
+    /// of them into the scratch (`shadow_merge.rs`): a cut merge whose shadow has the view.
+    pub shadow_merges_fetched: u64,
+    /// Of `shadow_merges_fetched`, those whose keep copies the shadow's texels into an image at
+    /// their own coordinates (`vkCmdCopyImage`), which their kernel fetches beside the shadow's,
+    /// in place of a copy or dispatch into the scratch: on a device whose copies in take no keep
+    /// (no `DriverFact::ShadowCopyInDispatchFaster`), so they make no scratch.
+    pub shadow_merges_kept_in_images: u64,
+    /// Of `shadow_merges_kept_in_images`, those that made their image: the others took one their
+    /// queue kept from an earlier keep of the same view and extent, whatever its shadow, once the
+    /// encoder that took it ended (`texture/kept_image.rs`).
+    pub shadow_merge_kept_images_made: u64,
+    /// Of the others, those that took an image a command buffer not yet completed still held: in
+    /// their queue's order, ahead of that completion, which they did not wait for.
+    pub shadow_merge_kept_images_followed: u64,
+    /// The kept images live now: those their queues keep, and those the command buffers that
+    /// used them hold until they complete.
+    pub shadow_merge_kept_images_live: u64,
+    /// The shadowed textures render passes took as attachments, each once a pass
+    /// (`render/shadows.rs`): among them textures over a buffer's bytes, a no-copy buffer's or an
+    /// IOSurface plane's, whose pass copies the texels in before it where it loads them and back
+    /// after it where it stores them.
+    pub shadow_attachment_passes: u64,
+    /// Of `shadow_attachment_passes`, those of a texture no earlier pass of its command buffer
+    /// took as an attachment. The difference counts the passes on a texture after its first in a
+    /// command buffer: the copies in and back a shadow kept across a command buffer's passes
+    /// could leave out, at most.
+    pub shadow_attachment_textures: u64,
+    /// The shadowed textures render passes took as color attachments and loaded, each once a
+    /// pass, whose copies are cut to the rectangle bounding the pass's draws' scissors
+    /// (`render/shadows.rs`): the copy in moves the texels inside it alone, as do the copy back
+    /// or the keep and merge.
+    pub shadow_attachment_loads_within: u64,
+    /// Those loaded whose copies move every texel: the pass's draws are not bounded so, or the
+    /// attachment is not the whole of a one-level, one-slice 2D texture rendered itself. Those
+    /// neither loaded nor cleared are among them.
+    pub shadow_attachment_loads_whole: u64,
+    /// Those cleared over the whole texture: no copy in.
+    pub shadow_attachment_clears: u64,
+    /// Those cleared over part of the texture (a render area smaller than it): every texel
+    /// copied in.
+    pub shadow_attachment_clears_in_part: u64,
+    /// Those loaded in a pass that reaches no tile: no copy in or back.
+    pub shadow_attachment_loads_untouched: u64,
+    /// Of `shadow_attachment_tiles_bounded`, the tiles the pass's draws' scissor rectangles
+    /// themselves reach: what a copy cut to those rectangles' tiles would move, where one cut to
+    /// their bounding rectangle moves all of them.
+    pub shadow_attachment_tiles_covered: u64,
+    /// The 32-pixel tiles (from the render area's origin) the rectangle bounding the draws'
+    /// scissors reaches, for each count of `shadow_attachment_loads_within`.
+    pub shadow_attachment_tiles_bounded: u64,
+    /// The shadowed textures an encoder used whose truth one it used before shares (another
+    /// texture over the same bytes, or a view's shadow of the same image), counted as each
+    /// encoder ends (not an indirect command buffer's segment): each copies its texels in apart.
+    pub shadows_sharing_truth: u64,
+    /// The descriptor pools commands made for their dispatches of the runtime's own kernels
+    /// (`owned_kernel.rs`), one per command: none for a kernel whose set 0 is pushed, on a device
+    /// that pushes descriptor sets (`vkCmdPushDescriptorSet`): the rows copy's, and a shadowed
+    /// texture's copy back's and merges'.
+    pub owned_descriptor_pools: u64,
+    /// The texels the keeps among `shadow_copies` copy from a shadow into their merge's scratch:
+    /// those inside the rectangle the encoder's commands write in, each row widened to whole
+    /// words of the buffer, where the commands bound it and the merge goes in place; every texel
+    /// otherwise.
+    pub shadow_texels_kept: u64,
+    /// Of `shadow_copies`, the copies in of the texels inside the rectangle bounding where the
+    /// bytes changed since the image's copy in, where only writes inside rectangles of its texels
+    /// changed them: a render pass instance's draws into a color attachment it loads, over a
+    /// buffer's bytes, inside their scissors, before the next instance whose draws sample the
+    /// attachment's texture (`texture/attached_reads.rs`). Each holds the same texels as a copy
+    /// of every one; the rest of the image holds the bytes still.
+    pub bounded_shadow_copies: u64,
+    /// Texture views made the image itself to their bindings, through a swizzle over the image's
+    /// own format: a view in other channels of its image's bits (an `A8Unorm` view of an
+    /// `R8Unorm` texture), which neither copies nor announces (`texture/view_shadow.rs`).
+    pub views_through_swizzle: u64,
+    /// Shadow images of texture views made (`texture/view_shadow.rs`, `shadowed-texture-view`):
+    /// a view's own, or the render shadow of one of `views_through_swizzle`, made at the first
+    /// pass that renders into it.
+    pub view_shadows: u64,
+    /// Draws that sample, at a slot, a texture that presents a color attachment of their own
+    /// render pass, each reading the texture's copy, taken before its render pass instance, in
+    /// the attachment's place where the texture's shadow is served (`texture/attached_reads.rs`;
+    /// the copies count in `shadow_copies`).
+    pub attachment_reads_through_copies: u64,
+    /// Draws that sample a color attachment's texture after a memory barrier of their render
+    /// pass, each recorded into a new instance (a barrier inside an instance orders one pixel
+    /// alone), whose copy holds what the draws before the barrier wrote
+    /// (`texture/attached_reads.rs`).
+    pub attachment_read_splits: u64,
+    /// Draws that sample a color attachment's texture after a memory barrier of their render
+    /// pass, each reading it through a snapshot inside its instance in place of a split: drawn
+    /// twice, first copying each fragment's texel into the snapshot, then reading the snapshot
+    /// (`render/snapshot.rs`). They count in neither `attachment_reads_through_copies` nor
+    /// `attachment_read_splits`.
+    pub reading_draws_snapshotted: u64,
+    /// Of `reading_draws_snapshotted`, the draws recorded into a new instance because their own
+    /// was recorded inline, its render pass instance begun without the feedback loop layout the
+    /// snapshot needs (`render/snapshot.rs`, `render/inline_first.rs`).
+    pub snapshot_inline_splits: u64,
+    /// Linear images aliasing a buffer's bytes (a texture over a buffer, a no-copy buffer or an
+    /// IOSurface plane) that the device made with feedback loop usage
+    /// (`texture::feedback_candidate`), so a draw may read the texture through a snapshot while
+    /// its pass renders it (`render/snapshot.rs`): one per image made. Where the device makes no
+    /// such image with the usage, it makes one without, and the texture's readers split.
+    pub feedback_loop_alias_images: u64,
+    /// Render pass instances that held their multisampled depth/stencil attachment in
+    /// `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, moved there from `GENERAL` just before each began and
+    /// back just after it ended, on a device measured to render it faster so
+    /// (`render_target::depth_layout`, `DriverFact::MultisampledDepthFasterOutOfGeneral`).
+    pub depth_attachments_moved: u64,
+    /// Render pass instances that rendered their multisampled depth/stencil attachment in
+    /// `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` with no move around them: their encoder holds it there,
+    /// and it rests there between the encoders that hold it, on a device measured to render it
+    /// faster so (`DriverFact::MultisampledDepthFasterOutOfGeneral`). They count in
+    /// `depth_attachments_moved` too.
+    pub depth_instances_held: u64,
+    /// The moves of such a held depth out of `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, back to
+    /// `GENERAL`, before an encoder that names it otherwise: each costs the device a resolve of
+    /// the depth, as each instance's move back did before.
+    pub held_depths_released: u64,
+    /// Of `attachment_reads_through_copies`, the draws that read the texture at their fragments'
+    /// own pixels alone (`StageModule::own_pixel_textures`) over a texture whose copy is cut to a
+    /// rectangle: the copy in before their instance moves only the texels inside the rectangle
+    /// bounding their scissors, a pixel wider each way (`texture/attached_reads.rs`).
+    pub own_pixel_reads: u64,
     /// Ended compute and blit encoders whose logs their command buffers kept, as a rebind before
     /// the first submission may encode them again (`replay.rs`), and the bytes of those logs.
     pub replay_logs_kept: u64,
@@ -973,9 +3228,22 @@ pub struct WorkCounts {
     /// Render variants' `VkPipeline`s linked from libraries (each counted in
     /// `variant_pipelines_made` too).
     pub pipelines_linked: u64,
-    /// Dispatches that handed the making of a region's `VkPipeline` to the device's pool and
-    /// went on, rather than make it at the dispatch: each counted once per region it handed.
+    /// Compute encoders' dispatches that handed the making of a region's `VkPipeline` to the
+    /// device's pool and went on, rather than make it at the dispatch: each counted once per
+    /// region it handed.
     pub dispatch_pipelines_pooled: u64,
+    /// Render encoders' tile dispatches that handed the making of a region's `VkPipeline` to the
+    /// device's pool and went on, their passes recorded once it is made, rather than make it at
+    /// the dispatch: each counted once per region it handed.
+    pub tile_pipelines_pooled: u64,
+    /// Chunks of command buffers' upload arenas placed in device-local memory on a device without
+    /// unified memory, which the encoding thread then writes: none where the device has
+    /// host-coherent, host-cached system memory (`upload.rs`).
+    pub upload_chunks_in_device_memory: u64,
+    /// Tile dispatches render encoders recorded (`dispatchThreadsPerTile:` and its region forms):
+    /// each one the compute dispatch of the tile function over the pass's tiles, between the
+    /// pass's instances, with its attachments' scratch copies.
+    pub tile_dispatches_recorded: u64,
 }
 
 impl Device {
@@ -984,24 +3252,80 @@ impl Device {
     #[doc(hidden)]
     pub fn work_counts(&self) -> WorkCounts {
         let counters = &self.shared().counts;
-        let (allocated, census) = {
-            let memory = lock(&self.shared().memory);
-            (memory.allocated(), memory.census())
+        let group_end = |end: GroupEnd| counters.group_ends[end as usize].load(Ordering::Relaxed);
+        let pending = |bucket: usize| counters.batches_by_pending[bucket].load(Ordering::Relaxed);
+        let not_inline =
+            |why: NotInline| counters.passes_not_inline[why.index()].load(Ordering::Relaxed);
+        let actions = |action: ActionsRefused| {
+            counters.passes_not_inline_actions_by[action as usize].load(Ordering::Relaxed)
         };
+        let read_apart = |reason: ReadApart| {
+            counters.host_imports_read_apart_by[reason as usize].load(Ordering::Relaxed)
+        };
+        let kept = |because: KeptBecause| {
+            counters.host_imports_kept_by[because as usize].load(Ordering::Relaxed)
+        };
+        let begun =
+            |what: Begun| counters.command_buffers_begun_by[what as usize].load(Ordering::Relaxed);
+        let (sleeps, [by_commit, by_completion, by_host, by_slice], scheduler_spared, gpu_waits) =
+            self.shared().scheduler.sleeps_and_wakings();
+        let (completion_wakes, completion_spared) = self.shared().completion.wakes();
+        let (handler_wakes, handler_spared) = self.shared().contexts.wakes();
+        let command_buffer_wakes = counters.command_buffer_wakes.load(Ordering::Relaxed);
+        let command_buffer_spared = counters.command_buffer_wakes_spared.load(Ordering::Relaxed);
+        let event_wakes = counters.event_wakes.load(Ordering::Relaxed);
+        let event_spared = counters.event_wakes_spared.load(Ordering::Relaxed);
+        let (allocated, census, (parked, waiting), (made, freed)) = {
+            let memory = lock(&self.shared().memory);
+            let turnover = memory.turnover();
+            (
+                memory.allocated(),
+                memory.census(),
+                memory.parked(),
+                turnover,
+            )
+        };
+        let replays = (self.shared().recorder())
+            .map_or_else(ReplayCounts::default, |recorder| recorder.counts());
         WorkCounts {
-            command_pools_made: counters.command_pools_made.load(Ordering::Relaxed),
+            command_pools_made: counters.command_pools_made.load(Ordering::Relaxed)
+                + replays.pools_made,
+            command_buffers_deferred: counters.command_buffers_deferred.load(Ordering::Relaxed),
+            command_buffers_replayed: replays.by_recorder,
+            command_buffers_replayed_inline: replays.by_submitter,
+            commands_replayed: replays.commands,
+            copy_sites: self.shared().vk().copy_sites(),
+            copy_regions_split: self.shared().vk().copy_regions_split(),
+            spare_command_pools_taken: counters.spare_command_pools_taken.load(Ordering::Relaxed),
+            spare_command_pools_reset: counters.spare_command_pools_reset.load(Ordering::Relaxed),
             live_tables_uploaded: counters.live_tables_uploaded.load(Ordering::Relaxed),
             timeline_waits: counters.timeline_waits.load(Ordering::Relaxed),
+            missed_completion_wakes: counters.missed_completion_wakes.load(Ordering::Relaxed),
+            completed_where_seen: counters.completed_where_seen.load(Ordering::Relaxed),
+            scheduled_where_submitted: (counters.scheduled_where_submitted).load(Ordering::Relaxed),
             timestamp_slots_taken: counters.timestamp_slots_taken.load(Ordering::Relaxed),
+            timestamp_slots_reset_on_host: (counters.timestamp_slots_reset_on_host)
+                .load(Ordering::Relaxed),
+            calibrations: counters.calibrations.load(Ordering::Relaxed),
+            calibration_readings: counters.calibration_readings.load(Ordering::Relaxed),
+            calibration_deviation_most: (counters.calibration_deviation_most)
+                .load(Ordering::Relaxed),
+            calibration_disagreements: (counters.calibration_disagreements).load(Ordering::Relaxed),
             storage_forms_taken: counters.storage_forms_taken.load(Ordering::Relaxed),
             addressable_buffers_made: counters.addressable_buffers_made.load(Ordering::Relaxed),
             mipmap_first_levels_fetched: counters
                 .mipmap_first_levels_fetched
                 .load(Ordering::Relaxed),
             pipelines_pooled: counters.pipelines_pooled.load(Ordering::Relaxed),
+            residual_form_draws: counters.residual_form_draws.load(Ordering::Relaxed),
+            residual_form_makings: counters.residual_form_makings.load(Ordering::Relaxed),
+            pipeline_pool_busy: self.shared().pipeline_pool.busy() as u64,
             shader_modules_made: counters.shader_modules_made.load(Ordering::Relaxed),
             shader_modules_shared: counters.shader_modules_shared.load(Ordering::Relaxed),
+            pipeline_layouts_made: counters.pipeline_layouts_made.load(Ordering::Relaxed),
+            pipeline_layouts_shared: counters.pipeline_layouts_shared.load(Ordering::Relaxed),
             variant_pipelines_made: counters.variant_pipelines_made.load(Ordering::Relaxed),
+            flights_followed: counters.flights_followed.load(Ordering::Relaxed),
             variants_taken_back: counters.variants_taken_back.load(Ordering::Relaxed),
             unlisted_argument_sampler_failures: counters
                 .unlisted_argument_sampler_failures
@@ -1015,8 +3339,16 @@ impl Device {
             sampler_sets_shared: counters.sampler_sets_shared.load(Ordering::Relaxed),
             sampler_sets_destroyed: counters.sampler_sets_destroyed.load(Ordering::Relaxed),
             ahead_render_passes_made: counters.ahead_render_passes_made.load(Ordering::Relaxed),
+            render_passes_made: counters.render_passes_made.load(Ordering::Relaxed),
             ahead_framebuffers_made: counters.ahead_framebuffers_made.load(Ordering::Relaxed),
             kept_backings_made: counters.kept_backings_made.load(Ordering::Relaxed),
+            pooled_backings_made: counters.pooled_backings_made.load(Ordering::Relaxed),
+            storage_placeholders_made: counters.storage_placeholders_made.load(Ordering::Relaxed),
+            storage_placeholder_attachments: counters
+                .storage_placeholder_attachments
+                .load(Ordering::Relaxed),
+            color_resolve_passes_made: counters.color_resolve_passes_made.load(Ordering::Relaxed),
+            color_resolve_passes_kept: counters.color_resolve_passes_kept.load(Ordering::Relaxed),
             ahead_nanos: counters.ahead_nanos.load(Ordering::Relaxed),
             unused_bits_load_passes: counters.unused_bits_load_passes.load(Ordering::Relaxed),
             unused_bits_load_texels: counters.unused_bits_load_texels.load(Ordering::Relaxed),
@@ -1034,12 +3366,19 @@ impl Device {
             device_memory_allocated: allocated,
             memory_blocks_live: census.pooled,
             empty_memory_blocks_live: census.empty,
+            pooled_memory_blocks_made: made,
+            pooled_memory_blocks_freed: freed,
             dedicated_memory_blocks_live: census.dedicated,
             host_imports_live: census.imported,
+            freed_memory_parked: parked,
+            freed_memory_waiting: waiting,
             stand_ins_made: counters.stand_ins_made.load(Ordering::Relaxed),
             stand_in_bytes: counters.stand_in_bytes.load(Ordering::Relaxed),
             stale_detached_reaches: counters.stale_detached_reaches.load(Ordering::Relaxed),
             detached_storage_reaches: counters.detached_storage_reaches.load(Ordering::Relaxed),
+            heap_slots_rewritten: counters.heap_slots_rewritten.load(Ordering::Relaxed),
+            heap_slot_writes_deferred: counters.heap_slot_writes_deferred.load(Ordering::Relaxed),
+            host_range_lookups: self.shared().aliases.range_lookups(),
             heap_textures_tiled: counters.heap_textures_tiled.load(Ordering::Relaxed),
             heap_texture_lossless_layouts: counters
                 .heap_texture_lossless_layouts
@@ -1062,8 +3401,89 @@ impl Device {
             internal_submissions: counters.internal_submissions.load(Ordering::Relaxed),
             queue_submissions: counters.queue_submissions.load(Ordering::Relaxed),
             command_buffers_submitted: counters.command_buffers_submitted.load(Ordering::Relaxed),
+            batch_submit_nanos: counters.batch_submit_nanos.load(Ordering::Relaxed),
             command_buffers_begun: counters.command_buffers_begun.load(Ordering::Relaxed),
+            command_buffers_begun_encoders: begun(Begun::Encoder),
+            command_buffers_begun_segments: begun(Begun::Segment),
+            command_buffers_begun_continuations: begun(Begun::Continuation),
+            command_buffers_begun_secondaries: begun(Begun::Secondary),
+            command_buffers_begun_batch_work: begun(Begun::BatchWork),
+            command_buffers_begun_batch_barriers: begun(Begun::BatchBarriers),
+            command_buffers_begun_kept_barriers: begun(Begun::KeptBarriers),
+            command_buffers_begun_internal: begun(Begun::Internal),
+            encoder_command_buffers_begun: (counters.encoder_command_buffers_begun)
+                .load(Ordering::Relaxed),
+            encoder_primaries_begun_ahead: (counters.encoder_primaries_begun_ahead)
+                .load(Ordering::Relaxed)
+                + replays.begun_ahead_taken,
+            primaries_begun_ahead: counters.primaries_begun_ahead.load(Ordering::Relaxed),
             barrier_buffers_kept: counters.barrier_buffers_kept.load(Ordering::Relaxed),
+            stamped_buffers_kept: counters.stamped_buffers_kept.load(Ordering::Relaxed),
+            stamped_buffers_reused: counters.stamped_buffers_reused.load(Ordering::Relaxed),
+            finales_folded: counters.finales_folded.load(Ordering::Relaxed),
+            finales_apart: counters.finales_apart.load(Ordering::Relaxed),
+            grouped_submissions: counters.grouped_submissions.load(Ordering::Relaxed),
+            batches_grouped: counters.batches_grouped.load(Ordering::Relaxed),
+            group_ends_full: group_end(GroupEnd::Full),
+            group_ends_wait: group_end(GroupEnd::Wait),
+            group_ends_apart: group_end(GroupEnd::Apart),
+            group_ends_first_work: group_end(GroupEnd::FirstWork),
+            group_ends_drained: group_end(GroupEnd::Drained),
+            group_ends_checks: group_end(GroupEnd::Checks),
+            group_ends_held: group_end(GroupEnd::Held),
+            batches_with_none_pending: pending(0),
+            batches_with_one_pending: pending(1),
+            batches_with_two_or_three_pending: pending(2),
+            batches_with_four_or_more_pending: pending(3),
+            groups_kept_pending: counters.groups_kept_pending.load(Ordering::Relaxed),
+            groups_sent_for_waits: counters.groups_sent_for_waits.load(Ordering::Relaxed),
+            registrations_waited: self.shared().textures.first_moves.registrations_waited(),
+            scheduler_sleeps: sleeps,
+            scheduler_wakes_commit: by_commit,
+            scheduler_wakes_completion: by_completion,
+            scheduler_wakes_host: by_host,
+            scheduler_sleep_slices: by_slice,
+            scheduler_gpu_waits: gpu_waits,
+            wakes_completion_waiters: completion_wakes,
+            wakes_handler_threads: handler_wakes,
+            wakes_command_buffer_waiters: command_buffer_wakes,
+            wakes_event_waiters: event_wakes,
+            wakes_spared: completion_spared
+                + handler_spared
+                + command_buffer_spared
+                + event_spared
+                + scheduler_spared,
+            slot_returns: counters.slot_returns.load(Ordering::Relaxed),
+            slot_return_nanos: counters.slot_return_nanos.load(Ordering::Relaxed),
+            slot_waits: counters.slot_waits.load(Ordering::Relaxed),
+            slot_wait_nanos: counters.slot_wait_nanos.load(Ordering::Relaxed),
+            completed_waits: counters.completed_waits.load(Ordering::Relaxed),
+            event_waits_met: counters.event_waits_met.load(Ordering::Relaxed),
+            bare_starts: counters.bare_starts.load(Ordering::Relaxed),
+            prefixed_starts: counters.prefixed_starts.load(Ordering::Relaxed),
+            unrun_instances_ended: counters.unrun_instances_ended.load(Ordering::Relaxed),
+            untouched_passes_skipped: counters.untouched_passes_skipped.load(Ordering::Relaxed),
+            inline_passes: counters.inline_passes.load(Ordering::Relaxed),
+            inline_passes_split: counters.inline_passes_split.load(Ordering::Relaxed),
+            inline_split_instances: counters.inline_split_instances.load(Ordering::Relaxed),
+            inline_memoryless_write_splits: (counters.inline_memoryless_write_splits)
+                .load(Ordering::Relaxed),
+            passes_not_inline_encoders: not_inline(NotInline::Encoders),
+            passes_not_inline_layouts: not_inline(NotInline::Layouts),
+            passes_not_inline_memoryless: not_inline(NotInline::Memoryless),
+            passes_not_inline_actions: (counters.passes_not_inline[NotInline::ACTIONS])
+                .load(Ordering::Relaxed),
+            passes_not_inline_actions_dont_care_load: actions(ActionsRefused::DontCareLoad),
+            passes_not_inline_actions_unequal_reach: actions(ActionsRefused::UnequalReach),
+            passes_not_inline_actions_nan_clear: actions(ActionsRefused::NanClear),
+            passes_not_inline_actions_resolve: actions(ActionsRefused::Resolve),
+            passes_not_inline_actions_store: actions(ActionsRefused::Store),
+            passes_not_inline_buffer_textures: not_inline(NotInline::BufferTextures),
+            passes_not_inline_attachments: not_inline(NotInline::Attachments),
+            passes_not_inline_storage: not_inline(NotInline::Storage),
+            passes_not_inline_stand_ins: not_inline(NotInline::StandIn),
+            passes_not_inline_memoryless_writes: not_inline(NotInline::MemorylessWrites),
+            passes_not_inline_draws: not_inline(NotInline::Draws),
             commits_handed_off: counters.commits_handed_off.load(Ordering::Relaxed),
             images_started_on_the_host: counters.images_started_on_the_host.load(Ordering::Relaxed),
             host_texel_copies: counters.host_texel_copies.load(Ordering::Relaxed),
@@ -1071,13 +3491,24 @@ impl Device {
             uncached_host_images: counters.uncached_host_images.load(Ordering::Relaxed),
             cpu_block_decodes: counters.cpu_block_decodes.load(Ordering::Relaxed),
             block_decode_passes: counters.block_decode_passes.load(Ordering::Relaxed),
+            second_twins: counters.second_twins.load(Ordering::Relaxed),
+            second_twin_checks: counters.second_twin_checks.load(Ordering::Relaxed),
+            second_twin_decodes: counters.second_twin_decodes.load(Ordering::Relaxed),
             queue_drains: counters.queue_drains.load(Ordering::Relaxed),
             stand_in_copies_made: counters.stand_in_copies_made.load(Ordering::Relaxed),
             stand_in_copies_made_at_draws: counters
                 .stand_in_copies_made_at_draws
                 .load(Ordering::Relaxed),
             draw_shapes_made: counters.draw_shapes_made.load(Ordering::Relaxed),
+            draw_shapes_found: counters.draw_shapes_found.load(Ordering::Relaxed),
+            argument_samplers_taken: counters.argument_samplers_taken.load(Ordering::Relaxed),
+            bind_views_worked_out: counters.bind_views_worked_out.load(Ordering::Relaxed),
+            stage_tables_read: counters.stage_tables_read.load(Ordering::Relaxed),
+            no_copy_lies_read: counters.no_copy_lies_read.load(Ordering::Relaxed),
+            commands_noted_as_before: counters.commands_noted_as_before.load(Ordering::Relaxed),
             draws_settled: counters.draws_settled.load(Ordering::Relaxed),
+            depth16_sided_draws: counters.depth16_sided_draws.load(Ordering::Relaxed),
+            two_plane_draws: counters.two_plane_draws.load(Ordering::Relaxed),
             bound_notices_made: counters.bound_notices_made.load(Ordering::Relaxed),
             argument_tables_retained: counters.argument_tables_retained.load(Ordering::Relaxed),
             graphics_pipelines_looked_up: counters
@@ -1088,24 +3519,226 @@ impl Device {
                 .linear_passes_through_copies
                 .load(Ordering::Relaxed),
             kept_bytes_passes: counters.kept_bytes_passes.load(Ordering::Relaxed),
+            signed_depth_switch_ons: counters.signed_depth_switch_ons.load(Ordering::Relaxed),
+            magnitude_stand_in_passes: counters.magnitude_stand_in_passes.load(Ordering::Relaxed),
+            magnitude_write_backs: counters.magnitude_write_backs.load(Ordering::Relaxed),
+            sign_strips: counters.sign_strips.load(Ordering::Relaxed),
+            color_group_passes: counters.color_group_passes.load(Ordering::Relaxed),
+            color_group_twins: counters.color_group_twins.load(Ordering::Relaxed),
+            color_group_draws_skipped: counters.color_group_draws_skipped.load(Ordering::Relaxed),
             draw_states_recorded: counters.draw_states_recorded.load(Ordering::Relaxed),
+            draws_pushing_set_zero: counters.draws_pushing_set_zero.load(Ordering::Relaxed),
+            set_zero_writes_pushed: counters.set_zero_writes_pushed.load(Ordering::Relaxed),
+            set_zero_equal_shape_switches: (counters.set_zero_equal_shape_switches)
+                .load(Ordering::Relaxed),
+            set_zero_writes_on_equal_shape_switches: (counters
+                .set_zero_writes_on_equal_shape_switches)
+                .load(Ordering::Relaxed),
+            set_zero_writes_if_shapes_shared: (counters.set_zero_writes_if_shapes_shared)
+                .load(Ordering::Relaxed),
+            dispatches_pushing_set_zero: (counters.dispatches_pushing_set_zero)
+                .load(Ordering::Relaxed),
+            baked_sampler_dispatches_apart: (counters.baked_sampler_dispatches_apart)
+                .load(Ordering::Relaxed),
             host_deallocators_delayed: counters.host_deallocators_delayed.load(Ordering::Relaxed),
+            host_import_releases_posted: (counters.host_import_releases_posted)
+                .load(Ordering::Relaxed),
+            host_import_releases_pending: (counters.host_import_releases_pending)
+                .load(Ordering::Acquire),
+            host_keep_alives_kept: counters.host_keep_alives_kept.load(Ordering::Relaxed),
+            host_keep_alives_covered: counters.host_keep_alives_covered.load(Ordering::Relaxed),
+            host_mappings_queried: counters.host_mappings_queried.load(Ordering::Relaxed),
             dma_buf_imports: counters.dma_buf_imports.load(Ordering::Relaxed),
+            dma_buf_memories_live: counters.dma_buf_memories_live.load(Ordering::Relaxed),
+            dma_buf_image_memories_live: counters
+                .dma_buf_image_memories_live
+                .load(Ordering::Relaxed),
+            host_imports_released: counters.host_imports_released.load(Ordering::Relaxed),
+            host_imports_reimported: counters.host_imports_reimported.load(Ordering::Relaxed),
+            host_imports_resident: counters.host_imports_resident.load(Ordering::Relaxed),
+            host_imports_used: counters.host_imports_used.load(Ordering::Relaxed),
+            host_imports_read_apart: counters.host_imports_read_apart.load(Ordering::Relaxed),
+            host_imports_read_apart_address: read_apart(ReadApart::Address),
+            host_imports_read_apart_vk_buffer: read_apart(ReadApart::VkBuffer),
+            host_imports_read_apart_binding: read_apart(ReadApart::Binding),
+            host_imports_read_apart_texture: read_apart(ReadApart::Texture),
+            host_imports_read_apart_second_buffer: read_apart(ReadApart::SecondBuffer),
+            host_imports_read_apart_unreleased: read_apart(ReadApart::Unreleased),
+            host_imports_kept_of_heap: kept(KeptBecause::Heap),
+            host_imports_kept_rebound: kept(KeptBecause::Rebind),
+            host_imports_kept_pointer: kept(KeptBecause::Pointer),
+            host_imports_kept_no_stand_in: kept(KeptBecause::NoStandIn),
+            host_imports_rebound_unlisted: counters
+                .host_imports_rebound_unlisted
+                .load(Ordering::Relaxed),
+            host_rebind_imports_made: counters.host_rebind_imports_made.load(Ordering::Relaxed),
+            host_rebind_imports_covered: counters
+                .host_rebind_imports_covered
+                .load(Ordering::Relaxed),
+            host_remaps_reported: counters.host_remaps_reported.load(Ordering::Relaxed),
+            host_remaps_over_imports: counters.host_remaps_over_imports.load(Ordering::Relaxed),
+            host_imports_remapped: counters.host_imports_remapped.load(Ordering::Relaxed),
+            host_pointer_imports_made: counters.host_pointer_imports_made.load(Ordering::Relaxed),
+            host_pointer_import_bytes_made: counters
+                .host_pointer_import_bytes_made
+                .load(Ordering::Relaxed),
+            host_imports_lost: counters.host_imports_lost.load(Ordering::Relaxed),
+            host_import_fds_kept: counters.host_import_fds_kept.load(Ordering::Relaxed),
+            host_imports_kept_for_fds: counters.host_imports_kept_for_fds.load(Ordering::Relaxed),
             dma_buf_sparse_buffers: counters.dma_buf_sparse_buffers.load(Ordering::Relaxed),
             dma_buf_images: counters.dma_buf_images.load(Ordering::Relaxed),
             dma_buf_image_fallbacks: counters.dma_buf_image_fallbacks.load(Ordering::Relaxed),
-            pitched_host_images: counters.pitched_host_images.load(Ordering::Relaxed),
-            pitched_host_image_refusals: counters
-                .pitched_host_image_refusals
-                .load(Ordering::Relaxed),
-            pitched_host_image_refusals_recalled: counters
-                .pitched_host_image_refusals_recalled
-                .load(Ordering::Relaxed),
             modifier_feature_queries: counters.modifier_feature_queries.load(Ordering::Relaxed),
             shadowed_textures: counters.shadowed_textures.load(Ordering::Relaxed),
+            views_through_swizzle: counters.views_through_swizzle.load(Ordering::Relaxed),
+            view_shadows: counters.view_shadows.load(Ordering::Relaxed),
+            attachment_reads_through_copies: counters
+                .attachment_reads_through_copies
+                .load(Ordering::Relaxed),
+            attachment_read_splits: counters.attachment_read_splits.load(Ordering::Relaxed),
+            reading_draws_snapshotted: counters.reading_draws_snapshotted.load(Ordering::Relaxed),
+            snapshot_inline_splits: counters.snapshot_inline_splits.load(Ordering::Relaxed),
+            feedback_loop_alias_images: counters.feedback_loop_alias_images.load(Ordering::Relaxed),
+            depth_attachments_moved: counters.depth_attachments_moved.load(Ordering::Relaxed),
+            depth_instances_held: counters.depth_instances_held.load(Ordering::Relaxed),
+            held_depths_released: counters.held_depths_released.load(Ordering::Relaxed),
+            own_pixel_reads: counters.own_pixel_reads.load(Ordering::Relaxed),
             shadows_zeroed: counters.shadows_zeroed.load(Ordering::Relaxed),
             shadow_copies: counters.shadow_copies.load(Ordering::Relaxed),
+            shadow_texels_copied_in: counters.shadow_texels_copied_in.load(Ordering::Relaxed),
+            shadow_texels_first_copied_in: counters
+                .shadow_texels_first_copied_in
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_images: counters
+                .shadow_texels_first_copied_in_images
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_private_buffers: counters
+                .shadow_texels_first_copied_in_private_buffers
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_mapped_buffers: counters
+                .shadow_texels_first_copied_in_mapped_buffers
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_host_pages: counters
+                .shadow_texels_first_copied_in_host_pages
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_aliased_host_pages: counters
+                .shadow_texels_first_copied_in_aliased_host_pages
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_surfaces: counters
+                .shadow_texels_first_copied_in_surfaces
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_large_surfaces: counters
+                .shadow_texels_first_copied_in_large_surfaces
+                .load(Ordering::Relaxed),
+            shadow_texels_first_copied_in_again: counters
+                .shadow_texels_first_copied_in_again
+                .load(Ordering::Relaxed),
+            shadow_texels_copied_in_images: counters
+                .shadow_texels_copied_in_images
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_beyond_held: counters
+                .shadow_texels_recopied_beyond_held
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_after_changes: counters
+                .shadow_texels_recopied_after_changes
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_after_other_shadows: counters
+                .shadow_texels_recopied_after_other_shadows
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_after_two_ways_merges: counters
+                .shadow_texels_recopied_after_two_ways_merges
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_after_writes: counters
+                .shadow_texels_recopied_after_writes
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_after_writes_within: counters
+                .shadow_texels_recopied_after_writes_within
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_after_dropped_writes: counters
+                .shadow_texels_recopied_after_dropped_writes
+                .load(Ordering::Relaxed),
+            shadow_texels_bounded_copied_in: counters
+                .shadow_texels_bounded_copied_in
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_images: counters
+                .shadow_texels_recopied_in_images
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_private_buffers: counters
+                .shadow_texels_recopied_in_private_buffers
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_mapped_buffers: counters
+                .shadow_texels_recopied_in_mapped_buffers
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_host_pages: counters
+                .shadow_texels_recopied_in_host_pages
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_aliased_host_pages: counters
+                .shadow_texels_recopied_in_aliased_host_pages
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_surfaces: counters
+                .shadow_texels_recopied_in_surfaces
+                .load(Ordering::Relaxed),
+            shadow_texels_recopied_in_large_surfaces: counters
+                .shadow_texels_recopied_in_large_surfaces
+                .load(Ordering::Relaxed),
             shadow_texels_copied_back: counters.shadow_texels_copied_back.load(Ordering::Relaxed),
+            shadow_copies_back_dispatched: counters
+                .shadow_copies_back_dispatched
+                .load(Ordering::Relaxed),
+            shadow_copies_in_dispatched: counters
+                .shadow_copies_in_dispatched
+                .load(Ordering::Relaxed),
+            shadow_merge_copies_dispatched: counters
+                .shadow_merge_copies_dispatched
+                .load(Ordering::Relaxed),
+            shadow_merge_scratches_reused: counters
+                .shadow_merge_scratches_reused
+                .load(Ordering::Relaxed),
+            shadow_merge_scratches_zeroed: counters
+                .shadow_merge_scratches_zeroed
+                .load(Ordering::Relaxed),
+            row_copies: counters.row_copies.load(Ordering::Relaxed),
+            row_copy_regions: counters.row_copy_regions.load(Ordering::Relaxed),
+            row_copy_regions_most: counters.row_copy_regions_most.load(Ordering::Relaxed),
+            row_copies_dispatched: counters.row_copies_dispatched.load(Ordering::Relaxed),
+            shadow_merges_fetched: counters.shadow_merges_fetched.load(Ordering::Relaxed),
+            shadow_merges_kept_in_images: counters
+                .shadow_merges_kept_in_images
+                .load(Ordering::Relaxed),
+            shadow_merge_kept_images_made: counters
+                .shadow_merge_kept_images_made
+                .load(Ordering::Relaxed),
+            shadow_merge_kept_images_followed: counters
+                .shadow_merge_kept_images_followed
+                .load(Ordering::Relaxed),
+            shadow_merge_kept_images_live: counters
+                .shadow_merge_kept_images_live
+                .load(Ordering::Relaxed),
+            shadow_attachment_passes: counters.shadow_attachment_passes.load(Ordering::Relaxed),
+            shadow_attachment_textures: counters.shadow_attachment_textures.load(Ordering::Relaxed),
+            shadow_attachment_loads_within: counters
+                .shadow_attachment_loads_within
+                .load(Ordering::Relaxed),
+            shadow_attachment_loads_whole: counters
+                .shadow_attachment_loads_whole
+                .load(Ordering::Relaxed),
+            shadow_attachment_clears: counters.shadow_attachment_clears.load(Ordering::Relaxed),
+            shadow_attachment_clears_in_part: counters
+                .shadow_attachment_clears_in_part
+                .load(Ordering::Relaxed),
+            shadow_attachment_loads_untouched: counters
+                .shadow_attachment_loads_untouched
+                .load(Ordering::Relaxed),
+            shadow_attachment_tiles_covered: counters
+                .shadow_attachment_tiles_covered
+                .load(Ordering::Relaxed),
+            shadow_attachment_tiles_bounded: counters
+                .shadow_attachment_tiles_bounded
+                .load(Ordering::Relaxed),
+            shadows_sharing_truth: counters.shadows_sharing_truth.load(Ordering::Relaxed),
+            owned_descriptor_pools: counters.owned_descriptor_pools.load(Ordering::Relaxed),
+            shadow_texels_kept: counters.shadow_texels_kept.load(Ordering::Relaxed),
+            bounded_shadow_copies: counters.bounded_shadow_copies.load(Ordering::Relaxed),
             replay_logs_kept: counters.replay_logs_kept.load(Ordering::Relaxed),
             replay_log_bytes: counters.replay_log_bytes.load(Ordering::Relaxed),
             encoders_reencoded: counters.encoders_reencoded.load(Ordering::Relaxed),
@@ -1117,6 +3750,10 @@ impl Device {
                 .load(Ordering::Relaxed),
             pipelines_linked: counters.pipelines_linked.load(Ordering::Relaxed),
             dispatch_pipelines_pooled: counters.dispatch_pipelines_pooled.load(Ordering::Relaxed),
+            tile_pipelines_pooled: counters.tile_pipelines_pooled.load(Ordering::Relaxed),
+            upload_chunks_in_device_memory: (counters.upload_chunks_in_device_memory)
+                .load(Ordering::Relaxed),
+            tile_dispatches_recorded: counters.tile_dispatches_recorded.load(Ordering::Relaxed),
         }
     }
 }

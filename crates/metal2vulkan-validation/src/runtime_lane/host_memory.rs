@@ -2,7 +2,7 @@
 //! purgeable state on the device the cfg selects, under the validation layer. Each test fails on
 //! any validation message, so a leaked import or buffer fails it too.
 //!
-//! The host memory is the consumer's (`paravirt-decompile`): guest RAM is one shared memory
+//! The host memory is the consumer's (reims-vgpu): guest RAM is one shared memory
 //! object, and the buffers wrap a second, 16-KiB-aligned mapping of some of its pages
 //! (`gpu_task/memory.rs`'s `no_copy_buffer`, with a deallocator that unmaps it; `display/efi.rs`'s
 //! framebuffer, with none), with resource options 0. The CPU writes through the guest RAM
@@ -239,7 +239,7 @@ impl Mapping {
     }
 
     /// Make the mapping read-only.
-    fn protect_read_only(&self) {
+    pub(super) fn protect_read_only(&self) {
         // SAFETY: the mapping is this object's.
         let done = unsafe { libc::mprotect(self.at.as_ptr().cast(), self.len, libc::PROT_READ) };
         assert_eq!(done, 0, "mprotect");
@@ -684,6 +684,99 @@ fn a_deallocator_may_touch_the_command_buffer_that_held_its_buffer() {
     });
 }
 
+/// The deallocator of a buffer an encoder named, with its command buffer's every reference to the
+/// buffer let go only after it completed, still runs as that command buffer releases what it
+/// retained, where its wait for the command buffer returns at once, as Metal's does. Here the
+/// device's thread that submits holds on past the completion, deterministically: the command
+/// buffer `filled` is submitted in one pass with `holding`, whose submission handler returns only
+/// once `after`, committed behind `filled` on its queue, ran its completed handler, after
+/// `filled`'s release. (`opener`, on `holding`'s queue, holds that thread until all three are
+/// committed, so the three go in that one pass.) A blit encoder logs its calls while the device has
+/// a buffer over host pages (`replay.rs`), and its log was let go there, with the buffer's last
+/// handle, after the completion: the deallocator then ran on that thread, whose own hold on the
+/// command buffer kept the deallocator's wait from ever returning.
+#[test]
+fn a_deallocator_returns_whatever_thread_submits_past_its_completion() {
+    on_device(|device| {
+        let (first, second) = (
+            device.new_command_queue().unwrap(),
+            device.new_command_queue().unwrap(),
+        );
+        let opener = second.command_buffer().unwrap();
+        let (opened, open) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        opener
+            .add_submission_handler(Box::new(move |_: &CommandBuffer| {
+                opened.send(()).unwrap();
+                released.recv_timeout(WAIT).unwrap();
+            }))
+            .unwrap();
+        opener.commit().unwrap();
+        open.recv_timeout(WAIT)
+            .expect("the opener's submission handler ran");
+        let memory = Mapping::anonymous(GUEST_PAGE);
+        let pointer = memory.pointer();
+        let filled = first.command_buffer().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let deallocator: Deallocator = {
+            let filled = filled.clone();
+            Box::new(move |_: NonNull<u8>, _: u64| {
+                let status = filled.status();
+                let waited = (
+                    filled.wait_until_completed(),
+                    filled.wait_until_completed_for(WAIT),
+                );
+                drop(filled);
+                drop(memory);
+                sender.send((status, waited)).unwrap();
+            })
+        };
+        // SAFETY: the deallocator releases the mapping, after the buffer's last use.
+        let buffer = unsafe {
+            no_copy(
+                device,
+                pointer,
+                GUEST_PAGE,
+                ResourceOptions::default(),
+                Some(deallocator),
+            )
+        }
+        .unwrap();
+        let mut blit = filled.blit_command_encoder().unwrap();
+        blit.fill_buffer(&buffer, 0..64, 0x2d).unwrap();
+        blit.end_encoding().unwrap();
+        filled.commit().unwrap();
+        drop(buffer);
+        let after = first.command_buffer().unwrap();
+        let (ran, after_ran) = std::sync::mpsc::channel::<()>();
+        after
+            .add_completed_handler(Box::new(move |_: &CommandBuffer| {
+                ran.send(()).unwrap();
+            }))
+            .unwrap();
+        after.commit().unwrap();
+        let holding = second.command_buffer().unwrap();
+        holding
+            .add_submission_handler(Box::new(move |_: &CommandBuffer| {
+                after_ran
+                    .recv_timeout(WAIT)
+                    .expect("the later command buffer's completed handler ran");
+            }))
+            .unwrap();
+        holding.commit().unwrap();
+        release.send(()).unwrap();
+        let (status, waited) = receiver
+            .recv_timeout(WAIT)
+            .expect("the deallocator ran and returned");
+        assert_eq!(status, CommandBufferStatus::Completed);
+        assert_eq!(waited, (Ok(()), Ok(())));
+        for command_buffer in [&opener, &filled, &after, &holding] {
+            command_buffer.wait_until_completed_for(WAIT).unwrap();
+            assert_eq!(command_buffer.error(), None);
+        }
+    });
+}
+
 /// The consumer's EFI framebuffer (`display/efi.rs`): a 16-KiB-aligned mapping of the
 /// framebuffer, a length of the rows times the stride rounded up to a guest page, options 0, and
 /// no deallocator. The GPU reads the pixels the guest wrote; the buffer's release runs nothing,
@@ -986,10 +1079,10 @@ fn a_buffer_made_after_an_unreported_remap_shares_the_live_import() {
 /// Which pages a no-copy buffer uses when the caller maps other pages at its address between its
 /// making and its first GPU use: guest page P1 mapped at address X, B made over X, X remapped in
 /// place to guest page P2 of the same shared memory object (`map_in_place`), and only then B's
-/// first use, a read and a fill of its bytes 0x30..0x40. Metal keeps the pages at the making (EV
-/// ZCI2-remapprobe-m4), and so does the runtime on macOS, whose import is MoltenVK's
-/// `newBufferWithBytesNoCopy:` in the making call: checked there. Elsewhere the driver decides,
-/// and the remap breaks `HostMemory::new`'s contract: printed only (`REMAP-BEFORE-USE`; lavapipe
+/// first use, a read and a fill of its bytes 0x30..0x40. Metal keeps the pages at the making, and
+/// so does the runtime on macOS, whose import is MoltenVK's `newBufferWithBytesNoCopy:` in the
+/// making call: checked there. Elsewhere the driver decides, and the remap breaks
+/// `HostMemory::new`'s contract: printed only (`REMAP-BEFORE-USE`; lavapipe
 /// follows the address, its imports reading through the pointer). Where the device imports no
 /// shared memory, the refusal is printed (typed, as
 /// `host_memory_kinds_are_imported_or_refused_typed` shows).
@@ -1253,8 +1346,7 @@ fn remaps_reported_from_any_thread_change_no_answer() {
 }
 
 /// A copy out of a no-copy buffer reads past its length to the end of its host pages: the
-/// caller's bytes there, the current ones, as plain Metal reads them (an M4 under macOS 27.0.1,
-/// EV SPCrp-probe4-m4 `p_nocopy_page`, `p_nocopy_live`, `p_nocopy_offset`, `p_nocopy_b2b`;
+/// caller's bytes there, the current ones, as plain Metal reads them (an M4 under macOS 27.0.1;
 /// its API validation stops them). The consumer's transfer buffer: 0x3f bytes at the start of a
 /// page-aligned mapping (and at 256 bytes into it), options 0, paged into a texture and copied into
 /// a buffer. A copy past the pages is refused (`Invalid`), as past any other buffer's length.
@@ -1416,7 +1508,7 @@ fn host_memory_kinds_are_imported_or_refused_typed() {
 
 /// A read-only page (Metal makes the buffer, and its GPU reads it). On Linux the runtime refuses
 /// it typed before the import, as it refuses every page the process cannot write: Linux drivers
-/// pin imported pages for writing (measured at 83a57ba2, EVs `RT4-dev-*`: RADV refused the page,
+/// pin imported pages for writing (measured at 83a57ba2: RADV refused the page,
 /// NVIDIA failed it as out of device memory, ANV made it and lost the device at the GPU's read;
 /// lavapipe read it, so there the rule refuses more than the driver would). Elsewhere (MoltenVK,
 /// which hands the range to Metal) it is made, and the GPU reads what the CPU wrote before the
@@ -1461,7 +1553,7 @@ fn a_read_only_page_is_refused_on_linux_and_read_elsewhere() {
 /// fence returned as the first of its Metal command buffer's handlers marked the device lost,
 /// the command pools went, and a later handler aborted the process (`mutex lock failed`): in
 /// one run of `a_gpu_fault_fails_its_command_buffer_and_the_queue_runs_on` on each of two Apple
-/// M4s (EV STL-au2-mvk4). On MoltenVK alone, as that test.
+/// M4s. On MoltenVK alone, as that test.
 #[test]
 fn a_lost_device_s_command_buffers_let_go_of_their_pools_after_the_driver_s_completion() {
     /// Devices lost one after another, each by one fault.
@@ -1576,16 +1668,15 @@ fn a_lost_device_s_command_buffers_let_go_of_their_pools_after_the_driver_s_comp
 }
 
 /// A GPU write into read-only host pages fails its command buffer, and the queue runs on, as
-/// Metal answers (EV RFX-probe1-m4, an M4 with macOS 27.0.1: `Internal`, 1; the consumer's M3
-/// Max with 26.7: `PageFault`, 3): MoltenVK reports the failed Metal command buffer, the runtime
-/// relays its code to the command buffer whose batch it was, and the next command buffer
-/// completes (`device/relay.rs`). A command buffer committed while the failing one runs finishes
-/// with its own answer: completed, or, as Metal's victim of the recovery (EV RFX-probe1-m4's
-/// `next0`), `Execution(1)` or `PageFault`, never the failed one's error. Under the program's own
-/// MoltenVK setting that loses the device after a failure (`MVK_CONFIG_RESUME_LOST_DEVICE` off,
-/// which wins over the runtime's), MoltenVK marks the device lost before it reports, so no
-/// batch's fence can be read: the failed command buffer and every later one fail `DeviceLost`
-/// (EV RFX-lane1-mvk4), and the device refuses new buffers `DeviceLost` (EV ZCI2-hostmem-mvk4);
+/// Metal answers (an M4 with macOS 27.0.1: `Internal`, 1; the consumer's M3 Max with 26.7:
+/// `PageFault`, 3): MoltenVK reports the failed Metal command buffer, the runtime relays its code
+/// to the command buffer whose batch it was, and the next command buffer completes
+/// (`device/relay.rs`). A command buffer committed while the failing one runs finishes with its own
+/// answer: completed, or, as Metal's victim of the recovery, `Execution(1)` or `PageFault`, never
+/// the failed one's error. Under the program's own MoltenVK setting that loses the device after a
+/// failure (`MVK_CONFIG_RESUME_LOST_DEVICE` off, which wins over the runtime's), MoltenVK marks the
+/// device lost before it reports, so no batch's fence can be read: the failed command buffer and
+/// every later one fail `DeviceLost`, and the device refuses new buffers `DeviceLost`;
 /// no runtime thread reaches the lost device outside a section of the exit
 /// guard on the way (a debug build once ended the process there). MoltenVK's reports of the failure
 /// are the only messages. On MoltenVK alone: a Linux driver is refused the pages
@@ -1712,7 +1803,7 @@ fn a_gpu_fault_fails_its_command_buffer_and_the_queue_runs_on() {
             );
         }
         // The next command buffer, committed once the failed one completed, over a buffer made
-        // then: on a lost device the buffer's making may be refused too (EV ZCI2-hostmem-mvk4).
+        // then: on a lost device the buffer's making may be refused too.
         let after = device.new_buffer(256, ResourceOptions::shared());
         let next = after.clone().and_then(|after| {
             let next = queue.command_buffer()?;
@@ -1761,12 +1852,12 @@ fn a_gpu_fault_fails_its_command_buffer_and_the_queue_runs_on() {
 }
 
 /// Memory Metal makes no buffer over is refused by the call that makes the buffer, as Metal
-/// answers nil there (EV ZCI2-remapprobe-m4: pages mapped without access, pages not mapped, and a
-/// mapped page followed by one that is not), never at a later use: typed, `Unsupported`
-/// (`HostMemory`) or `OutOfMemory` (on Linux the runtime's check of the process's mappings, on
-/// macOS the import's answer), the deallocator dropped unrun. Nothing reaches the GPU. Each answer
-/// is printed (`REFUSED-AT-MAKING`). The driver may report each import it failed, as MoltenVK
-/// reports its failed `vkAllocateMemory` (EV ZCI2-lane-mvk4); nothing else is reported.
+/// answers nil there (pages mapped without access, pages not mapped, and a mapped page followed by
+/// one that is not), never at a later use: typed, `Unsupported` (`HostMemory`) or `OutOfMemory` (on
+/// Linux the runtime's check of the process's mappings, on macOS the import's answer), the
+/// deallocator dropped unrun. Nothing reaches the GPU. Each answer is printed
+/// (`REFUSED-AT-MAKING`). The driver may report each import it failed, as MoltenVK reports its
+/// failed `vkAllocateMemory`; nothing else is reported.
 #[test]
 fn memory_metal_makes_no_buffer_over_is_refused_when_it_is_made() {
     let reported = on_device_reporting(|device| {
@@ -1846,7 +1937,7 @@ fn memory_metal_makes_no_buffer_over_is_refused_when_it_is_made() {
 /// Each refusal drops the deallocator without running it, as Metal never runs it for a buffer it
 /// did not make: what Metal stops (`Invalid`: Private and Memoryless storage), and what plain
 /// Metal answers nil for (`Nil`: length 0, and its descriptor form, and a length past
-/// `max_buffer_length`; EV TTG-nil10-m4). (The private option bit the consumer's detached buffers
+/// `max_buffer_length`). (The private option bit the consumer's detached buffers
 /// send, 0x1000000, is taken: `degrade_notices`' `the_private_option_bit_is_ignored_once`.)
 #[test]
 fn refused_no_copy_buffers_never_run_their_deallocator() {

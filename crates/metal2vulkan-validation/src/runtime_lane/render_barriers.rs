@@ -4,12 +4,12 @@
 //! fullscreen triangle over a 2x2 pass without attachments; each fragment ORs its sample into its
 //! pixel's word and counts itself in word 4, so every draw writes the same five words. The
 //! synchronization validation does not see a race between two draws of one render pass instance
-//! (layer 1.4.341 on lavapipe reported none between two such draws without a barrier, EV
-//! `CFIT-rb-lvpx86`), so the checks here are the counts, the split and the layer's other
-//! reports, not a hazard report.
+//! (layer 1.4.341 on lavapipe reported none between two such draws without a barrier), so the
+//! checks here are the counts, the split and the layer's other reports, not a hazard report.
 //!
 //! - A barrier that orders nothing (an empty scope, no stage before or after, a scope of the
-//!   render targets alone without the fragment stage on both sides, no resource) splits nothing.
+//!   render targets alone after no fragment stage or before none at or before it, no resource)
+//!   splits nothing.
 //!   A memory barrier over buffers between two draws orders the second after the first: the
 //!   layer reports nothing, the count is both draws', and the pass's split is announced once
 //!   (`render-pass-split`), its reason naming the barriers. A barrier before the encoder's first
@@ -21,9 +21,9 @@
 //! The rest draw into color attachments under the plain validation layer: with the owned fixture
 //! `rt6_resolves` (`resolves::lane`), and with `rt6_amplified` into two views.
 //!
-//! - A barrier over the render targets alone, from the fragment stage to the fragment stage,
-//!   records inside the render pass instance and splits nothing; so it does in a multiview
-//!   instance of amplified draws, with the view-local flag.
+//! - A barrier over the render targets alone, from the fragment stage to the fragment or the
+//!   vertex stage, records inside the render pass instance and splits nothing; so it does in a
+//!   multiview instance of amplified draws, with the view-local flag.
 //! - A split keeps the samples of a multisampled attachment Metal stores nowhere, memoryless or
 //!   resolved without a store, between its instances.
 //! - So do an execution's commands split into runs by a command's barrier, of a memoryless color or
@@ -182,8 +182,13 @@ fn barriers_that_order_nothing_split_nothing() {
             encoder.memory_barrier_with_scope(BUFFERS, FRAGMENT, RenderStages::empty());
             encoder.memory_barrier_with_scope(
                 BarrierScope::RENDER_TARGETS,
-                FRAGMENT,
                 RenderStages::VERTEX,
+                RenderStages::VERTEX.union(FRAGMENT),
+            );
+            encoder.memory_barrier_with_scope(
+                BarrierScope::RENDER_TARGETS,
+                FRAGMENT,
+                RenderStages::TILE,
             );
             encoder
                 .memory_barrier_with_resources(&[], FRAGMENT, FRAGMENT)
@@ -285,35 +290,38 @@ fn a_fence_orders_render_encoders() {
     assert_eq!(messages.take(), Vec::new(), "the validation layer reported");
 }
 
-/// A barrier over the render targets alone, from the fragment stage to the fragment stage,
-/// between two draws into a color attachment (the owned fixture `rt6_resolves`): it records
-/// inside the render pass instance, within its subpass's dependency on itself, so the layer
-/// reports nothing and the pass does not split; the second draw's white stands.
+/// A barrier over the render targets alone, from the fragment stage to the fragment or the
+/// vertex stage, between two draws into a color attachment (the owned fixture `rt6_resolves`):
+/// it records inside the render pass instance, within its subpass's dependency on itself, so the
+/// layer reports nothing and the pass does not split; the second draw's white stands.
 #[test]
 fn a_render_target_barrier_stays_inside_the_pass() {
     let (messages, _cache, lane) = lane();
     let rgba8 = PixelFormat::RGBA8Unorm;
-    let target = lane.single(rgba8);
     let samples = lane.pipeline((FULL, SAMPLES), &[rgba8], (None, None), 1);
     let white = lane.pipeline((FULL, WHITE), &[rgba8], (None, None), 1);
-    lane.run(
-        &color_pass(&target, None, StoreAction::Store, (0, 0)),
-        |l, e, h| {
-            l.draw(e, h, &samples, 0.5);
-            e.memory_barrier_with_scope(BarrierScope::RENDER_TARGETS, FRAGMENT, FRAGMENT);
-            l.draw(e, h, &white, 0.5);
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        lane.read(&target, (0, 0), 4, BlitOption::None),
-        repeat(&[0xff; 4], (SIZE * SIZE) as usize)
-    );
-    assert_eq!(
-        split(&messages),
-        None,
-        "a render target barrier split the pass"
-    );
+    for before in [FRAGMENT, RenderStages::VERTEX] {
+        let target = lane.single(rgba8);
+        lane.run(
+            &color_pass(&target, None, StoreAction::Store, (0, 0)),
+            |l, e, h| {
+                l.draw(e, h, &samples, 0.5);
+                e.memory_barrier_with_scope(BarrierScope::RENDER_TARGETS, FRAGMENT, before);
+                l.draw(e, h, &white, 0.5);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            lane.read(&target, (0, 0), 4, BlitOption::None),
+            repeat(&[0xff; 4], (SIZE * SIZE) as usize),
+            "before {before:?}"
+        );
+        assert_eq!(
+            split(&messages),
+            None,
+            "a render target barrier before {before:?} split the pass"
+        );
+    }
     quiet(lane, &messages);
 }
 
@@ -375,7 +383,7 @@ fn a_split_keeps_samples_metal_does_not_store() {
 /// 1 to 3); and into a memoryless `Depth32Float` attachment cleared to 1.0 beside a stored
 /// color, white at depth 0.5 under `Less` with depth writes, then the per-sample colors at 0.75,
 /// which the first command's depth fails, so every texel stays white. Plain Metal orders a
-/// command after its barrier (EV RFC-probe3-m4), whose draws are then the encoder's own two
+/// command after its barrier, whose draws are then the encoder's own two
 /// draws of one pass. The runs load and store such an attachment between them, or, where its
 /// image is lazily allocated (MoltenVK), render it into a backing, announced
 /// (`memoryless-backed`).

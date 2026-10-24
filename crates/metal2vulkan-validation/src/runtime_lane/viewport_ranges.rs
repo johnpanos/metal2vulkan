@@ -1501,9 +1501,9 @@ fn written_depths_store_metals_bits() {
 
 /// Each depth probe 3 wrote, written in a pass of 4 samples, stores Metal's bits in every sample
 /// through each of its viewports, or nothing where Metal's depth test failed: Metal's answers at
-/// 4 samples are its answers at 1 (EVs ZIN-zd1-m4 and ZIN-zd2-m4, an M4 under macOS 27.0.1:
-/// every sample of a 4x `Depth32Float` target alike). The color target is resolved and compared
-/// as [`written_depths_store_metals_bits`] compares it; its rules hold sample by sample.
+/// 4 samples are its answers at 1 (an M4 under macOS 27.0.1: every sample of a 4x `Depth32Float`
+/// target alike). The color target is resolved and compared as [`written_depths_store_metals_bits`]
+/// compares it; its rules hold sample by sample.
 #[test]
 fn written_depths_store_metals_bits_in_every_sample() {
     let messages = Messages::default();
@@ -1694,13 +1694,13 @@ fn a_positive_nan_depth_runs_no_stencil_depth_failure_operation() {
     quiet(probe, &messages);
 }
 
-/// A saturated or offset depth bias through a depth range past `[0, 1]` stores Metal's depths
-/// (RRS probe 15, an M4 with macOS 27.0.1, plain and validated): `rfb_full` without a fragment
-/// function, its depth `0.5 + 0.5 x` (`z` 0.125, 0.375, 0.625 and 0.875 at the columns), probe
-/// 15's ramp. In clip mode a saturated depth is 1 or 0 and an offset adds to the depth before
-/// the clamp to `[0, 1]`; in clamp mode a saturated depth is the range's larger depth, past 1
-/// too, or its smaller one but at least 0. A compensated saturated depth past the one clamp is
-/// refused typed where the device holds no Vulkan range past 1 (Taken under
+/// A saturated or offset depth bias through a depth range past `[0, 1]` stores Metal's depths (a
+/// Metal probe on an M4 with macOS 27.0.1, plain and validated): `rfb_full` without a fragment
+/// function, its depth `0.5 + 0.5 x` (`z` 0.125, 0.375, 0.625 and 0.875 at the columns), the
+/// probe's ramp. In clip mode a saturated depth is 1 or 0 and an offset adds to the depth before
+/// the clamp to `[0, 1]`; in clamp mode a saturated depth is the range's larger depth, past 1 too,
+/// or its smaller one but at least 0. A compensated saturated depth past the one clamp is refused
+/// typed where the device holds no Vulkan range past 1 (Taken under
 /// `VK_EXT_depth_range_unrestricted`). Offsets through a range with a negative depth or in clamp
 /// mode are [`offsets_through_clamped_vertices_store_metals_depths`]', whose quads stay inside
 /// Metal's planes. Not run where the device takes no such range (`depth_ranges_refused`).
@@ -1877,18 +1877,18 @@ fn saturated_and_offset_biases_store_metals_depths() {
     quiet(probe, &messages);
 }
 
-/// In depth clamp mode a viewport depth range whose one clamp is one depth stores that depth
-/// alone (the probe's 1.5 of 1.5 to 3; RRS probe 20, the M3 Max, plain and validated, each case
-/// below: 0 for a range below 0): `rfb_full` without a fragment function, flat at 0.5 and tilted
-/// from 0.25 to 0.75 across the columns, unbiased and under `set_depth_bias(1e9, 0, 0.75)`.
-/// Natively every case stores it; elsewhere the draw's Vulkan range collapses to it, a depth past
-/// `[0, 1]` only under `VK_EXT_depth_range_unrestricted` (lavapipe), refused
-/// `NotImplemented(ViewportDepthRange)` otherwise. A fragment function that reads its position's
-/// depth (`rfb_position`) would read the one depth there: refused but natively. A bias's offset
-/// moves Metal's depth off the one depth where the range's clamp to itself is not one depth (1.75
-/// of 1.5 to 3 and of 1 to 2): stored where the vertex stage clamps each vertex's depth and the
-/// device holds a Vulkan range past 1, for a function that does not read its position's depth;
-/// refused elsewhere. Not run where the device takes no such range (`depth_ranges_refused`).
+/// In depth clamp mode a viewport depth range whose one clamp is one depth stores that depth alone
+/// (the probe's 1.5 of 1.5 to 3; a Metal probe on the M3 Max, plain and validated, each case below:
+/// 0 for a range below 0): `rfb_full` without a fragment function, flat at 0.5 and tilted from 0.25
+/// to 0.75 across the columns, unbiased and under `set_depth_bias(1e9, 0, 0.75)`. Natively every
+/// case stores it; elsewhere the draw's Vulkan range collapses to it, a depth past `[0, 1]` only
+/// under `VK_EXT_depth_range_unrestricted` (lavapipe), refused `NotImplemented(ViewportDepthRange)`
+/// otherwise. A fragment function that reads its position's depth (`rfb_position`) would read the
+/// one depth there: refused but natively. A bias's offset moves Metal's depth off the one depth
+/// where the range's clamp to itself is not one depth (1.75 of 1.5 to 3 and of 1 to 2): stored
+/// where the vertex stage clamps each vertex's depth and the device holds a Vulkan range past 1,
+/// for a function that does not read its position's depth; refused elsewhere. Not run where the
+/// device takes no such range (`depth_ranges_refused`).
 #[test]
 fn one_depth_clamps_store_their_depth() {
     let messages = Messages::default();
@@ -2027,9 +2027,9 @@ pub(super) const VERTEX_CLAMPS: [Degradation; 3] = [
     Degradation::DepthBiasPastOne,
 ];
 
-/// One quad of RRS probe 19b (the M3 Max and an M4 alike, plain and validated): `rfb_span` over
-/// `y` -1 to 1 from `x0` to `x1`, its depth running from `z0` at `x0` to `z1` at `x1`, through a
-/// 64x1 viewport of the depth range `[n, f]`.
+/// One quad of a Metal probe (the M3 Max and an M4 alike, plain and validated): `rfb_span` over `y`
+/// -1 to 1 from `x0` to `x1`, its depth running from `z0` at `x0` to `z1` at `x1`, through a 64x1
+/// viewport of the depth range `[n, f]`.
 struct Span {
     name: &'static str,
     range: [f64; 2],
@@ -2040,9 +2040,9 @@ struct Span {
 /// The depth stored at each of the 64 pixels of `span`, in depth clamp mode where `clamps`: each
 /// vertex's window depth `n + (f - n) z` clamped before the interpolation where `per_vertex`
 /// (Metal's: at 0 in clip mode, to `[0, 1]` in clamp mode; within 1e-7 of each probe row below),
-/// interpolated at the pixel's center, a bias's `offset` added (Within 1e-5 of every row of RRS
-/// probes 15 and 20), and each sample clamped (to `[0, 1]` in clip mode, to `[max(min(n, f), 0),
-/// max(n, f)]` in clamp mode, its top at least its bottom).
+/// interpolated at the pixel's center, a bias's `offset` added (Within 1e-5 of every row of the
+/// Metal probes on an M4 and the M3 Max), and each sample clamped (to `[0, 1]` in clip mode, to
+/// `[max(min(n, f), 0), max(n, f)]` in clamp mode, its top at least its bottom).
 fn span_depths(span: &Span, clamps: bool, per_vertex: bool, offset: f64) -> Vec<f32> {
     let [n, f] = span.range;
     let [x0, x1] = span.x.map(f64::from);
@@ -2130,14 +2130,14 @@ fn draw_span(
     Ok(floats(&texels(&depth, 4)))
 }
 
-/// Metal clamps each vertex's depth before the interpolation (RRS probes 16 and 19b): RRS probe
-/// 19b's quads inside Metal's guard band and planes, through -0.5 to 1.5 in both clip modes and 0.5
-/// to 2 in clamp mode (clip mode's, which clamps no vertex there, alike), `rfb_span` without a
-/// fragment function, store Metal's depths, where the device takes such ranges (natively too: the
-/// draw takes the vertex stage's compensation). A draw whose fragment function reads its position's
-/// depth (`rfb_position`) keeps a clamp of each sample, and bias factors in clamp mode through 0.5
-/// to 2 hold a depth past 1 at 1 where the device holds no Vulkan range past 1: each announced
-/// once, with the vertex stage's clamp. Not run where the device takes no such range
+/// Metal clamps each vertex's depth before the interpolation (Metal probes on the M3 Max and an
+/// M4): a probe's quads inside Metal's guard band and planes, through -0.5 to 1.5 in both clip
+/// modes and 0.5 to 2 in clamp mode (clip mode's, which clamps no vertex there, alike), `rfb_span`
+/// without a fragment function, store Metal's depths, where the device takes such ranges (natively
+/// too: the draw takes the vertex stage's compensation). A draw whose fragment function reads its
+/// position's depth (`rfb_position`) keeps a clamp of each sample, and bias factors in clamp mode
+/// through 0.5 to 2 hold a depth past 1 at 1 where the device holds no Vulkan range past 1: each
+/// announced once, with the vertex stage's clamp. Not run where the device takes no such range
 /// (`depth_ranges_refused`).
 #[test]
 fn vertex_clamps_store_metals_depths() {
@@ -2252,22 +2252,21 @@ fn vertex_clamps_store_metals_depths() {
     quiet(probe, &messages);
 }
 
-/// A bias's offset through a range whose vertices Metal clamps stores Metal's depths (RRS probes
-/// 15 and 20, an M4 and the M3 Max, plain and validated; every row of both within 1e-5 of
-/// [`span_depths`]' model, the offset added after the interpolation): `rfb_span` without a
-/// fragment function over the whole target, its `z` from 0 to 1 (probe 15's ramp) or 0.1 to 0.6
-/// (probe 20's). An offset (`set_depth_bias(±inf, 0, ±0.25)`) through -0.5 to 1.5 in clip mode
-/// where the vertex stage clamps each vertex's depth at 0, and in clamp mode, past 1, where the
-/// device also holds a Vulkan range past 1 (`VK_EXT_depth_range_unrestricted`); through 0.25 to
-/// 0.75 in clamp mode everywhere. Bias factors of an offset of 0.75 (`set_depth_bias(1e9, 0,
-/// 0.75)`) through 0.5 to 1.5 and 1.5 to 3 in clamp mode store Metal's depths past 1 where the
-/// vertex stage clamps and the device holds such a range; elsewhere 0.5 to 1.5 holds them at 1
-/// (`depth-bias-past-one`) and 1.5 to 3 is refused `NotImplemented(ViewportDepthRange)`. An
-/// offset where the runtime does not build it: `NotImplemented(NonFiniteDepthBias)`. The vertex
-/// stage's clamp announces `clipped-depth-pieces`, and a bias in clamp mode through a range
-/// inside `[0, 1]` `sample-depth-clamp` (a primitive past Metal's planes, which Metal adds the
-/// bias to after its clamp of each vertex's depth to `[0, 1]`, stores otherwise). Not run where
-/// the device takes no such range (`depth_ranges_refused`).
+/// A bias's offset through a range whose vertices Metal clamps stores Metal's depths (Metal probes
+/// on an M4 and the M3 Max, plain and validated; every row of both within 1e-5 of [`span_depths`]'
+/// model, the offset added after the interpolation): `rfb_span` without a fragment function over
+/// the whole target, its `z` from 0 to 1 (probe 15's ramp) or 0.1 to 0.6 (probe 20's). An offset
+/// (`set_depth_bias(±inf, 0, ±0.25)`) through -0.5 to 1.5 in clip mode where the vertex stage
+/// clamps each vertex's depth at 0, and in clamp mode, past 1, where the device also holds a Vulkan
+/// range past 1 (`VK_EXT_depth_range_unrestricted`); through 0.25 to 0.75 in clamp mode everywhere.
+/// Bias factors of an offset of 0.75 (`set_depth_bias(1e9, 0, 0.75)`) through 0.5 to 1.5 and 1.5 to
+/// 3 in clamp mode store Metal's depths past 1 where the vertex stage clamps and the device holds
+/// such a range; elsewhere 0.5 to 1.5 holds them at 1 (`depth-bias-past-one`) and 1.5 to 3 is
+/// refused `NotImplemented(ViewportDepthRange)`. An offset where the runtime does not build it:
+/// `NotImplemented(NonFiniteDepthBias)`. The vertex stage's clamp announces `clipped-depth-pieces`,
+/// and a bias in clamp mode through a range inside `[0, 1]` `sample-depth-clamp` (a primitive past
+/// Metal's planes, which Metal adds the bias to after its clamp of each vertex's depth to `[0, 1]`,
+/// stores otherwise). Not run where the device takes no such range (`depth_ranges_refused`).
 #[test]
 fn offsets_through_clamped_vertices_store_metals_depths() {
     use DepthClipMode::{Clamp, Clip};
@@ -2456,12 +2455,12 @@ fn offsets_through_clamped_vertices_store_metals_depths() {
 /// A depth a bias takes past `[0, 1]` in clip mode stores Metal's clamp. The fullscreen triangle
 /// at depth `z + 0.05 x` (0.025 per pixel) through a viewport of `[0, 1]`, under a slope-scaled
 /// bias of 4 (0.1 at that slope), reads `z + 0.1` and more along its columns: from 0.9 its
-/// columns 2 and 3 read 1.0125 and 1.0375, which Metal stores as 1 (EVs DSX-ds3-m4 and
-/// XRR2-dz1b-m4: in clip mode a depth is clamped to `[0, 1]`); under a bias of -4 from 0.1 its
-/// columns 0 and 1 read -0.0375 and -0.0125, stored as +0. Each other column stores the depth its
-/// fragment read. A device that enabled `VK_EXT_depth_range_unrestricted`, and so stores such a
-/// depth unclamped, without the native range (`native_depth_range`) announces
-/// `biased-depth-past-unit-range` once instead, and its clamped columns print.
+/// columns 2 and 3 read 1.0125 and 1.0375, which Metal stores as 1 (in clip mode a depth is clamped
+/// to `[0, 1]`); under a bias of -4 from 0.1 its columns 0 and 1 read -0.0375 and -0.0125, stored
+/// as +0. Each other column stores the depth its fragment read. A device that enabled
+/// `VK_EXT_depth_range_unrestricted`, and so stores such a depth unclamped, without the native
+/// range (`native_depth_range`) announces `biased-depth-past-unit-range` once instead, and its
+/// clamped columns print.
 #[test]
 fn biased_depths_past_unit_range_store_metals_clamp() {
     let messages = Messages::default();

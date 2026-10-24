@@ -3,7 +3,7 @@
 
 use super::super::copy_plan::{
     block_extent, check_region, copy_unit, plan_host_copy, shape, BlitOption, CopyProblem,
-    CopyRefusal, CopyUnit, TextureRegion,
+    CopyRefusal, CopyUnit, HostLayout, TextureRegion,
 };
 use super::super::image_plan::{is_compressed, plan_image, ImagePlan};
 use super::super::texture_descriptor::TextureDescriptor;
@@ -118,7 +118,7 @@ fn copy_units_are_metals_pixels_blocks_and_aspects() {
         (stencil.bytes, stencil.aspect),
         (1, ImageAspectFlags::STENCIL)
     );
-    // Plain Metal's aspects where its validation stops the option (EV SPCrp-probe1-m4): a combined
+    // Plain Metal's aspects where its validation stops the option: a combined
     // format without one copies its depth (`bo_btt_d32s8_none`, `bo_ttb_d32s8_none`), and an option
     // naming an aspect the format lacks is ignored (`bo_*_rgba8_depth`, `bo_*_rgba8_stencil`,
     // `bo_*_d32_stencil`, `bo_*_s8_depth`).
@@ -244,7 +244,7 @@ fn host_copies_follow_metals_measured_verdicts_and_pack_rows() {
         plan(&rgba, full, 8, 0, true, false),
         Err(CopyProblem::CpuAccessPrivate)
     );
-    // Plain Metal's `bytesPerImage` off its rules (EV SPH-bpi1-m4): one image ignores it
+    // Plain Metal's `bytesPerImage` off its rules: one image ignores it
     // (`rp.2d.bpi3`, `gb.2d.bpi3`, `rp.2darray.bpi3`, `gb.2darray.bpi4`).
     for bpi in [0, 3, 4, 16, 18] {
         let host = plan(&rgba, full, 8, bpi, false, false).unwrap().unwrap();
@@ -275,9 +275,8 @@ fn host_copies_follow_metals_measured_verdicts_and_pack_rows() {
         .unwrap()
         .unwrap();
     assert_eq!((one_row.host_len(), one_row.packed_len()), (8, 8));
-    // Plain Metal's pitches off its rules (EV SPCrp-probe3-m4 `host`, SPCrp-probe1-m4 `bpr_rr_*`,
-    // `bpr_gb_*`): a pitch of a row or more exactly, off the pixel too; 0, every row at the first
-    // byte; between 0 and a row, nothing copied, one row or more.
+    // Plain Metal's pitches off its rules: a pitch of a row or more exactly, off the pixel too; 0,
+    // every row at the first byte; between 0 and a row, nothing copied, one row or more.
     let odd = plan(&rgba, full, 10, 0, false, false).unwrap().unwrap();
     assert_eq!(odd.rows().map(|(h, _)| h).collect::<Vec<_>>(), [0, 10]);
     let zero = plan(&rgba, full, 0, 0, false, false).unwrap().unwrap();
@@ -344,7 +343,7 @@ fn host_copies_follow_metals_measured_verdicts_and_pack_rows() {
 }
 
 /// A compressed region off its blocks copies the blocks it starts in, as plain Metal does (an M4
-/// under macOS 27.0.1, EV SPCrp-probe1-m4): the origin rounded down to its block and the size
+/// under macOS 27.0.1): the origin rounded down to its block and the size
 /// rounded up to whole blocks, each on its own, ending at the level's edge.
 #[test]
 fn compressed_regions_off_their_blocks_copy_the_blocks_they_start_in() {
@@ -438,7 +437,7 @@ fn compressed_regions_are_bounded_by_their_levels_blocks() {
 }
 
 /// A 4:2:2 texture's copy unit is its 2-byte texel, one texel of its `R8G8_UNORM` carrier: plain
-/// Metal copies it at any x and width (EV RRP-probe11-m4), its validation's 2 x 1 blocks aside.
+/// Metal copies it at any x and width, its validation's 2 x 1 blocks aside.
 #[test]
 fn a_four_two_two_texture_copies_its_two_byte_texels() {
     for pf in [PixelFormat::GBGR422, PixelFormat::BGRG422] {
@@ -455,5 +454,65 @@ fn a_four_two_two_texture_copies_its_two_byte_texels() {
         );
         let r = check_region(&t.record, &region([1, 2, 0], [3, 1, 1]), &u).unwrap();
         assert_eq!((r.origin, r.size), ([1, 2, 0], [3, 1, 1]), "{pf:?}");
+    }
+}
+
+/// A host upload's depth words hold a negative value or a NaN (`signed-depth-test`'s check) where a
+/// row the layout reads holds a negative normal or infinity, or a NaN of either sign; a zero of
+/// either sign, a denormal of either sign (`depth-denormals`'), a positive value, and a word
+/// between rows hold none.
+#[test]
+fn a_host_upload_holds_a_negative_or_nan_depth_only_in_its_rows() {
+    // Two rows of two words, 12 bytes apart: the third word of each row lies between them.
+    let layout = HostLayout {
+        row_bytes: 8,
+        rows: 2,
+        images: 1,
+        bytes_per_row: 12,
+        bytes_per_image: 24,
+    };
+    let bytes =
+        |words: [u32; 6]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let quiet = [
+        0x0000_0000,
+        0x8000_0000,
+        0x8000_0001,
+        0x807f_ffff,
+        0x3f00_0000,
+        0x7f80_0000,
+    ];
+    for at in [0, 1, 3, 4] {
+        for word in quiet {
+            let mut words = [0x3e80_0000; 6];
+            words[at] = word;
+            assert!(
+                !layout.holds_negative_or_nan(&bytes(words)),
+                "{word:08x} at {at}"
+            );
+        }
+        for word in [
+            0xbf00_0000,
+            0xc000_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0xffc0_0000,
+            0x7f80_0001,
+        ] {
+            let mut words = [0x3e80_0000; 6];
+            words[at] = word;
+            assert!(
+                layout.holds_negative_or_nan(&bytes(words)),
+                "{word:08x} at {at}"
+            );
+        }
+    }
+    // Between the rows.
+    for at in [2, 5] {
+        let mut words = [0x3e80_0000; 6];
+        words[at] = 0xbf00_0000;
+        assert!(
+            !layout.holds_negative_or_nan(&bytes(words)),
+            "between rows at {at}"
+        );
     }
 }

@@ -21,13 +21,29 @@
 //! - [`IoRole::WindowDepth`]: a vertex function's window depth, carried to a fragment function
 //!   that runs its draw's depth test itself at more than one sample. A no-perspective `float`
 //!   varying for link, one key ([`VaryingKey::window_depth`]) on both sides.
+//! - [`IoRole::Barycentric`]: the first two barycentric weights a fragment function reads as
+//!   `[[barycentric_coord]]` on a device without `fragmentShaderBarycentric`, which the pipeline's
+//!   synthesized geometry stage writes. A `float2` varying, perspective-correct or not, one key
+//!   per form ([`VaryingKey::barycentric`]).
+//! - [`IoRole::SelectedLayer`] and [`IoRole::SelectedViewport`]: the `Layer` and `ViewportIndex` a
+//!   vertex function selects its primitive's slice and viewport with on a device that cannot store
+//!   the builtin from a vertex function, which the pipeline's synthesized geometry stage stores
+//!   from the primitive's first vertex. A flat `uint` vertex output, one key each
+//!   ([`VaryingKey::selected_layer`], [`VaryingKey::selected_viewport`]), that no fragment
+//!   function reads.
+//! - [`IoRole::PrimitiveId`]: Metal's `[[primitive_id]]` on a device that cannot declare a
+//!   fragment `PrimitiveId`, which the pipeline's vertex function computes for the primitive each
+//!   vertex provokes, and behind a post-tessellation vertex function emulated on a device without
+//!   `tessellationShader`, which writes its patch's position in the draw. A flat `uint` varying
+//!   for link, one key ([`VaryingKey::primitive_id`]) on both sides.
 //!
-//! The roles live in disjoint key namespaces ([`VaryingKey::user`],
-//! [`VaryingKey::attribute`], [`VaryingKey::color`], [`VaryingKey::viewport_index`],
-//! [`VaryingKey::render_target_array_index`], [`VaryingKey::window_depth`]): the key bytes start
-//! with a namespace tag, so no
-//! AIR user key can collide with another role's key. Keys stay opaque to link; it reads the role
-//! here, never the bytes.
+//! The roles live in disjoint key namespaces ([`VaryingKey::user`], [`VaryingKey::attribute`],
+//! [`VaryingKey::color`], [`VaryingKey::viewport_index`],
+//! [`VaryingKey::render_target_array_index`], [`VaryingKey::window_depth`],
+//! [`VaryingKey::barycentric`], [`VaryingKey::selected_layer`],
+//! [`VaryingKey::selected_viewport`], [`VaryingKey::primitive_id`]): the key bytes start with a
+//! namespace tag, so no AIR user key can collide with another role's key. Keys stay opaque to
+//! link; it reads the role here, never the bytes.
 //!
 //! Every interface variable is 32-bit (narrow varyings are widened at the interface, so no varying
 //! needs `storageInputOutput16`) but a color output written as the bits of the half Metal stores,
@@ -57,6 +73,10 @@ const COLOR: u8 = 2;
 const VIEWPORT_INDEX: u8 = 3;
 const RENDER_TARGET_ARRAY_INDEX: u8 = 4;
 const WINDOW_DEPTH: u8 = 5;
+const BARYCENTRIC: u8 = 6;
+const SELECTED_LAYER: u8 = 7;
+const SELECTED_VIEWPORT: u8 = 8;
+const PRIMITIVE_ID: u8 = 9;
 
 impl VaryingKey {
     /// The key of the user varying with AIR user key `k` (vertex output and fragment input).
@@ -98,6 +118,31 @@ impl VaryingKey {
     /// its draw's depth test itself at more than one sample reads (`IoRole::WindowDepth`).
     pub fn window_depth() -> VaryingKey {
         VaryingKey(AirUserKey(vec![WINDOW_DEPTH].into()))
+    }
+
+    /// The key of the barycentric weights a pipeline's synthesized geometry stage writes and a
+    /// fragment function reads as `[[barycentric_coord]]` (`IoRole::Barycentric`), in the form
+    /// `perspective` names.
+    pub fn barycentric(perspective: bool) -> VaryingKey {
+        VaryingKey(AirUserKey(vec![BARYCENTRIC, u8::from(perspective)].into()))
+    }
+
+    /// The key of the `Layer` a vertex function selects for the pipeline's synthesized geometry
+    /// stage to store (`IoRole::SelectedLayer`).
+    pub fn selected_layer() -> VaryingKey {
+        VaryingKey(AirUserKey(vec![SELECTED_LAYER].into()))
+    }
+
+    /// The key of the `ViewportIndex` a vertex function selects for the pipeline's synthesized
+    /// geometry stage to store (`IoRole::SelectedViewport`).
+    pub fn selected_viewport() -> VaryingKey {
+        VaryingKey(AirUserKey(vec![SELECTED_VIEWPORT].into()))
+    }
+
+    /// The key of the primitive ID a vertex function writes and a fragment function reads as
+    /// `[[primitive_id]]` (`IoRole::PrimitiveId`).
+    pub fn primitive_id() -> VaryingKey {
+        VaryingKey(AirUserKey(vec![PRIMITIVE_ID].into()))
     }
 }
 
@@ -172,6 +217,15 @@ pub struct StageIo {
     /// stage compiled for another map than the pipeline's (`NeedsInput(ColorWrites)`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub extended_range_colors: BTreeMap<u32, crate::pipeline::lower_inputs::ExtendedRangeColor>,
+    /// The word attachments the fragment function writes a `float` or `half` output to through
+    /// output variables of dual-source index 0 (`LoweringInputs::word_colors`), by color index:
+    /// each output variable there is declared as the word's unsigned integer and holds the word
+    /// Metal stores ([`StageIo::declared_type`]; the variable's `ty` stays the Metal output's,
+    /// which link checks against the attachment's format), and link gives the attachment the
+    /// word's format and refuses a stage compiled for another map than the pipeline's
+    /// (`NeedsInput(ColorWrites)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub word_colors: BTreeMap<u32, crate::metal::format::WordAttachment>,
     /// The input attachments the fragment function reads through Metal's decode of their bytes
     /// (`LoweringInputs::srgb_fetches`): each read snaps the device's sRGB decode back to its
     /// byte and decodes that by Metal's table. Link refuses a stage compiled for another set
@@ -186,6 +240,15 @@ pub struct StageIo {
     /// refuses a stage compiled for another set than the pipeline's (`NeedsInput(ColorWrites)`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub rotated_colors: std::collections::BTreeSet<u32>,
+    /// The attachments whose image holds Metal's alpha in red
+    /// (`LoweringInputs::alpha_in_red_colors`) that the fragment function writes through an output
+    /// variable of either dual-source index, or reads (`[[color(n)]]`) through an input attachment
+    /// or the interlocked storage form, by color index: each such output holds Metal's alpha in
+    /// the image's alpha lane too, which alpha to coverage reads, and each read takes the image's
+    /// red as Metal's alpha. Link refuses a stage compiled for another set than the pipeline's
+    /// (`NeedsInput(ColorWrites)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub alpha_in_red_colors: std::collections::BTreeSet<u32>,
     /// The second outputs the fragment function writes for attachments held with their channels
     /// rotated (`LoweringInputs::rotated_factors`), by color index: those of the attachments it
     /// writes through a first output, each with what it holds in each channel of the image. Link
@@ -229,7 +292,8 @@ pub struct StageIo {
     /// a `half` output to. Link refuses a stage one of whose entries is not the pipeline's
     /// (`NeedsInput(ColorWrites)`); an attachment without one, every attachment of a function
     /// compiled without the map among them, takes the `half` the function rounds, under
-    /// `PrecisionNote::HalfOutputPrecision` (`HalfOutputFastMathBlend` under fast math), and links.
+    /// `PrecisionNote::HalfOutputPrecision` (under fast math `HalfOutputFastMathBlend`, by
+    /// [`half_fast_colors`](Self::half_fast_colors)), and links.
     /// Empty for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub half_output_lanes:
@@ -242,12 +306,17 @@ pub struct StageIo {
     /// answers a stage whose mode is not the pipeline's `NeedsInput(ColorWrites)`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub texture_write_rounding: Option<crate::metal::TextureWriteRoundingMode>,
-    /// The user varyings a vertex function writes the same value at every vertex of a primitive,
+    /// The varyings a vertex function writes the same value at every vertex of a primitive,
     /// sorted: computed only from constants, `constant` memory read through uniform pointers, the
     /// draw's instance, base vertex, base instance, amplification and patch, and the attributes
     /// it fetches per instance or at a constant step, never from `[[vertex_id]]` or another
-    /// per-vertex input. A fragment function of its pipeline reads those of them it interpolates
-    /// flat ([`uniform_inputs`](StageIo::uniform_inputs)). Empty for every other function.
+    /// per-vertex input. A fragment function of its pipeline reads those of its user varyings it
+    /// interpolates flat ([`uniform_inputs`](StageIo::uniform_inputs)). The raw varyings of the
+    /// slice and viewport indices it writes are among them so
+    /// (`VaryingKey::render_target_array_index`, `VaryingKey::viewport_index`): Vulkan takes
+    /// `Layer` and `ViewportIndex` from a vertex function only where every vertex of a primitive
+    /// stores the same, so it stores an index that is not to its selected index instead
+    /// (`IoRole::SelectedLayer`, `IoRole::SelectedViewport`). Empty for every other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub uniform_outputs: Vec<VaryingKey>,
     /// The `float` and `half` varyings the fragment function reads flat although it states an
@@ -278,10 +347,51 @@ pub struct StageIo {
     /// each factor, product and sum rounded to `half` and into a 32-bit float one as a `float`
     /// multiply-add of it, so the function stores Metal's value wherever the attachment does not
     /// blend; the pipeline's stage records `PrecisionNote::HalfOutputPrecision` only where one of
-    /// these attachments blends (`color_writes::blends_output`). A module with fast math, or naming
-    /// no math mode, records its note itself and lists none. Empty for any other function.
+    /// these attachments blends (`color_writes::blends_output`). A module with fast math lists its
+    /// attachments in [`half_fast_colors`](Self::half_fast_colors); one naming no math mode records
+    /// its note itself and lists none. Empty for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub half_blend_colors: Vec<u32>,
+    /// The attachments a `float` color output (a scalar or vector of AIR's `float`) of a module
+    /// compiled without fast math (`air.compile.fast_math_disable`) reaches as color attachments,
+    /// by color index, sorted. Where such an attachment is a 16-bit float format that blends with
+    /// factors one and zero, added, Metal keeps the destination's product by zero in the blend (a
+    /// NaN of an infinite or NaN texel, `+0` of a `-0` output over a texel of `+0` or above), which
+    /// no write of the output alone stores: the pipeline blends it there and
+    /// its stage records `PrecisionNote::HalfOutputPrecision` (`link::graphics`). Empty for any
+    /// other function.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub float_blend_colors: Vec<u32>,
+    /// The attachments a `half` color output of a module compiled with fast math
+    /// (`air.compile.fast_math_enable`) reaches as color attachments, by color index, sorted (not
+    /// one the function writes in the storage form, nor one whose channels take the output at
+    /// `float` precision where Metal computes it so, [`half_output_lanes`](Self::half_output_lanes)).
+    /// Metal's compiler folds the attachment's blend and conversion into the function under fast
+    /// math, so the pipeline's stage records `PrecisionNote::HalfOutputFastMathBlend` where one of
+    /// these attachments stores some channel (`color_writes::stores_output`). One whose write mask
+    /// stores none of its channels, or that the pipeline lacks, stores nothing, so no value of the
+    /// output can differ there. Empty for any other function.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub half_fast_colors: Vec<u32>,
+    /// The index builtins, `Layer` and `ViewportIndex`, a fragment function reads as 0 on a device
+    /// that cannot declare them (`Layer` needs `geometryShader` or `shaderOutputLayer`,
+    /// `ViewportIndex` `multiViewport` or `shaderOutputViewportIndex`), sorted: compiled for a
+    /// pipeline where no stage writes the index (neither under
+    /// `LoweringInputs::render_target_array_index_varying` or
+    /// `LoweringInputs::viewport_index_varying` nor under `LoweringInputs::amplification_draws`),
+    /// whose builtin would hold 0, which Metal's `[[render_target_array_index]]` and
+    /// `[[viewport_array_index]]` read there too. Link counts each as a read of its builtin: one
+    /// beside a vertex function that writes the index is `NeedsInput`, and `Layer` here makes the
+    /// pipeline's [`GraphicsState::declares_layer`](crate::pipeline::graphics::GraphicsState::declares_layer).
+    /// Empty for every other function.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub zero_indices: Vec<StageBuiltin>,
+    /// The group of its render pipeline's color attachments the fragment function writes
+    /// (`LoweringInputs::color_group`): its colors at locations `0..`. Link refuses the function
+    /// in a pipeline variant of another group (`NeedsInput(ColorWrites)`). `None` for a function
+    /// compiled with each color at its own index, and for every other function.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub color_group: Option<crate::pipeline::lower_inputs::ColorGroup>,
 }
 
 /// What a fragment function's write of a color attachment whose rules the draw selects does
@@ -422,7 +532,8 @@ impl StageIo {
 
     /// The type variable `v` is declared with: its `ty`, but for a color output of dual-source
     /// index 0 to an attachment among `extended_range_colors` the raw texel's, the raw format's
-    /// unsigned 32-bit components.
+    /// unsigned 32-bit components, and to one among `word_colors` the word's, one unsigned 32-bit
+    /// component.
     pub(crate) fn declared_type(&self, v: &IoVariable) -> IoType {
         let IoRole::Color {
             attachment,
@@ -431,6 +542,14 @@ impl StageIo {
         else {
             return v.ty;
         };
+        if self.word_colors.contains_key(&attachment) {
+            return IoType {
+                numeric: IoNumeric::Uint,
+                components: 1,
+                source_bits: 32,
+                bits: 32,
+            };
+        }
         match self.extended_range_colors.get(&attachment) {
             Some(e) => IoType {
                 numeric: IoNumeric::Uint,
@@ -609,11 +728,48 @@ pub enum IoRole {
     /// sample, which reads it at its sample and at the pixel centre to compute each sample's
     /// depth (`lower::fragment`'s `depth_test`).
     WindowDepth,
+    /// The first two barycentric weights a fragment function compiled for a device without
+    /// `fragmentShaderBarycentric` reads as its `[[barycentric_coord]]`: a center-sampled `float2`
+    /// input, perspective-correct when `perspective`, which no Metal function writes. Link
+    /// synthesizes the pipeline's geometry stage, which writes `(1, 0)`, `(0, 1)` and `(0, 0)` at
+    /// a triangle's vertices in their order (`(1, 0)` and `(0, 1)` at a line's, `(1, 0)` at a
+    /// point), and passes the fragment stage's other inputs through.
+    Barycentric { perspective: bool },
+    /// The `Layer` a vertex function compiled for a device without `shaderOutputLayer` selects its
+    /// primitive's render target slice with: the value it would store to `Layer` (the index it
+    /// writes, plus the amplification's offset when drawn one amplification at a time, held below
+    /// the render pass's length and 0 at or past it), as a flat `uint` vertex output. No fragment
+    /// function reads it: the pipeline's synthesized geometry stage stores it to `Layer` at every
+    /// vertex it emits, from the primitive's first vertex, whose index Metal renders the primitive
+    /// with.
+    SelectedLayer,
+    /// The `ViewportIndex` a vertex function compiled for a device with `multiViewport` but
+    /// without `shaderOutputViewportIndex` selects its primitive's viewport with, as
+    /// [`IoRole::SelectedLayer`] is for its slice: held below the draw's viewport count and 0 at
+    /// or past it.
+    SelectedViewport,
+    /// Metal's `[[primitive_id]]` carried from a vertex function to its fragment function: the
+    /// flat `uint` output of a vertex function compiled under
+    /// `LoweringInputs::primitive_id_varying`, and the input a fragment function reads as its
+    /// `[[primitive_id]]` on a device that cannot declare a fragment `PrimitiveId` (neither
+    /// `geometryShader` nor `tessellationShader`) or under that field. A plain vertex function
+    /// writes at each vertex the index of the primitive the vertex provokes: a flat input reads the
+    /// primitive's provoking vertex, its first (the Vulkan specification's primitive topologies),
+    /// whose stream position is the primitive's own times its vertex count in a list and the
+    /// primitive's own in a strip, so the vertex writes its stream position over the draw's vertex
+    /// count per primitive (`PushField::VerticesPerPrimitive`): Metal's count of the draw's
+    /// primitives in each instance (Metal probes on the M3 Max, macOS 27.0.1). A post-tessellation
+    /// vertex function emulated on a device without `tessellationShader`
+    /// (`GraphicsState::emulated_tessellation`) writes at every vertex of a patch the patch's
+    /// position in its draw (`patchStart + i`), Metal's `[[primitive_id]]` behind the tessellator.
+    PrimitiveId,
 }
 
 impl IoRole {
     /// Whether the role is a varying: a user varying, a raw index a vertex function writes for
-    /// its fragment function, or its window depth. Link numbers and packs these alike.
+    /// its fragment function, its window depth, the barycentric weights a synthesized geometry
+    /// stage writes, a selected index the geometry stage reads, or the primitive ID. Link numbers
+    /// these, and packs those a vertex function writes.
     pub(crate) fn is_varying(&self) -> bool {
         matches!(
             self,
@@ -621,6 +777,10 @@ impl IoRole {
                 | IoRole::ViewportIndex
                 | IoRole::RenderTargetArrayIndex
                 | IoRole::WindowDepth
+                | IoRole::Barycentric { .. }
+                | IoRole::SelectedLayer
+                | IoRole::SelectedViewport
+                | IoRole::PrimitiveId
         )
     }
 }
@@ -754,7 +914,17 @@ mod tests {
         let viewport = VaryingKey::viewport_index();
         let layer = VaryingKey::render_target_array_index();
         let depth = VaryingKey::window_depth();
-        let tagged = [&attr, &color, &viewport, &layer, &depth];
+        let perspective = VaryingKey::barycentric(true);
+        let linear = VaryingKey::barycentric(false);
+        let tagged = [
+            &attr,
+            &color,
+            &viewport,
+            &layer,
+            &depth,
+            &perspective,
+            &linear,
+        ];
         for (i, a) in tagged.iter().enumerate() {
             for b in &tagged[i + 1..] {
                 assert_ne!(a, b);

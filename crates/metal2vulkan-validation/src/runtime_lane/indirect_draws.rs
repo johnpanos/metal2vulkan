@@ -1,32 +1,35 @@
 //! Device tests of indirect draws (its third part) on the device the cfg selects, under the
 //! validation layer.
 //!
-//! Each draw is one RT6 Metal probe 5 measured (an M4 with macOS 27.0.1, each case with and
+//! Each draw is one that a Metal probe measured (an M4 with macOS 27.0.1, each case with and
 //! without Metal's API validation), drawn with the owned fixture `rt6_render_state`'s fullscreen
 //! triangle (vertices 0 to 2; vertex 3 and up land outside the target) into a 4² target, and
-//! compared with the texels Metal stored: the arguments' vertex start, index start, base vertex
-//! and the index buffer offset are taken; no instances or no vertices draw nothing; arguments a
-//! blit wrote earlier in the command buffer are the ones drawn. The indexed form draws on every
-//! device: where nothing bounds its index fetch (no `robustBufferAccess2`) through the index bounds
-//! pass. Misaligned argument and index offsets, which Metal's validation stops, draw what plain
-//! Metal drew from the offset rounded down; arguments past the buffer, which plain Metal reads past
-//! it, are refused typed.
+//! compared with the texels Metal stored: the arguments' vertex start, index start, base vertex and
+//! the index buffer offset are taken; no instances or no vertices draw nothing; arguments a blit
+//! wrote earlier in the command buffer are the ones drawn. The indexed form draws on every device:
+//! where nothing bounds its index fetch (no `robustBufferAccess2`) through the index bounds pass.
+//! Misaligned argument and index offsets, which Metal's validation stops, draw what plain Metal
+//! drew from the offset rounded down; arguments past the buffer, which plain Metal reads past it,
+//! are refused typed.
 //!
 //! An indexed indirect draw whose arguments or indices an earlier draw of the encoder writes (the
 //! rasterization-disabled `icb_render_replay_template`) draws as a Metal probe measured (an M3 Max
 //! and an M4): behind a buffer barrier after and before the vertex stage, what the earlier draw
 //! wrote, through an index bounds pass before the draw's own render pass instance where the device
 //! takes one. Without the barrier, which Metal does not order: before any barrier of the encoder,
-//! the bytes from before the write, which Metal's draw read in every run of a stress probe
-//! RRS-race, through a copy taken before the pass, announced once (`unordered-draw-bytes`), on
-//! every device; after a barrier, where a rewrite since it was read in some runs (probe RRS-race2),
+//! the bytes from before the write, which Metal's draw read in every run of a stress probe,
+//! through a copy taken before the pass, announced once (`unordered-draw-bytes`), on
+//! every device; after a barrier, where a rewrite since it was read in some runs,
 //! the index bounds pass is refused typed.
 
-use super::buffer_with;
 use super::degrade_notices::{
     assert_made_once, forced, made_render_kinds, shared_in_system_memory, UNORDERED_DRAWS,
 };
-use super::render_state::{quiet, rows, texture, validated, Probe, EMPTY, FULL, PASS, WHITE};
+use super::render_state::{
+    quiet, rows, texture, validated, validated_checking_synchronization, Probe, EMPTY, FULL, PASS,
+    WHITE,
+};
+use super::{buffer_with, read_buffer};
 use crate::air_library::AirLibrary;
 use metal2vulkan::device::VkFeature;
 use metal2vulkan::metal::{BarrierScope, IndexType, PixelFormat, PrimitiveType, RenderStages};
@@ -217,7 +220,7 @@ fn indirect_draws_read_misaligned_offsets_as_metal_reads_them() {
     });
     assert_eq!(answer, Some(Ok(())), "ind_index_offset_misaligned");
     assert_eq!(stored.color, full, "ind_index_offset_misaligned");
-    // The direct draw reads its indices so too (as probe `RT7-icb-probe7-m4`'s commands did).
+    // The direct draw reads its indices so too (as our probe's commands did).
     let stored = probe.run(PASS, |p, e, h| {
         prepare(p, e, h);
         answer = Some(e.draw_indexed_primitives(
@@ -334,7 +337,7 @@ const ZEROS: [u32; 2] = [0, 0];
 
 /// An indexed indirect draw whose arguments or indices an earlier draw of the encoder writes
 /// draws as probe 2 measured (the module docs); without a barrier, before any barrier, the bytes
-/// from before the write (a probe RRS-race), announced once; a rewrite after a barrier, where the
+/// from before the write (a probe), announced once; a rewrite after a barrier, where the
 /// device takes the index bounds pass, is refused `NotImplemented(IndirectDrawArguments)`.
 #[test]
 fn an_indexed_indirect_draw_reads_what_a_draw_wrote_behind_a_barrier() {
@@ -360,7 +363,7 @@ fn an_indexed_indirect_draw_reads_what_a_draw_wrote_behind_a_barrier() {
     use Step::{Barrier, Draw, Small};
     // Each case: its name, the arguments and the indices it starts with, its steps, and Metal's
     // texels where the runtime draws it (probe 2: the same on the M3 Max and the M4, plain and
-    // validated; without a barrier, the bytes from before the write, RRS-race on both chips),
+    // validated; without a barrier, the bytes from before the write, on both chips),
     // else `None` where it is refused with the index bounds pass.
     let full_rows = rows(&FULL);
     let empty_rows = rows(&EMPTY);
@@ -504,6 +507,49 @@ fn an_indexed_indirect_draw_reads_what_a_draw_wrote_behind_a_barrier() {
     quiet(probe, &messages);
 }
 
+/// A draw that writes the arguments an earlier indexed indirect draw of its pass read, behind no
+/// barrier, leaves that draw's texels as Metal's (probe 2's `ix2_args_barrier_twice`: the earlier
+/// draw read them first, on the M3 Max and the M4), and writes them; the validation layer, checking
+/// synchronization, reports no hazard between the read and the write, which records after an
+/// execution dependency from the read where the draw reads its arguments in place (no index bounds
+/// pass, [`bounds_pass`]). Twice: in the second pass both pipelines are made, so the writer's draw
+/// records into the indirect draw's render pass instance (in the first, a draw whose pipeline is
+/// being made may record into an instance of its own, `render/inline_first.rs`).
+#[test]
+fn a_draw_writes_arguments_an_earlier_draw_read_after_the_read() {
+    let (messages, _cache, probe) = validated_checking_synchronization();
+    let writer = writer(&probe);
+    let indices = u16s(&probe, &[0, 1, 2, 0]);
+    for pass in 0..2 {
+        let arguments = u32s(&probe, &[3, 1, 0, 0, 0]);
+        let stored = probe.run(PASS, |p, e, h| {
+            prepare(p, e, h);
+            e.draw_indexed_primitives_indirect(
+                PrimitiveType::Triangle,
+                IndexType::UInt16,
+                &indices,
+                0,
+                &arguments,
+                0,
+            )
+            .unwrap();
+            let params = u32s(p, &ZEROS);
+            e.set_render_pipeline_state(&writer).unwrap();
+            e.set_vertex_buffer(Some(&params), 0, 0).unwrap();
+            e.set_vertex_buffer(Some(&arguments), 0, 1).unwrap();
+            e.draw_primitives(PrimitiveType::Point, 0, 2, 1, 0).unwrap();
+            h.push(params);
+        });
+        assert_eq!(stored.color, rows(&FULL), "pass {pass}");
+        assert_eq!(
+            read_buffer(&arguments, 0, 20).unwrap(),
+            [0; 20],
+            "pass {pass}"
+        );
+    }
+    quiet(probe, &messages);
+}
+
 /// The tile writer: the owned fixture `rrs_tile_writer`, whose thread (0, 0) of each tile writes
 /// what the probe's writer writes ([`writer`]) from tile buffers 0 (`params`) and 1 (`out`), in
 /// a state of the probe pass's color.
@@ -522,7 +568,7 @@ fn tile_writer(probe: &Probe) -> RenderPipelineState {
 
 /// An indexed indirect draw whose arguments or indices a tile dispatch of the encoder wrote
 /// before it draws the bytes from before the write, which Metal's draw read in every run of
-/// a probe RRS-tilew (an M3 Max and an M4, plain and validated): through the copy taken before the
+/// a probe (an M3 Max and an M4, plain and validated): through the copy taken before the
 /// pass, announced once (`unordered-draw-bytes`), on every device. Metal refuses a memory barrier
 /// after the tile stage, and a barrier before the dispatch did not order the write either (the draw
 /// read what a draw wrote before the barrier, not the dispatch's rewrite); the runtime's copy
@@ -550,7 +596,7 @@ fn an_indexed_indirect_draw_reads_the_bytes_from_before_a_tile_dispatchs_write()
     use TileStep::{Draw, Tile, WriteBehindBarrier};
     let empty_rows = rows(&EMPTY);
     // Each case: its name, the arguments and indices it starts with, its steps, and Metal's
-    // texels where the runtime draws them (RRS-tilew), else `None` where it is refused.
+    // texels where the runtime draws them, else `None` where it is refused.
     let cases = [
         (
             "tw_args",

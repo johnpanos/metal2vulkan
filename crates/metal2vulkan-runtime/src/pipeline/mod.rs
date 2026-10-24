@@ -42,8 +42,9 @@ mod additions;
 mod attachment_formats;
 pub(super) mod budget;
 pub(super) mod content_keyed;
-mod creation_log;
+pub(super) mod creation_log;
 mod dispatch_making;
+pub(super) mod flight;
 mod graphics;
 mod indirect_arguments;
 pub(super) mod kept;
@@ -59,6 +60,7 @@ mod predicted;
 mod raster_samples;
 pub(super) mod reaper;
 mod render;
+pub(super) mod shared_layouts;
 mod sources;
 pub(super) mod stand_in;
 mod texture_access;
@@ -69,8 +71,11 @@ pub use additions::{
     BinaryFunctionProblem, BinaryFunctionStage, RenderPipelineFunctionsDescriptor,
     RequiredThreadsProblem,
 };
+pub(super) use creation_log::enabled as creation_log_enabled;
 pub(super) use dispatch_making::RegionPipeline;
-pub(super) use graphics::{keyed_assembly, DepthRange, DrawKey, FixedState, GraphicsKey};
+pub(super) use graphics::{
+    color_write_masks, keyed_assembly, DepthRange, DrawKey, FixedState, GraphicsKey,
+};
 pub(super) use making::Pending;
 pub(super) use objects::ShaderModules;
 pub(super) use objects::{create_set_layout, set_needs, RawPipeline, VariantObjects};
@@ -92,7 +97,9 @@ use super::families::GpuFamily;
 use super::library::Function;
 use super::values::Size;
 use super::Device;
+use crate::argument_table::AtBindViews;
 use crate::binary_archive::Used;
+use crate::degradation::{CompiledPipeline, Occurrence};
 use crate::residency::handle_stages;
 use crate::resource_ids::{
     function_name, number, pipeline_placement, Holder, IdHold, IdPlacement, IdSpace, Numbered,
@@ -271,6 +278,9 @@ pub(super) struct Program {
     /// (`dispatch_making.rs`), kept here so a pool thread never holds the device's last
     /// reference.
     pieces: Arc<piece_holds::PieceHolds<dispatch_making::RegionHeld>>,
+    /// Its buffer slots whose bind offset class tells the device's view base alignment apart
+    /// (`argument_table::AtBindViews`), of its base's interface.
+    at_bind_views: AtBindViews,
 }
 
 /// The program's release returns at once: a piece not started stops, and a piece running gives
@@ -359,6 +369,27 @@ impl Kernel {
             }
         }
         inputs
+    }
+
+    /// `pipeline`, this descriptor's compile with its kernel or tile function compiled under
+    /// `inputs` ([`Kernel::inputs`]), held to the device's compiler word bound
+    /// (`fit_compute_pipeline`, `fit_tile_pipeline`): translated again from the function this
+    /// descriptor holds, with the exact forms dropped, where its module passes the bound.
+    fn fit(
+        &self,
+        compile: &metal2vulkan::device::Device,
+        inputs: &metal2vulkan::pipeline::LoweringInputs,
+        budget: &metal2vulkan::Budget,
+        pipeline: ComputePipeline,
+    ) -> Result<ComputePipeline, metal2vulkan::error::Error> {
+        match self {
+            Kernel::Compute(descriptor) => {
+                compile.fit_compute_pipeline(descriptor, inputs, budget, pipeline)
+            }
+            Kernel::Tile(descriptor) => {
+                compile.fit_tile_pipeline(descriptor, inputs, budget, pipeline)
+            }
+        }
     }
 }
 
@@ -608,6 +639,7 @@ impl ComputePipelineState {
         );
         let identifier =
             UniqueIdentifier::state(&device.shared().identifiers, StateKind::Compute, indirect)?;
+        let at_bind_views = AtBindViews::new(device, &base.shared_pipeline().interface);
         Ok(ComputePipelineState(Arc::new_cyclic(|state| {
             // The state holds its ID's slot, which lists it among the states an indirect
             // command's record can name (`indirect_states`).
@@ -629,6 +661,7 @@ impl ComputePipelineState {
                 added_unsupported,
                 label: options.label.clone(),
                 pieces: piece_holds::PieceHolds::new(),
+                at_bind_views,
             };
             StateShared {
                 id,
@@ -646,8 +679,7 @@ impl ComputePipelineState {
 /// AIR, name or constant values), in that order. Metal's API validation stops every repeat ("All
 /// linked functions must have unique names. Function 'add_one' is a duplicate symbol in
 /// binaryFunctions, symbol first found in functions"), but plain Metal takes one function listed
-/// in both lists, with one handle (a probe `RT7-ftable-probe2`
-/// `number_same_function_in_both_lists`, an M3 and an M4), as the compile layer links it once.
+/// in both lists, with one handle (a probe, an M3 and an M4), as the compile layer links it once.
 /// Whether validation also counts `private_functions` and `groups` was not measured, so they are
 /// left to it.
 pub(super) fn duplicate_linked_name(linked: &LinkedFunctions) -> Option<String> {
@@ -721,6 +753,12 @@ impl ComputePipelineState {
     /// visible-function table comes from the AIR, so every variant states it alike.
     pub(crate) fn interface(&self) -> &PipelineInterface {
         &self.0.base.pipeline().interface
+    }
+
+    /// Its buffer slots whose bind offset class tells the device's view base alignment apart
+    /// (`argument_table::AtBindViews`).
+    pub(crate) fn at_bind_views(&self) -> &AtBindViews {
+        &self.0.at_bind_views
     }
 
     /// The layout of the kernel's base variant: which texture slot each sampler samples comes
@@ -904,8 +942,8 @@ impl ComputePipelineState {
     }
 
     /// `resourceIndex`, Apple's private property: [`gpu_resource_id`](Self::gpu_resource_id)'s
-    /// value, 0 for a state made without `supportIndirectCommandBuffers`, as Metal answers (EV
-    /// APX2-spi1-m4: equal to `gpuResourceID` for compute and render states made with and
+    /// value, 0 for a state made without `supportIndirectCommandBuffers`, as Metal answers (equal
+    /// to `gpuResourceID` for compute and render states made with and
     /// without it).
     pub fn resource_index(&self) -> u64 {
         self.gpu_resource_id().0
@@ -940,7 +978,7 @@ impl ComputePipelineState {
 
     /// `label`: the label of the descriptor the state was made with
     /// (`PipelineOptions::label`), `None` for nil; a state made with additional binary functions
-    /// keeps its original's, as Metal's does (EV CFR-probe5-m4).
+    /// keeps its original's, as Metal's does.
     pub fn label(&self) -> Option<&str> {
         self.0.label.as_deref()
     }
@@ -1254,7 +1292,8 @@ impl Variant {
     /// the variant of it the memo knows live, or the pipeline `sources` give, each stage found or
     /// compiled under one budget. The function compiles under the descriptor's stage input
     /// descriptor or color attachment formats ([`Kernel::inputs`]), and the pipeline under its
-    /// other fields. A refusal is the compile layer's.
+    /// other fields, held to the device's compiler word bound from `descriptor`, which holds the
+    /// function ([`Kernel::fit`]). A refusal is the compile layer's.
     fn compiled(
         sources: &Sources<'_>,
         function: &FunctionDescriptor,
@@ -1268,6 +1307,7 @@ impl Variant {
         let compiled = sources.function(function, &inputs, (&function_key, None), &budget)?;
         sources.kernel(
             &descriptor.with_stage(StageSource::Compiled(compiled)),
+            (descriptor, &inputs),
             &budget,
         )
     }
@@ -1284,12 +1324,14 @@ impl Variant {
             Remembered::Live(variant) => Arc::clone(&variant.pipeline),
             Remembered::Compiled(pipeline) => pipeline,
         };
+        // Before the variant's shader modules, as a render variant's.
+        device.degrade_pipeline(CompiledPipeline::Kernel(&pipeline), Occurrence::Made);
         let (objects, kept) = VariantObjects::kept_or_create(
             device,
             kept::Compiled::Compute(pipeline.key),
             &pipeline.layout,
             std::slice::from_ref(&pipeline.stage),
-            None,
+            CompiledPipeline::Kernel(&pipeline),
         )?;
         let variant = Arc::new(Variant {
             key,
@@ -1347,8 +1389,8 @@ impl Variant {
 
     /// The `VkPipeline` of `region`, from the memo or made now, outside the memo's lock
     /// (`making.rs`), for a dispatch that binds `formats` and waits for it: one an execution of
-    /// commands or a host step records, or a tile dispatch (an encoder's own dispatch hands its
-    /// making to the pool, `dispatch_making.rs`).
+    /// commands or a host step records, or one of an encoder encoded again (an encoder's own
+    /// dispatch or tile dispatch hands its making to the pool, `dispatch_making.rs`).
     pub(super) fn region_pipeline(
         &self,
         region: &DispatchRegion,
@@ -1386,7 +1428,7 @@ impl Variant {
 /// The devices whose Metal refuses the render pipeline of a fragment function reading a global
 /// `thread_index_in_quadgroup` ("Encountered unlowered function call to
 /// air.get_thread_index_in_quadgroup.i32", the M4 adding "Verify device or GPU architecture
-/// supports this feature"; EVs `GSM-gb2-m4` and `GSM-gb-m3`).
+/// supports this feature").
 const GLOBAL_BUILTIN_IN_FRAGMENT_REFUSED_ON: &[&str] =
     &["Apple M3 Max, macOS 26.7", "Apple M4, macOS 27.0.1"];
 

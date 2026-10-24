@@ -1,15 +1,14 @@
 //! The program's live buffers that a command reaches without naming them on a device, and the
 //! resident set of them that every command buffer's root tables search.
 //!
-//! - **What Metal reaches** (EVs RFL-reach-m3 and RFL-warm-m3, the M3 Max under macOS 26.7, and
-//!   RFL-reach2-m4 and RFL-warm-m4, an M4 under 27.0.1; every run alike, plain and with
-//!   `MTL_DEBUG_LAYER`, the chips alike). A pointer loaded from memory, an argument buffer's
-//!   pointer, and an indirect command's buffer address, read or written, reach a buffer of its own
-//!   that no encoder of the command buffer named, from its making on. A no-copy buffer and a heap's
-//!   buffer are reached so only once a command buffer's commands used it (a binding, a blit's
-//!   operand, `useResource:`; for a heap's, any resource of the heap, or `useHeap:`): from that
-//!   command buffer on, its own commands included, before that use or after it, and whether or not
-//!   it completed. Before, the access is dropped: a read is 0, a write lands nowhere, and the
+//! - **What Metal reaches** (the M3 Max under macOS 26.7, and an M4 under 27.0.1; every run alike,
+//!   plain and with `MTL_DEBUG_LAYER`, the chips alike). A pointer loaded from memory, an argument
+//!   buffer's pointer, and an indirect command's buffer address, read or written, reach a buffer of
+//!   its own that no encoder of the command buffer named, from its making on. A no-copy buffer and
+//!   a heap's buffer are reached so only once a command buffer's commands used it (a binding, a
+//!   blit's operand, `useResource:`; for a heap's, any resource of the heap, or `useHeap:`): from
+//!   that command buffer on, its own commands included, before that use or after it, and whether or
+//!   not it completed. Before, the access is dropped: a read is 0, a write lands nowhere, and the
 //!   command buffer completes with no error.
 //! - **What is listed.** So every buffer the program made of its own
 //!   ([`Device::new_buffer`], `new_buffer_with_bytes`, `new_buffer_with_descriptor`,
@@ -33,12 +32,22 @@
 //!   every command buffer committed meanwhile. A command buffer holds it weakly from its commit
 //!   to its first submission, which takes the table of the list then, the same one where the
 //!   list is unchanged, and holds it, and with it each listed buffer's pages, until it completes
-//!   (Metal resolves what a command buffer reaches as it submits it). So a buffer released while a
-//!   submitted command buffer may reach it keeps its memory until that command buffer completed,
-//!   and one released while only command buffers not yet submitted reach it goes at once, as
-//!   Metal's does (the consumer's G344: a release after the commit lets the pages go, and the reach
-//!   reads 0). A commit while the list is unchanged makes nothing (the cost, measured on an Apple
-//!   M4 and a Radeon 780M).
+//!   (Metal resolves what a command buffer reaches as it submits it). A host step after then
+//!   resolves against the table current as it runs, which the command buffer holds from then on
+//!   too (`CommandBuffer::residency`): the commands the step records may reach its buffers. So a
+//!   buffer released while a submitted command buffer may reach it keeps its memory until that
+//!   command buffer completed: Metal's deallocator runs at the release, and the command buffer's
+//!   later accesses reach nothing (the M3 Max under macOS 27.0.1, probe `dealloc-probe4`), where
+//!   Vulkan frees no memory that submitted commands may still use
+//!   (`VUID-vkFreeMemory-memory-00677`). With the caller's keep-alive the deallocator runs at the
+//!   release all the same, and the import keeps the keep-alive; without one it waits, announced
+//!   (`host-deallocator-delayed`). One the command buffer's commands name goes as
+//!   it completes, where Metal's goes too, announced only where another submitted command buffer's
+//!   table lists it: a command buffer lets go of its tables before what it retained
+//!   (`CommandBufferShared::complete`). One released while only command buffers not
+//!   yet submitted reach it goes at once, as Metal's does (the consumer's G344: a release after the
+//!   commit lets the pages go, and the reach reads 0). A commit while the list is unchanged makes
+//!   nothing (the cost, measured on an Apple M4 and a Radeon 780M).
 //! - **Kept as the list changes**. The device keeps the list sorted, each buffer with its range and
 //!   a hold on its pages from its listing on, in chunks the tables share (`sorted_chunks.rs`): a
 //!   buffer made or gone changes one chunk, and the next table copies none of the others, upgrades
@@ -92,6 +101,9 @@ struct Inner {
     listed: SortedChunks<Key, Listed>,
     /// Bumped by each change of what the table lists.
     generation: u64,
+    /// Bumped by each rebind or detach ([`LiveBuffers::rebound`]): a listing whose pages were
+    /// read before one is read again ([`LiveBuffers::register`]).
+    rebinds: u64,
     /// The table of the current generation, once made: dropped at the next change, so a gone
     /// buffer's pages go with the last command buffer that holds an older table. It holds the
     /// device only while a listed buffer lives, which holds it too.
@@ -165,23 +177,49 @@ impl LiveBuffers {
         }
     }
 
-    /// List `buffer`, unless it is: a change of the list only where it was not.
+    /// List `buffer`, unless it is: a change of the list only where it was not. Its pages are
+    /// read with no lock held, so a rebind or detach of them meanwhile ([`rebound`](Self::rebound),
+    /// which follows the swap of its pages) has them read again: else the list would hold the
+    /// pages it let go of until the buffer goes, and their deallocator with them.
     fn register(&self, buffer: &Buffer) {
-        let key = (buffer.gpu_address().0, buffer.object_id());
-        if lock(&self.inner).listed.contains(&key) {
+        let key = (buffer.metal_address().0, buffer.object_id());
+        loop {
+            let rebinds = {
+                let inner = lock(&self.inner);
+                if inner.listed.contains(&key) {
+                    return;
+                }
+                inner.rebinds
+            };
+            // Its range and pages, asked once, with no lock held.
+            let listed = Listed {
+                buffer: buffer.downgrade(),
+                length: buffer.length(),
+                resident: buffer.resident(),
+            };
+            let mut inner = lock(&self.inner);
+            if inner.rebinds != rebinds {
+                // Dropped with no lock held, as `let_go` drops: it may hold the old pages last.
+                drop(inner);
+                drop(listed);
+                continue;
+            }
+            let stale = inner.listed.insert(key, listed).then(|| inner.change());
+            drop(inner);
+            self.let_go(stale);
             return;
         }
-        // Its range and pages, asked once, with no lock held.
-        let listed = Listed {
-            buffer: buffer.downgrade(),
-            length: buffer.length(),
-            resident: buffer.resident(),
-        };
-        let stale = {
-            let mut inner = lock(&self.inner);
-            inner.listed.insert(key, listed).then(|| inner.change())
-        };
-        self.let_go(stale);
+    }
+
+    /// `buffer`'s import was released while idle and imported again before its Metal address was
+    /// handed out (`host_residency.rs`): where it is listed, its range is read again, its new
+    /// `VkBuffer`'s, or none while it is released.
+    pub(super) fn refresh(&self, buffer: &Buffer) {
+        let (address, id) = (buffer.metal_address().0, buffer.object_id());
+        if lock(&self.inner).listed.contains(&(address, id)) {
+            self.forget(address, id);
+            self.register(buffer);
+        }
     }
 
     /// The buffer `id` at Metal address `address` is gone.
@@ -214,9 +252,10 @@ impl LiveBuffers {
         };
         let stale = {
             let mut inner = lock(&self.inner);
+            inner.rebinds = inner.rebinds.wrapping_add(1);
             let mut listed = Vec::new();
             for buffer in &gone {
-                let key = (buffer.gpu_address().0, buffer.object_id());
+                let key = (buffer.metal_address().0, buffer.object_id());
                 listed.extend(inner.listed.remove(&key));
             }
             let mut stale = inner.change();

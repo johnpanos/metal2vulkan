@@ -562,8 +562,7 @@ pub enum Problem {
     /// plain Metal takes them).
     SizeOutOfRange,
     /// A buffer of no bytes, or more than the device can hold in one: plain Metal answers nil
-    /// (`Nil`), from the device, with bytes or over the caller's, and from either type of heap
-    /// (EV TTG-nil10-m4).
+    /// (`Nil`), from the device, with bytes or over the caller's, and from either type of heap.
     BufferLength {
         /// The length asked for, in bytes.
         length: u64,
@@ -623,7 +622,7 @@ pub enum Problem {
     /// `new_render_pipeline_state`: a tessellation pipeline made with
     /// `supportIndirectCommandBuffers` whose factor scale is enabled. Metal's validation stops it
     /// ("pipelines with tessellationFactorScaleEnabled = YES are not compatible with indirect
-    /// command buffers", measured on an M4, probe `RT7-icb-probe7-m4`).
+    /// command buffers", measured on an M4).
     IndirectScaledTessellation,
     /// `new_compute_pipeline_state`: a kernel the compile layer already compiled
     /// (`StageSource::Compiled`). Metal's descriptor takes a function, and a state compiles its
@@ -722,8 +721,8 @@ pub enum Problem {
     /// `stage` function uses a direct texture or sampler argument (`[[texture(n)]]`,
     /// `[[sampler(n)]]`; its reflection's used bindings of those types): plain Metal answers nil
     /// with an `NSError` ([`Error::MetalError`]), on an M3 Max under macOS 26.7 and an M4 under
-    /// 27.0.1 alike (EVs RRS3-icbtex3 to 6). Unused ones, an argument buffer's textures and
-    /// samplers, and constexpr samplers are made. Metal names the fragment function first, then
+    /// 27.0.1 alike. Unused ones, an argument buffer's textures and samplers, and constexpr
+    /// samplers are made. Metal names the fragment function first, then
     /// the vertex, mesh and object functions. Its error: code 3, `localizedDescription` "Vertex
     /// shader cannot be used with indirect command buffers" (and "Fragment shader", "Mesh
     /// shader", "Object shader", "Compute function" alike), `userInfo` holding that alone, and
@@ -737,11 +736,10 @@ pub enum Problem {
     /// `new_render_pipeline_state` of a descriptor with rasterization disabled whose vertex
     /// function's return type is not `void`: plain Metal answers nil with an `NSError`
     /// ([`Error::MetalError`]) with or without `supportIndirectCommandBuffers`, before the
-    /// indirect command buffers' refusal (EVs RRS3-icbtex7 and -icbtex10 on an M4 under macOS
-    /// 27.0.1), a post-tessellation vertex function's too (EV RRS3-icbtex17). Its error: code 3,
-    /// `localizedDescription` "RasterizationEnabled is false but the vertex shader's return type is
-    /// not void", `userInfo` holding that alone, and the domain of Metal's GPU driver class, as
-    /// [`Problem::IndirectCommandsDirectArgument`]'s.
+    /// indirect command buffers' refusal (on an M4 under macOS 27.0.1), a post-tessellation vertex
+    /// function's too. Its error: code 3, `localizedDescription` "RasterizationEnabled is false but
+    /// the vertex shader's return type is not void", `userInfo` holding that alone, and the domain
+    /// of Metal's GPU driver class, as [`Problem::IndirectCommandsDirectArgument`]'s.
     UnrasterizedVertexReturn,
     /// `new_render_pipeline_state` (a render or mesh state) of a descriptor with
     /// `supportIndirectCommandBuffers` whose function of `stage`, the first in the order Metal
@@ -772,22 +770,21 @@ pub enum Problem {
     /// `new_render_pipeline_state` of a descriptor without a depth attachment whose fragment
     /// function writes depth (a `[[depth(...)]]` output): plain Metal answers nil with an
     /// `NSError` ([`Error::MetalError`]) with or without rasterization, a color attachment or
-    /// `supportIndirectCommandBuffers`, before the indirect command buffers' refusal (EVs
-    /// RRS3-icbtex12 and -icbtex14 on an M4 under macOS 27.0.1); `new_mesh_render_pipeline_state`
-    /// alike, first (EV RRS3-icbtex17). Its error: code 3, `localizedDescription`
-    /// "depthAttachmentPixelFormat is not valid and shader writes to depth", and the domain of
-    /// Metal's GPU driver class, as [`Problem::IndirectCommandsDirectArgument`]'s.
+    /// `supportIndirectCommandBuffers`, before the indirect command buffers' refusal (on an M4
+    /// under macOS 27.0.1); `new_mesh_render_pipeline_state` alike, first. Its error: code 3,
+    /// `localizedDescription` "depthAttachmentPixelFormat is not valid and shader writes to depth",
+    /// and the domain of Metal's GPU driver class, as
+    /// [`Problem::IndirectCommandsDirectArgument`]'s.
     DepthWrittenWithoutAttachment,
     /// `new_render_pipeline_state` of a descriptor whose fragment function's stage inputs
     /// `inputs` (their MSL member names, in declaration order), which its linking keeps, are
     /// written by no vertex output, with or without rasterization: plain Metal answers nil with an
-    /// `NSError` ([`Error::MetalError`]), after the indirect command buffers' refusal (EVs
-    /// RRS3-icbtex11, -icbtex13 and -icbtex14 on an M4 under macOS 27.0.1). Its error: code 3,
-    /// `localizedDescription` "Fragment input(s) `c,d` mismatching vertex shader output type(s)
-    /// or not written by vertex shader" with `inputs` joined by commas, and the domain of Metal's
-    /// GPU driver class. A post-tessellation vertex function's alike, and
-    /// `new_mesh_render_pipeline_state`'s where the mesh function writes no per-vertex or
-    /// per-primitive data of them, its text naming the "mesh shader" (EV RRS3-icbtex16).
+    /// `NSError` ([`Error::MetalError`]), after the indirect command buffers' refusal (on an M4
+    /// under macOS 27.0.1). Its error: code 3, `localizedDescription` "Fragment input(s) `c,d`
+    /// mismatching vertex shader output type(s) or not written by vertex shader" with `inputs`
+    /// joined by commas, and the domain of Metal's GPU driver class. A post-tessellation vertex
+    /// function's alike, and `new_mesh_render_pipeline_state`'s where the mesh function writes no
+    /// per-vertex or per-primitive data of them, its text naming the "mesh shader".
     UnwrittenFragmentInputs {
         /// The inputs' names.
         inputs: Box<[String]>,
@@ -816,7 +813,7 @@ pub enum Problem {
     /// `Depth24Unorm_Stencil8` and `X24_Stencil8` at every level (an Apple GPU has neither).
     /// Plain Metal's descriptor validation stops it ("pixelFormat, for color render target(0), is
     /// not a valid MTLPixelFormat", "depthAttachmentPixelFormat is not a valid MTLPixelFormat";
-    /// EV XRR2-ol4-m4 on an Apple M4 under 27.0.1, the consumer's run on an M3 Max under 26.7),
+    /// on an Apple M4 under 27.0.1, the consumer's run on an M3 Max under 26.7),
     /// blended or not, before anything else; the first such attachment is named (the colors by
     /// index, then depth, then stencil).
     AttachmentNotAFormat {
@@ -828,8 +825,8 @@ pub enum Problem {
     /// `new_render_pipeline_state` or `new_mesh_render_pipeline_state` of a `rasterSampleCount`
     /// other than 1, 2 and 4, and `new_tile_render_pipeline_state` of 0, on every device: plain
     /// Metal answers nil with an `NSError` (code 2, "rasterSampleCount (8) is not supported by
-    /// device."; EVs RCH-msaa-m4 and RCH-msaa2-m4 on an Apple M4 under 27.0.1, with and without
-    /// API validation), an [`Error::MetalError`]. A device whose Vulkan driver rasterizes more
+    /// device."; on an Apple M4 under 27.0.1, with and without API validation), an
+    /// [`Error::MetalError`]. A device whose Vulkan driver rasterizes more
     /// samples makes no such state either.
     RasterSampleCount {
         /// The `rasterSampleCount` given.
@@ -1120,8 +1117,10 @@ pub enum RuntimeGap {
         /// The device's `max_buffer_length`.
         max_buffer_length: u64,
     },
-    /// What indirect command buffers lack of their render commands: a descriptor of mesh draws,
-    /// which the record format does not hold; an execution of a range a draw of the encoder before
+    /// What indirect command buffers lack of their render commands: a command whose mesh draw's
+    /// object function has threadgroup memory arguments, whose lengths (the command's
+    /// `setObjectThreadgroupMemoryLength:atIndex:` or the encoder's) are not measured; an
+    /// execution of a range a draw of the encoder before
     /// it may write, or of commands that need a render pass instance of their own (a fetched
     /// attachment, the shader-side stencil, views, a fragment imageblock, a texture whose shadow
     /// the pass does not hold, or a memoryless attachment the pass backs and reads past its
@@ -1219,7 +1218,10 @@ pub enum RuntimeGap {
     /// multiview, or lacks `drawIndirectFirstInstance`, whose path is a prepass that writes what
     /// the draw needs. The runtime never reads arguments an earlier command may write. An index
     /// bounds pass whose arguments or indices a draw of the encoder wrote since its last memory
-    /// barrier, which Metal does not order before the draw's fetch, is refused too.
+    /// barrier, which Metal does not order before the draw's fetch, is refused too. So is an
+    /// indirect patch draw whose post-tessellation function reads `[[base_instance]]` through the
+    /// device's tessellation stages, which take it from push constants; on a device without
+    /// `tessellationShader` the draw's tessellation scan reads it on the GPU, and none is refused.
     IndirectDrawArguments,
     /// A depth/stencil resolve no Vulkan resolve mode of the device states: a filter or pair of
     /// filters the device's `supportedDepthResolveModes`, `supportedStencilResolveModes` or
@@ -1262,8 +1264,8 @@ pub enum RuntimeGap {
     /// A sparse texture's access counters (`getTextureAccessCounters:...` and
     /// `resetTextureAccessCounters:...` of a blit encoder). Not scheduled (orchestrator,
     /// 2026-10-06): Metal's counts are its texture hardware's units, not a count of accesses,
-    /// nondeterministic for large dispatches and different on an M3 Max and an M4 (AMP sparse
-    /// probe 1), so no exact answer exists, and Vulkan counts nothing of the kind.
+    /// nondeterministic for large dispatches and different on an M3 Max and an M4 (a Metal sparse
+    /// probe on both), so no exact answer exists, and Vulkan counts nothing of the kind.
     TextureAccessCounters,
     /// Fast resource loading: `MTLIOCommandQueue`, its command buffers and file handles. Not
     /// scheduled.
@@ -1312,14 +1314,22 @@ pub enum RuntimeGap {
     RebindTextures,
     /// A PVRTC texture's blocks in a Metal block order the runtime does not lay out:
     /// `replaceRegion` and `getBytes` of a region other than a whole level, which Metal's API
-    /// validation stops and plain Metal places by no rule the runtime has found (EV
-    /// CFR-probe7-m4), and of a whole level at a `bytesPerRow` other than 0 and the level's row,
-    /// unmeasured. A whole level's take its blocks in Z order with the y bit lowest. A blit's copy
-    /// at a nonzero `bytesPerRow` moves the blocks row by row, and one at 0 lays them out in the
-    /// region's Morton order, a region off its blocks that of the blocks it is rounded to, with
-    /// `MTLBlitOptionRowLinearPVRTC` or without it, as plain Metal's does (its API validation stops
-    /// all but the first with the option).
+    /// validation stops and plain Metal places by no rule the runtime has found, and of a whole
+    /// level at a `bytesPerRow` other than 0 and the level's row, unmeasured. A whole level's take
+    /// its blocks in Z order with the y bit lowest. A blit's copy at a nonzero `bytesPerRow` moves
+    /// the blocks row by row, and one at 0 lays them out in the region's Morton order, a region off
+    /// its blocks that of the blocks it is rounded to, with `MTLBlitOptionRowLinearPVRTC` or
+    /// without it, as plain Metal's does (its API validation stops all but the first with the
+    /// option).
     PvrtcBlockOrder,
+    /// A heap's or a sparse heap's texture of an ASTC format on a device without that ASTC format
+    /// (`astc.rs`), or a sparse heap's texture of an ETC2 or EAC format on a device without them
+    /// (`etc.rs`) or of a 4:2:2 format (`chroma_pairs.rs`), which Metal makes: an ASTC texture's
+    /// blocks would lie in the heap's bytes, which its decoded twin would decode as the texture is
+    /// placed, and a sparse heap's tiles are mapped by GPU commands. A heap's size query for an
+    /// ASTC one is refused alike. A texture of its own takes them
+    /// (`Degradation::CarriedDecodedTwin`), and so does an ETC2, EAC or 4:2:2 texture of a heap.
+    DecodedHeapTexture,
     /// A draw (`drawPrimitives:` and its forms, or an indirect command buffer's command) that
     /// may read a vertex attribute the pipeline fetches in its vertex function past `2^32` bytes
     /// of its buffer's bind offset, in a buffer that runs past them: Metal reads the attribute at
@@ -1378,6 +1388,14 @@ pub enum RuntimeGap {
     /// barrier, which Metal does not order before the draw's fetch, read in place; and an
     /// argument or index range the binding layer cannot bind.
     RestartedStrip,
+    /// An indexed draw (`drawIndexedPrimitives:`) of a pipeline whose fragment function reads
+    /// `[[primitive_id]]` on a device whose fragment stage cannot declare it (neither
+    /// `geometryShader` nor `tessellationShader`), which draws its indices as vertices from 0 in
+    /// the de-indexed form, its vertex function reading the indices in place at their device
+    /// address (`VariantKey::primitive_id_indices`): indices a draw of the encoder wrote since
+    /// its last memory barrier, which Metal does not order before the draw's fetch and the draw
+    /// would read as a copy, and indices without a device address.
+    PrimitiveIdIndices,
     /// A rotated texture (`TextureDescriptor::rotation`) where the runtime does not build what
     /// Metal does: CPU access or a blit of a quarter-turned one whose rows, as those uses address
     /// them (the texture's `height` rows of `width` texels at the plane's `bytesPerRow`), run
@@ -1415,7 +1433,7 @@ pub enum RuntimeGap {
     /// `Texture::replace_region` or `get_bytes` of a texture whose bytes (a no-copy buffer's or
     /// heap's) are detached (`detach_backing`). Metal's CPU access reaches the pages the texture
     /// took as it was made (a heap's texture, the pages the heap was made over), measured on an
-    /// M4 under macOS 27.0.1 (EV TXN3-dtp-m4); the runtime keeps no pages of detached bytes.
+    /// M4 under macOS 27.0.1; the runtime keeps no pages of detached bytes.
     DetachedTexelAccess,
     /// A use of a texture of a depth or stencil format (`Depth16Unorm`, `Depth32Float`,
     /// `Depth32Float_Stencil8`, `Stencil8`, `X32_Stencil8`) over a plane of a surface with planes
@@ -1446,16 +1464,16 @@ pub enum RuntimeGap {
     /// other ends, or `encode_start_else`, with no block open; `encode_start_if` on a nil buffer
     /// with none). Metal answers NO and drops its unit's work from the unit's start up to a point
     /// the records after it decide, by no rule the measurements fit (and one such stream ends
-    /// the process; EV PRD-spec3-m4).
+    /// the process).
     PredicationUnbalanced,
     /// A command buffer one of whose units of predication ended with an If still open that no
     /// misused record killed, refused at `CommandBuffer::commit`. Metal runs it where the If's
     /// condition held, and fails the command buffer in a GPU recovery where it failed, the
-    /// unit's work from before the If not run either: GPU data decides (EV PRD-spec1-m4).
+    /// unit's work from before the If not run either: GPU data decides.
     PredicationOpenAtUnitEnd,
     /// A predication condition word (`encode_start_if`'s offset, rounded down to a multiple of
     /// 4) past its buffer's end. Metal reads whatever memory lies there: zero past a lone buffer,
-    /// the next buffer's bytes inside a heap (EVs PRD-spec1-m4, PRD-spec2-m4).
+    /// the next buffer's bytes inside a heap.
     PredicationWordPastBuffer,
     /// A predicated loop started (`ComputeCommandEncoder::encode_start_while`,
     /// `encode_start_do_while`) with three loops already open in its unit. Metal nests them
@@ -1474,8 +1492,8 @@ pub enum RuntimeGap {
     /// take it. Plain Metal copies it per sample, the pixel's samples consecutive in the buffer:
     /// texel `(x, y)` sample `s` of an `n`-sample texture lies at
     /// `offset + y * bytesPerRow + (x * n + s) * bpp`, whole or into a sub-region, for `R32Uint`
-    /// and `RGBA8Unorm` at 2 and 4 samples (measured on an Apple M4 under macOS 27.0.1, EV
-    /// ZIN2-bm1-m4; rows sit `bytesPerRow` apart even where that is below `n * width * bpp`, so
+    /// and `RGBA8Unorm` at 2 and 4 samples (measured on an Apple M4 under macOS 27.0.1; rows sit
+    /// `bytesPerRow` apart even where that is below `n * width * bpp`, so
     /// they overlap, and the debug layer stays silent). The runtime runs that copy exactly
     /// (`sample_interleave.rs`) through a single-sample wide image and a multisampled uint scratch,
     /// by a compute split and a sample-rate merge draw. This is the refusal where the device cannot
@@ -1485,11 +1503,27 @@ pub enum RuntimeGap {
     /// bits and move into or out of the aspect as the multisampled blit copies between
     /// depth/stencil and colour move them (maintenance8's copies, or sample-rate draws); this is
     /// also the refusal where that move refuses: on a device whose maintenance8 copies are missing
-    /// or wrong, a 16-bit depth, a depth or stencil texture the draws cannot sample or render to,
-    /// or a 32-bit float depth on a driver whose fragment depth is unmeasured. Nothing is recorded,
-    /// where previously the runtime recorded invalid Vulkan and some drivers hung instead of
-    /// failing (the consumer's NVIDIA Xid 32 stall).
+    /// or wrong, a 16-bit depth, or a depth or stencil texture the draws cannot sample or render
+    /// to (a 32-bit float depth on a driver whose fragment depth is not measured is drawn,
+    /// announced as `drawn-depth-copy`). Nothing is recorded, where previously the runtime
+    /// recorded invalid Vulkan and some drivers hung instead of failing (the consumer's NVIDIA
+    /// Xid 32 stall).
     MultisampledBufferCopy,
+    /// What a render pass the device draws in color groups does not build: a pass of more color
+    /// attachments with a texture than the lesser of the device's `maxColorAttachments` and
+    /// `maxFragmentOutputAttachments` (four on a device at Vulkan's floor), or of one at an index
+    /// at or past it, where Metal takes eight, draws each group's colors in a pass of its own
+    /// (`render/color_groups.rs`). Refused there: a render pipeline state whose colors with a
+    /// pixel format are not the pass's colors with a texture (or one the device draws in groups
+    /// in a pass it draws in one), a tile pipeline's state, an execution of render commands in a
+    /// pass of several groups, a depth or stencil the pass loads from a texture without the
+    /// transfer usage its later groups' copy needs, and in a pass of several groups a draw that
+    /// reads what another group writes (a color of another group, its own group's colors or the
+    /// depth and stencil where it draws in a later group too, a resolve texture, the visibility
+    /// result buffer, memory it reaches through a handle table, or a texture over a buffer's
+    /// bytes it may reach through a root table), and a resolve target set on a texture a draw of
+    /// the pass read.
+    ColorAttachmentGroups,
 }
 
 /// The kind of memory that ran out.
@@ -1567,6 +1601,12 @@ pub enum CommandBufferError {
     /// runtime's pool is the device's budget, so nothing is drawn short silently. The first such
     /// draw, as its scan saw it.
     MeshRecordsOverflow(MeshRecordsOverflow),
+    /// An emulated tessellation draw's records (an indirect patch draw's, on a device without
+    /// `tessellationShader`) did not fit the rest of the command buffer's records pool, the one
+    /// emulated mesh draws share: such draws drew nothing. Metal draws them; the runtime's pool is
+    /// the device's budget, so nothing is drawn short silently. The first records fault of the
+    /// command buffer, where it is a tessellation draw's, as its scan saw it.
+    TessellationRecordsOverflow(TessellationRecordsOverflow),
     /// A host step refused a command it recorded from an indirect command buffer's records
     /// (`Degradation::HostReplayedIndirectCommands`): what `commit` refuses where the CPU wrote
     /// the records, such as a command's pipeline state of other color formats than the pass's.
@@ -1582,9 +1622,8 @@ pub enum CommandBufferError {
     /// Metal fails the command buffer from that pass on with `MTLCommandBufferErrorInternal`
     /// ("Internal Error (0000010d:Internal Error)" on an M4, `0000010c` on the M3 Max), the
     /// encoders before it run and the event signals encoded before it fire, while the pass,
-    /// every encoder after it and the signals after it do not (EVs RRS-probe-13-m4, -13b-m4,
-    /// -13-m3 and -13b-m3, with and without API validation, which lets the pass through). The
-    /// queue runs on.
+    /// every encoder after it and the signals after it do not (with and without API validation,
+    /// which lets the pass through). The queue runs on.
     RenderTargetSize,
     /// Metal's GPU faulted an encoder, which ran nothing, not even a render pass's load, clear or
     /// store actions: a render encoder's execution of an indirect command buffer that inherits
@@ -1594,10 +1633,9 @@ pub enum CommandBufferError {
     /// `MTLCommandBufferErrorPageFault` ("Caused GPU Address Fault Error
     /// (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)" on an M4), the encoder's state
     /// `Faulted`; the encoders before it run, every event signal fires, and the queue runs on
-    /// (EVs CFR-probe1-m4, IRX-xfault1-m4 and IRX-xfault2-m4; two such passes both fault). The
-    /// encoders after it ran in 6 of 7 runs of one such pass, and Metal named the next one
-    /// `Affected` and ran none of it in the 7th and in both runs of two passes: the runtime runs
-    /// them.
+    /// (two such passes both fault). The encoders after it ran in 6 of 7 runs of one such pass, and
+    /// Metal named the next one `Affected` and ran none of it in the 7th and in both runs of two
+    /// passes: the runtime runs them.
     ///
     /// Also a page fault Metal answers for the command buffer's work under MoltenVK, which the
     /// runtime relays (`CommandBufferError::Execution`).
@@ -1607,8 +1645,8 @@ pub enum CommandBufferError {
     /// failed one, and the runtime gives its code to the command buffer whose batch it was
     /// (`device/relay.rs`), the device kept, as Metal keeps it. Measured: a GPU write into
     /// read-only host pages fails with `Internal` (1, "Discarded (victim of GPU error/recovery)")
-    /// on an M4 with macOS 27.0.1, as does a command buffer the GPU ran beside it (EV
-    /// RFX-probe1-m4), and with `PageFault` on an M3 Max with 26.7 (the consumer's). Code 3 is
+    /// on an M4 with macOS 27.0.1, as does a command buffer the GPU ran beside it, and with
+    /// `PageFault` on an M3 Max with 26.7 (the consumer's). Code 3 is
     /// [`CommandBufferError::PageFault`], and 11 [`CommandBufferError::DeviceLost`].
     Execution(u64),
     /// The driver did not make the `VkPipeline` of a draw the command buffer recorded, which
@@ -1666,10 +1704,10 @@ pub enum CommandBufferError {
     /// The command buffer encoded a render pass without attachments whose
     /// `defaultRasterSampleCount`'s low 8 bits are 16 to 127, which Metal's encoder takes: Metal
     /// fails the command buffer with `MTLCommandBufferErrorInternal` ("Internal Error
-    /// (0000010c:Internal Error)" on the M3 Max under macOS 26.7, the consumer's run of EV
-    /// RCH-s0-m4's probe, and `0000010d` on an M4 under macOS 27.0.1, EVs RCH-msaa-m4 to
-    /// RCH-msaa4-m4, plain Metal; its API validation stops the pass). The runtime fails it from
-    /// that pass on, as for [`RenderTargetSize`](Self::RenderTargetSize), on every device,
+    /// (0000010c:Internal Error)" on the M3 Max under macOS 26.7, the consumer's run of our probe,
+    /// and `0000010d` on an M4 under macOS 27.0.1, plain Metal; its API
+    /// validation stops the pass). The runtime fails it from that pass on, as for
+    /// [`RenderTargetSize`](Self::RenderTargetSize), on every device,
     /// whatever samples its driver rasterizes; which encoders and signals Metal runs was
     /// measured for that size alone.
     DefaultRasterSampleCount,
@@ -1758,8 +1796,8 @@ pub struct FailedPipeline {
     pub encoder: usize,
     /// The command, by its order among its encoder's commands of its kind that returned `Ok`,
     /// from 0: a render encoder's draw calls (every `draw_*` call: of primitives, indexed,
-    /// indirect, patches and meshes), a compute encoder's dispatch calls (every `dispatch_*`
-    /// call, direct and indirect).
+    /// indirect, patches and meshes) or tile dispatch calls (every `dispatch_threads_per_tile*`
+    /// call), a compute encoder's dispatch calls (every `dispatch_*` call, direct and indirect).
     pub draw: usize,
     /// The state the command ran.
     pub state: FailedState,
@@ -1781,7 +1819,7 @@ pub struct FailedPipeline {
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum FailedState {
-    /// A draw's render pipeline state.
+    /// A draw's render pipeline state, or a tile dispatch's tile render pipeline state.
     Render(crate::RenderPipelineState),
     /// A dispatch's compute pipeline state.
     Compute(crate::ComputePipelineState),
@@ -1792,7 +1830,7 @@ pub enum FailedState {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshRecordsOverflow {
-    /// The draw's order among the command buffer's emulated mesh draws, from 0.
+    /// The draw's order among the command buffer's emulated mesh and tessellation draws, from 0.
     pub draw: u32,
     /// Its object threadgroups (1 for a pipeline without an object function).
     pub object_threadgroups: u32,
@@ -1802,15 +1840,28 @@ pub struct MeshRecordsOverflow {
     pub budget: u64,
 }
 
+/// The first emulated tessellation draw of a command buffer whose records did not fit
+/// ([`CommandBufferError::TessellationRecordsOverflow`]).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TessellationRecordsOverflow {
+    /// The draw's order among the command buffer's emulated mesh and tessellation draws, from 0.
+    pub draw: u32,
+    /// Its records, `patchCount · instanceCount`, saturated at `u32::MAX`.
+    pub records: u32,
+    /// The bytes of the command buffer's records pool, the device's budget.
+    pub budget: u64,
+}
+
 impl CommandBufferError {
     /// Metal's `MTLCommandBufferError` code for this error: `MTLCommandBufferErrorDeviceRemoved`
-    /// (11) for a lost device, `OutOfMemory` (8) for the device's memory, the index pool's and
-    /// the mesh records pool's, and a detached buffer's, `PageFault` (3), and `Internal` (1), also
-    /// for the runtime's refusals (a cubic argument sampler's reach among them, a sampler state
-    /// left out of an argument-sampler listing, a host step's object nothing made, a named use
-    /// rebound before the submission, and a predicated loop past its copies); a command buffer
-    /// committed as failed, the code the program chose; a pipeline's failed making, its cause's; a
-    /// failure the driver relayed, Metal's.
+    /// (11) for a lost device, `OutOfMemory` (8) for the device's memory, the index pool's and the
+    /// records pool's (mesh and tessellation), and a detached buffer's, `PageFault` (3), and
+    /// `Internal` (1), also for the runtime's refusals (a cubic argument sampler's reach among
+    /// them, a sampler state left out of an argument-sampler listing, a host step's object nothing
+    /// made, a named use rebound before the submission, and a predicated loop past its copies); a
+    /// command buffer committed as failed, the code the program chose; a pipeline's failed making,
+    /// its cause's; a failure the driver relayed, Metal's.
     ///
     /// The code is Metal's answer only where [`origin`](Self::origin) is
     /// [`FailureOrigin::Metal`]. A [`FailureOrigin::Runtime`] error's code is the nearest of
@@ -1822,6 +1873,7 @@ impl CommandBufferError {
             CommandBufferError::OutOfMemory
             | CommandBufferError::IndexPoolOverflow
             | CommandBufferError::MeshRecordsOverflow(_)
+            | CommandBufferError::TessellationRecordsOverflow(_)
             | CommandBufferError::DetachedBacking => 8,
             CommandBufferError::Internal(_)
             | CommandBufferError::SparseHeapSplit
@@ -1868,6 +1920,7 @@ impl CommandBufferError {
             | CommandBufferError::CubicArgumentSampler
             | CommandBufferError::UnlistedArgumentSampler
             | CommandBufferError::MeshRecordsOverflow(_)
+            | CommandBufferError::TessellationRecordsOverflow(_)
             | CommandBufferError::Refused
             | CommandBufferError::PipelineCreation(_)
             | CommandBufferError::HostStepObject(_)

@@ -770,6 +770,40 @@ fn rotate_argb(fb: &mut FunctionBuilder<'_>, x: SValue, read: bool) -> BResult<S
     }
 }
 
+/// `A8Unorm`'s byte held in an `R8_UNORM` image's red (`AlphaInRed`): a read (image texel `x`,
+/// `(r, 0, 0, 1)`) is `(0, 0, 0, r)`, Metal's alpha-only texel; a write stores the texel's alpha
+/// in red (the image's other lanes are none).
+fn alpha_in_red(fb: &mut FunctionBuilder<'_>, x: SValue, read: bool) -> BResult<SValue> {
+    match read {
+        true => {
+            let zero = f32s(fb, 4, 0.0)?;
+            fb.vector_shuffle(zero, x, &[0, 1, 2, 4])
+        }
+        false => fb.vector_shuffle(x, x, &[3, 3, 3, 3]),
+    }
+}
+
+/// The words [`heap_alpha_in_red`] emits, at most: the class field's shift and mask, the
+/// comparison, the shuffle and the select.
+pub(crate) const HEAP_ALPHA_IN_RED_WORDS: u32 = 40;
+
+/// Image texel `x` (four `f32` lanes) of a storage access through heap handle `handle`, as
+/// [`alpha_in_red`] converts it (`read`: the image's to Metal's; else Metal's to the image's) where
+/// the handle's class index is `A8Unorm`'s (`metal::texel_format::heap_alpha_in_red_index`), as
+/// it is elsewhere (`Read::heap_alpha_red`, `Write::heap_alpha_red`).
+fn heap_alpha_in_red(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    handle: ValueId,
+    x: SValue,
+    read: bool,
+) -> BResult<SValue> {
+    let index = crate::metal::texel_format::heap_alpha_in_red_index();
+    let is = heap_class_among(cx, fb, handle, &[index])?;
+    let held = alpha_in_red(fb, x, read)?;
+    fb.select(is, held, x)
+}
+
 /// The words [`srgb_codes`] emits, at most: `math::pack`'s `unorm4x8_srgb` (its exact products,
 /// three table searches, and the placement) and the codes' extraction and scale.
 pub(crate) const SRGB_WRITE_WORDS: u32 =
@@ -781,7 +815,7 @@ pub(crate) const SRGB_WRITE_WORDS: u32 =
 /// [`srgb::declare`](crate::lower::arith::srgb::declare)): a NaN 0, the value clamped to `[0, 1]`,
 /// the exact product with 4095 rounded to nearest, and the byte of the largest first index at or
 /// below it; alpha's the exact product with 255 rounded to nearest: `pack_float_to_srgb_unorm4x8`
-/// (`math::pack`), which a kernel's write takes too (EV FPV-sr1-m4). Each code `c` is written as
+/// (`math::pack`), which a kernel's write takes too. Each code `c` is written as
 /// `c` times the `f32` nearest `1 / 255`, whose product with 255 lies within `2^-7` of `c`, so
 /// every device's conversion stores `c` (as `argb_codes` writes).
 fn srgb_codes(
@@ -848,7 +882,13 @@ fn from_image(
             };
             return srgb_raw_texel(cx, fb, form, x, SRGB_TEXEL);
         }
+        // `BGRA8Unorm_sRGB`'s codes through an rgba8 view: red and blue exchanged, then decoded.
+        StorageImageClass::SrgbEncodeBgra => {
+            let x = swizzle_bgra(fb, x)?;
+            return srgb_raw_texel(cx, fb, form, x, SRGB_TEXEL);
+        }
         StorageImageClass::RotateArgb => rotate_argb(fb, x, true)?,
+        StorageImageClass::AlphaInRed => alpha_in_red(fb, x, true)?,
         // A `YCbCrWrite` slot is only written (`StorageImageClass::YCbCrWrite`).
         StorageImageClass::HalfTowardZero
         | StorageImageClass::HalfQuietNan
@@ -857,6 +897,8 @@ fn from_image(
         | StorageImageClass::OneBitAlpha => x,
         // A half-float texel's bits, through its unsigned integer alias: Metal's read, whole.
         StorageImageClass::HalfBits => return half_bits_texel(fb, decl, form, x),
+        // An `RGB9E5Float` word, through its `R32_UINT` alias, decoded exactly.
+        StorageImageClass::SharedExponentBits => return shared_exponent_texel(fb, form, x),
     };
     let x = match decl.x_channel {
         true => x_channel_read(fb, decl, x)?,
@@ -904,6 +946,87 @@ pub(crate) fn srgb_raw_texel(
 ) -> BResult<SValue> {
     let steps = srgb_raw_steps(cx, fb, x, color)?;
     srgb_ratio(fb, form, steps)
+}
+
+/// The held texel (`form`, a `half` or `float` result) of a device's sample `x` (a `vec4` of
+/// `f32`) of an 8-bit sRGB texture held as its UNORM twin, whose view reads each code `c` as
+/// `c / 255`, so the device filters the codes, where Metal decodes each texel and filters the
+/// decoded values (`PrecisionNote::SrgbTexelDecode`). A lane within `2^-10` of a code once
+/// scaled by 255 (one texel's: a nearest sample's, a gather's) decodes as [`srgb_raw_texel`]
+/// decodes it, Metal's value exactly. Another color lane, `c + t` between codes `c` and `c + 1`,
+/// takes the steps' interpolation `(k_c + t (k_{c+1} - k_c)) / 4095`, Metal's sum where the
+/// filter blends two adjacent codes and near it where the codes are close; another alpha lane
+/// keeps the device's filtered value, which Metal's alpha sums alike. `color` says which lanes
+/// are color, as [`srgb_raw_texel`]'s.
+pub(crate) fn srgb_filtered_texel(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    form: TexelForm,
+    x: SValue,
+    color: [bool; 4],
+) -> BResult<SValue> {
+    use crate::lower::arith::legal::{Form, Held};
+    let Some(table) = cx.decl.families.arith.srgb else {
+        return Err(cx.fail("an sRGB twin's sample without Metal's table"));
+    };
+    let four = TexelForm { lanes: 4, ..form };
+    let exact = srgb_raw_texel(cx, fb, four, x, color)?;
+    let (u, f) = (u32_ty(fb)?, f32_ty(fb)?);
+    let (vu, vf) = (vec(fb, u, 4)?, vec(fb, f, 4)?);
+    let scale = f32s(fb, 4, 255.0)?;
+    let zero = f32s(fb, 4, 0.0)?;
+    let c = fb.binary(BinOp::FMul, x, scale)?;
+    let c = fb.glsl(GlslOp::FClamp, &[c, zero, scale])?;
+    // One texel's lanes: within `2^-10` of a code.
+    let nearest = fb.glsl(GlslOp::RoundEven, &[c])?;
+    let off = fb.binary(BinOp::FSub, c, nearest)?;
+    let off = fb.glsl(GlslOp::FAbs, &[off])?;
+    let within = f32s(fb, 4, 1.0 / 1024.0)?;
+    let one = fb.binary(BinOp::FOrdLessThanEqual, off, within)?;
+    // The steps' interpolation between the codes below and above, `c` 255 taking 254 and 255.
+    let below = fb.glsl(GlslOp::Floor, &[c])?;
+    let below = fb.convert(ConvOp::ConvertFToU, below, vu)?;
+    let top = u32s(fb, 4, 254)?;
+    let below = fb.glsl(GlslOp::UMin, &[below, top])?;
+    let base = fb.convert(ConvOp::ConvertUToF, below, vf)?;
+    let t = fb.binary(BinOp::FSub, c, base)?;
+    let ones = u32s(fb, 4, 1)?;
+    let above = fb.binary(BinOp::IAdd, below, ones)?;
+    let steps = f32s(fb, 1, 1.0 / 4095.0)?;
+    let mut lanes = Vec::with_capacity(4);
+    for (i, color) in (0u32..).zip(color) {
+        if !color {
+            lanes.push(fb.composite_extract(x, &[i])?);
+            continue;
+        }
+        let lo = fb.composite_extract(below, &[i])?;
+        let hi = fb.composite_extract(above, &[i])?;
+        let lo = crate::lower::arith::srgb::step(fb, table, lo)?;
+        let hi = crate::lower::arith::srgb::step(fb, table, hi)?;
+        let lo = fb.convert(ConvOp::ConvertUToF, lo, f)?;
+        let hi = fb.convert(ConvOp::ConvertUToF, hi, f)?;
+        let rise = fb.binary(BinOp::FSub, hi, lo)?;
+        let ti = fb.composite_extract(t, &[i])?;
+        let k = fb.glsl(GlslOp::Fma, &[ti, rise, lo])?;
+        lanes.push(fb.binary(BinOp::FMul, k, steps)?);
+    }
+    let blended = fb.composite_construct(vf, &lanes)?;
+    let blended = match form.conv {
+        TexelConv::F16 => {
+            let half = Form {
+                held: Held::Float(crate::lower::arith::legal::FloatFmt::Half),
+                lanes: 4,
+            };
+            narrow::round_texel(fb, half, blended)?
+        }
+        _ => blended,
+    };
+    let r = fb.select(one, exact, blended)?;
+    if form.lanes == 1 {
+        fb.composite_extract(r, &[0])
+    } else {
+        Ok(r)
+    }
 }
 
 /// A raw cube gather's held texel (`form`, a `half` or `float` result): the four taps' raw codes
@@ -1053,6 +1176,11 @@ pub(crate) const SRGB_TEXEL: [bool; 4] = [true, true, true, false];
 /// The words [`srgb_raw_texel`] emits, at most: the code's recovery, up to four table steps, and
 /// the exact quotients (`the_srgb_raw_words_bound_its_emission`).
 pub(crate) const SRGB_RAW_WORDS: u32 = 520;
+
+/// The words [`srgb_filtered_texel`] emits, at most: [`srgb_raw_texel`]'s, the codes' scale, test
+/// and interpolation (two table steps per color lane), a `half` result's rounding, and the
+/// selection (`the_raw_estimate_bounds_its_emission`).
+pub(crate) const SRGB_FILTERED_WORDS: u32 = SRGB_RAW_WORDS + 400;
 
 /// The conversion of a slot's `half` texels by the bound format's class: the module's routine and
 /// the slot's `TexelFormat` specialization constant; or of a heap color texture's by the class its
@@ -1298,7 +1426,7 @@ pub(crate) fn reinterpret(
             narrow::from_bits(fb, half.half(), x)
         }
         // A `short` or `ushort` result: an integer word's low 16 bits, a float texel's `half`
-        // bits (EVs XCR-p1-m3, XCR-p2-m3), held zero-extended.
+        // bits, held zero-extended.
         (TexelConv::I32, TexelConv::I16 { .. }) => {
             let mask = u32s(fb, n, 0xFFFF)?;
             fb.binary(BinOp::BitwiseAnd, x, mask)
@@ -1312,8 +1440,7 @@ pub(crate) fn reinterpret(
 
 /// Written lanes `v`, held as `c.declared` declares them, as the texel `native` of the bound
 /// texture's own class (`texture::native_write_form`), as plain Metal stores them in format
-/// `c.format` (EVs XCR-p1-m3, XCR-p2-m3 on an Apple M3 Max, 28 formats, texture and
-/// texture-buffer writes):
+/// `c.format` (on an Apple M3 Max, 28 formats, texture and texture-buffer writes):
 ///
 /// - into an integer format, the lane's word (a 32-bit lane's bits, a 16-bit lane's, a `half`'s
 ///   bits, extended by the format's signedness), which the write then saturates to each
@@ -1514,10 +1641,10 @@ fn int_lanes(fb: &mut FunctionBuilder<'_>, elem: TypeId, lanes: &[u32]) -> BResu
 }
 
 /// `x` (`f32` lanes of form `f`) rounded to nearest even onto `RG11B10Float`'s channels, as
-/// Metal's integer store rounds them (EVs XCR-p1-m3, XCR-p2-m3): red and green to six fraction
-/// bits, blue to five, unsigned (a negative value to 0), a finite value that rounds past the
-/// largest finite one held there (65024, 64512), an infinity kept and a NaN quieted, which the
-/// float class's write stores as Metal's NaN code (`StorageImageClass::SmallFloatQuietNan`).
+/// Metal's integer store rounds them: red and green to six fraction bits, blue to five, unsigned (a
+/// negative value to 0), a finite value that rounds past the largest finite one held there (65024,
+/// 64512), an infinity kept and a NaN quieted, which the float class's write stores as Metal's NaN
+/// code (`StorageImageClass::SmallFloatQuietNan`).
 fn small_floats_nearest(
     fb: &mut FunctionBuilder<'_>,
     f: crate::lower::arith::legal::Form,
@@ -1600,9 +1727,26 @@ pub fn to_image(
                 ))
             }
         },
+        StorageImageClass::SrgbEncodeBgra => match srgb {
+            Some(table) => {
+                let codes = srgb_codes(fb, table, form, x, test)?;
+                swizzle_bgra(fb, codes)?
+            }
+            None => {
+                return Err(crate::spirv::error::BuildError::Type(
+                    crate::spirv::error::TypeRule::FunctionSignature,
+                ))
+            }
+        },
         StorageImageClass::RotateArgb => {
             let x = argb_codes(fb, form, x)?;
             rotate_argb(fb, x, false)?
+        }
+        StorageImageClass::AlphaInRed if form.lanes == 4 => alpha_in_red(fb, x, false)?,
+        StorageImageClass::AlphaInRed => {
+            return Err(crate::spirv::error::BuildError::Type(
+                crate::spirv::error::TypeRule::FunctionSignature,
+            ))
         }
         StorageImageClass::HalfTowardZero
         | StorageImageClass::HalfQuietNan
@@ -1617,6 +1761,7 @@ pub fn to_image(
             _ => x,
         },
         StorageImageClass::HalfBits => half_bits(fb, form, x)?,
+        StorageImageClass::SharedExponentBits => shared_exponent_word(fb, form, x)?,
     };
     match decl.x_channel && form.lanes == 4 {
         true => x_channel_write(fb, x),
@@ -1681,7 +1826,7 @@ fn ycbcr_write_texel(fb: &mut FunctionBuilder<'_>, form: TexelForm, x: SValue) -
 /// read gives, 0 or alpha 1, and Metal's out-of-bounds texel's likewise): each channel's half
 /// widened exactly (`narrow::from_bits`), Metal's `half` read of the half stored, a NaN's sign
 /// and payload kept; for a `float` result every NaN `0x7fc00000`, Metal's `float` read of a half
-/// NaN (EV LTF-hp1-m3, the M3 Max: every NaN, fast and safe math); a lane the format lacks its
+/// NaN (the M3 Max: every NaN, fast and safe math); a lane the format lacks its
 /// integer converted (0.0, alpha 1.0).
 fn half_bits_texel(
     fb: &mut FunctionBuilder<'_>,
@@ -1743,6 +1888,133 @@ fn half_bits(fb: &mut FunctionBuilder<'_>, form: TexelForm, x: SValue) -> BResul
     crate::lower::arith::narrow::to_bits(fb, form.half(), x)
 }
 
+/// The held texel (`form`, a `half` or `float` result) of a `SharedExponentBits` slot's image texel
+/// `x` (a `uvec4`, the `RGB9E5Float` word in its first lane): each of red, green and blue its
+/// mantissa `m` times `2^(e - 24)` for the word's exponent `e`, exact in `f32` and in `half` (nine
+/// significant bits, from `2^-24` to 65408), and alpha 1, as Metal reads the texel.
+fn shared_exponent_texel(
+    fb: &mut FunctionBuilder<'_>,
+    form: TexelForm,
+    x: SValue,
+) -> BResult<SValue> {
+    let f = f32_ty(fb)?;
+    let word = fb.composite_extract(x, &[0])?;
+    let twenty_seven = fb.u32_const(27)?;
+    let twenty_seven = fb.module().const_value(twenty_seven)?;
+    let e = fb.binary(BinOp::ShiftRightLogical, word, twenty_seven)?;
+    // `2^(e - 24)`: the `f32` of biased exponent `e + 103`, a normal for every `e` in `[0, 31]`.
+    let bias = fb.u32_const(103)?;
+    let bias = fb.module().const_value(bias)?;
+    let biased = fb.binary(BinOp::IAdd, e, bias)?;
+    let twenty_three = fb.u32_const(23)?;
+    let twenty_three = fb.module().const_value(twenty_three)?;
+    let scale = fb.binary(BinOp::ShiftLeftLogical, biased, twenty_three)?;
+    let scale = fb.convert(ConvOp::Bitcast, scale, f)?;
+    let nine_bits = fb.u32_const(0x1ff)?;
+    let nine_bits = fb.module().const_value(nine_bits)?;
+    let mut lanes = Vec::with_capacity(4);
+    for c in 0..3u32 {
+        let shift = fb.u32_const(9 * c)?;
+        let shift = fb.module().const_value(shift)?;
+        let m = fb.binary(BinOp::ShiftRightLogical, word, shift)?;
+        let m = fb.binary(BinOp::BitwiseAnd, m, nine_bits)?;
+        let m = fb.convert(ConvOp::ConvertUToF, m, f)?;
+        lanes.push(fb.binary(BinOp::FMul, m, scale)?);
+    }
+    lanes.push(f32s(fb, 1, 1.0)?);
+    let v4 = vec(fb, f, 4)?;
+    let v = fb.composite_construct(v4, &lanes)?;
+    match form.lanes {
+        1 => fb.composite_extract(v, &[0]),
+        _ => Ok(v),
+    }
+}
+
+/// The `uvec4` a `SharedExponentBits` slot stores for held texel `x` (`f32` lanes of `form`, a
+/// `half` texel's widened exactly): the `RGB9E5Float` word Metal stores in its first lane
+/// (`StorageImageClass::SharedExponentBits`, [`rgb9e5_word`]); alpha is not stored. An integer
+/// texel is not one the format takes.
+fn shared_exponent_word(
+    fb: &mut FunctionBuilder<'_>,
+    form: TexelForm,
+    x: SValue,
+) -> BResult<SValue> {
+    if form.lanes != 4 || !matches!(form.conv, TexelConv::F32 | TexelConv::F16) {
+        return Err(crate::spirv::error::BuildError::Type(
+            crate::spirv::error::TypeRule::FunctionSignature,
+        ));
+    }
+    let u = u32_ty(fb)?;
+    let word = rgb9e5_word(fb, x)?;
+    let zero = fb.u32_const(0)?;
+    let zero = fb.module().const_value(zero)?;
+    let v4 = vec(fb, u, 4)?;
+    fb.composite_construct(v4, &[word, zero, zero, zero])
+}
+
+/// An upper estimate of the SPIR-V words of one [`rgb9e5_word`].
+pub(crate) const RGB9E5_WORDS: u64 = 3 * 8 * 7 + 3 * 7 * 7 + 16 * 7;
+
+/// The `RGB9E5Float` word, a `u32`, Metal stores for the red, green and blue `f32` lanes of `x` (a
+/// vector of at least three; a kernel's write, a `float` output's store into a word attachment,
+/// `metal::format::WordAttachment::Rgb9e5`): each clamped to `[0, 65408]` on its bits (a NaN, a
+/// negative value and `-0` 0; an infinity 65408), the exponent `e = max(⌊log2 m⌋, -16) + 16` from
+/// the largest clamped channel `m`'s exponent field, and each mantissa the clamped channel times
+/// `2^(24 - e)` (exact: a power of two, the product below 512) converted toward zero.
+pub(crate) fn rgb9e5_word(fb: &mut FunctionBuilder<'_>, x: SValue) -> BResult<SValue> {
+    let u = u32_ty(fb)?;
+    let f = f32_ty(fb)?;
+    let constant = |fb: &mut FunctionBuilder<'_>, v: u32| -> BResult<SValue> {
+        let c = fb.u32_const(v)?;
+        fb.module().const_value(c)
+    };
+    let zero = constant(fb, 0)?;
+    let top = constant(fb, 65408.0f32.to_bits())?;
+    let magnitude = constant(fb, 0x7fff_ffff)?;
+    let infinity = constant(fb, 0x7f80_0000)?;
+    let mut clamped = [zero; 3];
+    for (c, out) in (0u32..).zip(clamped.iter_mut()) {
+        let v = fb.composite_extract(x, &[c])?;
+        let bits = fb.convert(ConvOp::Bitcast, v, u)?;
+        // A NaN, or any value with its sign bit set, is 0; a positive value's bits order as its
+        // value does, so the clamp is an unsigned minimum.
+        let mag = fb.binary(BinOp::BitwiseAnd, bits, magnitude)?;
+        let nan = fb.binary(BinOp::UGreaterThan, mag, infinity)?;
+        let negative = fb.binary(BinOp::UGreaterThan, bits, magnitude)?;
+        let dropped = fb.binary(BinOp::LogicalOr, nan, negative)?;
+        let below = fb.glsl(GlslOp::UMin, &[bits, top])?;
+        *out = fb.select(dropped, zero, below)?;
+    }
+    let [red, green, blue] = clamped;
+    let largest = fb.glsl(GlslOp::UMax, &[red, green])?;
+    let largest = fb.glsl(GlslOp::UMax, &[largest, blue])?;
+    // `max(⌊log2 m⌋, -16) + 16` is `max(field, 111) - 111` of the exponent field (a zero or a
+    // denormal `m` taking 0).
+    let twenty_three = constant(fb, 23)?;
+    let field = fb.binary(BinOp::ShiftRightLogical, largest, twenty_three)?;
+    let floor = constant(fb, 111)?;
+    let field = fb.glsl(GlslOp::UMax, &[field, floor])?;
+    let e = fb.binary(BinOp::ISub, field, floor)?;
+    // `2^(24 - e)`: the `f32` of biased exponent `151 - e`.
+    let top_bias = constant(fb, 151)?;
+    let biased = fb.binary(BinOp::ISub, top_bias, e)?;
+    let scale = fb.binary(BinOp::ShiftLeftLogical, biased, twenty_three)?;
+    let scale = fb.convert(ConvOp::Bitcast, scale, f)?;
+    let most = constant(fb, 0x1ff)?;
+    let exponent_at = constant(fb, 27)?;
+    let mut word = fb.binary(BinOp::ShiftLeftLogical, e, exponent_at)?;
+    for (c, bits) in clamped.into_iter().enumerate() {
+        let v = fb.convert(ConvOp::Bitcast, bits, f)?;
+        let scaled = fb.binary(BinOp::FMul, v, scale)?;
+        let m = fb.convert(ConvOp::ConvertFToU, scaled, u)?;
+        let m = fb.glsl(GlslOp::UMin, &[m, most])?;
+        let shift = constant(fb, 9 * c as u32)?;
+        let m = fb.binary(BinOp::ShiftLeftLogical, m, shift)?;
+        word = fb.binary(BinOp::BitwiseOr, word, m)?;
+    }
+    Ok(word)
+}
+
 /// The `f32` NaN a written `float`'s NaN becomes under `HalfTowardZero` and `HalfQuietNan`
 /// (`color_write::round`'s), which a device of `DriverDeviation::MetalFloatStorageNans` stores as
 /// Metal's `0x7e00`.
@@ -1767,7 +2039,7 @@ fn quiet_nans(
 /// class `class`: under `HalfTowardZero` the values every device stores as Metal's `half`, each
 /// rounded toward zero to the `f32` that holds that `half` exactly, a finite value past 65504 to
 /// 65504, an infinity kept and a NaN to [`QUIET_NAN`] (the half-float rule of `color_write::round`,
-/// the fragment rule, which a kernel's write takes too: EV TXN-hkw-m4; `color_write::small_float`
+/// the fragment rule, which a kernel's write takes too, as measured; `color_write::small_float`
 /// on the whole vector), so a device that rounds a conversion to nearest stores the exact `half`;
 /// under `HalfQuietNan`, on a device that rounds as Metal does, the value as computed but a NaN as
 /// [`QUIET_NAN`]. The NaN stores as the device's encoding of [`QUIET_NAN`] (Metal's `0x7e00` where
@@ -1909,11 +2181,11 @@ fn half_nan_texel(
 }
 
 /// Held `half` texel `held` of image texel `x` (`f32` lanes: the device's value, one texel's or
-/// filtered) with Metal's NaN wherever `x` is a NaN (`texture::half_texel_nans`, EV
-/// NAN-hrn1-m3): `x` itself, the device's decode of the texel, where the access reads one texel
-/// (`one`: `None` where it always does, else a `bool`) of a texture the class says holds 16-bit
-/// float channels (`class`: a slot's `TexelFormat` class of the half-float family without a
-/// packed field, `metal::texel_format::half_channels`, or `TexelFormat::OTHER`, a format whose
+/// filtered) with Metal's NaN wherever `x` is a NaN (`texture::half_texel_nans`): `x` itself, the
+/// device's decode of the texel, where the access reads one texel (`one`: `None` where it always
+/// does, else a `bool`) of a texture the class says holds 16-bit float channels (`class`: a slot's
+/// `TexelFormat` class of the half-float family without a packed field,
+/// `metal::texel_format::half_channels`, or `TexelFormat::OTHER`, a format whose
 /// conversion is not measured, whose NaN stays the device's decode as the module notes,
 /// `DeviceNanEncoding`; a heap handle's class index, [`heap_half_format`]); [`QUIET_NAN`]
 /// elsewhere, the `half` `0x7e00` held. The NaN test reads
@@ -2036,8 +2308,9 @@ pub(crate) fn class_write_words(class: StorageImageClass) -> u32 {
             color_write::words(&[Some(ChannelWrite::Unorm { bits: 8 }); 4]) as u32
         }
         StorageImageClass::YCbCrWrite => YCBCR_WRITE_WORDS,
-        StorageImageClass::SrgbEncode => SRGB_WRITE_WORDS,
+        StorageImageClass::SrgbEncode | StorageImageClass::SrgbEncodeBgra => SRGB_WRITE_WORDS,
         StorageImageClass::OneBitAlpha => ONE_BIT_ALPHA_WORDS,
+        StorageImageClass::SharedExponentBits => SHARED_EXPONENT_WORDS,
         // A `float` texel's rounding, then four lanes' bits.
         StorageImageClass::HalfBits => {
             let half = crate::lower::arith::legal::Form {
@@ -2052,6 +2325,10 @@ pub(crate) fn class_write_words(class: StorageImageClass) -> u32 {
         _ => 0,
     }
 }
+
+/// The words of [`shared_exponent_word`], at most: three channels' extract, clamp and mantissa
+/// (about twelve instructions each), the exponent's six, the word's placement, and the constants.
+pub(crate) const SHARED_EXPONENT_WORDS: u32 = 3 * 12 * 6 + 8 * 6 + 3 * 6 + 12 * 4;
 
 /// The words of [`one_bit_alpha`]: the extract, comparison, select and insert, and the
 /// constants.
@@ -2152,8 +2429,8 @@ fn norm_codes(
 /// `[0, 1]`, a NaN 0, the exact product with 255 rounded to nearest) times the `f32` nearest `1 /
 /// 255`, the rule (`color_write::round`). A device's conversion to the code may take either
 /// neighbour of the product: the RTX 3090 stored the code below on 22 of the
-/// `extended_range_planes` lane's 1,024 alpha values whose product lies just above a half (EV
-/// TXN-xrl5-nvidia), where Metal and the other venues stored the nearest.
+/// `extended_range_planes` lane's 1,024 alpha values whose product lies just above a half, where
+/// Metal and the other venues stored the nearest.
 fn argb_codes(fb: &mut FunctionBuilder<'_>, form: TexelForm, x: SValue) -> BResult<SValue> {
     use crate::lower::arith::color_write;
     use crate::lower::arith::legal::{FloatFmt, Form, Held};
@@ -2231,7 +2508,7 @@ fn swizzled_texel(
 
 /// `v`, a four-lane held texel of `form` written to a storage slot of
 /// `LoweringInputs::swizzled_storage`, with the swizzle `word` undone as plain Metal undoes it
-/// (EV RRP-probe1-m4, an M4 under macOS 27.0.1): channel `c` takes the lane `i` of the first of the
+/// (an M4 under macOS 27.0.1): channel `c` takes the lane `i` of the first of the
 /// swizzle's four sources that is channel `c` (raw value `2 + c`), and its own lane `c` where no
 /// source is. A permutation's inverse, and for a swizzle with a zero, a one or a repeated source
 /// the same rule: `RRRR` stores `v` as it is, `GR01` on two channels stores `(v.y, v.x)`.
@@ -2944,6 +3221,22 @@ fn read(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, r: &Read) -> BResult<
     } else {
         texel_memory(cx, fb, &r.image)?
     };
+    // A slot the draw reads through a snapshot (`LoweringInputs::snapshot_textures`): its
+    // interface fact admits only the plain fetch of a level the snapshot's copy makes, through the
+    // image the copy fetches from.
+    let snapshot = match r.image {
+        ImageRef::Slot(index) => {
+            let plain = sampled
+                && spec.is_none()
+                && sample.is_none()
+                && r.edge.is_none()
+                && !r.level_views
+                && within.is_none()
+                && r.raw == cx.decl.families.texture.raw.contains_key(&index);
+            crate::lower::fragment::snapshot_prepare(cx, fb, index, img, plain)?
+        }
+        ImageRef::Heap { .. } => None,
+    };
     let access = move |fb: &mut FunctionBuilder<'_>, sparse: bool| -> BResult<SValue> {
         match (sampled, sparse) {
             (true, false) => fb.fetch(img, coord, &ops),
@@ -3001,7 +3294,13 @@ fn read(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, r: &Read) -> BResult<
             inb = Some(and(fb, inb, kept)?);
             (texel, Some(word))
         }
-        None => (access(fb, false)?, None),
+        None => match snapshot {
+            Some(s) => (
+                crate::lower::fragment::snapshot_read(cx, fb, s, coord)?,
+                None,
+            ),
+            None => (access(fb, false)?, None),
+        },
     };
     // A heap member of a form a heap reads: its raw texel's value, Metal's out-of-bounds texel
     // selected against its own image, which the float array's test below then leaves.
@@ -3014,6 +3313,12 @@ fn read(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, r: &Read) -> BResult<
             texel
         }
         false => texel,
+    };
+    // An `A8Unorm` storage member's texel held in red, Metal's `(0, 0, 0, r)` before Metal's
+    // out-of-bounds texel is selected.
+    let texel = match (r.heap_alpha_red, r.image) {
+        (true, ImageRef::Heap { handle, .. }) => heap_alpha_in_red(cx, fb, handle, texel, true)?,
+        _ => texel,
     };
     // An extended-range texel's value, decoded from its raw code before Metal's out-of-bounds
     // texel is selected.
@@ -3468,6 +3773,11 @@ fn write(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, w: &Write) -> BResul
     };
     // An integer texel's lanes, saturated to the format's channels as Metal stores them.
     let texel = saturated(cx, fb, &decl, (w.saturate, w.texel), texel)?;
+    // An `A8Unorm` storage member's alpha, stored in its image's red.
+    let texel = match (w.heap_alpha_red, w.image) {
+        (true, ImageRef::Heap { handle, .. }) => heap_alpha_in_red(cx, fb, handle, texel, false)?,
+        _ => texel,
+    };
     // A `float` through a heap handle, rounded where the handle's class is a half-float
     // format's.
     let texel = match (w.heap_half, w.image) {

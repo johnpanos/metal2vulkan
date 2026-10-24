@@ -1,9 +1,9 @@
-// Owned fixture (WP-TXN2, DESIGN D556; written for this repository): a kernel's `float` write
+// Owned fixture (written for this repository): a kernel's `float` write
 // to a storage texture, one thread per texel, of buffer 0's element at the thread's index
 // (`gid.y * width + gid.x`, the row's width in buffer 1): through `access::write` and
 // `access::read_write` of a `texture2d`, through a `texture_buffer`, and through an argument
 // buffer's `texture2d` (buffer 2). Bound to a half-float texture, Metal rounds each channel toward
-// zero (EV TXN-hkw-m4). Loop-free.
+// zero. Loop-free.
 // metal-fast-math: off
 #include <metal_stdlib>
 using namespace metal;

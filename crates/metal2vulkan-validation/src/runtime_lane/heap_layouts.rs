@@ -4,10 +4,11 @@
 //! - **Tiles.** A texture of a plain format that Metal keeps uncompressed lies in the heap's
 //!   bytes as Metal's tiles hold it: each element (a texel) in the tile of the largest 16 KiB
 //!   whose side is the level's own where shorter, the tiles in rows, the elements of a tile in
-//!   Morton order (`x0 y0 x1 y1 ...`, the longer side's extra bits on top). Its `replaceRegion`
-//!   and `getBytes`, the GPU's blits, and the CPU's and a buffer's writes over the bytes all meet
-//!   the texels at those bytes, and no byte between them changes. The runtime counts the texture
-//!   (`WorkCounts::heap_textures_tiled`) and announces no layout notice. Each lane-side offset
+//!   Morton order (`x0 y0 x1 y1 ...`, the longer side's extra bits on top). The bytes it is made
+//!   over, its `replaceRegion` and `getBytes`, the GPU's blits, and the CPU's and a buffer's
+//!   writes over the bytes all meet the texels at those bytes, and no byte between them changes.
+//!   The runtime counts the texture (`WorkCounts::heap_textures_tiled`), announces no layout
+//!   notice, and writes no zeros making it. Each lane-side offset
 //!   is restated here from the measured rule, apart from the runtime's
 //!   (`texture/heap_tiled.rs`).
 //! - **Two ways in one command.** A dispatch that writes the tiled texture's texel (0, 0) and
@@ -16,9 +17,9 @@
 //!   other byte the heap's, through the merge (`shadow-merge` once).
 //! - **Blocks**. A BC, ETC2, EAC or ASTC texture lies as its device's Metal level lays it out, at
 //!   each level: each row's span, every block numbered as the probes numbered it, hashes to the
-//!   M4's at 27.0.1 through `replaceRegion` and blits, and at 26.7 to the M3 Max's CPU's through
-//!   `replaceRegion` and its GPU's through blits; `getBytes` reads the CPU's writes of the CPU's
-//!   bytes.
+//!   M3 Max's and the M4's at 27.0.1 through `replaceRegion` and blits, and at 26.7 to the M3
+//!   Max's CPU's through `replaceRegion` and its GPU's through blits; `getBytes` reads the CPU's
+//!   writes of the CPU's bytes.
 //! - **Layouts the runtime does not follow** ([`HEAP_LAYOUTS`]). A texture Metal keeps
 //!   losslessly compressed (`heap-texture-lossless-layout`), one of a block-compressed format
 //!   whose placement no level measures (PVRTC, `heap-texture-block-compressed-layout`) and one
@@ -60,7 +61,7 @@ pub(super) const HEAP_LAYOUTS: [Degradation; 3] = [
 /// Where each texture lies in its heap: a multiple of every alignment Metal answers.
 const OFFSET: u64 = 64 << 10;
 
-/// Metal's largest tile of `unit`-byte elements, 16 KiB (EVs TXN3-htl1-m4 to TXN3-htl5-m4).
+/// Metal's largest tile of `unit`-byte elements, 16 KiB.
 fn largest_tile(unit: u64) -> [u64; 2] {
     match unit {
         1 => [128, 128],
@@ -283,9 +284,10 @@ fn layouts_counted(before: &WorkCounts, after: &WorkCounts) -> [u64; 4] {
 }
 
 /// A plain texture in a heap over host pages lies in Metal's tiles (the module docs): its
-/// answered size holds them; `replaceRegion`, a blit into it, the CPU's writes and a buffer's
-/// over the bytes meet its texels there, and `getBytes` and a blit out of it read them; no byte
-/// between them changes. Counted tiled, with no layout notice.
+/// answered size holds them; the bytes it is made over, `replaceRegion`, a blit into it, the CPU's
+/// writes and a buffer's over the bytes meet its texels there, and `getBytes` and a blit out of it
+/// read them; no byte between them changes. Counted tiled, with no layout notice; made with no
+/// zeros (`WorkCounts::images_started_on_the_host`, `staging_submissions`).
 #[test]
 fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
     on_device(|device, messages| {
@@ -303,16 +305,36 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
                 "{what}: the answer {answer:?} holds Metal's tiles ({} bytes)",
                 plain.span()
             );
+            let len = plain.texels() * plain.unit as usize;
+            let zero = vec![0u8; HEAP];
+
+            // What the heap's bytes held before the texture was made is its texels: making it
+            // writes nothing (its image starts as its memory lies, each move in writing every
+            // element first: no copy on the host, no staging submission), and a blit reads them.
+            let held = named(len, 5);
+            mapping.write(0, &plain.laid(&held, &zero));
             let before = device.work_counts();
             let texture = heap.new_texture_at_offset(&descriptor, OFFSET).unwrap();
+            let made = device.work_counts();
             assert_eq!(
-                layouts_counted(&before, &device.work_counts()),
+                layouts_counted(&before, &made),
                 [1, 0, 0, 0],
                 "{what}: counted tiled"
             );
+            assert_eq!(
+                (made.images_started_on_the_host, made.staging_submissions),
+                (
+                    before.images_started_on_the_host,
+                    before.staging_submissions
+                ),
+                "{what}: made with no zeros"
+            );
             assert_eq!(layout_notices(messages), [], "{what}");
-            let len = plain.texels() * plain.unit as usize;
-            let zero = vec![0u8; HEAP];
+            assert_eq!(
+                blit_out(&queue, &texture, &plain),
+                held,
+                "{what}: the bytes it was made over"
+            );
             mapping.fill(0);
 
             // `replaceRegion` writes the texels into Metal's tiles; `getBytes` and a blit read
@@ -497,7 +519,7 @@ fn heap_textures_laid_out_otherwise_than_metal_s_tiles_are_counted_and_announced
             TextureDescriptor::texture_2d(PixelFormat::Depth32FloatStencil8, 32, 32, false);
         aspects.resource_options = shared();
         aspects.usage = read | TextureUsage::RENDER_TARGET;
-        // Metal's answer for the compressed shape (SPR-heaptex1, `heap_textures`): its
+        // Metal's answer for the compressed shape (`heap_textures`): its
         // metadata included.
         let answer = device.heap_texture_size_and_align(&compressed).unwrap();
         assert!(answer.size >= 16512, "{answer:?}");
@@ -660,10 +682,9 @@ fn making_many_textures_of_a_layout_kind_announces_it_once_and_counts_each() {
 }
 
 /// A block-compressed texture's shape, one of the rows of `runtime::tests::heap_tiled_blocks`
-/// (EVs TXN3-htl5-m4 and TXN3-bcsw2-m4 to TXN3-bcsw4-m4, and the same probes on an Apple M3 Max):
-/// its format, block bytes and texels, type, level-0 extent, levels and array length, Metal's
-/// size, and the FNV-1a hashes of its span with every block numbered in turn, as each level's
-/// Metal lays it out.
+/// (and the same probes on an Apple M3 Max): its format, block bytes and texels, type, level-0
+/// extent, levels and array length, Metal's size, and the FNV-1a hashes of its span with every
+/// block numbered in turn, as each level's Metal lays it out.
 struct Blocks {
     format: PixelFormat,
     unit: u64,
@@ -903,11 +924,15 @@ fn block_rows_lie_as_their_level_lays_them_out(
             return;
         };
         let descriptor = row.descriptor();
-        // A format the device has no image of is refused before any layout (lavapipe's ETC2 and
-        // EAC).
+        // A format the device has no image of is refused before any layout, and an ASTC texture
+        // on a device without ASTC (`RuntimeGap::DecodedHeapTexture`); an ETC2 or EAC texture on a
+        // device without them lies in a carrier of the same blocks (`etc.rs`).
         let answer = match device.heap_texture_size_and_align(&descriptor) {
             Ok(answer) => answer,
-            Err(error @ Error::Unsupported(_)) => {
+            Err(
+                error @ (Error::Unsupported(_)
+                | Error::NotImplemented(RuntimeGap::DecodedHeapTexture)),
+            ) => {
                 eprintln!("HEAPLAYOUT {what}: refused {error:?}");
                 continue;
             }
@@ -1029,7 +1054,7 @@ fn block_rows_lie_as_their_level_lays_them_out(
 /// resolves it into a texture that reads the clear colour in every texel, and the heap's bytes
 /// keep every byte they held. Without it, which Metal keeps uncompressed, refused
 /// `NotImplemented(HostHeapUncompressedMultisample)`. The size query answers at least Metal's for
-/// each on every device (66048 and 65536 bytes at 128, EV FPV-hm2-m4; and measured for the
+/// each on every device (66048 and 65536 bytes at 128; and measured for the
 /// uncompressed one where the device cannot hold its samples in the heap's bytes, an NVIDIA GPU's:
 /// no optimal image in host-visible memory, no multisample linear image).
 #[test]

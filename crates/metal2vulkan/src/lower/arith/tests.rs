@@ -17,7 +17,7 @@ use super::ops::{self, BitcastPlan, CastKind};
 use crate::air::ir::{BinOp as AirBin, FloatPredicate, IntPredicate};
 use crate::device::DeviceProfile;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
-use crate::spirv::builder::{FunctionBuilder, MaskForm, ModuleBuilder, ProductForm};
+use crate::spirv::builder::{FunctionBuilder, MaskForm, ModuleBuilder, ProductForm, QuantizeForm};
 use crate::spirv::error::BResult;
 use crate::spirv::ids::{FuncId, GlobalId, TypeId, Value};
 use crate::spirv::interp::{run, Buffer, Config, Resources};
@@ -382,6 +382,11 @@ fn wide_profile() -> DeviceProfile {
         })
         .expect("a committed profile with int64, float64, and float16")
 }
+
+/// The `half` roundings the blends' checks run under (`extended_range::blend::half_of`): the
+/// integer sequence every device answers alike, and the device's conversion under the 16-bit float
+/// controls, each checked against Metal's arithmetic.
+const HALF_FORMS: [QuantizeForm; 2] = [QuantizeForm::Integer, QuantizeForm::Controlled];
 
 /// One case: per operand, per lane, the held bits.
 type Case = Vec<Vec<u64>>;
@@ -1766,7 +1771,7 @@ fn a_narrow_mask_after_a_signed_clamp_is_an_extract_under_the_workaround() {
 }
 
 /// Metal's `round`: halves away from zero, and on `float` and `half` (`positive_zero`) a zero
-/// result is `+0` (`round(-0.3)` and `round(-0)` are `+0`, EV HRD-nan-edge-metal).
+/// result is `+0` (`round(-0.3)` and `round(-0)` are `+0`).
 fn metal_round(positive_zero: bool, x: f64) -> f64 {
     let r = x.round();
     if positive_zero && r == 0.0 {
@@ -2515,16 +2520,16 @@ fn half_nan_answers_follow_the_measured_states() {
     }
 }
 
-/// The float facts of a profile whose `float` fused multiply-add is `OpFmaKHR`, whose `half` one
-/// is the routine, and whose `float` functions and denormals are the device's.
+/// The float facts of a profile whose `float` fused multiply-add is `OpFmaKHR`, checked by the
+/// integer routine, whose `half` one is the routine, and whose `float` functions are the device's.
 const KHR_FACTS: super::FloatFacts = super::FloatFacts {
     routes: super::fma::Routes {
         float: super::fma::Route::Khr,
         half: super::fma::Route::HalfOdd,
+        tiny: Some(super::fma::Route::Soft),
     },
     reciprocal: super::divide::Reciprocal::Rounded,
     metal_functions: false,
-    metal_denormals: false,
     native: false,
     nan_native: false,
     native_min_max: false,
@@ -2690,7 +2695,7 @@ fn nan_answers_follow_the_measured_flag_states() {
 }
 
 /// `powr(x, y)` is Metal's canonical NaN where Metal's `exp2(y * log2(x))` is a NaN for operands
-/// that are not (EV HRD-nan-edge-metal): `x < 0` (`-0` is not), `y = ±0` with `x = ±0` or `+inf`,
+/// that are not: `x < 0` (`-0` is not), `y = ±0` with `x = ±0` or `+inf`,
 /// and `y = ±inf` with `x = 1`, an `f32` denormal read as a zero by the zero tests and, in
 /// `fast::powr` only, by the sign test; every other lane keeps the device's result, which the
 /// kernel's third input stands for, except that `fast::powr` answers IEEE's value where `y ·
@@ -3421,15 +3426,14 @@ fn fast_variants_refine_float_functions() {
         for op in [FloatFn::Sign, FloatFn::Saturate] {
             assert_eq!(refine(op, true, fmf, f32_), op);
         }
-        // `llvm.minnum` and `llvm.maxnum` (never `fast_`) with every flag, Metal's fast-math `a < b
-        // ? a : b` and `a > b ? a : b`, are Metal's `fmin` and `fmax` on `float`; any other call
-        // keeps LLVM's function.
+        // `llvm.minnum` and `llvm.maxnum` (never `fast_`), Metal's fast-math `a < b ? a : b` and
+        // `a > b ? a : b`, are Metal's `fmin` and `fmax` on `float` with any flags; on the other
+        // formats they keep LLVM's function.
         for (op, metal) in [
             (FloatFn::MinNum, FloatFn::Min),
             (FloatFn::MaxNum, FloatFn::Max),
         ] {
-            let want = if fmf == every { metal } else { op };
-            assert_eq!(refine(op, false, fmf, f32_), want);
+            assert_eq!(refine(op, false, fmf, f32_), metal);
             assert_eq!(refine(op, false, fmf, float(16)), op);
             assert_eq!(refine(op, false, fmf, bfloat()), op);
         }
@@ -4099,7 +4103,11 @@ fn aggregate_leaf_total_is_capped_before_expansion() {
 
 mod atan2;
 mod bicubic;
+mod blend16;
+mod blend8;
+mod blend_packed;
 mod color_write;
+mod depth16;
 mod divide;
 mod fast;
 mod float_texel;
@@ -4110,6 +4118,7 @@ mod libm_exp;
 mod narrow;
 mod norm_write;
 mod round_texel;
+mod snapshot_codes;
 mod specials;
 mod texel_round;
 mod wide;

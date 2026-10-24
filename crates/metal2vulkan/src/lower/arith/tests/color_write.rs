@@ -345,7 +345,7 @@ fn run_rules_in(what: &str, rules: [Option<ChannelWrite>; 4], values: &[f32], cl
 /// nearest stores the code, whatever it does at ties, and so does Metal; and the linear value of
 /// every sRGB byte is that byte's in Metal's encode.
 /// A render state's half-float channel under `textureWriteRoundingMode` 2 rounds to nearest even
-/// (`color_writes::HALF_NEAREST`): the consumer's spot values on an M3 Max and EV TXN2-twr-m4's
+/// (`color_writes::HALF_NEAREST`): the consumer's spot values on an M3 Max and our probe's
 /// on an M4 (1 + 3 * 2^-12 to `0x3C01`, the tie 1 + 3 * 2^-11 to `0x3C02`, 65519 to `0x7BFF`, from
 /// 65520 infinity), and on the interpreter every 7th half and the ties beside it, the unsigned
 /// 11- and 10-bit grids under the same rule, and the specials: each lane of an output beside
@@ -498,7 +498,7 @@ fn narrow_channels_round_to_metals_codes() {
 }
 
 /// The packed 16-bit formats' channels (`ChannelWrite::HalfUnorm`) round the value to a half
-/// first, then as unorm channels: EV TXN2-pk16b-m3's spot values on an M3 Max (`0x3C842FFF`, a
+/// first, then as unorm channels: our probe's spot values on an M3 Max (`0x3C842FFF`, a
 /// half below 1/62, to 5-bit code 0; `0x3D463000` to 2; `0x3EFFFFFF`, whose half is 0.5, to 16
 /// of 31 and 32 of 63; 0.5 to 1-bit code 0; `0x3D089000` to 4-bit code 0; `0x3C021000` to 6-bit
 /// code 0), then on the interpreter the values beside every code and tie of 1, 4, 5 and 6 bits,
@@ -893,4 +893,73 @@ fn half_bits_are_each_halfs_bits() {
         "half_bits is {words} words, bound {}",
         color_write::HALF_BITS_WORDS
     );
+}
+
+/// A word attachment's encode (`stage_io::word_color::encode`) stores Metal's word for every
+/// packed 16-bit layout: each lane rounded to `half`, then its code rounded to even
+/// (`WordAttachment::output_word`, which the M3 Max's draws and clears matched on every texel),
+/// over the values beside each code and tie of the 1-, 4-, 5- and 6-bit channels, the half grid
+/// and the specials, each lane of a case a different value, and a three-lane output's alpha 1;
+/// and `RGB9E5Float`'s word of a `float` output, its mantissas truncated, over those and values
+/// across its range.
+#[test]
+fn word_attachments_store_metals_words() {
+    use crate::metal::format::WordAttachment;
+    use crate::metal::PixelFormat;
+    let mut values = Vec::new();
+    for m in [1, 15, 31, 63] {
+        values.extend(around_codes(m, false, 1, 2));
+    }
+    values.extend(half_values().into_iter().step_by(5));
+    values.extend(specials());
+    // `RGB9E5Float`'s range: past its largest, its smallest step, and between.
+    values.extend([
+        70000.0,
+        65408.0,
+        65409.0,
+        1e-7,
+        2f32.powi(-24),
+        3e-5,
+        1000.3,
+        2.5,
+        0.375,
+    ]);
+    let n = values.len();
+    let quad = |i: usize| [0, 1, 2, 3].map(|l| values[(i + l * 7919) % n]);
+    for pf in [
+        PixelFormat::B5G6R5Unorm,
+        PixelFormat::A1BGR5Unorm,
+        PixelFormat::ABGR4Unorm,
+        PixelFormat::BGR5A1Unorm,
+        PixelFormat::RGB9E5Float,
+    ] {
+        let word = WordAttachment::layout(pf).expect("a word layout");
+        for lanes in [4u8, 3] {
+            let f = vec(float(32), lanes);
+            let cases: Vec<Case> = (0..n)
+                .map(|i| {
+                    let q = quad(i);
+                    vec![q[..usize::from(lanes)]
+                        .iter()
+                        .map(|x| u64::from(x.to_bits()))
+                        .collect()]
+                })
+                .collect();
+            check_accept(
+                &format!("{pf:?} word of {lanes} lanes"),
+                &[f],
+                int(32),
+                &|fb, x| crate::lower::stage_io::word_color::encode(fb, word, (f, x[0]), None),
+                &cases,
+                &|c| {
+                    let mut rgba = [0.0, 0.0, 0.0, 1.0];
+                    for (out, b) in rgba.iter_mut().zip(&c[0]) {
+                        *out = f32::from_bits(*b as u32);
+                    }
+                    Some(vec![u64::from(word.output_word(rgba))])
+                },
+                &|g, w| g == w,
+            );
+        }
+    }
 }

@@ -1,90 +1,19 @@
-//! Which framebuffer-fetch pipelines the runtime makes: the compile layer's ordered forms, never
-//! the unordered one `AcceptUnordered` admits; and which color render targets may take `STORAGE`
-//! usage for the interlock form, or the sample planes' copies' usage, and the answers remembered
-//! for them (`framebuffer_fetch.rs`).
-//!
-//! The graphics states are the compile layer's three fetch outputs as
-//! `pipeline::compile::tests::a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it`
-//! compiles them from `fragment_fetch.ll`'s `fetch_scalar` into an `R32Float` attachment:
-//! ordered input attachments on a device with rasterization-order access, the interlocked
-//! storage attachment on one with the pixel interlock alone, and, under `AcceptUnordered`,
-//! unordered input attachments on a synthetic profile with neither feature (or a blending
-//! attachment on the interlock alone). Compiling them here would assemble the fixture through
-//! test infrastructure the runtime may not reach (`api_surface`'s public-layer check).
+//! Which color render targets may take `STORAGE` usage for framebuffer fetch's interlock form, or
+//! the sample planes' copies' usage, and the answers remembered for them (`framebuffer_fetch.rs`).
 
 use super::image_plan::{committed, facts};
 use super::texture_descriptor::APPLE;
-use crate::error::Error;
 use crate::framebuffer_fetch::{
-    fetch_candidate, ordered, planes_candidate, planes_copies, planes_copies_gap,
-    storage_candidate, stores_samples, through_inputs, through_multisampled_storage,
-    through_planes, through_storage, UsageAnswers,
+    fetch_candidate, planes_candidate, planes_copies, planes_copies_gap, storage_candidate,
+    stores_samples, through_inputs, through_multisampled_storage, through_planes, through_storage,
+    UsageAnswers,
 };
 use crate::image_plan::{plan_image, ImagePlan};
 use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
 use metal2vulkan::bind::PlanesCopy;
-use metal2vulkan::device::{FormatUsage, VkFeature};
-use metal2vulkan::error::{Capability, Feature, Needs};
+use metal2vulkan::device::FormatUsage;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
-use metal2vulkan::pipeline::{
-    ColorAttachmentState, GraphicsState, InputAttachmentUse, SampledType, StorageAttachmentUse,
-    StorageAttachmentView,
-};
-use metal2vulkan::vk::ImageCreateFlags;
-use metal2vulkan::vk::{
-    ColorComponentFlags, Format, ImageUsageFlags, PrimitiveTopology, SampleCountFlags,
-};
-
-/// The graphics state of a fetching pipeline: `input` for an input attachment, ordered by
-/// rasterization-order access where `access`; otherwise the storage attachment.
-fn fetching(input: bool, access: bool) -> GraphicsState {
-    let write_mask = ColorComponentFlags::R
-        | ColorComponentFlags::G
-        | ColorComponentFlags::B
-        | ColorComponentFlags::A;
-    let color = ColorAttachmentState::new(Format::R32_SFLOAT, write_mask, None);
-    let mut state = GraphicsState::new(PrimitiveTopology::TRIANGLE_LIST, SampleCountFlags::COUNT_1);
-    state.color_attachments = vec![input.then_some(color)];
-    state.input_attachments = input
-        .then_some(InputAttachmentUse::new(0, 0, SampledType::Float))
-        .into_iter()
-        .collect();
-    state.rasterization_order_attachment_access = input && access;
-    state.storage_attachments = (!input)
-        .then_some(StorageAttachmentUse::new(
-            0,
-            Format::R32_SFLOAT,
-            true,
-            false,
-            StorageAttachmentView::Attachment,
-        ))
-        .into_iter()
-        .collect();
-    state
-}
-
-/// The ordered forms are made, as is a pipeline that fetches nothing; the unordered input
-/// attachment is refused, naming the access that orders it.
-#[test]
-fn only_ordered_framebuffer_fetch_is_made() {
-    let mut plain = fetching(true, false);
-    plain.input_attachments.clear();
-    assert_eq!(ordered(&plain), Ok(()));
-    assert_eq!(ordered(&fetching(true, true)), Ok(()));
-    assert_eq!(ordered(&fetching(false, false)), Ok(()));
-    match ordered(&fetching(true, false)) {
-        Err(Error::Unsupported(u)) => assert_eq!(
-            (u.feature, u.needs),
-            (
-                Feature::FramebufferFetch,
-                Needs::AnyOf(vec![vec![Capability::Feature(
-                    VkFeature::RasterizationOrderColorAttachmentAccess
-                )]])
-            )
-        ),
-        other => panic!("the unordered fetch is made: {other:?}"),
-    }
-}
+use metal2vulkan::vk::{Format, ImageCreateFlags, ImageUsageFlags};
 
 /// A checked layout of a 2D texture of `pf`, `width` by 8, with `samples` (a multisample type
 /// above 1).
@@ -207,10 +136,11 @@ fn storage_is_offered_to_the_interlock_forms_color_targets() {
 }
 
 /// A multisampled `A8Unorm` render target held as `A8_UNORM`, whose class ("8-bit alpha") no
-/// copy format shares, is offered no planes copies' usage, on a device whose fetch reads planes
-/// too: no view in `R8_UINT` is listed for it.
+/// unsigned copy format shares, takes the planes copies in its own format
+/// (`PlanesCopy::Alpha8`), on a device whose fetch reads planes: its candidate is the plan sampled,
+/// neither mutable nor listing another format, which the copies then read and write directly.
 #[test]
-fn an_a8_target_is_offered_no_planes_copies() {
+fn an_a8_target_takes_the_planes_copies_in_its_own_format() {
     let mut planes = 0;
     for (name, desc, device) in committed() {
         let facts = facts(&desc, &device);
@@ -222,10 +152,27 @@ fn an_a8_target_is_offered_no_planes_copies() {
         if target.format != Format::A8_UNORM {
             continue;
         }
-        planes += usize::from(through_planes(profile, 4));
         assert_eq!(PlanesCopy::for_format(target.format), None, "{name}");
-        assert_eq!(planes_candidate(&target, profile), None, "{name}");
-        assert!(!planes_copies(&target), "{name}");
+        assert_eq!(
+            PlanesCopy::for_planes(target.format),
+            Some(PlanesCopy::Alpha8),
+            "{name}"
+        );
+        if !through_planes(profile, 4) || planes_copies_gap(target.format, profile).is_some() {
+            continue;
+        }
+        planes += 1;
+        let candidate = planes_candidate(&target, profile).expect("the planes' usage");
+        assert_eq!(
+            candidate,
+            ImagePlan {
+                usage: target.usage | ImageUsageFlags::SAMPLED,
+                ..target.clone()
+            },
+            "{name}"
+        );
+        assert!(planes_copies(&candidate), "{name}");
+        assert_eq!(planes_candidate(&candidate, profile), None, "{name}");
     }
     assert!(planes > 0, "a planes profile holds A8Unorm as A8_UNORM");
 }
@@ -428,4 +375,74 @@ fn multisampled_depth_stencil_targets_are_offered_sampled_where_the_copies_read_
         }
     }
     assert!(offered > 0);
+}
+
+/// A single-sample depth render target is offered sampled usage where its driver keeps a depth
+/// image's hierarchical depth in `GENERAL` only for a sampled image
+/// (`image_plan::hiz_candidate`, `DriverFact::SampledDepthKeepsHiZ`): never without the fact,
+/// never multisampled, never transient (memoryless), never a stencil alone, never already
+/// sampled; the candidate is the plan with `SAMPLED` added and nothing else changed. The committed
+/// Iris Xe of RPL-P's profile has the fact, and its `Depth32Float` target takes the usage.
+#[test]
+fn single_sample_depth_targets_are_offered_sampled_where_the_driver_keeps_hiz_so() {
+    use crate::image_plan::hiz_candidate;
+    use metal2vulkan::device::DriverFact;
+    let mut offered = Vec::new();
+    for (name, desc, device) in committed() {
+        let facts = facts(&desc, &device);
+        let profile = device.profile();
+        let keeps = desc
+            .driver_facts()
+            .contains(&DriverFact::SampledDepthKeepsHiZ);
+        for pf in [
+            PixelFormat::Depth16Unorm,
+            PixelFormat::Depth32Float,
+            PixelFormat::Stencil8,
+            PixelFormat::Depth32FloatStencil8,
+        ] {
+            for (samples, memoryless) in [(1, false), (1, true), (4, false)] {
+                let usage = TextureUsage::RENDER_TARGET;
+                let Ok(target) = plan_image(&layout(pf, 8, samples), usage, memoryless, &facts)
+                else {
+                    continue;
+                };
+                assert!(hiz_candidate(&target, profile, false).is_none());
+                let candidate = hiz_candidate(&target, profile, keeps);
+                let samples_it = profile.supports_format(target.format, FormatUsage::SampledImage);
+                let vk_usage = target.usage;
+                let open = vk_usage.contains(ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                    && !vk_usage.intersects(
+                        ImageUsageFlags::TRANSIENT_ATTACHMENT | ImageUsageFlags::SAMPLED,
+                    );
+                let depth = pf != PixelFormat::Stencil8;
+                assert_eq!(
+                    candidate.is_some(),
+                    keeps && samples == 1 && depth && open && samples_it,
+                    "{name} {pf:?} {samples}x memoryless {memoryless}: {vk_usage:?}"
+                );
+                if let Some(candidate) = candidate {
+                    let mut expected = target.clone();
+                    expected.usage |= ImageUsageFlags::SAMPLED;
+                    assert_eq!(candidate, expected, "{name} {pf:?}");
+                    offered.push((name.clone(), pf));
+                }
+                let sampled = plan_image(
+                    &layout(pf, 8, samples),
+                    usage | TextureUsage::SHADER_READ,
+                    memoryless,
+                    &facts,
+                );
+                if let Ok(sampled) = sampled {
+                    assert!(
+                        hiz_candidate(&sampled, profile, true).is_none(),
+                        "{name} {pf:?}: already sampled"
+                    );
+                }
+            }
+        }
+    }
+    assert!(offered.contains(&(
+        "intel-irisxe-rplp-anv".to_owned(),
+        PixelFormat::Depth32Float
+    )));
 }

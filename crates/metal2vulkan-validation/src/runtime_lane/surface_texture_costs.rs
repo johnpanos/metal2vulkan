@@ -22,45 +22,34 @@
 //! and 90th percentile of the host's time making the buffer, making the texture and releasing
 //! both, per texture; per frame, the encoding and the commit-to-completion wall time and the
 //! process's CPU time; and the device's work counts per frame that the path moves (dma-buf images
-//! and fallbacks, shadows and those zeroed as made, images at Metal's row pitch over host pages
-//! and the driver's refusals of them, asked and recalled, images started on the host, internal
-//! submissions, shadows' copies and the texels their copies back move). `SURFTEX-QUERY` lines
-//! print what the driver answers for a `DRM_FORMAT_MOD_LINEAR` image of host allocations.
-//!
-//! [`pitch_classes`] asks which row pitches the device lays a texture over a no-copy buffer's
-//! host pages at: for each of a few formats and usages (a device each), widths, and pitches of
-//! each power-of-two class from 16 bytes up (a pitch's class is the largest power of two dividing
-//! it; two pitches a class, the smallest odd multiples of the class that cover the row), each
-//! texture made twice, the form its making took (the driver's own linear image, an image at
-//! Metal's row pitch, a shadow where the driver refused that image, asked or recalled, or a shadow
-//! for another reason) and the median time of each form's making. Printed per format, usage and
-//! class (`SURFTEX-PITCH`): the forms, and whether every texture of the class that the driver's
-//! own linear image does not alias took one answer; per format and usage (`SURFTEX-PITCH-RULE`)
-//! the classes at Metal's pitch, shadowed and mixed, and the reason the first shadow announced.
+//! and fallbacks, shadows and those zeroed as made, images started on the host, internal
+//! submissions, shadows' copies and the texels their copies in and back move, the merges'
+//! scratches reused and zeroed, the merges that fetched their texels, the command buffers begun by
+//! what for, the render pass begins and secondary executions replayed, and the passes whose first
+//! instance recorded inline).
 //!
 //! [`surface_texture_cost_parts`] takes the frame apart over anonymous pages: the textures' making
 //! around an empty command buffer, the passes that store, the passes that store `DontCare`, the
 //! passes that draw and store, the blits, and both, so a shadow's copies in and back show apart
-//! from the rest (`SURFTEX-PART`).
+//! from the rest (`SURFTEX-PART`), then over `Private` buffers: a shadow over the pages, which the
+//! CPU may write, is merged back, and one over a tracked `Private` buffer's bytes copied back.
 //!
 //! [`shadow_copy_costs`] times a shadow's copies alone, and the same bytes moved between other
 //! memories, to tell the image's tiling from the pages' memory (`SURFTEX-COPY`).
 //!
 //! [`read_only_padded_costs`] times a compositor's frame over the padded layouts' textures made
-//! with `ShaderRead` usage alone, each sampled by a draw, under each `PaddedReadsPolicy`: an image
-//! over the rows (`Alias`, the default) against the shadow copied in at each use (`Shadow`),
-//! interleaved (`SURFTEX-READS`).
+//! with `ShaderRead` usage alone, each sampled by a draw: shadows copied in at each use, made each
+//! frame or once (`SURFTEX-READS`).
 //!
-//! All five are ignored by default: measurements, not checks. Run them by name with `--run-ignored all`, in a
-//! build with `--cfg m2v_system_alloc`, whose lib test binary keeps the system allocator as a
-//! consumer's process does.
+//! All four are ignored by default: measurements, not checks. Run them by name with
+//! `--run-ignored all`, in a build with `--cfg m2v_system_alloc`, whose lib test binary keeps the
+//! system allocator as a consumer's process does.
 
 use super::dma_buf_imports::{udmabuf_openable, Calls, Memfd, View};
 use super::host_memory::{host_page, Mapping, GUEST_PAGE};
 use super::no_copy_textures::{blending, floats, staged};
 use super::{validated_device_with, Messages, ScratchCache, WAIT};
 use crate::gpu::TEST_DEVICE;
-use ash::vk;
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan_runtime::{
     BlitOption, Buffer, CommandQueue, Device, HostMemory, IoSurfacePlane, LoadAction, Origin,
@@ -168,6 +157,15 @@ fn plane_texture(buffer: &Buffer, width: u64, height: u64, bpr: u64) -> Texture 
     buffer
         .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, bpr, false))
         .unwrap()
+}
+
+/// A texture `width`x`height` with rows `bpr` bytes apart over the `Private` `buffer`'s first
+/// byte, as [`plane_texture`]'s is used.
+fn private_texture(buffer: &Buffer, width: u64, height: u64, bpr: u64) -> Texture {
+    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, height, false);
+    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    d.resource_options = ResourceOptions::private();
+    buffer.new_texture(&d, 0, bpr).unwrap()
 }
 
 /// Whether `texture`'s texels are its own image over the buffer's memory: aliased, not shadowed.
@@ -286,21 +284,16 @@ fn frame(
 fn counts_per_frame(before: &WorkCounts, after: &WorkCounts, frames: usize) -> String {
     let per = |a: u64, b: u64| (a - b) as f64 / frames as f64;
     format!(
-        "shadowed textures {:.2} (zeroed {:.2}), pitched host images {:.2} (refused {:.2}, \
-         recalled {:.2}), dma-buf images {:.2}, dma-buf image fallbacks {:.2}, dma-buf imports \
+        "shadowed textures {:.2} (zeroed {:.2}), dma-buf images {:.2}, dma-buf image fallbacks {:.2}, dma-buf imports \
          {:.2}, images started on the host {:.2}, internal submissions {:.2}, staging submissions \
-         {:.2}, shadow copies {:.2} (texels copied back {:.0})",
+         {:.2}, shadow copies {:.2} (texels copied in {:.0}, back {:.0}; copies back dispatched \
+         {:.2}; keeps and merges dispatched {:.2}, texels kept {:.0}; merge scratches reused \
+         {:.2}, zeroed {:.2}; merges fetched {:.2}); command buffers begun {:.2} (encoders' own \
+         {:.2}, segments {:.2}, draws' secondaries {:.2}, batches' {:.2}, barriers kept {:.2}, \
+         internal {:.2}), render pass begins replayed {:.2}, secondaries executed {:.2}, passes \
+         recorded inline {:.2}",
         per(after.shadowed_textures, before.shadowed_textures),
         per(after.shadows_zeroed, before.shadows_zeroed),
-        per(after.pitched_host_images, before.pitched_host_images),
-        per(
-            after.pitched_host_image_refusals,
-            before.pitched_host_image_refusals
-        ),
-        per(
-            after.pitched_host_image_refusals_recalled,
-            before.pitched_host_image_refusals_recalled
-        ),
         per(after.dma_buf_images, before.dma_buf_images),
         per(
             after.dma_buf_image_fallbacks,
@@ -315,76 +308,66 @@ fn counts_per_frame(before: &WorkCounts, after: &WorkCounts, frames: usize) -> S
         per(after.staging_submissions, before.staging_submissions),
         per(after.shadow_copies, before.shadow_copies),
         per(
+            after.shadow_texels_copied_in,
+            before.shadow_texels_copied_in
+        ),
+        per(
             after.shadow_texels_copied_back,
             before.shadow_texels_copied_back
         ),
+        per(
+            after.shadow_copies_back_dispatched,
+            before.shadow_copies_back_dispatched
+        ),
+        per(
+            after.shadow_merge_copies_dispatched,
+            before.shadow_merge_copies_dispatched
+        ),
+        per(after.shadow_texels_kept, before.shadow_texels_kept),
+        per(
+            after.shadow_merge_scratches_reused,
+            before.shadow_merge_scratches_reused
+        ),
+        per(
+            after.shadow_merge_scratches_zeroed,
+            before.shadow_merge_scratches_zeroed
+        ),
+        per(after.shadow_merges_fetched, before.shadow_merges_fetched),
+        per(after.command_buffers_begun, before.command_buffers_begun),
+        per(
+            after.command_buffers_begun_encoders,
+            before.command_buffers_begun_encoders
+        ),
+        per(
+            after.command_buffers_begun_segments + after.command_buffers_begun_continuations,
+            before.command_buffers_begun_segments + before.command_buffers_begun_continuations
+        ),
+        per(
+            after.command_buffers_begun_secondaries,
+            before.command_buffers_begun_secondaries
+        ),
+        per(
+            after.command_buffers_begun_batch_work + after.command_buffers_begun_batch_barriers,
+            before.command_buffers_begun_batch_work + before.command_buffers_begun_batch_barriers
+        ),
+        per(
+            after.command_buffers_begun_kept_barriers,
+            before.command_buffers_begun_kept_barriers
+        ),
+        per(
+            after.command_buffers_begun_internal,
+            before.command_buffers_begun_internal
+        ),
+        per(
+            after.commands_replayed.cmd_begin_render_pass,
+            before.commands_replayed.cmd_begin_render_pass
+        ),
+        per(
+            after.commands_replayed.cmd_execute_commands,
+            before.commands_replayed.cmd_execute_commands
+        ),
+        per(after.inline_passes, before.inline_passes),
     )
-}
-
-/// What the driver answers for a `B8G8R8A8_UNORM` image of `DRM_FORMAT_MOD_LINEAR` tiling made for
-/// host allocations, at each usage the runtime may ask of a surface's texture: whether it makes
-/// one, and whether it imports host memory for it (`SURFTEX-QUERY`).
-fn print_host_modifier_queries(device: &Device) {
-    // SAFETY: read while the device lives; nothing is made.
-    let raw = unsafe { device.raw() };
-    let sampled = vk::ImageUsageFlags::SAMPLED
-        | vk::ImageUsageFlags::TRANSFER_SRC
-        | vk::ImageUsageFlags::TRANSFER_DST;
-    for (name, usage) in [
-        ("sampled", sampled),
-        (
-            "sampled+color",
-            sampled | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        ),
-        (
-            "sampled+color+storage",
-            sampled | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
-        ),
-    ] {
-        for (tiling, modifier, tiling_name) in [
-            (vk::ImageTiling::LINEAR, false, "LINEAR"),
-            (
-                vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
-                true,
-                "DRM_FORMAT_MOD_LINEAR",
-            ),
-        ] {
-            let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
-                .drm_format_modifier(0)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let mut host = vk::PhysicalDeviceExternalImageFormatInfo::default()
-                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-            let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
-                .format(vk::Format::B8G8R8A8_UNORM)
-                .ty(vk::ImageType::TYPE_2D)
-                .tiling(tiling)
-                .usage(usage)
-                .push_next(&mut host);
-            if modifier {
-                info = info.push_next(&mut drm);
-            }
-            let mut external = vk::ExternalImageFormatProperties::default();
-            let mut properties = vk::ImageFormatProperties2::default().push_next(&mut external);
-            // SAFETY: the physical device is the instance's; the chains live for the call.
-            let answer = unsafe {
-                raw.instance.get_physical_device_image_format_properties2(
-                    raw.physical_device,
-                    &info,
-                    &mut properties,
-                )
-            };
-            let limits = properties.image_format_properties;
-            let features = external.external_memory_properties.external_memory_features;
-            println!(
-                "SURFTEX-QUERY on {}: B8G8R8A8_UNORM {tiling_name} {name} for host allocations: \
-                 {answer:?}, max extent {}x{}, external features {:#x}",
-                device.name(),
-                limits.max_extent.width,
-                limits.max_extent.height,
-                features.as_raw(),
-            );
-        }
-    }
 }
 
 #[test]
@@ -397,7 +380,6 @@ fn surface_texture_costs() {
     })
     .unwrap();
     messages.take_notices();
-    print_host_modifier_queries(&device);
     let queue = device.new_command_queue().unwrap();
     let page = host_page();
     let lens: Vec<usize> = LAYOUTS
@@ -539,12 +521,16 @@ fn surface_texture_costs() {
 /// [`LAYOUTS`] each frame, taken apart ([`Part`]): the textures made and released around an empty
 /// command buffer, the passes that store, the passes that store `DontCare`, the passes that draw a
 /// rectangle and store (also under a scissor of the left half), the blits, and both;
-/// then the same over the packed layouts alone, which no shadow is made beside. Where a texture is
-/// a shadow, the passes that store less the empty frame are its copies in and back and the pass,
-/// the passes that do not store less the empty frame its copies in and the pass; the blits read
-/// the bytes either way. Printed per set and part (`SURFTEX-PART`): the textures' forms, the
-/// medians and 90th percentiles of each one's making (its buffer and texture), of the frame's
-/// release, encoding, commit to completion and process CPU time, and the work counts per frame.
+/// then the same over the packed layouts alone, which no shadow is made beside; then over every
+/// layout again, each texture over a `Private` buffer of the layout's bytes made once, a new
+/// texture over it each frame. Where a texture is a shadow, the passes that store less the empty
+/// frame are its copies in and back and the pass, the passes that do not store less the empty
+/// frame its copies in and the pass; the blits read the bytes either way. A shadow over the pages
+/// is kept and merged back in place of a copy back, and one over a tracked `Private` buffer's
+/// bytes copied back. Printed per set and part (`SURFTEX-PART`): the
+/// textures' forms, the medians and 90th percentiles of each one's making (its buffer and
+/// texture), of the frame's release, encoding, commit to completion and process CPU time, and the
+/// work counts per frame.
 #[test]
 #[ignore = "a release-mode measurement: run by name"]
 fn surface_texture_cost_parts() {
@@ -573,6 +559,14 @@ fn surface_texture_cost_parts() {
         .iter()
         .map(|&len| Surface::Anonymous(Mapping::anonymous(len)))
         .collect();
+    let private_buffers: Vec<Buffer> = lens
+        .iter()
+        .map(|&len| {
+            device
+                .new_buffer(len as u64, ResourceOptions::private())
+                .unwrap()
+        })
+        .collect();
     // Every layout, then the packed ones alone (rows one after another, no texture a shadow).
     let every: Vec<usize> = (0..LAYOUTS.len()).collect();
     let packed: Vec<usize> = every
@@ -591,7 +585,12 @@ fn surface_texture_cost_parts() {
     ];
     let drawing = Drawing::new(&device);
     let drawing = Some(&drawing);
-    for (set, chosen) in [("every layout", &every), ("packed layouts", &packed)] {
+    let sets = [
+        ("every layout", &every, false),
+        ("packed layouts", &packed, false),
+        ("every layout over Private buffers", &every, true),
+    ];
+    for (set, chosen, over_private) in sets {
         let privates: Vec<Texture> = chosen.iter().map(|&i| privates[i].clone()).collect();
         for part in parts {
             let mut forms = Vec::new();
@@ -608,8 +607,18 @@ fn surface_texture_cost_parts() {
                 for (at, &index) in chosen.iter().enumerate() {
                     let (_, w, h, bpr) = LAYOUTS[index];
                     let began = Instant::now();
-                    let buffer = surfaces[index].buffer(&device, lens[index], None);
-                    let texture = plane_texture(&buffer, w, h, bpr);
+                    let (buffer, texture) = match over_private {
+                        false => {
+                            let buffer = surfaces[index].buffer(&device, lens[index], None);
+                            let texture = plane_texture(&buffer, w, h, bpr);
+                            (buffer, texture)
+                        }
+                        true => {
+                            let buffer = private_buffers[index].clone();
+                            let texture = private_texture(&buffer, w, h, bpr);
+                            (buffer, texture)
+                        }
+                    };
                     if k >= WARM {
                         makes[at].push(since(began));
                     }
@@ -649,7 +658,8 @@ fn surface_texture_cost_parts() {
             let (wait, wait90) = median_p90(waits);
             let (cpu, cpu90) = median_p90(cpus);
             println!(
-                "SURFTEX-PART on {}: {set}, {part:?}, forms {forms} (a aliased, s shadowed): \
+                "SURFTEX-PART on {}: {set}, {part:?}, forms {forms} (a aliased, s \
+                 shadowed): \
                  making us {}; release {release:.0} us (p90 {release90:.0}), encode {encode:.0} us \
                  (p90 {encode90:.0}), commit to completion {wait:.0} us (p90 {wait90:.0}), process \
                  CPU {cpu:.0} us (p90 {cpu90:.0}); per frame: {}",
@@ -659,7 +669,7 @@ fn surface_texture_cost_parts() {
             );
         }
     }
-    drop(surfaces);
+    drop((surfaces, private_buffers));
     let notices = super::degrade_notices::counts(&messages.take_notices());
     println!("SURFTEX-NOTICES on {}: {notices:?}", device.name());
 }
@@ -760,216 +770,20 @@ fn shadow_copy_costs() {
     // The copies, then the buffers, then the pages they lie over go, in that order.
 }
 
-/// The formats [`pitch_classes`] asks about, with their texel bytes.
-const SWEPT_FORMATS: [(PixelFormat, u64); 9] = [
-    (PixelFormat::BGRA8Unorm, 4),
-    (PixelFormat::RGBA8Unorm, 4),
-    (PixelFormat::RGB10A2Unorm, 4),
-    (PixelFormat::RGBA16Float, 8),
-    (PixelFormat::R8Unorm, 1),
-    (PixelFormat::RG8Unorm, 2),
-    (PixelFormat::R16Float, 2),
-    (PixelFormat::R32Float, 4),
-    (PixelFormat::RGBA32Float, 16),
-];
-
-/// The widths [`pitch_classes`] makes textures of, and their height.
-const SWEPT_WIDTHS: [u64; 5] = [5, 64, 300, 1307, 1913];
-const SWEPT_HEIGHT: u64 = 16;
-
-/// The largest power-of-two class [`pitch_classes`] asks about: 2^12 bytes.
-const SWEPT_CLASSES: std::ops::RangeInclusive<u32> = 4..=12;
-
-/// The form a texture over host pages took, by what its making counted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Form {
-    /// The driver's own linear image lies at the pitch.
-    Own,
-    /// A `DRM_FORMAT_MOD_LINEAR` image at Metal's row pitch.
-    Pitched,
-    /// A shadow: the driver refused the image at Metal's row pitch, asked.
-    Refused,
-    /// A shadow: the driver refused the same image before, and was not asked again.
-    Recalled,
-    /// A shadow for another reason (the modifier's features or the format query).
-    Shadowed,
-    /// The texture was refused.
-    Failed,
-}
-
-/// The two smallest odd multiples of `class` (a power of two) at least `row`: two pitches whose
-/// class is exactly `class`.
-fn pitches_of_class(row: u64, class: u64) -> [u64; 2] {
-    let mut first = row.next_multiple_of(class);
-    if (first / class).is_multiple_of(2) {
-        first += class;
-    }
-    [first, first + 2 * class]
-}
-
-/// A texture of `d` over a new no-copy buffer of `len` bytes of `mapping`, rows `bpr` apart: the
-/// form its making took, and the host's time making it.
-fn swept(
-    device: &Device,
-    mapping: &Mapping,
-    len: usize,
-    d: &TextureDescriptor,
-    bpr: u64,
-) -> (Form, f64) {
-    // SAFETY: the mapping outlives the buffer, dropped here.
-    let buffer = unsafe {
-        device.new_buffer_with_bytes_no_copy(
-            HostMemory::new(mapping.pointer()),
-            len as u64,
-            ResourceOptions::default(),
-            None,
-        )
-    }
-    .unwrap();
-    let mut d = *d;
-    d.resource_options = buffer.resource_options();
-    let before = device.work_counts();
-    let began = Instant::now();
-    let made = buffer.new_texture(&d, 0, bpr);
-    let took = since(began);
-    let after = device.work_counts();
-    let moved = |count: fn(&WorkCounts) -> u64| count(&after) > count(&before);
-    let form = match made {
-        Err(_) => Form::Failed,
-        Ok(_) if moved(|c| c.pitched_host_images) => Form::Pitched,
-        Ok(_) if moved(|c| c.pitched_host_image_refusals) => Form::Refused,
-        Ok(_) if moved(|c| c.pitched_host_image_refusals_recalled) => Form::Recalled,
-        Ok(_) if moved(|c| c.shadowed_textures) => Form::Shadowed,
-        Ok(_) => Form::Own,
-    };
-    (form, took)
-}
-
-#[test]
-#[ignore = "a release-mode measurement: run by name"]
-fn pitch_classes() {
-    let cache = ScratchCache::new().unwrap();
-    let messages = Messages::default();
-    let largest = SWEPT_FORMATS.iter().map(|&(_, texel)| texel).max().unwrap();
-    let widest = SWEPT_WIDTHS.iter().max().unwrap() * largest + (4 << *SWEPT_CLASSES.end());
-    let len = Surface::len(widest, SWEPT_HEIGHT);
-    let mapping = Mapping::anonymous(len);
-    let usages = [
-        ("read", TextureUsage::SHADER_READ),
-        (
-            "read+render",
-            TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
-        ),
-        (
-            "read+write",
-            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE,
-        ),
-        (
-            "read+write+render",
-            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET,
-        ),
-    ];
-    let mut times: std::collections::BTreeMap<Form, Vec<f64>> = Default::default();
-    let mut name = String::new();
-    for &(pf, texel) in &SWEPT_FORMATS {
-        for &(usage_name, usage) in &usages {
-            // A device for each format and usage, which announces its first shadow's reason.
-            let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
-                options.layers.clear();
-            })
-            .unwrap();
-            messages.take_notices();
-            name = device.name().to_owned();
-            let (mut pitched_classes, mut refused_classes, mut mixed) =
-                (Vec::new(), Vec::new(), Vec::new());
-            for class in SWEPT_CLASSES.map(|bits| 1u64 << bits) {
-                let mut forms = Vec::new();
-                for &w in &SWEPT_WIDTHS {
-                    for bpr in pitches_of_class(w * texel, class) {
-                        let mut d = TextureDescriptor::texture_2d(pf, w, SWEPT_HEIGHT, false);
-                        d.usage = usage;
-                        // Made twice: the second making of a refused image recalls the refusal.
-                        for _ in 0..2 {
-                            let (form, took) = swept(&device, &mapping, len, &d, bpr);
-                            times.entry(form).or_default().push(took);
-                            forms.push((w, bpr, form));
-                        }
-                    }
-                }
-                // Every texture the driver's own linear image does not alias took one answer
-                // (a recalled refusal is the driver's earlier one).
-                let answers: std::collections::BTreeSet<Form> = forms
-                    .iter()
-                    .map(|&(_, _, form)| match form {
-                        Form::Recalled => Form::Refused,
-                        form => form,
-                    })
-                    .filter(|&form| form != Form::Own)
-                    .collect();
-                let one = answers.len() <= 1;
-                match answers.iter().next() {
-                    _ if !one => mixed.push(class),
-                    Some(Form::Pitched) => pitched_classes.push(class),
-                    Some(_) => refused_classes.push(class),
-                    None => {}
-                }
-                let count = |form: Form| forms.iter().filter(|&&(_, _, f)| f == form).count();
-                println!(
-                    "SURFTEX-PITCH on {}: {} {usage_name} class {class}: own linear {}, pitched \
-                     {}, refused {} (recalled {}), shadowed {}, failed {}; one answer {one}{}",
-                    device.name(),
-                    pf.name(),
-                    count(Form::Own),
-                    count(Form::Pitched),
-                    count(Form::Refused),
-                    count(Form::Recalled),
-                    count(Form::Shadowed),
-                    count(Form::Failed),
-                    if one {
-                        String::new()
-                    } else {
-                        format!(" ({forms:?})")
-                    },
-                );
-            }
-            let reason = messages
-                .take_notices()
-                .into_iter()
-                .find_map(|message| message.degradation.map(|notice| notice.reason))
-                .unwrap_or_else(|| "no shadow".to_owned());
-            println!(
-                "SURFTEX-PITCH-RULE on {}: {} {usage_name}: at Metal's pitch {pitched_classes:?}, \
-                 shadowed {refused_classes:?}, mixed {mixed:?}; the first shadow: {reason}",
-                device.name(),
-                pf.name(),
-            );
-        }
-    }
-    for (form, took) in times {
-        let count = took.len();
-        let (median, p90) = median_p90(took);
-        println!(
-            "SURFTEX-PITCH-TIME on {name}: {form:?}: {count} textures, making {median:.1} us (p90 \
-             {p90:.1})"
-        );
-    }
-}
-
 /// A compositor's frame over textures that only read: each frame, for each padded layout of
 /// [`LAYOUTS`] (the tight one left out), a no-copy buffer over its surface's anonymous pages and a
 /// texture of its plane over it with `ShaderRead` usage alone; one pass into a private target of
 /// the browser's tile, drawing each texture over the whole target through a nearest sampler; one
-/// command buffer, committed and waited for; then the textures and buffers are released. Run under
-/// `PaddedReadsPolicy::Alias` (an image over the rows where the device lays one) and `Shadow` (the
-/// shadow, copied in before the pass), a device each, the two interleaved in rounds so a drift of
-/// the host's falls on both. Printed per policy and round (`SURFTEX-READS`): the textures' forms,
-/// the medians and 90th percentiles of a texture's making, the frame's encoding, commit to
-/// completion and process CPU time, and the shadow copies a frame.
+/// command buffer, committed and waited for; then the textures and buffers are released. Or, where
+/// `reused`, the textures are made once and every frame samples them; each texture a shadow,
+/// copied in before the pass; a device each, the two interleaved in rounds so a drift of the
+/// host's falls on both. Printed per reuse and round (`SURFTEX-READS`): the textures' forms, the
+/// medians and 90th percentiles of a texture's making, the frame's encoding, commit to completion
+/// and process CPU time, and the shadow copies a frame.
 #[test]
 #[ignore = "a release-mode measurement: run by name"]
 fn read_only_padded_costs() {
     use super::pitched_surfaces::{reading, sampler};
-    use metal2vulkan::device::PaddedReadsPolicy;
     use metal2vulkan::metal::SamplerMinMagFilter;
     let chosen: Vec<usize> = (0..LAYOUTS.len())
         .filter(|&i| LAYOUTS[i].3 != LAYOUTS[i].1 * 4)
@@ -979,12 +793,11 @@ fn read_only_padded_costs() {
         .map(|&(_, _, h, bpr)| Surface::Anonymous(Mapping::anonymous(Surface::len(bpr, h))))
         .collect();
     for round in 0..3 {
-        for policy in [PaddedReadsPolicy::Alias, PaddedReadsPolicy::Shadow] {
+        for reused in [false, true] {
             let cache = ScratchCache::new().unwrap();
             let messages = Messages::default();
             let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
                 options.layers.clear();
-                options.policy.padded_reads = policy;
             })
             .unwrap();
             messages.take_notices();
@@ -1001,13 +814,14 @@ fn read_only_padded_costs() {
             let mut makes = Vec::new();
             let (mut encodes, mut waits, mut cpus) = (Vec::new(), Vec::new(), Vec::new());
             let mut before = device.work_counts();
+            let mut made = Vec::new();
             for k in 0..WARM + FRAMES {
                 if k == WARM {
                     before = device.work_counts();
                 }
                 let cpu = process_cpu_us();
-                let mut made = Vec::new();
-                for &index in &chosen {
+                let making = if reused { k == 0 } else { true };
+                for &index in chosen.iter().filter(|_| making) {
                     let (_, w, h, bpr) = LAYOUTS[index];
                     let len = Surface::len(bpr, h);
                     let began = Instant::now();
@@ -1018,7 +832,7 @@ fn read_only_padded_costs() {
                     let texture = buffer
                         .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, bpr, false))
                         .unwrap();
-                    if k >= WARM {
+                    if k >= WARM || reused {
                         makes.push(since(began));
                     }
                     made.push((texture, buffer));
@@ -1055,13 +869,16 @@ fn read_only_padded_costs() {
                 command_buffer.wait_until_completed_for(WAIT).unwrap();
                 assert_eq!(command_buffer.error(), None);
                 let waited = since(committed);
-                drop(made);
+                if !reused {
+                    made.clear();
+                }
                 if k >= WARM {
                     encodes.push(encoded);
                     waits.push(waited);
                     cpus.push(process_cpu_us() - cpu);
                 }
             }
+            drop(made);
             let after = device.work_counts();
             let copies = (after.shadow_copies - before.shadow_copies) as f64 / FRAMES as f64;
             let (make, make90) = median_p90(makes);
@@ -1069,10 +886,11 @@ fn read_only_padded_costs() {
             let (wait, wait90) = median_p90(waits);
             let (cpu, cpu90) = median_p90(cpus);
             println!(
-                "SURFTEX-READS on {}: round {round}, {policy:?}, forms {forms} (a aliased, s \
-                 shadowed): making {make:.0} us a texture (p90 {make90:.0}), encode {encode:.0} \
-                 us (p90 {encode90:.0}), commit to completion {wait:.0} us (p90 {wait90:.0}), \
-                 process CPU {cpu:.0} us (p90 {cpu90:.0}); shadow copies a frame {copies:.2}",
+                "SURFTEX-READS on {}: round {round}, reused {reused}, forms {forms} \
+                 (a aliased, s shadowed): making {make:.0} us a texture (p90 {make90:.0}), encode \
+                 {encode:.0} us (p90 {encode90:.0}), commit to completion {wait:.0} us (p90 \
+                 {wait90:.0}), process CPU {cpu:.0} us (p90 {cpu90:.0}); shadow copies a frame \
+                 {copies:.2}",
                 device.name(),
             );
         }

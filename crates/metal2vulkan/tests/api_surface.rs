@@ -222,13 +222,19 @@ surface! {
         struct DevicePolicy N;
         enum Unorm8LinearFilterPolicy N;
         enum SamplingPolicy N;
+        enum YCbCrFilterPolicy N;
         enum FloatMathsPolicy N;
         enum TexelConversionPolicy N;
         enum HalfRoundingPolicy N;
         enum NanMinMaxPolicy N;
         enum RoundingOrderPolicy N;
         enum HalfBlendPolicy N;
-        enum PaddedReadsPolicy N;
+        enum DecodedTexelsPolicy N;
+        enum HeapCompressionPolicy N;
+        enum CompletionPolicy N;
+        enum TileStorePolicy N;
+        enum ResolvePolicy N;
+        enum BatchOrderPolicy N;
         struct DeviceProfile O;
         struct SpirvValidation N;
         struct EnabledCaps N;
@@ -236,7 +242,6 @@ surface! {
         struct ImageCaps N;
         struct FloatControls N;
         struct FloatWidthControls N;
-        enum FramebufferFetchPolicy N;
         enum DriverWorkaround N;
         enum DriverFact N;
         struct DriverDiagnostic N;
@@ -249,6 +254,7 @@ surface! {
         enum PointerDomain N;
         enum Containment N;
         struct DescriptorCaps N;
+        enum FunctionStorage N;
         enum Robustness N;
         enum SimdClass N;
         struct StageSubgroup N;
@@ -362,6 +368,7 @@ surface! {
         struct StorageAttachmentUse N;
         enum StorageAttachmentView E;
         struct TessellationState N;
+        struct EmulatedTessellation N;
         struct AccessSet N;
         enum AttributeFetch E;
         enum BufferForm N;
@@ -393,6 +400,7 @@ surface! {
         struct BlendEquation N;
         enum CaptureForm N;
         enum ChannelWrite N;
+        struct ColorGroup N;
         struct ExtendedRangeColor N;
         enum FactorLane N;
         struct FetchedAttachment N;
@@ -425,6 +433,7 @@ surface! {
         enum SamplerRef N;
         enum SlotClass E;
         struct SlotRef E;
+        enum SnapshotForm N;
         enum SpecKey N;
         enum Stage N;
         enum StorageFormatClass N;
@@ -455,6 +464,8 @@ surface! {
         struct MeshDispatch N;
         enum MeshGroups N;
         enum MeshRecordsRegion N;
+        struct TessellationDispatch N;
+        enum TessellationRecords N;
         fn heap_classes;
         struct HeapElements O;
         enum HeapSource E;
@@ -536,6 +547,7 @@ surface! {
         enum FragmentTests N;
         struct ExecutionStatus E;
         struct MeshRecordsFault N;
+        struct TessellationRecordsFault N;
         struct StatusBits E;
         struct StatusReport N;
         enum StatusWord N;
@@ -597,8 +609,20 @@ surface! {
         fn visibility_resolve_module;
         struct VisibilityResolve N;
         struct VisibilityResolveModule N;
+        fn shadow_copy_back_module;
+        struct ShadowCopyBackModule N;
+        enum ShadowTexelView E;
+        fn shadow_copy_in_module;
+        struct ShadowCopyInModule N;
+        fn rows_copy_module;
+        struct RowsCopyModule N;
         fn shadow_merge_module;
         struct ShadowMergeModule N;
+        fn shadow_merge_image_module;
+        fn shadow_merge_kept_image_module;
+        struct ShadowMergeImageModule N;
+        fn depth_magnitude_module;
+        struct DepthMagnitudeModule N;
         fn unused_bits_module;
         struct UnusedBitsModule N;
         fn extended_shadow_module;
@@ -616,13 +640,27 @@ surface! {
         fn block_decode_module;
         enum BlockDecode N;
         struct BlockDecodeModule N;
+        fn astc_decode_module;
+        struct AstcDecode N;
+        enum AstcTexels N;
+        fn pvrtc_decode_module;
+        struct PvrtcDecode N;
+        fn etc_decode_module;
+        enum EtcDecode N;
+        enum EtcTexels N;
+        fn chroma_decode_module;
+        enum ChromaDecode N;
         fn mesh_scan_module;
         struct MeshScanModule N;
+        fn tessellation_scan_module;
+        struct TessellationScanKernel N;
+        struct TessellationScanModule N;
         fn mipmap_filter_module;
         struct MipmapFilterChain N;
         struct MipmapFilterKernel O;
         struct MipmapFilterLevel N;
         struct MipmapFilterModule N;
+        enum MipmapRule N;
         fn plane_copy_module;
         struct PlaneCopyModule N;
         struct PlaneRows N;
@@ -795,8 +833,11 @@ surface! {
         struct FormatMapping N;
         enum FormatEmulation N;
         enum ExtendedRange N;
+        enum WordAttachment N;
+        struct WordField E;
         enum ClearRoute N;
         fn vk_format;
+        fn swizzle_over;
         fn direct_format;
         fn byte_format;
         fn srgb_raw_twin;
@@ -827,6 +868,8 @@ surface! {
         fn ycbcr_format;
         fn rotated_channels;
         fn to_rotated_image;
+        fn alpha_in_red;
+        fn alpha_in_red_format;
     }
     "metal::sampler" => metal2vulkan::metal::sampler {
         struct SamplerUse N;
@@ -861,6 +904,8 @@ surface! {
         struct DepthBias N;
         enum DepthBiasUnit N;
         fn depth_bias;
+        fn depth16_bias;
+        fn depth16_bias_side;
     }
     "metal::vertex" => metal2vulkan::metal::vertex {
         fn vk_vertex_format;
@@ -1499,7 +1544,7 @@ fn one_entry_of_a_bare_module_translates_through_the_public_api() {
         assert_eq!(plan.stage, Stage::Kernel, "{stem}");
         assert!(
             plan.estimated_words >= alone.words.len() as u64,
-            "{stem}: the estimate bounds the module (D16.2)"
+            "{stem}: the estimate bounds the module"
         );
         let specialized = profile
             .specialized_entry(&entry, &none, &budget)
@@ -2154,9 +2199,7 @@ fn the_table_matches_the_source() {
     let only_table: Vec<_> = table.difference(&source).collect();
     let only_source: Vec<_> = source.difference(&table).collect();
     if !only_table.is_empty() || !only_source.is_empty() {
-        let mut msg = String::from(
-            "the public surface changed: update tests/api_surface.rs and DESIGN D166\n",
-        );
+        let mut msg = String::from("the public surface changed: update tests/api_surface.rs\n");
         msg.push_str("in the table, not the source:\n");
         for e in &only_table {
             msg.push_str(&format!("  {e:?}\n"));
@@ -2262,8 +2305,7 @@ fn the_reference_build_renders_exactly_the_surface() {
     surface.insert("ash_interop".to_owned());
     assert_eq!(
         rendered, surface,
-        "the crate-root items the reference renders are the table's module roots and root items \
-         (DESIGN D166, D184)"
+        "the crate-root items the reference renders are the table's module roots and root items"
     );
 }
 
@@ -2334,7 +2376,7 @@ fn every_public_entry_is_documented() {
     }
     assert!(
         missing.is_empty(),
-        "the consumer reference renders these undocumented (DESIGN D184):\n  {}",
+        "the consumer reference renders these undocumented:\n  {}",
         missing.join("\n  ")
     );
 }

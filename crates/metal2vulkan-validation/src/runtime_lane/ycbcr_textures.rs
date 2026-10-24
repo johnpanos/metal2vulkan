@@ -6,10 +6,14 @@
 //!
 //! - A kernel's `read()` of every texel is the conversion Metal's reads were measured to follow
 //!   (`metal2vulkan::bind::ycbcr_texel`, after the 9/3/3/1 chroma filter), for both ranges and
-//!   both matrices, and for one surface Metal's own reads (EV XRR2-ycc2-m4): the same digest. A
+//!   both matrices, and for one surface Metal's own reads: the same digest. A
 //!   nearest sample at each texel's centre reads the same texel, unannounced; a linear one there
-//!   too, and between the texels it is Metal's filter of them, unannounced. A function that samples
-//!   handles and reaches the texture is refused, typed.
+//!   too, and between the texels it is Metal's filter of them, unannounced (the lane's devices
+//!   sample as Metal does). Under native sampling it is Metal's filter under
+//!   `YCbCrFilterPolicy::Exact`, through one pipeline more at the draw, and under the default the
+//!   device's filter of the same texels (on MoltenVK Metal's own sampler's, announced), within
+//!   [`DEVICE_FILTER_BOUND`] of Metal's, through the pipeline the state's creation made. A function
+//!   that samples handles and reaches the texture is refused, typed.
 //! - The texture follows writes of its planes' bytes through other textures over them, as a
 //!   decoder writes the planes as `R8Unorm` and `RG8Unorm` textures: in an earlier command
 //!   buffer, an earlier encoder of the same one, an earlier dispatch of the same encoder, and a
@@ -19,14 +23,13 @@
 //!   kept; those of the 4:4:4 formats whose writes are not known (the `_sRGB` twins, the packed
 //!   format) and over plane 1 are refused, typed.
 //! - Plain creation and a buffer's texture of the format answer Metal's nil (`Error::Nil`,
-//!   `NoTextureOfFormat`; EVs TTG-nil1-m4 and TTG-nil2-m3) and the heap query 0 bytes at 16; a
-//!   surface without its facts, plane 1 and a matrix other than BT.601, BT.709 and BT.2020 are
-//!   refused, typed. Every other two-plane YCbCr format answers as Metal does without a surface,
-//!   and is refused over one.
+//!   `NoTextureOfFormat`) and the heap query 0 bytes at 16; a surface without its facts, plane 1
+//!   and a matrix other than BT.601, BT.709 and BT.2020 are refused, typed. Every other two-plane
+//!   YCbCr format answers as Metal does without a surface, and is refused over one.
 
 use super::argument_linear_samples::{self, LINEAR_EDGE};
 use super::blits::SYSTEM_MEMORY;
-use super::degrade_notices::{assert_once, counts, on_device};
+use super::degrade_notices::{assert_once, counts, on_device, on_device_with};
 use super::depth_compares::{pipeline_of, run_held, Held, Through};
 use super::host_memory::{self, host_page, Mapping};
 use super::{buffer_with, read_buffer};
@@ -35,8 +38,8 @@ use metal2vulkan::bind::{
     ycbcr_read, ycbcr_texel, ycbcr_write, SamplerDescriptor, YCbCrCodes, YCbCrMatrix, YCbCrOutput,
     YCbCrRange,
 };
-use metal2vulkan::device::VkProperty;
-use metal2vulkan::error::{BindError, Feature};
+use metal2vulkan::device::{SamplingPolicy, VkProperty, YCbCrFilterPolicy};
+use metal2vulkan::error::{BindError, Feature, RuntimeDriverDefect};
 use metal2vulkan::metal::format::{ycbcr_format, ChromaSubsampling, YCbCrReads};
 use metal2vulkan::metal::{
     PixelFormat, PrimitiveType, ResourceUsage, SamplerAddressMode, SamplerBorderColor,
@@ -49,14 +52,15 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_devtools::llvm_assemble_text;
 use metal2vulkan_runtime::{
     BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputePipelineState, Deallocator,
-    Degradation, Device, Error, Invalid, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
-    MappedSampling, Nil, Origin, PipelineOptions, Problem, Region, RenderPassDescriptor,
-    ResourceOptions, RuntimeGap, SamplerState, Size, StoreAction, SurfaceYCbCrMatrix, Texture,
-    TextureDescriptor, TextureProblem,
+    Degradation, Device, DeviceOptions, Error, Invalid, IoSurfacePlane, IoSurfaceYCbCr, Library,
+    LoadAction, MappedSampling, Nil, Origin, PipelineOptions, Problem, Region,
+    RenderPassDescriptor, RenderPipelineState, ResourceOptions, RuntimeGap, SamplerState, Size,
+    StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, TextureProblem,
 };
 use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(60);
+
 /// The surface's size, and its planes' rows and offsets.
 const W: u64 = 40;
 const H: u64 = 24;
@@ -76,7 +80,7 @@ const FULL: u32 = u32::from_be_bytes(*b"420f");
 /// the points inside the texture and the rest outside it. `write_masked` writes buffer 0's
 /// `float4` element `gid.y * width + gid.x` to texel `gid` of texture 0 where buffer 1's `uint`
 /// element there is not 0, and `write_masked_half` the same of `half4`s.
-pub(super) const KERNELS: &str = r#"; Owned synthetic kernels (WP-XRR2).
+pub(super) const KERNELS: &str = r#"; Owned synthetic kernels.
 source_filename = "ycbcr_textures.metal"
 
 define void @read_texels(ptr addrspace(1) %t, ptr addrspace(1) noalias %out, <2 x i32> %gid, <2 x i32> %size) {
@@ -192,7 +196,7 @@ entry:
   ret void
 }
 
-; ---- Added by WP-TXN2 (DESIGN D620): gathers of red and blue at texel corners ----
+; ---- Gathers of red and blue at texel corners ----
 define void @gather_red(ptr addrspace(1) %t, ptr addrspace(1) noalias %out, ptr addrspace(2) %smp, <2 x i32> %gid, <2 x i32> %size) {
 entry:
   %g = tail call <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %gid)
@@ -504,9 +508,9 @@ fn modelled_as(
     out
 }
 
-/// Metal's `read()` of the surface of seed 5 as a `420v` one without a matrix (EV
-/// XRR2-ycc2-m4, an Apple M4 under macOS 27.0.1): the FNV-1a digest of each texel's red, green
-/// and blue `v` as little-endian 16-bit words.
+/// Metal's `read()` of the surface of seed 5 as a `420v` one without a matrix (an Apple M4 under
+/// macOS 27.0.1): the FNV-1a digest of each texel's red, green and blue `v` as little-endian 16-bit
+/// words.
 const METAL_READ_DIGEST: u32 = 0x26e2_da15;
 
 fn digest(texels: &[[u16; 3]]) -> u32 {
@@ -643,7 +647,7 @@ fn sampler(device: &Device, filter: SamplerMinMagFilter) -> SamplerState {
 }
 
 /// Linear samplers through each mip filter: a YCbCr texture has one level, which Metal's mip
-/// filter leaves as it is (EVs TXN2-ycm1-m4 and -m3).
+/// filter leaves as it is.
 fn linear_samplers(device: &Device) -> Vec<(SamplerMipFilter, SamplerState)> {
     [
         SamplerMipFilter::NotMipmapped,
@@ -741,10 +745,10 @@ fn ycbcr_textures_read_the_texels_metal_converts() {
 /// `(0.90625, 0.71875)` texels past its corner.
 const BETWEEN: [u32; 2] = [104, 56];
 
-/// Metal's step of a linear sample of a `YCBCR8_420_2P` texture (EVs TXN2-ycf1-m3 and -m4) at
-/// fractions `[a, b]` past texel `(x, y)`, from the texels' steps `read`: the taps `(x, y)` to
-/// `(x + 1, y + 1)` clamped to the edge, an axis whose two taps address one texel weighed `(256,
-/// 0)`, each term `k · w` truncated by `2^7`, then `(T + 2^8) >> 9`.
+/// Metal's step of a linear sample of a `YCBCR8_420_2P` texture at fractions `[a, b]` past texel
+/// `(x, y)`, from the texels' steps `read`: the taps `(x, y)` to `(x + 1, y + 1)` clamped to the
+/// edge, an axis whose two taps address one texel weighed `(256, 0)`, each term `k · w` truncated
+/// by `2^7`, then `(T + 2^8) >> 9`.
 fn metal_step(read: &[[u16; 3]], (x, y): (u64, u64), [a, b]: [u32; 2], c: usize) -> u32 {
     let (x1, y1) = ((x + 1).min(W - 1), (y + 1).min(H - 1));
     let a = if x1 == x { 0 } else { a };
@@ -934,7 +938,7 @@ fn fragments() -> String {
         ));
     }
     format!(
-        r#"; Owned synthetic shaders (WP-TXN2).
+        r#"; Owned synthetic shaders.
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 {LINEAR_EDGE}, i64 0], align 8
 
 define <{{ <4 x float> }}> @corner(i32 %vid, ptr addrspace(2) %p) {{
@@ -992,6 +996,12 @@ fn drawn_after(
     (texture, sampler): (&Texture, Option<&SamplerState>),
     before: impl FnOnce(&CommandQueue, &CommandBuffer),
 ) -> Vec<[f32; 4]> {
+    let pipeline = between_state(device, library, fragment);
+    drawn_with(device, &pipeline, (texture, sampler), before)
+}
+
+/// The render pipeline state of vertex `corner` and `fragment` into one `RGBA32Float` color.
+fn between_state(device: &Device, library: &Library, fragment: &str) -> RenderPipelineState {
     let function = |name: &str| {
         StageSource::Function(
             library
@@ -1004,9 +1014,18 @@ fn drawn_after(
     descriptor.fragment = Some(function(fragment));
     descriptor.color_attachments[0] =
         Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Float));
-    let pipeline = device
+    device
         .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
-        .unwrap();
+        .unwrap()
+}
+
+/// [`drawn_after`]'s draw through `pipeline`.
+fn drawn_with(
+    device: &Device,
+    pipeline: &RenderPipelineState,
+    (texture, sampler): (&Texture, Option<&SamplerState>),
+    before: impl FnOnce(&CommandQueue, &CommandBuffer),
+) -> Vec<[f32; 4]> {
     let mut target = TextureDescriptor::texture_2d(PixelFormat::RGBA32Float, W, H, false);
     target.usage = TextureUsage::RENDER_TARGET;
     target.resource_options = ResourceOptions::shared();
@@ -1034,7 +1053,7 @@ fn drawn_after(
     let command_buffer = queue.command_buffer().unwrap();
     before(&queue, &command_buffer);
     let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
-    encoder.set_render_pipeline_state(&pipeline).unwrap();
+    encoder.set_render_pipeline_state(pipeline).unwrap();
     encoder.set_vertex_buffer(Some(&corners), 0, 0).unwrap();
     encoder.set_fragment_texture(Some(texture), 0).unwrap();
     if let Some(sampler) = sampler {
@@ -1114,6 +1133,139 @@ fn a_fragments_linear_sample_is_metals_through_each_sampler_and_result() {
         ] {
             assert_eq!(notices.get(&kind), None, "{notices:?}");
         }
+    });
+}
+
+/// How far the device's own linear filter of a two-plane YCbCr texture's texels may land from
+/// Metal's filter of the format at coordinates on the 1/256 grid, in codes of `1/255`: the bound
+/// `PrecisionNote::DeviceSampling` states for such a texture there (docs/FAST-PATHS.md), 0.498 on
+/// NVIDIA and 0.125 on RADV, ANV and lavapipe; through Metal's own sampler one step of the grid
+/// `1/2048`, 0.125 (`ycbcr-filter-not-exact`).
+const DEVICE_FILTER_BOUND: f32 = 0.5;
+
+/// Under native sampling (`SamplingPolicy::NativeDevice`) and the default
+/// (`YCbCrFilterPolicy::Device`), a fragment function's linear sample of a `YCBCR8_420_2P` texture
+/// through a runtime sampler, with a `float` and a `half` result, takes the pipeline a draw binding
+/// any other texture takes: the draw binding it makes no pipeline after the one that bound an
+/// `RGBA16Float` texture of the same texels, and its samples are that texture's bit for bit (the
+/// device's filter of them), within [`DEVICE_FILTER_BOUND`] of Metal's step. On a device that
+/// samples natively the module's `device-sampling` is announced and no filter notice; on one that
+/// samples through Metal's own sampler `ycbcr-filter-not-exact`, once, naming the slot and the
+/// format, and no `device-sampling`.
+#[test]
+fn a_ycbcr_slot_takes_the_devices_filter_in_the_pipeline_its_creation_made() {
+    ycbcr_draws_under(YCbCrFilterPolicy::Device);
+}
+
+/// [`a_ycbcr_slot_takes_the_devices_filter_in_the_pipeline_its_creation_made`] under Metal's
+/// filter of the format (`YCbCrFilterPolicy::Exact`): on every device the draw binding the
+/// texture takes the slot's YCbCr variant, one pipeline more, and its samples are Metal's step
+/// exactly, announced by no filter notice.
+#[test]
+fn a_ycbcr_slot_takes_metals_filter_under_the_exact_switch() {
+    ycbcr_draws_under(YCbCrFilterPolicy::Exact);
+}
+
+/// The draws of [`a_ycbcr_slot_takes_the_devices_filter_in_the_pipeline_its_creation_made`] on a
+/// device that samples natively, under `filter`.
+fn ycbcr_draws_under(filter: YCbCrFilterPolicy) {
+    let native = |options: &mut DeviceOptions| {
+        options.policy.sampling = SamplingPolicy::NativeDevice;
+        options.policy.ycbcr_filter = filter;
+    };
+    on_device_with(native, |device, messages| {
+        let kernels = Kernels::new(device);
+        let surface = buffer_with(device, &surface_bytes(9)).unwrap();
+        let texture = ycbcr_texture(
+            &surface,
+            Some(facts(VIDEO, None)),
+            TextureUsage::SHADER_READ,
+        )
+        .unwrap();
+        let read = grid(&texels_of(device, &kernels.read, &texture, None));
+        let d = TextureDescriptor::texture_2d(PixelFormat::RGBA16Float, W, H, false);
+        let twin = device.new_texture(&d).unwrap();
+        let bytes: Vec<u8> = read
+            .iter()
+            .flat_map(|t| [t[0], t[1], t[2], 2048].map(half_of_step))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        twin.replace_region(Region::new_2d(0, 0, W, H), 0, 0, &bytes, 8 * W, 0)
+            .unwrap();
+        let metal = device
+            .compile_device()
+            .profile()
+            .enabled()
+            .properties
+            .contains(&VkProperty::MetalSampler);
+        let exact = filter == YCbCrFilterPolicy::Exact;
+        let linear = sampler(device, SamplerMinMagFilter::Linear);
+        let library = device
+            .new_library_with_air(&llvm_assemble_text(&fragments()).unwrap())
+            .unwrap();
+        for fragment in ["between_runtime_float", "between_runtime_half"] {
+            let pipeline = between_state(device, &library, fragment);
+            let plain = drawn_with(device, &pipeline, (&twin, Some(&linear)), |_, _| {});
+            let before = device.work_counts().variant_pipelines_made;
+            let got = drawn_with(device, &pipeline, (&texture, Some(&linear)), |_, _| {});
+            let made = device.work_counts().variant_pipelines_made - before;
+            assert_eq!(
+                made,
+                u64::from(exact),
+                "{fragment}: pipelines the YCbCr draw made"
+            );
+            let mut worst = 0f32;
+            for (i, texel) in (0..W * H).zip(&got) {
+                let at = (i % W, i / W);
+                for (c, &value) in texel.iter().enumerate().take(3) {
+                    let want = metal_step(&read, at, BETWEEN, c) as f32 / 2048.0;
+                    match exact {
+                        true => assert_eq!(value, want, "pixel {at:?} of {fragment}"),
+                        false => worst = worst.max((value - want).abs() * 255.0),
+                    }
+                }
+                assert_eq!(texel[3], 1.0, "pixel {at:?} of {fragment}");
+            }
+            if !exact {
+                println!(
+                    "YCBCR-DEVICE-FILTER {} {fragment}: largest difference from Metal's step \
+                     {worst} codes",
+                    device.name()
+                );
+                assert!(
+                    got == plain,
+                    "{fragment}: the device's filter of the same texels"
+                );
+                assert!(worst <= DEVICE_FILTER_BOUND, "{fragment}: {worst} codes");
+            }
+        }
+        let notices = messages.take_notices();
+        let announced = counts(&notices);
+        for kind in [
+            Degradation::FloatSampleFilter,
+            Degradation::HalfSampleFilter,
+        ] {
+            assert_eq!(announced.get(&kind), None, "{announced:?}");
+        }
+        let ycbcr = announced.get(&Degradation::YCbCrFilterNotExact);
+        match metal && !exact {
+            true => {
+                assert_eq!(ycbcr, Some(&1), "{announced:?}");
+                let notice = notices
+                    .iter()
+                    .filter_map(|m| m.degradation.as_ref())
+                    .find(|n| n.degradation == Degradation::YCbCrFilterNotExact)
+                    .unwrap();
+                let named = format!("texture 0 bound as {:?}", PixelFormat::YCBCR84202P);
+                assert!(notice.reason.contains(&named), "{notice:?}");
+            }
+            false => assert_eq!(ycbcr, None, "{announced:?}"),
+        }
+        assert_eq!(
+            announced.contains_key(&Degradation::DeviceSampling),
+            !metal,
+            "{announced:?}"
+        );
     });
 }
 
@@ -1909,16 +2061,16 @@ fn write_then_read(
 }
 
 /// Metal stores a function's writes to `YCBCR8_444_2P`, `YCBCR10_444_2P`, `RGB8_444_2P` and
-/// `RGB10_444_2P` into both planes of the surface (EVs XRR2-ycw1-m4 to XRR2-ycw4-m4 on an Apple M4,
-/// XRR2-ycw2-m3 and XRR2-ycw3-m3 on an Apple M3 Max, byte for byte alike): each written texel's
-/// luma code and its Cb and Cr pair, the codes `metal2vulkan::bind::ycbcr_write` states, and every
-/// other byte kept. Here a dispatch writes `float` and `half` values (on the code grid and off it,
-/// out of `[0, 1]`, NaNs, infinities) to about two texels in three, over both ranges and each
-/// matrix: the surface's bytes are those codes and otherwise as they were, the rows' padding and
-/// the bytes past the planes among them. A `read()` of the texture in the same encoder after the
-/// writes, and one in a later command buffer, read the planes as written. A dispatch writing no
-/// texel keeps every byte. Nothing is announced past the lane's pipeline states' own notes and, on
-/// a device without unified memory, the first `Shared` buffer's `shared-in-system-memory`.
+/// `RGB10_444_2P` into both planes of the surface (on an Apple M4, on an Apple M3 Max, byte for
+/// byte alike): each written texel's luma code and its Cb and Cr pair, the codes
+/// `metal2vulkan::bind::ycbcr_write` states, and every other byte kept. Here a dispatch writes
+/// `float` and `half` values (on the code grid and off it, out of `[0, 1]`, NaNs, infinities) to
+/// about two texels in three, over both ranges and each matrix: the surface's bytes are those codes
+/// and otherwise as they were, the rows' padding and the bytes past the planes among them. A
+/// `read()` of the texture in the same encoder after the writes, and one in a later command buffer,
+/// read the planes as written. A dispatch writing no texel keeps every byte. Nothing is announced
+/// past the lane's pipeline states' own notes and, on a device without unified memory, the first
+/// `Shared` buffer's `shared-in-system-memory`.
 #[test]
 fn a_four_four_four_texture_s_writes_store_metal_s_codes() {
     use PixelFormat as P;
@@ -2145,11 +2297,10 @@ fn ycbcr_textures_are_made_only_over_their_surfaces() {
     });
 }
 
-/// Every two-plane YCbCr format answers as Metal does on an M4 without a surface (EV
-/// XRR2-ycf3p1b-m4): Metal's nil from a descriptor alone, a 2D multisample texture or array
-/// stopped (EVs TTG-nil1-m4, TTG-nil2-m3), and the heap query 0 bytes at 16, or 128 for a 2D
-/// array; over a `420v` surface the runtime refuses, typed, every one but `YCBCR8_420_2P`, its
-/// sRGB twin and `RGB8_420_2P` (the 10-bit ones it makes over 10-bit surfaces,
+/// Every two-plane YCbCr format answers as Metal does on an M4 without a surface: Metal's nil from
+/// a descriptor alone, a 2D multisample texture or array stopped, and the heap query 0 bytes at 16,
+/// or 128 for a 2D array; over a `420v` surface the runtime refuses, typed, every one but
+/// `YCBCR8_420_2P`, its sRGB twin and `RGB8_420_2P` (the 10-bit ones it makes over 10-bit surfaces,
 /// `ten_bit_textures_read_what_metal_reads`).
 #[test]
 fn two_plane_ycbcr_formats_answer_as_metal_does() {
@@ -2190,7 +2341,7 @@ fn two_plane_ycbcr_formats_answer_as_metal_does() {
             multisample.texture_type = TextureType::Type2DMultisample;
             multisample.sample_count = 4;
             refused(&multisample, stopped.clone());
-            // A 2D multisample array too (EVs TTG-nil1-m4, TTG-nil2-m3).
+            // A 2D multisample array too.
             multisample.texture_type = TextureType::Type2DMultisampleArray;
             multisample.array_length = 2;
             refused(&multisample, stopped);
@@ -2326,10 +2477,10 @@ fn code_grid(texels: &[u8], max: u16) -> Vec<[u16; 3]> {
         .collect()
 }
 
-/// `YCBCR10_420_2P` and `RGB10_420_2P` textures over 10-bit surfaces read what Metal reads (EVs
-/// TXN2-ycr1-m4 and TXN2-ycr3-m4; `ycbcr_read` states it): `read()` and a linear sample at each
-/// texel's centre, over `x420`, `xf20`, `x422` and `xf44` surfaces without a matrix, with BT.709
-/// and with BT.2020; and `YCBCR10_420_2P`'s linear sample between the texels is Metal's step on the
+/// `YCBCR10_420_2P` and `RGB10_420_2P` textures over 10-bit surfaces read what Metal reads
+/// (`ycbcr_read` states it): `read()` and a linear sample at each texel's centre, over `x420`,
+/// `xf20`, `x422` and `xf44` surfaces without a matrix, with BT.709 and with BT.2020; and
+/// `YCBCR10_420_2P`'s linear sample between the texels is Metal's step on the
 /// grid `2048`, as `YCBCR8_420_2P`'s. No filter notice.
 #[test]
 fn ten_bit_textures_read_what_metal_reads() {
@@ -2386,9 +2537,9 @@ fn ten_bit_textures_read_what_metal_reads() {
     });
 }
 
-/// A 10-bit texture's copies move its luma words, two bytes a texel, as Metal's do (EV
-/// TXN2-ycr2-m4): `get_bytes` reads the luma rows' words, and `replace_region` writes them,
-/// keeping the chroma plane, the texture then reading the new codes' conversion.
+/// A 10-bit texture's copies move its luma words, two bytes a texel, as Metal's do: `get_bytes`
+/// reads the luma rows' words, and `replace_region` writes them, keeping the chroma plane, the
+/// texture then reading the new codes' conversion.
 #[test]
 fn ten_bit_textures_copy_their_luma_words() {
     on_device(|device, _| {
@@ -2465,7 +2616,7 @@ fn ten_bit_textures_refuse_what_is_not_held() {
 }
 
 /// The `f32` of the `half` nearest `step / 8192` with ties away from zero, as Metal rounds a
-/// `half` read of a step of `1 / 8192` (EV TXN2-ycr1-m4). Every nonzero step is a normal `half`'s
+/// `half` read of a step of `1 / 8192`. Every nonzero step is a normal `half`'s
 /// magnitude, so the `half`s about it lie `2^(e - 10)` apart for its binade `e`.
 fn half_away(step: u16) -> f32 {
     if step == 0 {
@@ -2487,12 +2638,12 @@ fn assert_half_reads(texels: &[u8], want: &[[u16; 3]], case: &str) {
     }
 }
 
-/// The `_sRGB` twins over their surfaces read what Metal reads (EVs TXN2-ycr1-m4, TXN2-ycv1-m4 and
-/// TXN2-ycr3-m4; `ycbcr_read` states it): `YCBCR8_420_2P_sRGB` over `420v` and `420f`, and
-/// `YCBCR10_420_2P_sRGB` over `x420`, `xf20`, `x422` and `xf44`, without a matrix, with BT.709 and
-/// with BT.2020. Each texel's `float` `read()` and a linear sample at its centre are its step of
-/// `1/8192`; a `half` read and a `half` nearest sample that step rounded with ties away from zero;
-/// and a linear sample between the texels Metal's step on the grid `8192`. No filter notice.
+/// The `_sRGB` twins over their surfaces read what Metal reads (`ycbcr_read` states it):
+/// `YCBCR8_420_2P_sRGB` over `420v` and `420f`, and `YCBCR10_420_2P_sRGB` over `x420`, `xf20`,
+/// `x422` and `xf44`, without a matrix, with BT.709 and with BT.2020. Each texel's `float` `read()`
+/// and a linear sample at its centre are its step of `1/8192`; a `half` read and a `half` nearest
+/// sample that step rounded with ties away from zero; and a linear sample between the texels
+/// Metal's step on the grid `8192`. No filter notice.
 #[test]
 fn srgb_twins_read_what_metal_reads() {
     on_device(|device, messages| {
@@ -2566,7 +2717,7 @@ fn srgb_twins_read_what_metal_reads() {
 }
 
 /// A converted texture's view as its `_sRGB` twin reads what a texture of the twin over the same
-/// planes reads, as Metal's view does (EV TXN2-ycv1-m4, made with `ShaderRead` alone):
+/// planes reads, as Metal's view does (made with `ShaderRead` alone):
 /// `YCBCR8_420_2P` over `420f` with BT.709 as `YCBCR8_420_2P_sRGB`, and `YCBCR10_420_2P` over
 /// `x420` as `YCBCR10_420_2P_sRGB`; the texture itself still reads its own conversion, and after
 /// `replace_region` writes the luma plane through it, the view reads the new codes' twin. The other
@@ -2667,16 +2818,14 @@ fn float4_bytes(v: [f32; 4]) -> Vec<u8> {
     v.iter().flat_map(|c| c.to_le_bytes()).collect()
 }
 
-/// Samples outside a two-plane YCbCr texture read as Metal reads them (EVs TXN2-ycb1-m4 and
-/// TXN2-ycb1-m3, the M4 and the M3 Max alike; TXN2-ycq1-m4 and TXN2-ycb2-m4 for 4:2:2 and
-/// 4:4:4), nearest and linear, at texel centres from `-W/2` to `3W/2`: under clamp-to-edge,
-/// mirror-clamp-to-edge, repeat and mirrored repeat each point of a 4:2:0 or 4:2:2 texture reads
-/// its texel clamped to the texture, of a 4:4:4 one its texel by that mode; under clamp-to-zero
-/// and clamp-to-border-color (transparent black, opaque black, opaque white) the converted
-/// formats and their sRGB twins read the border outside, its alpha 1, and `RGB10_420_2P` and
-/// `RGB8_420_2P` (EV XRR2-ycr540-m4, the M4), read as codes, its texel clamped to the texture
-/// again, under every border color. The packed formats read as their unpacked twins (EV
-/// TXN2-ycp1-m4).
+/// Samples outside a two-plane YCbCr texture read as Metal reads them (the M4 and the M3 Max alike;
+/// for 4:2:2 and 4:4:4), nearest and linear, at texel centres from `-W/2` to `3W/2`: under
+/// clamp-to-edge, mirror-clamp-to-edge, repeat and mirrored repeat each point of a 4:2:0 or 4:2:2
+/// texture reads its texel clamped to the texture, of a 4:4:4 one its texel by that mode; under
+/// clamp-to-zero and clamp-to-border-color (transparent black, opaque black, opaque white) the
+/// converted formats and their sRGB twins read the border outside, its alpha 1, and `RGB10_420_2P`
+/// and `RGB8_420_2P` (the M4), read as codes, its texel clamped to the texture again, under every
+/// border color. The packed formats read as their unpacked twins.
 #[test]
 fn ycbcr_samples_outside_read_metals_modes() {
     on_device(|device, _| {
@@ -2804,7 +2953,7 @@ const NEAREST_REPEAT: u64 = 0x007b_ff00_0008_0000 | 2 | 2 << 3 | 2 << 6;
 /// constexpr sampler of [`NEAREST_REPEAT`]'s words in place of sampler slot 0.
 fn constexpr_outside() -> String {
     format!(
-        r#"; Owned synthetic kernel (WP-TXN2).
+        r#"; Owned synthetic kernel.
 source_filename = "ycbcr_constexpr.metal"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 {NEAREST_REPEAT}, i64 0], align 8
@@ -2856,13 +3005,15 @@ declare {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr
 /// variant of its slot, and every other texture keeps the state's pipeline:
 /// `sample_outside_repeat`, through a constexpr nearest repeat sampler, makes nothing when
 /// dispatched again over an `RGBA8Unorm` texture, and no variant (no shader module) over a
-/// `YCBCR10_444_2P` one, whose map keeps repeat (a 4:4:4 texture repeats, EV TXN2-ycb2-m4); over
-/// a `YCBCR10_420_2P` one, whose map samples repeat as clamp-to-edge, it makes exactly one
-/// variant (one shader module), once, which a `YCBCR8_420_2P` one, whose map agrees on repeat,
-/// shares. Over each it reads, word for
-/// word, what the runtime repeat sampler at slot 0 reads (`sample_outside`), as Metal samples a
-/// constexpr sampler as a runtime one of its modes (EV TXN2-ycx1-m4): the 4:2:0 textures their
-/// texels clamped to the edge.
+/// `YCBCR10_444_2P` one, whose map keeps repeat (a 4:4:4 texture repeats); over a `YCBCR10_420_2P`
+/// one, whose map samples repeat as clamp-to-edge, it makes exactly one variant (one shader
+/// module), once, which a `YCBCR8_420_2P` one, whose map agrees on repeat, shares. Over each it
+/// reads, word for word, what the runtime repeat sampler at slot 0 reads (`sample_outside`), as
+/// Metal samples a constexpr sampler as a runtime one of its modes: the 4:2:0 textures their
+/// texels clamped to the edge. A dispatch again of a made variant, after the texture's shadow
+/// copy, records in a `VkCommandBuffer` of its own exactly where the driver loses baked samplers
+/// after a copy (`RuntimeDriverDefect::ImmutableSamplersLostAfterCopies`: lavapipe 26.0.8 sampled
+/// it as Repeat in place).
 #[test]
 fn a_constexpr_sampler_takes_a_ycbcr_map_through_one_variant() {
     on_device(|device, _| {
@@ -2928,9 +3079,8 @@ fn a_constexpr_sampler_takes_a_ycbcr_map_through_one_variant() {
         }
         // What one dispatch of the constexpr kernel over `texture` reads, the shader modules its
         // new variant's stages took, and the `VkPipeline`s it made. A new variant takes its
-        // module, made or the device's shared one of the same SPIR-V (on the M4, EV
-        // RRS3-lane1-mvk4, the YCBCR10_420_2P variant made none of its own). A variant kept takes
-        // none.
+        // module, made or the device's shared one of the same SPIR-V (on the M4, the YCBCR10_420_2P
+        // variant made none of its own). A variant kept takes none.
         let dispatched = |texture: &Texture| {
             let before = device.work_counts();
             let got = outside_of(device, &constexpr, texture, None);
@@ -2940,44 +3090,58 @@ fn a_constexpr_sampler_takes_a_ycbcr_map_through_one_variant() {
                 (after.shader_modules_made + after.shader_modules_shared)
                     - (before.shader_modules_made + before.shader_modules_shared),
                 after.variant_pipelines_made - before.variant_pipelines_made,
+                after.baked_sampler_dispatches_apart - before.baked_sampler_dispatches_apart,
             )
         };
-        let (got, _, _) = dispatched(&rgba);
+        // Each variant bakes its sampler: a dispatch whose pipeline is made records apart where
+        // the driver loses baked samplers after a copy, the texture's shadow copy among them.
+        let apart = u64::from(
+            device
+                .properties()
+                .driver_defects
+                .contains(&RuntimeDriverDefect::ImmutableSamplersLostAfterCopies),
+        );
+        let (got, _, _, _) = dispatched(&rgba);
         assert_eq!(got, want[0], "RGBA8Unorm");
-        let (got, modules, pipelines) = dispatched(&rgba);
+        let (got, modules, pipelines, recorded_apart) = dispatched(&rgba);
         assert_eq!(got, want[0], "RGBA8Unorm, again");
         assert_eq!((modules, pipelines), (0, 0), "RGBA8Unorm, again");
+        assert_eq!(recorded_apart, apart, "RGBA8Unorm, again: recorded apart");
         // A texture of another texel class may specialize the variant's module anew (a
         // `VkPipeline`, the filter class), never compile another.
-        let (got, modules, _) = dispatched(&ten_444);
+        let (got, modules, _, _) = dispatched(&ten_444);
         assert_eq!(got, want[3], "YCBCR10_444_2P");
         assert_eq!(
             modules, 0,
             "YCBCR10_444_2P keeps the RGBA8Unorm texture's variant"
         );
-        let (got, modules, pipelines) = dispatched(&ten_420);
+        let (got, modules, pipelines, _) = dispatched(&ten_420);
         assert_eq!(got, want[1], "YCBCR10_420_2P");
         assert_eq!(modules, 1, "YCBCR10_420_2P makes one variant");
         assert!(
             pipelines >= 1,
             "YCBCR10_420_2P makes its variant's pipeline"
         );
-        let (got, modules, pipelines) = dispatched(&ten_420);
+        let (got, modules, pipelines, recorded_apart) = dispatched(&ten_420);
         assert_eq!(got, want[1], "YCBCR10_420_2P, again");
         assert_eq!((modules, pipelines), (0, 0), "YCBCR10_420_2P, again");
-        let (got, modules, _) = dispatched(&eight_420);
+        assert_eq!(
+            recorded_apart, apart,
+            "YCBCR10_420_2P, again: recorded apart"
+        );
+        let (got, modules, _, _) = dispatched(&eight_420);
         assert_eq!(got, want[2], "YCBCR8_420_2P");
         assert_eq!(modules, 0, "YCBCR8_420_2P shares YCBCR10_420_2P's variant");
-        let (got, modules, _) = dispatched(&rgba);
+        let (got, modules, _, _) = dispatched(&rgba);
         assert_eq!(got, want[0], "RGBA8Unorm, after");
         assert_eq!(modules, 0, "RGBA8Unorm, after");
     });
 }
 
-/// `RGB8_420_2P` textures over `420v` and `420f` surfaces read their codes as Metal does (EVs
-/// XRR2-ycr540-m4 and XRR2-ycf3p2-m4; `ycbcr_read` states it): red Cr, green Y, blue Cb, each
-/// `code / 255`, alpha 1, after the 9/3/3/1 chroma filter, whatever the matrix: `read()`, and a
-/// nearest and a linear sample at each texel's centre. No filter notice.
+/// `RGB8_420_2P` textures over `420v` and `420f` surfaces read their codes as Metal does
+/// (`ycbcr_read` states it): red Cr, green Y, blue Cb, each `code / 255`, alpha 1, after the
+/// 9/3/3/1 chroma filter, whatever the matrix: `read()`, and a nearest and a linear sample at each
+/// texel's centre. No filter notice.
 #[test]
 fn eight_bit_codes_read_what_metal_reads() {
     on_device(|device, messages| {
@@ -3154,14 +3318,13 @@ fn family_texture(
     surface.new_texture_with_iosurface_plane(&d, at)
 }
 
-/// The 4:2:2 and 4:4:4 formats over their own surfaces read what Metal reads (EV TXN2-ycq1-m4;
-/// `ycbcr_read` states it): `YCBCR8_422_2P`, `YCBCR8_444_2P`, `YCBCR10_422_2P`, `YCBCR10_444_2P`
-/// and their `_sRGB` twins over `422v`, `422f`, `444v`, `444f`, `x422`, `xf22`, `x444` and `xf44`,
-/// without a matrix, with BT.709, with BT.2020 and with SMPTE 240M (read as BT.709, EV
-/// XRR2-ycf3p4-m4): `read()`, a nearest and a linear sample at each texel's centre, and a `half`
-/// read (the twins' steps rounded with ties away from zero). No filter notice. A format over a
-/// surface whose chroma plane holds its own reads its pairs at the surface's rows; over one whose
-/// plane is smaller it is refused.
+/// The 4:2:2 and 4:4:4 formats over their own surfaces read what Metal reads (`ycbcr_read` states
+/// it): `YCBCR8_422_2P`, `YCBCR8_444_2P`, `YCBCR10_422_2P`, `YCBCR10_444_2P` and their `_sRGB`
+/// twins over `422v`, `422f`, `444v`, `444f`, `x422`, `xf22`, `x444` and `xf44`, without a matrix,
+/// with BT.709, with BT.2020 and with SMPTE 240M (read as BT.709): `read()`, a nearest and a linear
+/// sample at each texel's centre, and a `half` read (the twins' steps rounded with ties away from
+/// zero). No filter notice. A format over a surface whose chroma plane holds its own reads its
+/// pairs at the surface's rows; over one whose plane is smaller it is refused.
 #[test]
 fn four_two_two_and_four_four_four_textures_read_what_metal_reads() {
     on_device(|device, messages| {
@@ -3224,7 +3387,7 @@ fn four_two_two_and_four_four_four_textures_read_what_metal_reads() {
         ] {
             assert_eq!(notices.get(&kind), None, "{notices:?}");
         }
-        // Over a surface whose chroma plane holds the format's (EV TXN2-ycq1-m4 for 4:2:2 over
+        // Over a surface whose chroma plane holds the format's (for 4:2:2 over
         // 4:4:4): the format's pairs, at the surface's rows.
         for (seed, (pf, ostype, range)) in (160..).zip([
             (PixelFormat::YCBCR84222P, "444v", YCbCrRange::Video),
@@ -3265,7 +3428,7 @@ fn four_two_two_and_four_four_four_textures_read_what_metal_reads() {
 }
 
 /// A 4:2:2 or 4:4:4 texture's view as its `_sRGB` twin reads what a texture of the twin over the
-/// same planes reads, as Metal's view does (EV TXN2-ycq1-m4, made with `ShaderRead` alone), and the
+/// same planes reads, as Metal's view does (made with `ShaderRead` alone), and the
 /// texture itself its own conversion.
 #[test]
 fn four_two_two_and_four_four_four_views_read_their_twins_texels() {
@@ -3314,8 +3477,8 @@ fn four_two_two_and_four_four_four_views_read_their_twins_texels() {
     });
 }
 
-/// A 4:2:2 or 4:4:4 texture's copies move its luma codes, a code's bytes a texel, as Metal's do
-/// (EV TXN2-ycr4-m4): `get_bytes` reads the luma rows, and `replace_region` writes them, keeping
+/// A 4:2:2 or 4:4:4 texture's copies move its luma codes, a code's bytes a texel, as Metal's do:
+/// `get_bytes` reads the luma rows, and `replace_region` writes them, keeping
 /// the chroma plane, the texture then reading the new codes' conversion.
 #[test]
 fn four_two_two_and_four_four_four_textures_copy_their_luma_codes() {
@@ -3399,11 +3562,11 @@ fn is_half_tie(step: u16) -> bool {
 }
 
 /// A `half` gather of a two-plane YCbCr texture rounds each lane with ties away from zero, as
-/// Metal's does (EV TXN2-ycg1-m4): red and blue of `YCBCR8_420_2P_sRGB` over `420v` without a
-/// matrix, with BT.709 and with BT.2020, `YCBCR10_420_2P_sRGB` over `x420`, the 4:2:2 and 4:4:4
-/// twins, the packed 4:2:0 and 4:4:4 twins (EV TXN2-ycg3-m4), and `YCBCR8_420_2P`, at every texel
-/// corner under clamp-to-edge, clamp-to-zero and clamp-to-border-color: each lane the `float`
-/// gather's step of `1/8192` rounded so, ties among them.
+/// Metal's does: red and blue of `YCBCR8_420_2P_sRGB` over `420v` without a matrix, with BT.709 and
+/// with BT.2020, `YCBCR10_420_2P_sRGB` over `x420`, the 4:2:2 and 4:4:4 twins, the packed 4:2:0 and
+/// 4:4:4 twins, and `YCBCR8_420_2P`, at every texel corner under clamp-to-edge, clamp-to-zero and
+/// clamp-to-border-color: each lane the `float` gather's step of `1/8192` rounded so, ties among
+/// them.
 #[test]
 fn ycbcr_half_gathers_round_ties_away() {
     on_device(|device, _| {
@@ -3485,7 +3648,7 @@ fn ycbcr_half_gathers_round_ties_away() {
     });
 }
 
-/// The 4:2:2 and 4:4:4 code twins read their codes as Metal does (EV XRR2-ycr541-m4, every
+/// The 4:2:2 and 4:4:4 code twins read their codes as Metal does (every
 /// texel of 24 surfaces; `ycbcr_read` states it): `RGB8_422_2P`, `RGB8_444_2P`, `RGB10_422_2P`
 /// and `RGB10_444_2P` over their own surfaces (`422v`, `422f`, `444v`, `444f`, `x422`, `xf22`,
 /// `x444`, `xf44`), and the 4:2:2 ones over a 4:4:4 surface (whose plane theirs fits in), without
@@ -3558,7 +3721,7 @@ fn four_two_two_and_four_four_four_codes_read_what_metal_reads() {
 }
 
 /// A texture over plane 1 of a 4:2:2 or 4:4:4 surface reads plane 1's codes as its luma plane,
-/// at plane 1's rows, with chroma codes 0, as Metal does (EV XRR2-ycp3-m4: every one of the 18
+/// at plane 1's rows, with chroma codes 0, as Metal does (every one of the 18
 /// formats over plane 1 of `422v`, `422f`, `444v`, `444f`, `x422`, `xf22`, `x444` and `xf44`,
 /// 0 texels off that model): each format over each such surface of its bits, without a matrix
 /// and with BT.709, reads (`read()`, a nearest sample, and the converted ones' `half` read) what
@@ -3711,16 +3874,15 @@ const PACKED: [(PixelFormat, [&str; 2]); 6] = [
     (PixelFormat::YCBCR104442PPACKEDSRGB, ["p444", "pf44"]),
 ];
 
-/// The packed formats over their own surfaces read what Metal reads (EVs TXN2-ycq1-m4 and
-/// TXN2-ycp1-m4; `ycbcr_read` states it): `YCBCR10_420_2P_PACKED`, `YCBCR10_422_2P_PACKED`,
-/// `YCBCR10_444_2P_PACKED` and their `_sRGB` twins over `p420`, `pf20`, `p422`, `pf22`, `p444` and
-/// `pf44`, three codes a 32-bit word, without a matrix, with BT.709 and with BT.2020: `read()`, a
-/// nearest and a linear sample at each texel's centre, a `half` read (the twins' steps rounded with
-/// ties away from zero), and a linear sample between texels Metal's step (EV TXN2-ycf2-m4, every
-/// case of the six formats). No filter notice. A 4:2:0 format over a packed 4:4:4 surface reads its
-/// pairs at the surface's rows; a format over a surface whose plane is smaller, a packed one over
-/// an unpacked surface, an unpacked one over a packed surface, and one over plane 1 of a packed
-/// surface are refused.
+/// The packed formats over their own surfaces read what Metal reads (`ycbcr_read` states it):
+/// `YCBCR10_420_2P_PACKED`, `YCBCR10_422_2P_PACKED`, `YCBCR10_444_2P_PACKED` and their `_sRGB`
+/// twins over `p420`, `pf20`, `p422`, `pf22`, `p444` and `pf44`, three codes a 32-bit word, without
+/// a matrix, with BT.709 and with BT.2020: `read()`, a nearest and a linear sample at each texel's
+/// centre, a `half` read (the twins' steps rounded with ties away from zero), and a linear sample
+/// between texels Metal's step (every case of the six formats). No filter notice. A 4:2:0 format
+/// over a packed 4:4:4 surface reads its pairs at the surface's rows; a format over a surface whose
+/// plane is smaller, a packed one over an unpacked surface, an unpacked one over a packed surface,
+/// and one over plane 1 of a packed surface are refused.
 #[test]
 fn packed_textures_read_what_metal_reads() {
     on_device(|device, messages| {
@@ -3781,7 +3943,7 @@ fn packed_textures_read_what_metal_reads() {
         ] {
             assert_eq!(notices.get(&kind), None, "{notices:?}");
         }
-        // Over a surface whose chroma plane holds the format's (EV TXN2-ycp1-m4: 4:2:0 over 4:2:2
+        // Over a surface whose chroma plane holds the format's (4:2:0 over 4:2:2
         // and 4:4:4, 4:2:2 over 4:4:4): the format's pairs, at the surface's rows.
         for (seed, (pf, ostype, range)) in (340..).zip([
             (PixelFormat::YCBCR104202PPACKED, "p444", YCbCrRange::Video),
@@ -3843,7 +4005,7 @@ fn packed_textures_read_what_metal_reads() {
 }
 
 /// A packed texture's view as its `_sRGB` twin reads what a texture of the twin over the same
-/// planes reads, as Metal's view does (EV TXN2-ycq1-m4 for 4:2:0 and 4:2:2, made with `ShaderRead`
+/// planes reads, as Metal's view does (for 4:2:0 and 4:2:2, made with `ShaderRead`
 /// alone; 4:4:4 by the rule every measured pair follows), and the texture itself its own
 /// conversion.
 #[test]
@@ -3884,7 +4046,7 @@ fn packed_views_read_their_twins_texels() {
     });
 }
 
-/// A packed texture's CPU calls move nothing, as Metal's (EV TXN2-ycp1-m4, 48 `getBytes` and 48
+/// A packed texture's CPU calls move nothing, as Metal's (48 `getBytes` and 48
 /// `replaceRegion` calls): `get_bytes` leaves the bytes it is given and `replace_region` the
 /// planes, at a row's words, twice them, four bytes a texel and 256 bytes a row, the texture
 /// reading the planes' conversion still. A blit with a buffer either way, whose bytes Metal moves

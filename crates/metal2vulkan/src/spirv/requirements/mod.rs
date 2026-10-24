@@ -22,6 +22,13 @@
 //!   (`VK_KHR_shader_terminate_invocation`) depends on the device's version, so it is not listed:
 //!   the description lists the feature only where it is exposed (`Device::new` checks it), and
 //!   `DeviceDescription::required_enables` names the extension below that version.
+//! - **A capability with a version or an extension beside its feature is enabled on the device.**
+//!   `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` are enabled by
+//!   `shaderStorageImage{Read,Write}WithoutFormat`, by Vulkan 1.3, or by
+//!   `VK_KHR_format_feature_flags2`, under which each format's own bits govern its access. The
+//!   module lists the capability alone, and `DeviceProfile::check` and
+//!   `DeviceDescription::required_enables` resolve it on the device
+//!   (`device::requirements::WITHOUT_FORMAT_CAPABILITIES`).
 //! - **Contextual choices are structural.** Where the Vulkan registry offers alternatives for one
 //!   capability (buffer vs shared vs image float atomics, 8/16-bit access per storage class), the
 //!   walk picks the one the instruction's storage class and type select. A test checks every
@@ -46,6 +53,7 @@ use std::collections::BTreeSet;
 
 use crate::spv::Capability as Cap;
 
+use crate::device::profile::Independence;
 use crate::device::requirements::{
     ApiVersion, FloatControl, FloatWidth, Requirements, SpirvCapability, SpirvExtension,
     SubgroupOp, VkExtension, VkFeature, VkLimit, VkProperty,
@@ -66,8 +74,26 @@ use crate::spirv::ir::{
 /// `SkipTrianglesKHR | SkipAABBsKHR`.
 const SKIP_PRIMITIVES: u64 = 0x100 | 0x200;
 
+/// The independence an entry needs whose one denormal (or rounding) mode names `widths`
+/// (RuntimeSpirv VUIDs 06289-06292): none where every width or none is named; 32-bit only where 16
+/// and 64 bits agree and 32 bits does not; all where 16 and 64 bits differ.
+fn independence_needed(widths: &BTreeSet<u8>) -> Independence {
+    let named = |w: u8| widths.contains(&w);
+    if named(16) != named(64) {
+        Independence::All
+    } else if named(32) != named(16) {
+        Independence::Only32Bit
+    } else {
+        Independence::None
+    }
+}
+
+mod own_pixel;
+mod snapshot;
 mod writes;
 
+pub use own_pixel::own_pixel_textures;
+pub use snapshot::{snapshot_copies_alone, snapshot_textures};
 pub use writes::writes_memory;
 
 #[cfg(test)]
@@ -213,13 +239,14 @@ pub fn interface(m: &ModuleView<'_>) -> BResult<Vec<GlobalId>> {
     Ok(interface)
 }
 
-/// The Metal stage of an execution model: both tessellation stages belong to Metal's vertex
-/// stage.
+/// The Metal stage of an execution model: both tessellation stages and the synthesized geometry
+/// stage belong to Metal's vertex stage.
 pub(crate) fn metal_stage(model: ExecModel) -> Stage {
     match model {
-        ExecModel::Vertex | ExecModel::TessellationEvaluation | ExecModel::TessellationControl => {
-            Stage::Vertex
-        }
+        ExecModel::Vertex
+        | ExecModel::TessellationEvaluation
+        | ExecModel::TessellationControl
+        | ExecModel::Geometry => Stage::Vertex,
         ExecModel::Fragment => Stage::Fragment,
         ExecModel::GLCompute => Stage::Kernel,
         ExecModel::TaskEXT => Stage::Object,
@@ -252,6 +279,10 @@ pub fn derive(m: &ModuleView<'_>) -> BResult<Requirements> {
     if m.entry.model.is_tessellation() {
         d.cap(Cap::Tessellation);
         d.feat(VkFeature::TessellationShader);
+    }
+    if m.entry.model == ExecModel::Geometry {
+        d.cap(Cap::Geometry);
+        d.feat(VkFeature::GeometryShader);
     }
     // A task or mesh entry, and a fragment entry reading a mesh entry's primitive outputs
     // (`PerPrimitiveEXT`), declare mesh shading.
@@ -443,9 +474,8 @@ impl Deriver<'_> {
         match self.model {
             ExecModel::Vertex
             | ExecModel::TessellationEvaluation
-            | ExecModel::TessellationControl => {
-                self.feat(VkFeature::VertexPipelineStoresAndAtomics)
-            }
+            | ExecModel::TessellationControl
+            | ExecModel::Geometry => self.feat(VkFeature::VertexPipelineStoresAndAtomics),
             ExecModel::Fragment => self.feat(VkFeature::FragmentStoresAndAtomics),
             // Vulkan's stage store features name no task or mesh stage.
             ExecModel::GLCompute | ExecModel::TaskEXT | ExecModel::MeshEXT => {}
@@ -688,9 +718,13 @@ impl Deriver<'_> {
         ty: TypeId,
     ) -> BResult<()> {
         use crate::spv::BuiltIn as B;
-        // A mesh entry's outputs are arrayed per vertex or per primitive: a builtin's own array, a
-        // clip or cull distance's, is that array's element.
-        let arrayed = self.model == ExecModel::MeshEXT && dir == IoDir::Output;
+        // A mesh entry's outputs are arrayed per vertex or per primitive, and a geometry entry's
+        // per-vertex inputs per vertex: a builtin's own array, a clip or cull distance's, is that
+        // array's element.
+        let arrayed = (self.model == ExecModel::MeshEXT && dir == IoDir::Output)
+            || (self.model == ExecModel::Geometry
+                && dir == IoDir::Input
+                && crate::spirv::builder::geometry_per_vertex(b));
         let array_len = |d: &Self| -> BResult<Option<u32>> {
             let own = match (arrayed, d.ty(ty)?) {
                 (false, _) => ty,
@@ -702,9 +736,30 @@ impl Deriver<'_> {
                 _ => Ok(None),
             }
         };
-        // A tessellation stage's `PrimitiveId` is enabled by `Tessellation`, which the entry
-        // declared.
-        if b == B::PrimitiveId && self.model.is_tessellation() {
+        // A tessellation stage's `PrimitiveId` is enabled by `Tessellation`, and a geometry stage's
+        // by `Geometry`, which the entry declared.
+        if b == B::PrimitiveId
+            && (self.model.is_tessellation() || self.model == ExecModel::Geometry)
+        {
+            return Ok(());
+        }
+        // A geometry stage's `Layer` output is enabled by `Geometry`, which the entry declared, and
+        // its `ViewportIndex` output by `MultiViewport` (`multiViewport`).
+        if self.model == ExecModel::Geometry && dir == IoDir::Output {
+            match b {
+                B::Layer => return Ok(()),
+                B::ViewportIndex => {
+                    self.cap(Cap::MultiViewport);
+                    self.feat(VkFeature::MultiViewport);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        // A geometry stage's point size, input or output, is `GeometryPointSize`'s.
+        if b == B::PointSize && self.model == ExecModel::Geometry {
+            self.cap(Cap::GeometryPointSize);
+            self.feat(VkFeature::ShaderTessellationAndGeometryPointSize);
             return Ok(());
         }
         // A mesh entry's per-primitive outputs (`PrimitiveId`, `Layer`, `ViewportIndex`) and its
@@ -811,6 +866,12 @@ impl Deriver<'_> {
                     FloatControl::SignedZeroInfNanPreserve,
                     width,
                 ),
+                ExecMode::DenormPreserve { width } => {
+                    self.float_control(Cap::DenormPreserve, FloatControl::DenormPreserve, width)
+                }
+                ExecMode::RoundingModeRte { width } => {
+                    self.float_control(Cap::RoundingModeRTE, FloatControl::RoundingModeRte, width)
+                }
                 ExecMode::PixelInterlockOrdered => {
                     self.cap(Cap::FragmentShaderPixelInterlockEXT);
                     self.ext(SpirvExtension::ExtFragmentShaderInterlock);
@@ -877,8 +938,30 @@ impl Deriver<'_> {
                 | ExecMode::OutputPoints
                 | ExecMode::OutputLines
                 | ExecMode::OutputTriangles => {}
+                // The entry's `Geometry` covers a geometry entry's modes. The synthesized stage
+                // emits at most 3 vertices in one invocation, within every device's
+                // `maxGeometryOutputVertices` (at least 256) and `maxGeometryShaderInvocations`
+                // (at least 32) where `geometryShader` is.
+                ExecMode::InputPoints
+                | ExecMode::InputLines
+                | ExecMode::OutputLineStrip
+                | ExecMode::OutputTriangleStrip
+                | ExecMode::Invocations { .. } => {}
             }
         }
+        // The widths the denormal and rounding modes name: a width without one keeps the
+        // device's default, which is another mode for the independence rules.
+        let widths = |pick: fn(&ExecMode) -> Option<u8>| -> BTreeSet<u8> {
+            m.entry.modes.iter().filter_map(pick).collect()
+        };
+        self.r.denorm_independence = independence_needed(&widths(|m| match m {
+            ExecMode::DenormPreserve { width } => Some(*width),
+            _ => None,
+        }));
+        self.r.rounding_independence = independence_needed(&widths(|m| match m {
+            ExecMode::RoundingModeRte { width } => Some(*width),
+            _ => None,
+        }));
         Ok(())
     }
 
@@ -1023,9 +1106,9 @@ impl Deriver<'_> {
                     self.sparse_residency();
                 }
                 let img = self.image_of(*image)?;
+                // Enabled on the device (`DeviceProfile::check`), not by a feature listed here.
                 if img.format == crate::spv::ImageFormat::Unknown && img.dim != Dim::SubpassData {
                     self.cap(Cap::StorageImageReadWithoutFormat);
-                    self.feat(VkFeature::ShaderStorageImageReadWithoutFormat);
                 }
             }
             Inst::ImageWrite {
@@ -1036,7 +1119,6 @@ impl Deriver<'_> {
                 self.stage_stores();
                 if self.image_of(*image)?.format == crate::spv::ImageFormat::Unknown {
                     self.cap(Cap::StorageImageWriteWithoutFormat);
-                    self.feat(VkFeature::ShaderStorageImageWriteWithoutFormat);
                 }
             }
             Inst::ImageQuery { .. } | Inst::ImageQueryLod { .. } => self.cap(Cap::ImageQuery),
@@ -1075,12 +1157,21 @@ impl Deriver<'_> {
                     self.cap(Cap::RayTraversalPrimitiveCullingKHR);
                 }
             }
-            // The builder admits 32-bit floats only (`FunctionBuilder::fma`), so `shaderFmaFloat32`
-            // is the feature (VUID-RuntimeSpirv-shaderFmaFloat32-10978).
-            Inst::Fma { .. } => {
+            // The builder admits 16- and 32-bit floats (`FunctionBuilder::fma`): `shaderFmaFloat16`
+            // or `shaderFmaFloat32` by the operands' width, the result's
+            // (VUID-RuntimeSpirv-shaderFmaFloat16-10977, VUID-RuntimeSpirv-shaderFmaFloat32-10978).
+            Inst::Fma { a, .. } => {
                 self.cap(Cap::Fmakhr);
                 self.ext(SpirvExtension::KhrFma);
-                self.feat(VkFeature::ShaderFmaFloat32);
+                let half = matches!(
+                    self.scalar_of(self.value_ty(*a)?)?,
+                    Type::Float { width: 16 }
+                );
+                self.feat(if half {
+                    VkFeature::ShaderFmaFloat16
+                } else {
+                    VkFeature::ShaderFmaFloat32
+                });
             }
             Inst::DemoteToHelperInvocation | Inst::IsHelperInvocation => {
                 self.cap(Cap::DemoteToHelperInvocation);

@@ -346,12 +346,14 @@ fn a_compiled_stage_links_without_decoding() {
     assert_eq!(compiled.artifact().profile, dev.profile().fingerprint());
 
     let mut m = Meter::new(&Budget::default());
-    let from_function = dev.compute_pipeline(&kernel(f), &mut m).expect("function");
+    let from_function = dev
+        .compute_pipeline(&kernel(f), &inp, &mut m)
+        .expect("function");
     assert!(m.work() > 0, "the function path decodes and lowers");
 
     let d = ComputePipelineDescriptor::new(StageSource::Compiled(compiled.clone()));
     let mut m = Meter::new(&Budget::default());
-    let from_compiled = dev.compute_pipeline(&d, &mut m).expect("compiled");
+    let from_compiled = dev.compute_pipeline(&d, &inp, &mut m).expect("compiled");
     assert_eq!(
         (m.work(), m.ledger_peak()),
         (0, 0),
@@ -645,11 +647,15 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", replay_bindings: false", "")
                 .replace(", framebuffer_fetch: None", "")
                 .replace(", srgb_textures: {}", "")
+                .replace(", srgb_twins: {}", "")
+                .replace(", snapshot_textures: {}", "")
                 .replace(", ycbcr_textures: {}", "")
                 .replace(", viewport_index_varying: false", "")
                 .replace(", max_call_stack_depth: None", "")
                 .replace(", flat_grid: false", "")
                 .replace(", render_target_array_index_varying: false", "")
+                .replace(", primitive_id_varying: false", "")
+                .replace(", primitive_id_indices: None", "")
                 .replace(", amplification_draws: None", "")
                 .replace(", color_writes: {}", "")
                 .replace(", primitive_varyings: {}", "")
@@ -658,6 +664,7 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", folded_groups: false", "")
                 .replace(", extended_range: {}", "")
                 .replace(", extended_range_colors: {}", "")
+                .replace(", word_colors: {}", "")
                 .replace(", srgb_fetches: {}", "")
                 .replace(", zeroed_colors: {}", "")
                 .replace(", dropped_colors: {}", "")
@@ -672,6 +679,7 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", shader_stencil: false", "")
                 .replace(", window_depth_varying: false", "")
                 .replace(", rotated_colors: {}", "")
+                .replace(", alpha_in_red_colors: {}", "")
                 .replace(", rotated_factors: {}", "")
                 .replace(", threadgroup_size_matches_tile_size: false", "")
                 .replace(", address_maps: {}", "")
@@ -684,7 +692,12 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", texture_write_rounding: TowardZero", "")
                 .replace(", anisotropic_samplers: {}", "")
                 .replace(", uniform_varyings: {}", "")
-                .replace(", instanced_attributes: {}", ""),
+                .replace(", instanced_attributes: {}", "")
+                .replace(", depth16_codes: false", "")
+                .replace(", depth16_bias_raises: None", "")
+                .replace(", color_group: None", "")
+                .replace(", object_payload: None", "")
+                .replace(", tessellation: None", ""),
             "{derived}"
         );
     }
@@ -1391,16 +1404,13 @@ fn a_vertex_pipeline_makes_its_input_assembly_dynamic_exactly_with_both_extended
 /// requires `rasterizationOrderColorAttachmentAccess` (enabled with its extension). With only the
 /// ordered pixel interlock it reads and writes the attachment as a storage image inside the
 /// interlock: no input attachment, no color attachment state for it, the interlock, the
-/// fragment-stage store, and the format's storage access required, under either policy. Where the
-/// pipeline's state blocks that form (a blending attachment), `RequireOrdered` refuses with the
-/// blocker and `AcceptUnordered` compiles it unordered: no flag, no requirement, and the stage's
-/// `UnorderedFramebufferFetch` note. With neither, `RequireOrdered` refuses naming both forms.
+/// fragment-stage store, and the format's storage access required. Where the pipeline's state
+/// blocks that form (a blending attachment), the pipeline is refused with the blocker; with
+/// neither form, refused naming both: an unordered read is never compiled.
 #[test]
 fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() {
-    use crate::device::profile::FramebufferFetchPolicy;
     use crate::device::requirements::{FormatUsage, VkExtension, VkFeature};
     use crate::error::Capability;
-    use crate::pipeline::artifact::PrecisionNote;
     use crate::pipeline::RenderPipeline;
     const ORDERED: VkFeature = VkFeature::RasterizationOrderColorAttachmentAccess;
     const INTERLOCK: VkFeature = VkFeature::FragmentShaderPixelInterlock;
@@ -1436,33 +1446,15 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
             .expect("the requirements are the device's");
         Ok::<RenderPipeline, Error>(pipe)
     };
-    let lenient = || DevicePolicy {
-        framebuffer_fetch: FramebufferFetchPolicy::AcceptUnordered,
-        ..DevicePolicy::default()
-    };
-    let unordered = |pipe: &RenderPipeline| {
-        pipe.stages.iter().any(|s| {
-            s.precision_notes
-                .contains(&PrecisionNote::UnorderedFramebufferFetch)
-        })
-    };
-    let read_unordered = |pipe: &RenderPipeline| {
-        assert_eq!(pipe.graphics.input_attachments.len(), 1);
-        assert!(pipe.graphics.storage_attachments.is_empty());
-        assert!(!pipe.graphics.rasterization_order_attachment_access);
-        assert!(!pipe.requirements.features.contains(&ORDERED));
-        assert!(unordered(pipe));
-    };
 
     let lavapipe = description("lavapipe");
     assert!(lavapipe.has(ORDERED));
-    for policy in [DevicePolicy::default(), lenient()] {
-        let pipe = compile(&lavapipe, policy, &d).expect("lavapipe");
+    {
+        let pipe = compile(&lavapipe, DevicePolicy::default(), &d).expect("lavapipe");
         assert_eq!(pipe.graphics.input_attachments.len(), 1);
         assert!(pipe.graphics.storage_attachments.is_empty());
         assert!(pipe.graphics.rasterization_order_attachment_access);
         assert!(pipe.requirements.features.contains(&ORDERED));
-        assert!(!unordered(&pipe));
         let enables = lavapipe
             .required_enables(&pipe.requirements)
             .expect("enables");
@@ -1475,8 +1467,8 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
     let mut interlocked = lavapipe.clone();
     interlocked.features.remove(&ORDERED);
     assert!(interlocked.has(INTERLOCK));
-    for policy in [DevicePolicy::default(), lenient()] {
-        let pipe = compile(&interlocked, policy, &d).expect("interlocked");
+    {
+        let pipe = compile(&interlocked, DevicePolicy::default(), &d).expect("interlocked");
         assert!(pipe.graphics.input_attachments.is_empty());
         assert!(pipe.graphics.color_attachments.iter().all(Option::is_none));
         let [s] = pipe.graphics.storage_attachments.as_slice() else {
@@ -1487,7 +1479,13 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
             (s.color_index, s.format, s.writes, s.formatless),
             (0, vk::Format::R32_SFLOAT, true, true)
         );
-        assert!(pipe
+        // The capability, which the device resolves (`DeviceProfile::check`), not its feature.
+        assert!(pipe.requirements.spirv_capabilities.contains(
+            &crate::device::requirements::SpirvCapability::of(
+                crate::spv::Capability::StorageImageReadWithoutFormat
+            )
+        ));
+        assert!(!pipe
             .requirements
             .features
             .contains(&VkFeature::ShaderStorageImageReadWithoutFormat));
@@ -1500,7 +1498,6 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
             .requirements
             .formats
             .contains(&(vk::Format::R32_SFLOAT, FormatUsage::StorageImage)));
-        assert!(!unordered(&pipe));
     }
     match compile(&interlocked, DevicePolicy::default(), &blended) {
         Err(Error::Unsupported(u)) => assert_eq!(
@@ -1509,7 +1506,6 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
         ),
         other => panic!("{:?}", other.map(|_| ())),
     }
-    read_unordered(&compile(&interlocked, lenient(), &blended).expect("unordered"));
 
     let mut without = interlocked.clone();
     without.features.remove(&INTERLOCK);
@@ -1526,7 +1522,6 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
         ),
         other => panic!("{:?}", other.map(|_| ())),
     }
-    read_unordered(&compile(&without, lenient(), &d).expect("unordered"));
 }
 
 /// The SPIR-V `OpTypeImage`s of `words` as `(dim, arrayed, ms)` operand triples, and whether a
@@ -2417,6 +2412,181 @@ fn a_render_pipeline_requires_its_framebuffer_sample_counts() {
     }
 }
 
+/// The interface states the texture slots a fragment function reads only at its own pixel
+/// (`spirv::requirements::own_pixel`): owned fixture `tob_renders`'s `tob_read`
+/// (`t.read(uint2(in.position.xy))`) on every profile, whether the device's robustness returns
+/// Metal's out-of-bounds texel or the shader clamps the read (both kinds of profile are among
+/// them); not `tob_sample` (a sample at the pixel's center), `tob_read_buffer` (a texture
+/// buffer's texel by arithmetic), nor `tob_solid`, which reads no texture.
+#[test]
+fn the_interface_states_the_textures_read_at_the_fragments_own_pixel() {
+    let Some(bc) = fixture("tob_renders") else {
+        return;
+    };
+    let mut checks = std::collections::BTreeSet::new();
+    for stem in [
+        "intel-irisxe-anv",
+        "nvidia-rtx5080-laptop",
+        "amd-780m-radv",
+        "lavapipe",
+        "moltenvk-m3",
+        "vk12-floor",
+    ] {
+        let p = crate::pipeline::testing::profile(stem, DevicePolicy::default()).expect("profile");
+        checks.insert(crate::memory::contain::device_reads_texels(&p, false));
+        for (entry, own) in [
+            ("tob_read", &[0u32][..]),
+            ("tob_sample", &[]),
+            ("tob_read_buffer", &[]),
+            ("tob_solid", &[]),
+        ] {
+            let a = crate::pipeline::testing::compile(&bc, entry, &p)
+                .unwrap_or_else(|e| panic!("{stem} {entry}: {e}"));
+            assert_eq!(a.interface.own_pixel_textures, own, "{stem} {entry}");
+        }
+    }
+    assert_eq!(checks.len(), 2, "both read checks");
+}
+
+/// The interface states the own-pixel slots a draw can read through a snapshot
+/// (`spirv::requirements::snapshot`): `tob_read`'s, whose texel reaches only its output. Its
+/// snapshot variant (`LoweringInputs::snapshot_textures`) links and validates on every profile with
+/// the pixel interlock, which it requires; binds the slot's snapshot; places the phase in the
+/// fragment window; still states the slot, as read at the own pixel and through a snapshot; and
+/// writes no memory of the function's. A profile without the interlock refuses it, naming the
+/// feature. A variant asked for `tob_sample`'s slot, which the fact does not list, would sample the
+/// texture beside the copy: refused, never compiled so. All of it holds under the exact answers too,
+/// whose texel reaches its output through a call of Metal's conversion routine
+/// (`lower::texture::float_texel`) where the device's conversion is not Metal's.
+#[test]
+fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
+    use crate::device::requirements::VkFeature;
+    use crate::error::Capability;
+    use crate::pipeline::interface::PushLoc;
+    use crate::pipeline::sym::{PushField, ResourceKind, SlotClass, SlotRef, SnapshotForm, Stage};
+    let Some(bc) = fixture("tob_renders") else {
+        return;
+    };
+    let inputs = |form: SnapshotForm| {
+        let mut inputs = LoweringInputs::new();
+        let slot = SlotRef {
+            stage: Stage::Fragment,
+            class: SlotClass::Texture,
+            index: 0,
+        };
+        inputs.snapshot_textures.insert(slot, form);
+        inputs
+    };
+    let mut interlocked = 0;
+    let mut converted = 0;
+    let policies = [
+        DevicePolicy::default(),
+        DevicePolicy::default().exact_answers(),
+    ];
+    for (stem, policy) in [
+        "intel-irisxe-anv",
+        "nvidia-rtx5080-laptop",
+        "amd-780m-radv",
+        "lavapipe",
+        "moltenvk-m3",
+        "vk12-floor",
+    ]
+    .into_iter()
+    .flat_map(|stem| policies.map(|policy| (stem, policy)))
+    {
+        let p = crate::pipeline::testing::profile(stem, policy).expect("profile");
+        let stem = format!("{stem} {:?}", policy.texel_conversion);
+        let base = crate::pipeline::testing::compile(&bc, "tob_read", &p)
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert_eq!(base.interface.snapshot_textures, [0u32], "{stem}");
+        let routine = crate::lower::texture::float_texel::CENSUS_NAME;
+        if base.strategies.entries.contains_key(routine) {
+            assert_eq!(
+                policy.texel_conversion,
+                crate::device::TexelConversionPolicy::Exact,
+                "{stem}"
+            );
+            converted += 1;
+        }
+        let sampled = crate::pipeline::testing::compile(&bc, "tob_sample", &p)
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert!(sampled.interface.snapshot_textures.is_empty(), "{stem}");
+        let variant = crate::pipeline::testing::compile_with(
+            &bc,
+            "tob_read",
+            &p,
+            &inputs(SnapshotForm::Bits),
+        );
+        if !p.fields().fragment.pixel_interlock {
+            assert_eq!(
+                variant.map(|_| ()),
+                Err(Error::Unsupported(crate::error::Unsupported::needs(
+                    Feature::RasterOrderGroups,
+                    Capability::Feature(VkFeature::FragmentShaderPixelInterlock),
+                ))),
+                "{stem}"
+            );
+            continue;
+        }
+        interlocked += 1;
+        // Each form of a float slot's codes compiles, its copy alone reading the texture.
+        for form in [
+            SnapshotForm::Unorm8,
+            SnapshotForm::Snorm8,
+            SnapshotForm::Unorm16,
+            SnapshotForm::Snorm16,
+            SnapshotForm::Half,
+        ] {
+            let narrow = crate::pipeline::testing::compile_with(&bc, "tob_read", &p, &inputs(form))
+                .unwrap_or_else(|e| panic!("{stem} {form:?}: {e}"));
+            assert_eq!(
+                narrow.interface.snapshot_textures,
+                [0u32],
+                "{stem} {form:?}"
+            );
+        }
+        let a = variant.unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert_eq!(a.interface.snapshot_textures, [0u32], "{stem}");
+        assert_eq!(a.interface.own_pixel_textures, [0u32], "{stem}");
+        assert!(!a.interface.writes_memory, "{stem}");
+        assert!(
+            a.interface
+                .descriptors
+                .iter()
+                .any(|d| d.slot.kind == ResourceKind::SnapshotTexels(0)),
+            "{stem}"
+        );
+        assert!(
+            a.interface.push.fields.iter().any(|f| {
+                f.field == PushField::SnapshotPhase && matches!(f.loc, PushLoc::Push { .. })
+            }),
+            "{stem}"
+        );
+        assert!(
+            a.requirements
+                .features
+                .contains(&VkFeature::FragmentShaderPixelInterlock),
+            "{stem}"
+        );
+        crate::pipeline::testing::link_and_validate(&a, &p)
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        match crate::pipeline::testing::compile_with(
+            &bc,
+            "tob_sample",
+            &p,
+            &inputs(SnapshotForm::Bits),
+        ) {
+            Err(Error::Internal(e)) if e.kind == InternalKind::Invariant => {}
+            other => panic!("{stem} tob_sample: {other:?}"),
+        }
+    }
+    assert!(
+        interlocked >= 8,
+        "the interlocked profiles, under both policies"
+    );
+    assert!(converted >= 4, "the exact conversion's calls");
+}
+
 /// The interface states whether the function writes memory another invocation or a later command
 /// can read: a buffer store, an image write (through an argument buffer's handle too), in a
 /// fragment function or a kernel alike; a function that only reads does not, nor does one that only
@@ -2548,11 +2718,12 @@ fn the_interface_states_whether_the_function_writes_textures() {
 }
 
 /// A render pipeline whose fragment function reads `[[sample_id]]` and `[[point_coord]]`
-/// (`stage_io_fragment_point`) links at one sample and is refused at four, where Vulkan's sample
-/// shading may move the point coordinate to the sample while Metal keeps it at the pixel's.
+/// (`stage_io_fragment_point`) compiles at one sample and at four, where Vulkan's sample shading
+/// may move the point coordinate to the sample while Metal keeps it at the pixel's: there its
+/// fragment module notes `MultisamplePosition`, and at one sample nothing.
 #[test]
-fn a_sample_rate_point_coordinate_is_refused_under_multisampling() {
-    use crate::error::Unsupported;
+fn a_sample_rate_point_coordinate_is_noted_under_multisampling() {
+    use crate::pipeline::artifact::PrecisionNote;
     let Some(bc) = fixture("stage_io") else {
         return;
     };
@@ -2568,16 +2739,24 @@ fn a_sample_rate_point_coordinate_is_refused_under_multisampling() {
     ));
     for stem in ["moltenvk-m3", "lavapipe"] {
         let dev = device(stem);
-        d.raster_sample_count = 1;
-        dev.compile_render_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        d.raster_sample_count = 4;
-        assert_eq!(
-            dev.compile_render_pipeline(&d, &Budget::standard())
-                .unwrap_err(),
-            Error::Unsupported(Unsupported::not_implemented(Feature::SampleRateShading)),
-            "{stem}"
-        );
+        for samples in [1, 4] {
+            d.raster_sample_count = samples;
+            let p = dev
+                .compile_render_pipeline(&d, &Budget::standard())
+                .unwrap_or_else(|e| panic!("{stem} at {samples}: {e}"));
+            let fragment = p
+                .stages
+                .iter()
+                .find(|m| m.stage == crate::vk::ShaderStage::FRAGMENT)
+                .expect("fragment stage");
+            assert_eq!(
+                fragment
+                    .precision_notes
+                    .contains(&PrecisionNote::MultisamplePosition),
+                samples == 4,
+                "{stem} at {samples}"
+            );
+        }
     }
 }
 

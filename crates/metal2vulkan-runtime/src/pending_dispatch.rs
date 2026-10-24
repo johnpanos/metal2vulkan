@@ -25,7 +25,7 @@
 //!   `CommandBuffer::failed_pipeline` names the dispatch: its encoder's place and its order among
 //!   the encoder's dispatches, the state, its variant and specialization, and the driver's error.
 
-use super::binding::PushWrite;
+use super::binding::{self, PushWrite, SetWrite};
 use super::command_buffer::CommandBuffer;
 use super::encoder::{EncoderCore, RecordedSegment};
 use super::error::{Error, FailedPipeline, FailedState};
@@ -34,6 +34,8 @@ use super::pipeline::{ComputePipelineState, RawPipeline, RegionKey, RegionPipeli
 use super::resource::ResourceKey;
 use super::tracker::{Barrier, EncoderUses, Summary};
 use super::upload::Upload;
+use crate::device::functions::Vk;
+use crate::pipeline::budget::Urgency;
 use ash::vk;
 use metal2vulkan::bind::PredicationStep;
 use std::sync::{Arc, OnceLock};
@@ -46,6 +48,9 @@ pub(super) struct Recording {
     pub(super) layout: vk::PipelineLayout,
     /// Set 0, where the variant binds one.
     pub(super) set: Option<vk::DescriptorSet>,
+    /// Set 0's writes, where the variant pushes it (`pipeline::objects::pushes_set_zero`):
+    /// pushed with the device's push command (`Vk::push_descriptor`).
+    pub(super) pushed: Vec<SetWrite>,
     /// Set 1, the heap, where the variant has one.
     pub(super) heap: Option<vk::DescriptorSet>,
     pub(super) preprocess: Option<FlatPreprocess>,
@@ -64,7 +69,7 @@ impl Recording {
     /// one per region.
     pub(super) unsafe fn record(
         &self,
-        raw: &ash::Device,
+        raw: &Vk,
         command_buffer: vk::CommandBuffer,
         pipelines: &[Arc<RawPipeline>],
     ) {
@@ -73,15 +78,26 @@ impl Recording {
             if let Some(preprocess) = &self.preprocess {
                 preprocess.record(raw, command_buffer, self.gates.first());
             }
-            if let Some(set) = self.set {
-                raw.cmd_bind_descriptor_sets(
+            match raw.push_descriptor().filter(|_| !self.pushed.is_empty()) {
+                Some(push) => binding::push_set(
+                    push,
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
                     self.layout,
-                    0,
-                    &[set],
-                    &[],
-                );
+                    &self.pushed,
+                ),
+                None => {
+                    if let Some(set) = self.set {
+                        raw.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.layout,
+                            0,
+                            &[set],
+                            &[],
+                        );
+                    }
+                }
             }
             if let Some(heap) = self.heap {
                 raw.cmd_bind_descriptor_sets(
@@ -170,11 +186,11 @@ impl PendingDispatch {
         }
     }
 
-    /// Run its makings before the device's pool's pieces that nothing waits for: its batch's
-    /// submission waits for them.
-    pub(super) fn hasten(&self) {
+    /// Run its makings before the device's pool's pieces of a lower rank than `urgency`: its
+    /// batch's submission waits for them.
+    pub(super) fn hasten(&self, urgency: Urgency) {
         for pending in self.makings() {
-            pending.hasten();
+            pending.hasten(urgency);
         }
     }
 
@@ -221,7 +237,7 @@ impl PendingDispatch {
             creation.get_or_init(|| pipelines.iter().map(|made| made.created_in).collect());
         }
         let (barrier, recording, made) = (self.barrier, &self.recording, &pipelines);
-        let record = |raw: &ash::Device, cb: vk::CommandBuffer| {
+        let record = |raw: &Vk, cb: vk::CommandBuffer| {
             // SAFETY: the segment's command buffer is recording outside a render pass, by this
             // call alone; what the dispatch records was retained at the dispatch, its pipelines
             // with the segment, and they are its variant's, one per region.

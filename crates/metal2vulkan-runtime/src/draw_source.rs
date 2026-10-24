@@ -47,11 +47,11 @@
 //!   bytes behind one, the copy runs before the draw's own render pass instance instead, after
 //!   the writer's ([`CopySteps`]), and reads the write, as the draw does in Metal. A write since
 //!   the last barrier races the draw's read in Metal. Before any barrier of the encoder, Metal's
-//!   indexed indirect draw read the bytes from before the write in every run measured (a probe
-//!   RRS-race, an M3 Max and an M4), so such a draw whose arguments or indices a draw of the
+//!   indexed indirect draw read the bytes from before the write in every run measured (a probe, an
+//!   M3 Max and an M4), so such a draw whose arguments or indices a draw of the
 //!   encoder wrote reads a copy of them taken before the pass for that reason alone
 //!   ([`DrawSource::racing`]), announced once as `Degradation::UnorderedDrawBytes`. After a
-//!   barrier, a rewrite since it was read in some runs (probe RRS-race2), so no copy is taken
+//!   barrier, a rewrite since it was read in some runs, so no copy is taken
 //!   there.
 //! - **Bounds.** The copy holds every byte the draw reads inside the buffer: a direct draw's
 //!   indices that lie wholly inside it, an indirect draw's arguments, or an indexed indirect
@@ -68,6 +68,7 @@ use super::encoder::EncoderCore;
 use super::error::Error;
 use super::resource::ResourceKey;
 use super::tracker::{Barrier, Use};
+use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::device::{EnableSet, VkExtension, VkFeature};
 use std::ffi::CStr;
@@ -490,7 +491,7 @@ impl CopySteps {
     ///
     /// `command_buffer` is the encoder's, recording outside a render pass, and only the encoder
     /// records it.
-    pub(super) unsafe fn record_in(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer) {
+    pub(super) unsafe fn record_in(&self, raw: &Vk, command_buffer: vk::CommandBuffer) {
         // SAFETY: as the caller states.
         unsafe {
             Barrier::everything().record(raw, command_buffer);
@@ -502,7 +503,7 @@ impl CopySteps {
     /// # Safety
     ///
     /// `command_buffer` is recording outside a render pass, and only one encoder records it.
-    unsafe fn copy(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer) {
+    unsafe fn copy(&self, raw: &Vk, command_buffer: vk::CommandBuffer) {
         // SAFETY: as the caller states; both buffers are live until the command buffer completes
         // (the encoder holds the Metal buffer, and the command buffer the new one), and the
         // region lies in both: the Metal buffer's length from the offset, and the new buffer's

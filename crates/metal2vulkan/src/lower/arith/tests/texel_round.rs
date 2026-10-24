@@ -198,6 +198,7 @@ fn f32_to_half_from_even_is_exact_on_every_tie() {
         QuantizeForm::Integer,
         QuantizeForm::Device,
         QuantizeForm::Converted,
+        QuantizeForm::Controlled,
     ] {
         for (tz, mode) in [
             (true, HalfRounding::TowardZeroSaturating),
@@ -268,6 +269,52 @@ fn ones_ratio_to_half_is_exact_on_every_step() {
     }
 }
 
+/// `ones_ratio_factor`'s product of every step `m` of the 16-bit normalized grids rounds to `half`
+/// as `m / D` does, from either `f32` neighbour of the exact product; and the factors `2^-b · (1 +
+/// k · 2^-23)` that do so are exactly those its note states, strictly between `2^-b` (`k = 0`)
+/// and the reciprocal `RN(1 / D)` (`k = 128` on `65535`, `256` on `32767`). Exact: the product of
+/// a step below `2^16` and a 24-bit factor has at most 40 bits, and the `half` of an `f32` and of
+/// `f64`'s correctly rounded quotient are single roundings (the module note).
+#[test]
+fn the_ones_ratio_factor_rounds_every_step() {
+    for (b, last) in [(16u32, 127u32), (15, 255)] {
+        let d = (1u32 << b) - 1;
+        let want: Vec<u16> = (0..=d)
+            .map(|m| f64_to_f16(f64::from(m) / f64::from(d)))
+            .collect();
+        let holds = |k: u32| {
+            let c = f64::from(f32::from_bits(((127 - b) << 23) | k));
+            (0..=d).all(|m| {
+                let exact = f64::from(m) * c;
+                let near = exact as f32;
+                let other = match f64::from(near).partial_cmp(&exact) {
+                    Some(std::cmp::Ordering::Greater) => f32::from_bits(near.to_bits() - 1),
+                    Some(std::cmp::Ordering::Less) => f32::from_bits(near.to_bits() + 1),
+                    _ => near,
+                };
+                [near, other]
+                    .iter()
+                    .all(|v| f64_to_f16(f64::from(*v)) == want[m as usize])
+            })
+        };
+        let reciprocal = (1.0 / d as f32).to_bits();
+        assert_eq!(reciprocal, ((127 - b) << 23) | (last + 1), "RN(1 / {d})");
+        assert!(!holds(0), "2^-{b} itself");
+        assert!(!holds(last + 1), "RN(1 / {d}) itself");
+        let failing: Vec<u32> = (1..=last).filter(|k| !holds(*k)).collect();
+        assert!(
+            failing.is_empty(),
+            "1 / {d}: factors {failing:?} below RN(1 / D)"
+        );
+        let k = texel_round::ONES_RATIO_FACTOR_ULPS;
+        assert!((1..=last).contains(&k), "the factor's {k} ulps on {d}");
+        assert_eq!(
+            texel_round::ones_ratio_factor(b).to_bits(),
+            ((127 - b) << 23) | k
+        );
+    }
+}
+
 /// The normalized grids the bicubic filter's exact sums land on: `16 · 255`, `16 · 127`, `65535`,
 /// `32767`, and the sRGB step scale 4095. The grids: a texture's `half` conversion's, the sRGB
 /// table's, and the normalized formats' fields' that a tile function's `half` member reads, down to
@@ -305,6 +352,106 @@ fn ratio_to_f32_is_correctly_rounded() {
             false,
         );
     }
+}
+
+/// `ratio_by_255_to_f32` is `m / 255` correctly rounded for every `m` below `2^16` (the
+/// extended-range grids' steps reach `2 · 8160`), and for `m` up to `2^24` sampled, the powers of
+/// two `255 · 2^j` and their neighbours among them.
+#[test]
+fn ratio_by_255_to_f32_is_correctly_rounded() {
+    let u = int(32);
+    let powers = (0..16u64).flat_map(|j| {
+        let p = 255 << j;
+        [p - 1, p, p + 1]
+    });
+    let cases: Vec<Case> = (0..1u64 << 16)
+        .chain(((1u64 << 16)..(1 << 24)).step_by(4093))
+        .chain(powers)
+        .chain([(1 << 24) - 1])
+        .map(|m| vec![vec![m]])
+        .collect();
+    check(
+        "m / 255 to f32",
+        &[u],
+        float(32),
+        &|fb, a| texel_round::ratio_by_255_to_f32(fb, u, a[0]),
+        &cases,
+        &|c| {
+            Some(vec![u64::from(
+                ((arg(c, 0) as f64 / 255.0) as f32).to_bits(),
+            )])
+        },
+        false,
+    );
+}
+
+/// The extended-range grids' `half` value of a step `m` (`m / D`, `D = 255 · 2^k` for `k` 4 and 5:
+/// alpha's `8 · 510` and a color lane's `16 · 510`) rounds once through
+/// `ratio_by_255_to_f32` and `normal_half_bits`: `RN_half(RN_f32(m / D)) = RN_half(m / D)` for
+/// every `m` below `2^16` (the grids' steps reach `2D`), as no `f32` quotient lands on a `half`
+/// tie (`bicubic::routines`'s extended sum takes it so). An `_sRGB` twin's color step `m / 8192`
+/// (exact in `f32`) rounds with ties away from zero, for every `m` up to `2 · 8192`.
+#[test]
+fn the_extended_grids_half_rounds_once_through_f32() {
+    let u = int(32);
+    let b = Form {
+        held: Held::Bool,
+        lanes: 1,
+    };
+    let cases: Vec<Case> = (0..1u64 << 16).map(|m| vec![vec![m]]).collect();
+    for k in [4u32, 5] {
+        let d = f64::from(255u32 << k);
+        check(
+            &format!("m / (255 · 2^{k}) to half"),
+            &[u],
+            float(32),
+            &|fb, a| {
+                let q = texel_round::ratio_by_255_to_f32(fb, u, a[0])?;
+                let scale = (1.0f32 / (1u32 << k) as f32).to_bits();
+                let scale = crate::lower::arith::ops::splat(fb, float(32), u64::from(scale))?;
+                let x = fb.binary_no_contraction(crate::spirv::ir::BinOp::FMul, q, scale)?;
+                let ut = crate::lower::arith::ops::ty(fb, u)?;
+                let bits = fb.convert(crate::spirv::ir::ConvOp::Bitcast, x, ut)?;
+                let even = crate::lower::arith::ops::splat(fb, b, 0)?;
+                let h = texel_round::normal_half_bits(fb, u, bits, even)?;
+                let ft = crate::lower::arith::ops::ty(fb, float(32))?;
+                fb.convert(crate::spirv::ir::ConvOp::Bitcast, h, ft)
+            },
+            &cases,
+            &|c| {
+                let h = f64_to_f16(arg(c, 0) as f64 / d);
+                Some(vec![u64::from((f16_to_f64(h) as f32).to_bits())])
+            },
+            false,
+        );
+    }
+    let steps: Vec<Case> = (0..=2 * 8192u64).map(|m| vec![vec![m]]).collect();
+    check(
+        "m / 8192 to half, ties away",
+        &[u],
+        float(32),
+        &|fb, a| {
+            let ft = crate::lower::arith::ops::ty(fb, float(32))?;
+            let x = fb.convert(crate::spirv::ir::ConvOp::ConvertUToF, a[0], ft)?;
+            let scale = crate::lower::arith::ops::splat(
+                fb,
+                float(32),
+                u64::from((1.0f32 / 8192.0).to_bits()),
+            )?;
+            let x = fb.binary_no_contraction(crate::spirv::ir::BinOp::FMul, x, scale)?;
+            let ut = crate::lower::arith::ops::ty(fb, u)?;
+            let bits = fb.convert(crate::spirv::ir::ConvOp::Bitcast, x, ut)?;
+            let away = crate::lower::arith::ops::splat(fb, b, 1)?;
+            let h = texel_round::normal_half_bits(fb, u, bits, away)?;
+            fb.convert(crate::spirv::ir::ConvOp::Bitcast, h, ft)
+        },
+        &steps,
+        &|c| {
+            let x = arg(c, 0) as f32 / 8192.0;
+            Some(vec![u64::from(half_of(x, HalfRounding::NearestAway))])
+        },
+        false,
+    );
 }
 
 /// `ratio_to_half` rounds `k / d` to `half` once, half denormals included, where rounding the

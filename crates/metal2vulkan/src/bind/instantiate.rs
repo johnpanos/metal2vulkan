@@ -1,7 +1,8 @@
 //! Per-draw and per-dispatch instantiation outputs shared by draws and dispatches, and the
 //! arithmetic both share: descriptor ranges and residual bind offsets (`descriptor_range`), and the
 //! resident root table ([`RootTable`]), and the buffer-slot, push-field, and texel-buffer
-//! instantiation both share (`bind_buffers`, `slot_field`, `put`, `texel_ranges`).
+//! instantiation both share (`bind_buffers`, `slot_field`, `put`, `texel_ranges`). A push
+//! field's bytes are held in place ([`FieldBytes`]), so a draw's fields allocate nothing.
 
 use crate::bind::plan::compute::internal;
 use crate::bind::plan::{BoundKind, PlannedBuffer, ResourceTemplate};
@@ -102,6 +103,14 @@ pub enum PushHole {
     /// `u16` index is read in the aligned 4-byte word that holds it, which lies inside the
     /// `VkBuffer` an `IndexBufferRef` describes.
     CaptureIndexAddress {
+        stages: vk::ShaderStageFlags,
+        offset: u32,
+    },
+    /// Which draw of a snapshot variant (`VariantKey::snapshot_textures`,
+    /// `PushField::SnapshotPhase`) runs, as a `u32` at `offset` of the variant's fragment push
+    /// bytes: 1 in the draw that takes the snapshot (every color write mask 0), 0 in the draw that
+    /// reads it (the pipeline's masks).
+    SnapshotPhase {
         stages: vk::ShaderStageFlags,
         offset: u32,
     },
@@ -395,6 +404,23 @@ pub(crate) enum RangeError {
     TooLarge { needed: u64 },
 }
 
+/// Whether [`descriptor_range`] starts the range of a slot with `window` at `bind_offset` for the
+/// descriptor base alignment `alignment` (`A`, at least 4 used), so its residual is 0, wherever
+/// the bind offset lies before the padded end of the allocation: the bind offset is a multiple of
+/// `A`, and the window is `Whole` or starts in `[0, A)` (`align_down(bind_offset + start, A)` is
+/// then the bind offset, and a range from an aligned bind offset inside the allocation is at least
+/// 16 bytes, so it is never widened down). At or past the end, where every byte the slot reaches
+/// lies outside the bound buffer, the range is widened down into the allocation and the residual
+/// is not 0. The plan specializes `SpecKey::RangeAtBindOffset` on it.
+pub(crate) fn starts_at_bind(bind_offset: u64, window: Window, alignment: u64) -> bool {
+    let a = alignment.max(4);
+    bind_offset.is_multiple_of(a)
+        && match window {
+            Window::Whole => true,
+            Window::Bounded { start, .. } => u64::try_from(start).is_ok_and(|s| s < a),
+        }
+}
+
 /// The descriptor range and the `SlotBindOffset` residual of a descriptor-form slot, in checked
 /// `i128` arithmetic, for an allocation of `length` bytes (padded to 16) bound at `bind_offset`,
 /// with the slot's proven `window`, the descriptor base `alignment` `A` (at least 4 is used; a
@@ -460,7 +486,8 @@ pub(crate) fn bound_buffer(
         .stages
         .get(&slot.stage)
         .and_then(|t| t.buffers.get(&slot.index));
-    if BoundKind::of(b.map(BoundBuffer::shape).as_ref()) != expected {
+    // The kind alone is compared, which no offset class changes.
+    if BoundKind::of(b.map(|b| b.shape(0)).as_ref()) != expected {
         return Err(internal(format!(
             "the bind state's shape differs from the plan's at {slot:?}"
         )));
@@ -468,16 +495,43 @@ pub(crate) fn bound_buffer(
     Ok(b)
 }
 
-/// What a draw or dispatch binds for the plan's buffer slots.
+/// What a draw or dispatch binds for the plan's buffer slots beside their descriptor ranges and
+/// extents ([`bind_buffers`]).
 pub(crate) struct BoundBuffers {
-    /// The range of every descriptor-form slot's buffer or inline bytes.
-    pub descriptor_ranges: Vec<DescriptorRange>,
-    /// The window of every bound buffer slot.
-    pub extents: Vec<BufferExtent>,
     /// The `SlotBindOffset` residual of every bound descriptor-form slot.
-    pub residuals: Vec<(SlotRef, u32)>,
+    pub residuals: Residuals,
     /// The root entry of every bound device-address slot.
     pub statics: Vec<(SlotRef, RootEntry)>,
+}
+
+/// The `SlotBindOffset` residuals a [`BoundBuffers`] holds that are kept in place, so a draw or
+/// dispatch of no more descriptor-form slots allocates none.
+const INLINE_RESIDUALS: usize = 8;
+
+/// The `SlotBindOffset` residual of every bound descriptor-form slot, in the order they were
+/// added: the first [`INLINE_RESIDUALS`] in place, the rest after them.
+#[derive(Default)]
+pub(crate) struct Residuals {
+    inline: [Option<(SlotRef, u32)>; INLINE_RESIDUALS],
+    rest: Vec<(SlotRef, u32)>,
+}
+
+impl Residuals {
+    /// Add `slot`'s residual last.
+    fn push(&mut self, slot: SlotRef, residual: u32) {
+        match self.inline.iter_mut().find(|r| r.is_none()) {
+            Some(free) => *free = Some((slot, residual)),
+            None => self.rest.push((slot, residual)),
+        }
+    }
+
+    /// The first residual added for `slot`.
+    fn of(&self, slot: SlotRef) -> Option<u32> {
+        (self.inline.iter().flatten())
+            .chain(&self.rest)
+            .find(|(s, _)| *s == slot)
+            .map(|r| r.1)
+    }
 }
 
 /// The Metal addresses `[lo, hi)` a buffer bound at `gpu_address + offset` (an allocation of
@@ -534,27 +588,27 @@ fn check_uniform_aliasing(buffers: &[PlannedBuffer], state: &BindState) -> Resul
     Ok(())
 }
 
-/// Instantiate `buffers` for `state`: each descriptor-form slot's range and residual (checked
-/// `i128`, `DescriptorRangeExceeded` above the view's limit, an empty allocation
-/// `Unsupported{BufferRange}`), each bound device-address slot's root entry, and each bound
-/// buffer's extent. A `device` slot's uniform view must not alias a written slot
-/// (`UniformViewAliased`).
+/// Instantiate `buffers` for `state`: each descriptor-form slot's range, pushed onto
+/// `descriptor_ranges`, and residual (checked `i128`, `DescriptorRangeExceeded` above the view's
+/// limit, an empty allocation `Unsupported{BufferRange}`), each bound device-address slot's root
+/// entry, and each bound buffer's extent, pushed onto `extents`. A `device` slot's uniform view
+/// must not alias a written slot (`UniformViewAliased`).
 pub(crate) fn bind_buffers(
     buffers: &[PlannedBuffer],
     state: &BindState,
+    descriptor_ranges: &mut Vec<DescriptorRange>,
+    extents: &mut Vec<BufferExtent>,
 ) -> Result<BoundBuffers, BindError> {
     check_uniform_aliasing(buffers, state)?;
     let mut out = BoundBuffers {
-        descriptor_ranges: Vec::new(),
-        extents: Vec::new(),
-        residuals: Vec::new(),
+        residuals: Residuals::default(),
         statics: Vec::new(),
     };
     for pb in buffers {
         let bound = bound_buffer(state, pb.slot, pb.bound)?;
         let (bind_offset, length) = match bound {
             Some(&BoundBuffer::Buffer { length, offset, .. }) => {
-                out.extents.push(BufferExtent {
+                extents.push(BufferExtent {
                     slot: pb.slot,
                     window: pb.window,
                 });
@@ -578,12 +632,12 @@ pub(crate) fn bind_buffers(
                                 Unsupported::not_representable(Feature::BufferRange),
                             ),
                         })?;
-                out.descriptor_ranges.push(DescriptorRange {
+                descriptor_ranges.push(DescriptorRange {
                     set,
                     binding,
                     range,
                 });
-                out.residuals.push((pb.slot, residual));
+                out.residuals.push(pb.slot, residual);
             }
             (BufferForm::Psb, _) => {
                 if let Some(&BoundBuffer::Buffer {
@@ -611,6 +665,77 @@ pub(crate) fn bind_buffers(
     Ok(out)
 }
 
+/// The bytes of one push field ([`put`]): held in place up to [`FieldBytes::INLINE`] bytes, as
+/// every field of a few words is, so writing a draw's or a dispatch's fields allocates nothing;
+/// a longer one (a capture's layout) on the heap.
+pub(crate) enum FieldBytes {
+    /// The first `len` bytes of `bytes`.
+    Inline {
+        len: u8,
+        bytes: [u8; FieldBytes::INLINE],
+    },
+    Heap(Vec<u8>),
+}
+
+impl FieldBytes {
+    /// The most bytes a field holds in place: eight words.
+    pub(crate) const INLINE: usize = 32;
+
+    /// A field of `bytes`.
+    pub(crate) fn of(bytes: &[u8]) -> FieldBytes {
+        match bytes.len() <= Self::INLINE {
+            true => {
+                let mut inline = [0; Self::INLINE];
+                inline[..bytes.len()].copy_from_slice(bytes);
+                FieldBytes::Inline {
+                    len: bytes.len() as u8,
+                    bytes: inline,
+                }
+            }
+            false => FieldBytes::Heap(bytes.to_vec()),
+        }
+    }
+
+    /// A field of `words`, each little-endian.
+    pub(crate) fn words(words: impl IntoIterator<Item = u32>) -> FieldBytes {
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+}
+
+impl std::ops::Deref for FieldBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            FieldBytes::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            FieldBytes::Heap(bytes) => bytes,
+        }
+    }
+}
+
+/// Bytes collected in place while they fit, else on the heap.
+impl FromIterator<u8> for FieldBytes {
+    fn from_iter<I: IntoIterator<Item = u8>>(iter: I) -> FieldBytes {
+        let mut inline = [0; Self::INLINE];
+        let mut len = 0;
+        let mut iter = iter.into_iter();
+        for byte in iter.by_ref() {
+            if len == Self::INLINE {
+                let mut heap = inline.to_vec();
+                heap.push(byte);
+                heap.extend(iter);
+                return FieldBytes::Heap(heap);
+            }
+            inline[len] = byte;
+            len += 1;
+        }
+        FieldBytes::Inline {
+            len: len as u8,
+            bytes: inline,
+        }
+    }
+}
+
 /// The bytes of a slot push field (`SlotBindOffset`: the residual, 0 unbound; `SlotGuestBase`: the
 /// slot's `gpu_address + offset`, which is Metal's `nil`; `TextureLevels`: the level count the plan
 /// bound; `InstanceCount`: the bound structure's instance count; `Specialized`: the value the plan
@@ -618,10 +743,10 @@ pub(crate) fn bind_buffers(
 /// `set*Bytes` slot (`MissingGuestAddress`), so no inline-bytes slot is written as null here.
 pub(crate) fn slot_field(
     field: PushField,
-    residuals: &[(SlotRef, u32)],
+    residuals: &Residuals,
     resources: &crate::bind::plan::ResourceTemplate,
     state: &BindState,
-) -> Option<Vec<u8>> {
+) -> Option<FieldBytes> {
     match field {
         // The bound structure's instance count, 0 for an unbound slot.
         PushField::InstanceCount(slot) => {
@@ -630,38 +755,35 @@ pub(crate) fn slot_field(
                 .get(&slot.stage)
                 .and_then(|t| t.acceleration_structures.get(&slot.index))
                 .map_or(0, |s| s.instance_count);
-            Some(count.to_le_bytes().to_vec())
+            Some(FieldBytes::of(&count.to_le_bytes()))
         }
         // The level count the plan bound.
         PushField::TextureLevels(slot) => resources
             .texture_levels
             .iter()
             .find(|(s, _)| *s == slot)
-            .map(|(_, levels)| levels.to_le_bytes().to_vec()),
+            .map(|(_, levels)| FieldBytes::of(&levels.to_le_bytes())),
         // The value the bound resources decide, as the plan recorded it.
         PushField::Specialized(key) => resources
             .specialized
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, value)| value.to_le_bytes().to_vec()),
+            .map(|(_, value)| FieldBytes::of(&value.to_le_bytes())),
         // Whether the texture the plan bound holds 16-bit float channels.
         PushField::TextureHalfChannels(slot) => resources
             .texture_half_channels
             .iter()
             .find(|(s, _)| *s == slot)
-            .map(|(_, half)| half.to_le_bytes().to_vec()),
+            .map(|(_, half)| FieldBytes::of(&half.to_le_bytes())),
         // The integer channel widths of the texture the plan bound.
         PushField::TextureIntegerChannels(slot) => resources
             .texture_integer_channels
             .iter()
             .find(|(s, _)| *s == slot)
-            .map(|(_, word)| word.to_le_bytes().to_vec()),
+            .map(|(_, word)| FieldBytes::of(&word.to_le_bytes())),
         PushField::SlotBindOffset(slot) => {
-            let r = residuals
-                .iter()
-                .find(|(s, _)| *s == slot)
-                .map_or(0, |r| r.1);
-            Some(r.to_le_bytes().to_vec())
+            let r = residuals.of(slot).unwrap_or(0);
+            Some(FieldBytes::of(&r.to_le_bytes()))
         }
         PushField::SlotGuestBase(slot) => {
             let base = match state
@@ -676,7 +798,7 @@ pub(crate) fn slot_field(
                 }) => gpu_address.wrapping_add(offset),
                 _ => 0,
             };
-            Some(base.to_le_bytes().to_vec())
+            Some(FieldBytes::of(&base.to_le_bytes()))
         }
         _ => None,
     }

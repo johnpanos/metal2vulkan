@@ -1805,7 +1805,7 @@ fn linear_3d_samples_take_metals_filter() {
 }
 
 /// A sample through a runtime sampler slot takes Metal's filter by the bound sampler's word, as a
-/// constexpr sampler of the same state does (EV MSFZ-m4-probe1): every lane is Metal's rule on the
+/// constexpr sampler of the same state does: every lane is Metal's rule on the
 /// interpreter under each address mode, a transparent, opaque-black, and white border (and
 /// `clamp_to_zero` beside a white and an opaque-black border color, which it reads as
 /// `clamp_to_border` does), pixel coordinates, 1D, a constant offset, 3D, and a `half` or `float`
@@ -2513,9 +2513,9 @@ fn check_depth(
 }
 
 /// A depth texture's linear sample is its color class's (`Depth32Float`'s `R32Float`'s,
-/// `Depth16Unorm`'s `R16Unorm`'s; RT13-px2-probe-m4 and RT13-px4-probe-m4, 2,191 lanes), emulated
-/// on lavapipe and Metal's on every lane of the interpreter: clamping to the edge, to zero, and to
-/// a white border, pixel coordinates, an offset, and an array's layer.
+/// `Depth16Unorm`'s `R16Unorm`'s; 2,191 lanes), emulated on lavapipe and Metal's on every lane of
+/// the interpreter: clamping to the edge, to zero, and to a white border, pixel coordinates, an
+/// offset, and an array's layer.
 #[test]
 fn depth_linear_samples_take_their_color_class() {
     const WHITE: [f64; 4] = [1.0; 4];
@@ -2550,7 +2550,7 @@ fn depth_linear_samples_take_their_color_class() {
 }
 
 /// A linear comparison is an `r8Unorm` linear sample of the taps' passes as codes 0 and 255
-/// (RT13-px2/px3-probe-m4, 8,640 lanes; RT13-px4-probe-m4 compares the border's depth as a
+/// (our probes, 8,640 lanes; our probe compares the border's depth as a
 /// texel's), on `Depth32Float` and `Depth16Unorm` (whose reference and texels compare as codes):
 /// every compare function clamping to the edge, `less` and `greater` against zero and white
 /// borders, `less` with an offset, and `less_equal` at an array's layer, on every lane of the
@@ -3423,16 +3423,26 @@ pub(super) fn notes_pipeline(
 
 /// The notes of pipeline `p` on `dev` planned for texture slot 0 bound as a `ty` texture in `pf`,
 /// buffers 0 to 2 bound, and sampler slot 0 bound to `sampler` (or nothing): its stage's notes
-/// under the plan's specialization.
+/// under the plan's specialization, where a test of the format bound at texture slot 0
+/// (`SpecKey::BoundTexelFormat`), which no pipeline's key carries, reads `pf`'s class
+/// (`metal::format::bound_texel_format`), as a runtime reads it at each draw or dispatch.
 pub(super) fn notes_bound(
     p: &crate::pipeline::ComputePipeline,
     dev: &crate::device::Device,
     texture: (crate::metal::TextureType, PixelFormat),
     sampler: Option<crate::bind::SamplerDescriptor>,
 ) -> Vec<PrecisionNote> {
+    let pf = texture.1;
     let plan = plan_bound(p, dev, texture, sampler);
     p.stage
-        .precision_notes_bound(&plan.specialization, &|k| plan.specialized_value(k))
+        .precision_notes_bound(&plan.specialization, &|k| match k {
+            SpecKey::BoundTexelFormat(SlotRef {
+                class: SlotClass::Texture,
+                index: 0,
+                ..
+            }) => Some(u64::from(crate::metal::format::bound_texel_format(pf))),
+            k => plan.specialized_value(k),
+        })
 }
 
 /// The plan of pipeline `p` on `dev` for texture slot 0 bound as a `ty` texture in `pf`, buffers
@@ -4029,8 +4039,9 @@ impl ModuleFunctions {
 /// its shape's sampling routine, which the entry calls; the routine calls the two sums, which are
 /// declared `DontInline` on every such profile. The routine states `DontInline` where the driver is
 /// measured to keep such a call a call (`DriverWorkaround::DontInlineKeepsCalls`, NVIDIA's
-/// 615.71.09 on the RTX 3090) and no control elsewhere: on Mesa's drivers, which inline every
-/// function whatever it states, and on a GPU not measured (the RTX 5080 Laptop GPU's profile). The
+/// 615.71.09 on the RTX 3090 and the RTX 5080 Laptop GPU) and no control elsewhere: on Mesa's
+/// drivers, which inline every function whatever it states, and on a GPU not measured (the desktop
+/// RTX 5080's profile, `nvidia-rtx50-linux`, on the same release). The
 /// texel conversion the device's sample calls, which its class specialization folds where it is
 /// inlined, and the entry take no control.
 #[test]
@@ -4043,6 +4054,11 @@ fn the_linear_sums_run_one_by_a_branch_and_stay_calls() {
         (
             "nvidia-rtx5080-laptop",
             profile("nvidia-rtx5080-laptop", EXACT_SAMPLING).expect("profile"),
+            true,
+        ),
+        (
+            "nvidia-rtx50-linux",
+            profile("nvidia-rtx50-linux", EXACT_SAMPLING).expect("profile"),
             false,
         ),
         (
@@ -4113,7 +4129,8 @@ fn the_linear_sums_run_one_by_a_branch_and_stay_calls() {
 }
 
 /// The profile of the RTX 5080 Laptop GPU's committed description with the RTX 3090's `deviceID`:
-/// NVIDIA's 615.71.09 on the GPU `DriverWorkaround::DontInlineKeepsCalls` is measured on.
+/// NVIDIA's 615.71.09 on the RTX 3090, a GPU `DriverWorkaround::DontInlineKeepsCalls` is measured
+/// on.
 fn rtx3090() -> DeviceProfile {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/nvidia-rtx5080-laptop.json");

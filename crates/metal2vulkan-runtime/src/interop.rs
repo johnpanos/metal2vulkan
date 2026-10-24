@@ -18,6 +18,7 @@
 //!   refuses what it can tell is no binary semaphore of the device: a null handle, and its own
 //!   timeline semaphores (events' and queues'). Every other contract is the caller's.
 
+use super::buffer::ReadApart;
 use super::device::relay::By;
 use super::event::EventRef;
 use super::texture::wrapped::Wrapped;
@@ -95,30 +96,25 @@ impl Device {
 
 impl Texture {
     /// No Metal counterpart (an interop hook): the texture's `VkImage`, the image of the texture
-    /// and of every view of it, made by the
-    /// runtime or the caller's
+    /// and of every view of it, made by the runtime or the caller's
     /// ([`Device::new_texture_with_vk_image`](super::Device::new_texture_with_vk_image)). `None`
     /// where the texels are a buffer's bytes the runtime copies into and out of an image of its
-    /// own (a texture buffer, or a texture over a buffer that does not alias it), or another
-    /// image's texels it so copies (a view of another component layout on a device whose views
-    /// reinterpret none). A texture with a depth twin gives its `R32_SFLOAT` image, which holds its
-    /// texels; its comparisons read the twin, which a write into the image does not reach.
+    /// own (a texture buffer, a texture over a no-copy buffer's host pages, or a texture over
+    /// another buffer that does not alias it), or another image's texels it so copies (a view of
+    /// another component layout on a device whose views reinterpret none). A texture with a depth
+    /// twin gives its `R32_SFLOAT` image, which holds its texels; its comparisons read the twin,
+    /// which a write into the image does not reach.
     ///
-    /// A texture over a buffer's bytes whose image aliases them gives a linear image: of
-    /// `VK_IMAGE_TILING_LINEAR`, or of `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with
-    /// `DRM_FORMAT_MOD_LINEAR` and one memory plane laid out at the texels' offset and the
-    /// texture's `bytes_per_row`. Such a texture's rows lie one after another and its image's
-    /// subresource holds no byte but its texels, or, for a texture that only reads under
-    /// `PaddedReadsPolicy::Alias` (the default), its rows lie apart and its subresource holds the
-    /// buffer's bytes between them too, up to its last row's pitch. A texture whose rows lie with
-    /// the buffer's bytes between them and which renders or which a shader writes gives none (it
-    /// is a shadow, `shadowed-texture`) but on MoltenVK, whose image is a Metal texture over the
-    /// buffer. The second is the image over host pages imported as
-    /// dma-bufs (`HostMemory::with_dma_buf`), and over a no-copy buffer's host pages where the
-    /// driver's own linear image lays its rows out otherwise than `bytes_per_row`
-    /// (`WorkCounts::pitched_host_images` counts them). Ask such an image's layout of its memory
-    /// plane (`VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT`, not the color aspect), and its modifier
-    /// with `vkGetImageDrmFormatModifierPropertiesEXT`.
+    /// A texture over a buffer's bytes whose image aliases them gives a linear image of
+    /// `VK_IMAGE_TILING_LINEAR`, bound to the buffer's memory, the runtime's own: such a texture's
+    /// rows lie one after another and its image's subresource holds no byte but its texels. A
+    /// texture over a no-copy buffer's host pages (imported by their pointer or as dma-bufs) gives
+    /// none: an image bound to them would start `VK_IMAGE_LAYOUT_UNDEFINED`, whose first move
+    /// Vulkan lets read and write every byte bound to it (it is a shadow, `shadowed-texture`). A
+    /// texture placed in a heap over host pages imported as dma-bufs (`HostMemory::with_dma_buf`)
+    /// gives an image of `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with `DRM_FORMAT_MOD_LINEAR`:
+    /// ask its layout of its memory plane (`VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT`, not the color
+    /// aspect), and its modifier with `vkGetImageDrmFormatModifierPropertiesEXT`.
     ///
     /// # Safety
     ///
@@ -150,7 +146,7 @@ impl Buffer {
     /// The `VkBuffer` stays the runtime's: the caller does not destroy it, and uses it only while
     /// the buffer lives, ordered against the runtime's work on it.
     pub unsafe fn vk_buffer(&self) -> (vk::Buffer, u64) {
-        self.at(0)
+        self.at_for(0, ReadApart::VkBuffer)
     }
 }
 
@@ -173,7 +169,10 @@ impl CommandQueue {
     /// and presents (`vkQueuePresentKHR`) go there, externally synchronized as Vulkan requires.
     /// On MoltenVK, where the runtime relays the driver's command-buffer failures, it submits no
     /// work with a fence of its own after `f` under the same lock, so a failure of the caller's
-    /// submissions stays the caller's.
+    /// submissions stays the caller's. There the runtime's frees of its memory wait for the work
+    /// in flight (`RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork`), the caller's
+    /// submissions in `f` among it: that submission of no work also signals a value the use took
+    /// before `f` ran, and memory that goes while it is pending is freed once it completed.
     ///
     /// # Safety
     ///
@@ -184,7 +183,12 @@ impl CommandQueue {
         let shared = self.device().shared();
         let family = shared.queue_family_of(self.vk_queue());
         // Where the queue's failures are relayed, a mark after `f`'s submissions keeps a failure
-        // of theirs the caller's (`device/relay.rs`).
-        shared.use_queue(self.vk_queue(), By::Program, |queue| f(queue, family))
+        // of theirs the caller's (`device/relay.rs`); where freed memory waits for the work in
+        // flight, it waits for that mark (`freed_memory.rs`).
+        let used = shared.use_queue(self.vk_queue(), By::Program, |queue| f(queue, family));
+        if let Some(parking) = shared.parking.get() {
+            parking.watch(self.device());
+        }
+        used
     }
 }

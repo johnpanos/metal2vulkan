@@ -27,24 +27,32 @@
 //! - Encoders are `Send` but not `Sync`: every method takes `&mut self`, and the core holds a
 //!   `!Sync` marker so no encoder is shared between threads by reference.
 
+use super::buffer::Buffer;
 use super::command_buffer::CommandBuffer;
 use super::deferred::{Deferred, StepInputs};
 use super::error::{internal, invalid, vulkan, CommandBufferError, Error, Problem};
 use super::execution::Execution;
 use super::fresh_unwritten::FreshRead;
 use super::heap::Heap;
+use super::noted_apart::{NotedApart, NotedInto};
 use super::pending_dispatch::PendingDispatch;
 use super::rebind::{Holds, Taken};
 use super::replay::Replay;
 use super::residency::Residency;
 use super::resource::ResourceKey;
 use super::retained::Retained;
-use super::shadow::{ShadowCopy, ShadowSync, ShadowUse, Step};
+use super::row_copies::RowCopies;
+use super::shadow::{CopyCause, ShadowCopy, ShadowSync, ShadowUse, Step, Within};
+use super::shadow_copy_in::CopyIn;
 use super::shadow_merge::ShadowMerge;
 use super::sparse::encoder::SparseUpdate;
+use super::texture::decoded_twin::TwinWrite;
+use super::texture::kept_image::KeptLease;
 use super::tracker::{Barrier, EncoderUses, Summary, Use, UseRange};
 use super::used_resources::EncoderKind;
 use super::Device;
+use crate::device::functions::Vk;
+use crate::work_counts::Begun;
 use ash::vk;
 use metal2vulkan::bind::{ReplayFaults, ResidentRange};
 use std::any::Any;
@@ -72,6 +80,10 @@ pub(super) struct Recorded {
     /// A resource state encoder's sparse mapping updates, which its batch binds before its work
     /// (`sparse/`); none for any other encoder.
     pub(super) sparse: Vec<SparseUpdate>,
+    /// A blit encoder's writes into ASTC carriers, which its batch's submission decodes into
+    /// their second decoded twins after its work (`texture/decoded_twin.rs`); none for any other
+    /// encoder.
+    pub(super) twin_writes: Vec<TwinWrite>,
 }
 
 /// Commands an encoder left to record later (`deferred.rs`).
@@ -139,9 +151,12 @@ impl Segment {
 /// ([`EncoderCore::continuation`]).
 pub(super) struct Continuation(vk::CommandBuffer);
 
-/// A segment recorded: its `VkCommandBuffer`, ended, and what it used and ran.
+/// A segment recorded: its `VkCommandBuffer`s, ended, in order, and what it used and ran. One,
+/// but for a render pass that executes render commands whose first instance recorded inline
+/// (`render/executions.rs`): what the pass records before itself, the first instance's own, then
+/// the rest ([`cut_before`](EncoderCore::cut_before)).
 pub(super) struct RecordedSegment {
-    pub(super) raw: vk::CommandBuffer,
+    pub(super) raws: Vec<vk::CommandBuffer>,
     pub(super) summary: Summary<ResourceKey>,
     pub(super) retained: Retained,
     pub(super) executions: Vec<Execution>,
@@ -160,13 +175,27 @@ pub(super) struct RecordedSegment {
 /// The state every open encoder carries.
 pub(super) struct EncoderCore {
     open: OpenGuard,
+    /// The `VkCommandBuffer` its commands record into; null while a pass holds the one before
+    /// (`pass`) and no command came since, which begins another ([`recording`](Self::recording)).
     raw: vk::CommandBuffer,
+    /// Something recorded into `raw` that a command recorded before a pass must follow: any
+    /// command of the encoder's, not the first encoder's start (`gpu_time.rs`), which a pass may
+    /// hold the command buffer of ([`hold_pass`](Self::hold_pass)).
+    recorded: bool,
+    /// The `VkCommandBuffer` a render pass instance records its draws inline in, from the pass's
+    /// first draw to its end (`render.rs`, [`hold_pass`](Self::hold_pass)): the encoder's
+    /// commands meanwhile record into `raw`, which goes before it in submission order, as they go
+    /// before a pass recorded at its end.
+    pass: Option<vk::CommandBuffer>,
     /// The encoder's `VkCommandBuffer`s ended before a segment, in order.
     ended: Vec<vk::CommandBuffer>,
     /// The segments it left for commit, `executions_at` counting its own executions.
     segments: Vec<Segment>,
     /// The order of the encoder's commands, and its summary.
     uses: EncoderUses<ResourceKey>,
+    /// The uses of the command [`note_reaching`](Self::note_reaching) notes, with those of the
+    /// host memory beside them ([`aliased`](Self::aliased)): kept, so a draw makes no vector.
+    aliased_uses: Vec<Use<ResourceKey>>,
     /// What the encoder's commands use; `end` hands it to the command buffer.
     retained: Retained,
     /// What its dispatches and draws executed; `end` hands it to the command buffer.
@@ -176,6 +205,20 @@ pub(super) struct EncoderCore {
     /// The keys its commands' uses named, and its bindings' (`used_resources.rs`): `end` finds the
     /// heaps among them, and hands them to the command buffer.
     keys: BTreeSet<ResourceKey>,
+    /// The key of each use the last command [`touch_reaching`](Self::touch_reaching) touched took,
+    /// in order, and whether it named it (`Taken::name`): both only grow while the encoder is
+    /// open, so a use at that place of the same key, named only where that one was, is kept and
+    /// named already.
+    touched: Vec<(ResourceKey, bool)>,
+    /// The shadowed textures its pass took as attachments (`render/shadows.rs`): `end` notes them
+    /// in the command buffer (`WorkCounts::shadow_attachment_passes`).
+    attachment_shadows: Vec<ResourceKey>,
+    /// Its first copies in of shadowed textures, each copy's texture and texels: `end` notes them
+    /// in the command buffer (`WorkCounts::shadow_texels_first_copied_in_again`).
+    first_copies: Vec<(ResourceKey, u64)>,
+    /// Its holds on the kept images its merges took from its queue (`texture/kept_image.rs`):
+    /// no keep of another encoder takes one before this one ends, its merges done.
+    kept_leases: Vec<KeptLease>,
     /// The heaps its commands used through what the encoder made resident; `end` hands them,
     /// and those of `keys`, to the command buffer, whose commit marks them used.
     heaps: Vec<Heap>,
@@ -195,6 +238,9 @@ pub(super) struct EncoderCore {
     /// made without `supportIndirectCommandBuffers`): `end` says so to the command buffer, whose
     /// commit runs nothing of it (`State::fault`).
     faults: bool,
+    /// Its writes into ASTC carriers ([`wrote_twin`](Self::wrote_twin)): `end` hands them to the
+    /// command buffer with its last part.
+    twin_writes: Vec<TwinWrite>,
     /// The core's own number in the process ([`id`](Self::id)).
     id: u64,
     /// It encodes an ended encoder's calls again, its command buffer committed (`replay.rs`):
@@ -208,6 +254,8 @@ pub(super) struct EncoderCore {
 pub(super) struct Replayed {
     pub(super) raws: Vec<vk::CommandBuffer>,
     pub(super) summary: Summary<ResourceKey>,
+    /// The images it holds in their attachment layout (`texture/held_depth.rs`).
+    pub(super) held: Vec<ResourceKey>,
     pub(super) retained: Retained,
     pub(super) executions: Vec<Execution>,
     pub(super) keys: BTreeSet<ResourceKey>,
@@ -247,17 +295,21 @@ impl EncoderCore {
         if let Some(problem) = state.refusal() {
             return Err(invalid(call, problem));
         }
-        let raw = command_buffer.allocate_raw(&mut state)?;
-        let device = command_buffer.device().shared().vk();
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: the command buffer was just allocated from the pool, under the state lock.
-        unsafe { device.begin_command_buffer(raw, &begin) }.map_err(vulkan)?;
-        command_buffer
-            .device()
-            .shared()
-            .counts
-            .command_buffer_begun();
+        // The pool's primary begun ahead where it holds one (`spares.rs`).
+        let (raw, begun) = command_buffer.encoder_primary(&mut state)?;
+        let shared = command_buffer.device().shared();
+        if !begun {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: the command buffer was just handed out of the pool, under the state lock.
+            unsafe { shared.vk().begin_command_buffer(raw, &begin) }.map_err(vulkan)?;
+        }
+        shared.counts.encoder_command_buffer_begun(Begun::Encoder);
+        if begun {
+            shared.counts.encoder_primary_begun_ahead();
+        }
+        // The first encoder of a timed command buffer writes its start first (`gpu_time.rs`).
+        command_buffer.open_start(&mut state, raw);
         state.encoder_open = true;
         drop(state);
         command_buffer
@@ -271,6 +323,8 @@ impl EncoderCore {
                 ended: false,
             },
             raw,
+            recorded: false,
+            pass: None,
             ended: Vec::new(),
             segments: Vec::new(),
             uses: EncoderUses::new(ordered),
@@ -278,11 +332,17 @@ impl EncoderCore {
             executions: Vec::new(),
             shadows: ShadowSync::default(),
             keys: BTreeSet::new(),
+            touched: Vec::new(),
+            attachment_shadows: Vec::new(),
+            first_copies: Vec::new(),
+            kept_leases: Vec::new(),
             heaps: Vec::new(),
             holds: Holds::new(command_buffer.device()),
             taken: Taken::default(),
             fails_command_buffer: None,
             faults: false,
+            twin_writes: Vec::new(),
+            aliased_uses: Vec::new(),
             id: CORES.fetch_add(1, Ordering::Relaxed),
             replaying: false,
             _not_sync: PhantomData,
@@ -297,9 +357,10 @@ impl EncoderCore {
         command_buffer: &CommandBuffer,
         ordered: bool,
     ) -> Result<EncoderCore, Error> {
-        let core = EncoderCore::segment_raw(command_buffer, ordered)?;
+        let mut core = EncoderCore::segment_raw(command_buffer, ordered)?;
         // SAFETY: the command buffer is recording, and only this core records it.
         unsafe { Barrier::everything().record(core.device().shared().vk(), core.raw) };
+        core.recorded = true;
         Ok(core)
     }
 
@@ -333,13 +394,15 @@ impl EncoderCore {
             .device()
             .shared()
             .counts
-            .command_buffer_begun();
+            .encoder_command_buffer_begun(Begun::Segment);
         Ok(EncoderCore {
             open: OpenGuard {
                 command_buffer: command_buffer.clone(),
                 ended: true,
             },
             raw,
+            recorded: false,
+            pass: None,
             ended: Vec::new(),
             segments: Vec::new(),
             uses: EncoderUses::new(ordered),
@@ -347,11 +410,17 @@ impl EncoderCore {
             executions: Vec::new(),
             shadows: ShadowSync::default(),
             keys: BTreeSet::new(),
+            touched: Vec::new(),
+            attachment_shadows: Vec::new(),
+            first_copies: Vec::new(),
+            kept_leases: Vec::new(),
             heaps: Vec::new(),
             holds: Holds::new(command_buffer.device()),
             taken: Taken::default(),
             fails_command_buffer: None,
             faults: false,
+            twin_writes: Vec::new(),
+            aliased_uses: Vec::new(),
             id: CORES.fetch_add(1, Ordering::Relaxed),
             replaying: false,
             _not_sync: PhantomData,
@@ -361,6 +430,12 @@ impl EncoderCore {
     /// The device.
     pub(super) fn device(&self) -> &Device {
         self.open.command_buffer.device()
+    }
+
+    /// The queue flags of the family its command buffer records for: its queue's `VkQueue`'s.
+    pub(super) fn queue_flags(&self) -> vk::QueueFlags {
+        let queue = self.open.command_buffer.command_queue().vk_queue();
+        self.device().shared().queue_flags_of(queue)
     }
 
     /// The core's own number, which no other core of the process has: what an argument table
@@ -394,10 +469,39 @@ impl EncoderCore {
         self.retained.boxed(Box::new(object));
     }
 
+    /// A command of the encoder wrote `write` into an ASTC carrier's blocks: its batch's
+    /// submission decodes it into the image's second decoded twin (`texture/decoded_twin.rs`).
+    pub(super) fn wrote_twin(&mut self, write: TwinWrite) {
+        self.twin_writes.push(write);
+    }
+
     /// Hold `object`, a shared one (`Buffer::held` and its kin), until the command buffer
     /// completes: by another reference to it, without a box of its own (`retained.rs`).
     pub(super) fn retain_shared(&mut self, object: Arc<dyn Any + Send + Sync>) {
         self.retained.shared(object);
+    }
+
+    /// `buffer`'s `VkBuffer`, and where its byte `offset` lies in it, for a blit's command
+    /// ([`Buffer::blit_at`]): a no-copy buffer's import the device released while idle is
+    /// imported again first, and what the command reads of it held until the command buffer
+    /// completes (`host_residency.rs`). Refused where the device cannot import it again.
+    ///
+    /// The buffer itself is held until the command buffer completes too, whatever path records
+    /// the command (a per-sample copy's plan holds only the raw `VkBuffer`): its `VkBuffer`, and a
+    /// no-copy buffer's import of the caller's pages, go only once nothing holds the buffer
+    /// (`HostImport`'s drop), so a program that lets go of it once it committed (as Metal lets it,
+    /// a command buffer retaining what its commands use) frees nothing a command in flight writes.
+    pub(super) fn blit_at(
+        &mut self,
+        buffer: &Buffer,
+        offset: u64,
+    ) -> Result<(vk::Buffer, u64), Error> {
+        let (at, hold) = buffer.blit_at(offset)?;
+        if let Some(hold) = hold {
+            self.taken.hold_import(hold);
+        }
+        self.retain_shared(buffer.held());
+        Ok(at)
     }
 
     /// Add a dispatch or draw the encoder took to the command buffer's execution record, as
@@ -416,8 +520,122 @@ impl EncoderCore {
 
     /// Record a barrier the program asked for (a compute encoder's memory barriers).
     pub(super) fn barrier(&mut self, barrier: Barrier) {
+        let Some(raw) = self.recording() else {
+            return;
+        };
         // SAFETY: the encoder's command buffer is recording, and only this encoder records it.
-        unsafe { barrier.record(self.device().shared().vk(), self.raw) };
+        unsafe { barrier.record(self.device().shared().vk(), raw) };
+    }
+
+    /// The `VkCommandBuffer` the encoder's next command records into: `raw`, or where a pass
+    /// holds the one before and no command came since, a new one of the command buffer's pool,
+    /// begun, which goes before the pass's. `None` where none can be made, which abandons the
+    /// command buffer (as a failure to end one does, [`defer`](Self::defer)).
+    fn recording(&mut self) -> Option<vk::CommandBuffer> {
+        if self.raw == vk::CommandBuffer::null() {
+            match self.continuation() {
+                Ok(next) => self.raw = next.0,
+                Err(_) => {
+                    self.open.command_buffer.state().abandoned = true;
+                    return None;
+                }
+            }
+        }
+        self.recorded = true;
+        Some(self.raw)
+    }
+
+    /// Hold a `VkCommandBuffer` for a render pass instance whose draws record inline in it from
+    /// now to the pass's end (`render.rs`): the encoder's own where nothing recorded into it
+    /// yet, else a new one of the pool, begun. Until [`release_pass`](Self::release_pass), the
+    /// encoder's commands record into another, which goes before it in submission order: where
+    /// they go before a pass recorded at its end. Refused where one is held, or none can be made.
+    ///
+    /// The first encoder's own holds its command buffer's start, written first
+    /// (`gpu_time.rs`): where a command then records before the pass, in a command buffer that
+    /// goes before it, the batch's first command buffer is no longer the one that wrote it, and
+    /// the batch reads the start its command buffer of barriers writes before everything instead
+    /// (`command_buffer/submit.rs`, which compares the batch's first command buffer with the one
+    /// that wrote the start).
+    pub(super) fn hold_pass(&mut self) -> Result<vk::CommandBuffer, Error> {
+        if self.pass.is_some() {
+            return Err(internal("a render pass held twice"));
+        }
+        let held = match self.recorded {
+            true => self.continuation()?.0,
+            false => {
+                let own = self.raw;
+                self.raw = vk::CommandBuffer::null();
+                own
+            }
+        };
+        self.pass = Some(held);
+        Ok(held)
+    }
+
+    /// End the hold [`hold_pass`](Self::hold_pass) took: the render pass instance recorded in
+    /// the held command buffer ends there, whatever the encoder's commands record from here on
+    /// (a command that names a detached buffer records nothing, [`skips`](Self::skips)); the
+    /// command buffer of the commands before the pass, where any recorded, ends and goes before
+    /// it; and the encoder's commands record on into the pass's, after it. Refused only where
+    /// that one does not end, which abandons the command buffer.
+    pub(super) fn release_pass(&mut self) -> Result<(), Error> {
+        let Some(pass) = self.pass.take() else {
+            return Ok(());
+        };
+        // SAFETY: the held command buffer is recording inside the render pass instance its pass
+        // began, and only this encoder records it.
+        unsafe { self.device().shared().vk().cmd_end_render_pass(pass) };
+        if self.raw != vk::CommandBuffer::null() {
+            // SAFETY: as in `barrier`.
+            if let Err(error) = unsafe { self.open.command_buffer.end_raw(self.raw) } {
+                self.open.command_buffer.state().abandoned = true;
+                return Err(vulkan(error));
+            }
+            self.ended.push(self.raw);
+        }
+        self.raw = pass;
+        self.recorded = true;
+        Ok(())
+    }
+
+    /// After [`release_pass`](Self::release_pass), hand the pass's command buffer, where its first
+    /// instance and what followed it recorded, over to the segment the pass records later in
+    /// (`render/executions.rs`), ended: it goes between what the segment records before the pass
+    /// and the pass's later instances ([`cut_before`](Self::cut_before)), so nothing the segment
+    /// records before the pass at the commit runs after the first instance. The encoder's next
+    /// command begins another command buffer. Refused only where it does not end, which abandons
+    /// the command buffer.
+    pub(super) fn hand_over_pass(&mut self) -> Result<vk::CommandBuffer, Error> {
+        let pass = self.raw;
+        if pass == vk::CommandBuffer::null() {
+            return Err(internal(
+                "a render pass handed over without its command buffer",
+            ));
+        }
+        // SAFETY: as in `barrier`.
+        if let Err(error) = unsafe { self.open.command_buffer.end_raw(pass) } {
+            self.open.command_buffer.state().abandoned = true;
+            return Err(vulkan(error));
+        }
+        self.raw = vk::CommandBuffer::null();
+        self.recorded = false;
+        Ok(pass)
+    }
+
+    /// In a [`segment`](Self::segment): place `before`, an ended command buffer handed over to it
+    /// ([`hand_over_pass`](Self::hand_over_pass)), after what the segment recorded so far, between
+    /// barriers from everything before and to everything after, and go on in a new command buffer.
+    /// Refused where the current one does not end or the new one cannot be begun.
+    pub(super) fn cut_before(&mut self, before: vk::CommandBuffer) -> Result<(), Error> {
+        self.barrier(Barrier::everything());
+        // SAFETY: as in `barrier`.
+        unsafe { self.open.command_buffer.end_raw(self.raw) }.map_err(vulkan)?;
+        self.ended.push(self.raw);
+        self.ended.push(before);
+        self.raw = self.continuation()?.0;
+        self.barrier(Barrier::everything());
+        Ok(())
     }
 
     /// Record one command that ran in `stages` with `uses`: the barrier the uses need after the
@@ -427,7 +645,7 @@ impl EncoderCore {
         &mut self,
         stages: vk::PipelineStageFlags2,
         uses: &[Use<ResourceKey>],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) {
         self.command_reaching(stages, uses, &BTreeSet::new(), record);
     }
@@ -441,7 +659,7 @@ impl EncoderCore {
         stages: vk::PipelineStageFlags2,
         uses: &[Use<ResourceKey>],
         reads: &[FreshRead],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) {
         self.command_observing(stages, uses, &BTreeSet::new(), reads, record);
     }
@@ -454,7 +672,7 @@ impl EncoderCore {
         stages: vk::PipelineStageFlags2,
         uses: &[Use<ResourceKey>],
         resident: &BTreeSet<ResourceKey>,
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) {
         self.command_observing(stages, uses, resident, &[], record);
     }
@@ -467,17 +685,20 @@ impl EncoderCore {
         uses: &[Use<ResourceKey>],
         resident: &BTreeSet<ResourceKey>,
         reads: &[FreshRead],
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) {
         let Some(barrier) = self.track(stages, uses, resident, reads) else {
+            return;
+        };
+        let Some(raw) = self.recording() else {
             return;
         };
         let device = self.open.command_buffer.device().shared().vk();
         if let Some(barrier) = barrier {
             // SAFETY: as in `barrier`.
-            unsafe { barrier.record(device, self.raw) };
+            unsafe { barrier.record(device, raw) };
         }
-        record(device, self.raw);
+        record(device, raw);
     }
 
     /// [`command_reaching`](Self::command_reaching) of a command recorded later, into a segment
@@ -584,12 +805,23 @@ impl EncoderCore {
     /// through the resident set alone: every other key is named (`Taken`), where the device has
     /// a buffer over host pages.
     fn touch_reaching(&mut self, uses: &[Use<ResourceKey>], resident: &BTreeSet<ResourceKey>) {
-        self.touch_keys(uses.iter().map(|used| used.key));
-        if self.device().shared().rebinds.any() {
-            for used in uses.iter().filter(|used| !resident.contains(&used.key)) {
-                self.taken.name(used.key);
+        let rebinds = self.device().shared().rebinds.any();
+        for (at, used) in uses.iter().enumerate() {
+            let key = used.key;
+            let named = rebinds && !resident.contains(&key);
+            let before = self.touched.get(at).copied();
+            if before.map(|(touched, _)| touched) != Some(key) && self.keys.insert(key) && rebinds {
+                self.hold(key);
+            }
+            if named && before != Some((key, true)) {
+                self.taken.name(key);
+            }
+            match self.touched.get_mut(at) {
+                Some(touched) => *touched = (key, named),
+                None => self.touched.push((key, named)),
             }
         }
+        self.touched.truncate(uses.len());
     }
 
     /// Keep `keys`, those of resources a command uses (its own uses', or its bindings', which
@@ -600,6 +832,19 @@ impl EncoderCore {
             if self.keys.insert(key) && rebinds {
                 self.hold(key);
             }
+        }
+    }
+
+    /// Hold each buffer over host pages among `keys` from now on, as a command that names it
+    /// does (`touch_keys`), without keeping the keys: the bytes a render pass's attachments lie
+    /// in, which it holds from its open (`render.rs`). Free while the device has no buffer over
+    /// host pages.
+    pub(super) fn hold_bytes(&mut self, keys: impl IntoIterator<Item = ResourceKey>) {
+        if !self.device().shared().rebinds.any() {
+            return;
+        }
+        for key in keys {
+            self.hold(key);
         }
     }
 
@@ -670,12 +915,15 @@ impl EncoderCore {
     /// Note one command recorded outside the encoder's own `VkCommandBuffer` (a render encoder's
     /// draw, in its secondary command buffer) that runs in `stages` with `uses`. Only an
     /// unordered encoder's commands are recorded so: they need no barrier between them. Call it
-    /// before recording the command; it refuses (internal) an ordered encoder.
+    /// before recording the command; it refuses (internal) an ordered encoder. A draw noted with
+    /// the same uses, reaching the same keys through the resident set alone, as the last one
+    /// `noted` keeps (a render encoder's draws'), into the same state, is noted already
+    /// (`noted_apart.rs`); a command with no `noted` (a tile dispatch) is noted whole.
     pub(super) fn note_reaching(
         &mut self,
         stages: vk::PipelineStageFlags2,
-        uses: &[Use<ResourceKey>],
-        resident: &BTreeSet<ResourceKey>,
+        (uses, resident): (&[Use<ResourceKey>], &BTreeSet<ResourceKey>),
+        noted: Option<&mut NotedApart>,
     ) -> Result<(), Error> {
         if self.uses.ordered() {
             return Err(super::error::internal(
@@ -683,11 +931,40 @@ impl EncoderCore {
             ));
         }
         self.observe_fresh(uses, &[]);
-        let aliased = self.aliased(uses);
-        self.uses
-            .record(stages, aliased.as_deref().unwrap_or(uses), None);
+        let Some(noted) = noted else {
+            self.record_aliased(stages, uses);
+            self.touch_reaching(uses, resident);
+            return Ok(());
+        };
+        let shared = self.device().shared();
+        // Read before the host aliases' uses are worked out, so a change made since counts.
+        let into = NotedInto {
+            core: self.id,
+            parts: self.uses.parts(),
+            held: self.uses.held().len(),
+            rebinds: shared.rebinds.any(),
+            aliases: shared.aliases.version(),
+        };
+        if noted.holds(stages, (uses, resident), into) {
+            shared.counts.command_noted_as_before();
+            return Ok(());
+        }
+        self.record_aliased(stages, uses);
         self.touch_reaching(uses, resident);
+        noted.note(stages, (uses, resident), into);
         Ok(())
+    }
+
+    /// Record one command apart that runs in `stages` with `uses`, and the uses of the host
+    /// memory beside them ([`aliased`](Self::aliased)), worked out into the vector the encoder
+    /// keeps for them.
+    fn record_aliased(&mut self, stages: vk::PipelineStageFlags2, uses: &[Use<ResourceKey>]) {
+        let aliases = &self.open.command_buffer.device().shared().aliases;
+        let all = match aliases.augment_into(uses, &mut self.aliased_uses) {
+            true => &self.aliased_uses[..],
+            false => uses,
+        };
+        self.uses.record(stages, all, None);
     }
 
     /// The copies a command that uses the shadowed textures `shadows` and has `uses` needs
@@ -703,54 +980,269 @@ impl EncoderCore {
         let device = self.device().clone();
         let aliased = self.aliased(uses);
         let uses = aliased.as_deref().unwrap_or(uses);
-        let copies = self.shadows.before(shadows, uses, |copies| {
-            ShadowMerge::new(&device, copies).map(Arc::new)
-        })?;
-        let texels = copies.iter().map(ShadowCopy::texels_back).sum();
-        (device.shared().counts).shadow_copies_planned(copies.len(), texels);
+        // The kept images its merges take are held to the encoder's end, those of a refused
+        // command let go of here.
+        let images = self.open.command_buffer.command_queue().kept_images();
+        let held = self.kept_leases.len();
+        let leases = &mut self.kept_leases;
+        let planned = self
+            .shadows
+            .before(shadows, uses, |copies, two_ways, area| {
+                let (merge, lease) = ShadowMerge::new(&device, copies, (two_ways, area), images)?;
+                leases.extend(lease);
+                Ok(Arc::new(merge))
+            });
+        let copies = match planned {
+            Ok(copies) => copies,
+            Err(refused) => {
+                self.kept_leases.truncate(held);
+                return Err(refused);
+            }
+        };
+        self.count_shadow_copies(&copies);
         for copy in &copies {
             if let Step::Keep(merge) = &copy.step {
                 self.retain(Arc::clone(merge));
+            }
+            if copy.cause == Some(CopyCause::First) {
+                (self.first_copies).push((copy.copies.shadow_key, copy.texels_copied_in()));
             }
         }
         Ok(copies)
     }
 
-    /// Note a recorded command that used the shadowed textures `shadows` and had `uses`.
-    pub(super) fn shadows_used(&mut self, shadows: &[ShadowUse], uses: &[Use<ResourceKey>]) {
+    /// Note that the encoder's pass takes the shadowed texture `key` as an attachment.
+    pub(super) fn shadow_attached(&mut self, key: ResourceKey) {
+        if !self.attachment_shadows.contains(&key) {
+            self.attachment_shadows.push(key);
+        }
+    }
+
+    /// Count shadowed textures' `copies` as planned (`WorkCounts::shadow_copies`), the texels
+    /// their copies in and back of buffers' textures' images move, each copy in's texels by why
+    /// it is made and what holds its truth (`WorkCounts::shadow_texels_first_copied_in` and kin),
+    /// those copies in of what changed within a rectangle alone
+    /// (`WorkCounts::bounded_shadow_copies`), and the keeps and merges whose copies of the shadow
+    /// into the scratch dispatch (`WorkCounts::shadow_merge_copies_dispatched`), and the texels the
+    /// keeps copy (`WorkCounts::shadow_texels_kept`).
+    fn count_shadow_copies(&self, copies: &[ShadowCopy]) {
+        let texels_in = copies.iter().map(ShadowCopy::texels_in).sum();
+        let texels_back = copies.iter().map(ShadowCopy::texels_back).sum();
+        let counts = &self.device().shared().counts;
+        counts.shadow_copies_planned(copies.len(), texels_in, texels_back);
+        for copy in copies {
+            counts.shadow_copy_in_planned(copy);
+        }
+        let bounded = (copies.iter())
+            .filter(|copy| copy.cause == Some(CopyCause::Bounded))
+            .count();
+        if bounded > 0 {
+            counts.bounded_shadow_copies_planned(bounded);
+        }
+        let dispatched = copies
+            .iter()
+            .filter(|copy| match &copy.step {
+                Step::Keep(merge) => merge.dispatches(),
+                Step::Merge(merge) => merge.changed_dispatches(),
+                Step::Into | Step::Back => false,
+            })
+            .count();
+        if dispatched > 0 {
+            counts.shadow_merge_copies_dispatched(dispatched);
+        }
+        let kept: u64 = copies
+            .iter()
+            .filter_map(|copy| match &copy.step {
+                Step::Keep(merge) => Some(merge.texels_kept()),
+                _ => None,
+            })
+            .sum();
+        if kept > 0 {
+            counts.shadow_texels_kept(kept);
+        }
+    }
+
+    /// Whether the encoder used a shadowed texture so far: where it did not, a command that uses
+    /// none takes no copy and notes no use ([`plan_shadows`](Self::plan_shadows),
+    /// [`shadows_used`](Self::shadows_used)).
+    pub(super) fn used_shadows(&self) -> bool {
+        !self.shadows.is_empty()
+    }
+
+    /// Note a recorded command that used the shadowed textures `shadows` and had `uses`, and
+    /// whose writes `within` change the bytes of a texture inside a rectangle of its texels alone
+    /// (`shadow::Within`).
+    pub(super) fn shadows_used(
+        &mut self,
+        shadows: &[ShadowUse],
+        uses: &[Use<ResourceKey>],
+        within: &[Within],
+    ) {
         let aliased = self.aliased(uses);
+        let within: Vec<Within> = within
+            .iter()
+            .map(|part| Within {
+                uses: self
+                    .aliased(&part.uses)
+                    .unwrap_or_else(|| part.uses.clone()),
+                texels: part.texels.clone(),
+                area: part.area,
+            })
+            .collect();
         self.shadows
-            .after(shadows, aliased.as_deref().unwrap_or(uses));
+            .after(shadows, aliased.as_deref().unwrap_or(uses), &within);
     }
 
     /// Record shadowed textures' `copies` as commands of the encoder: ordered as any command
-    /// is, in an encoder Metal orders; with a barrier from everything before and one to
-    /// everything after each copy, in one whose commands Metal leaves unordered.
+    /// is, in an encoder Metal orders; in one whose commands Metal leaves unordered, as one run
+    /// ([`ShadowRun`]) between a barrier from everything before its first copy and one to
+    /// everything after its last. A copy back the device runs faster as a dispatch is that
+    /// dispatch (`shadow_copy_back.rs`), a merged texture's copy in and its keep are one dispatch
+    /// at the copy in where the device takes it (`shadow_copy_in.rs`), and the rows a copy back
+    /// moves out of a staging buffer are a copy of rows (`row_copies.rs`); the command buffer
+    /// retains each until it completes.
     pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
-        for copy in copies {
-            let stages = copy.stages();
-            let uses = copy.uses();
-            if self.uses.ordered() {
-                self.command(stages, &uses, |device, raw| {
-                    // SAFETY: the encoder's command buffer is recording outside a render pass;
-                    // its commands retain the shadowed textures until it completes, and every
-                    // image rests in the `GENERAL` layout.
-                    unsafe { copy.record(device, raw) }
-                });
-            } else {
-                // A copy of a detached buffer's bytes records nothing, nor does what follows.
-                if self.skips(uses.iter().map(|used| used.key)) {
-                    continue;
-                }
-                self.barrier(Barrier::everything());
-                // SAFETY: as above.
-                unsafe { copy.record(self.device().shared().vk(), self.raw) };
-                self.barrier(Barrier::everything());
-                let aliased = self.aliased(&uses);
-                self.uses
-                    .record(stages, aliased.as_deref().unwrap_or(&uses), None);
-                self.touch(&uses);
+        let device = self.device().clone();
+        let mut run = ShadowRun::default();
+        // The keeps a dispatch at their copy in took, which record nothing.
+        let mut taken = Vec::new();
+        for (i, copy) in copies.iter().enumerate() {
+            if taken.contains(&i) {
+                continue;
             }
+            if let Some((keep, both, uses)) = keep_with_copy_in(&device, copies, i) {
+                taken.push(keep);
+                let record = |device: &Vk, raw: vk::CommandBuffer| {
+                    // SAFETY: the encoder's command buffer is recording outside a render pass;
+                    // its commands retain the shadowed texture (and its view), the merge's scratch
+                    // and the dispatch until it completes, and every image rests in the `GENERAL`
+                    // layout.
+                    unsafe { both.record(device, raw) }
+                };
+                let stages = vk::PipelineStageFlags2::COMPUTE_SHADER;
+                self.shadow_command(&mut run, (stages, &uses, false), record);
+                device.shared().counts.shadow_copy_in_dispatched();
+                self.retain(both);
+                continue;
+            }
+            // A shadow takes the view a dispatch reads on a device that dispatches alone.
+            let dispatched = copy.dispatched(&device);
+            let rows = match dispatched {
+                Some(_) => None,
+                None => copy.staged_back(&device),
+            };
+            let (stages, uses) = match &dispatched {
+                Some(_) => (
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    copy.dispatched_uses(),
+                ),
+                None => (
+                    copy.stages_with(rows.as_ref()),
+                    copy.uses_with(rows.as_ref()),
+                ),
+            };
+            let record = |device: &Vk, raw: vk::CommandBuffer| match &dispatched {
+                // SAFETY: the encoder's command buffer is recording outside a render pass; its
+                // commands retain the shadowed textures (and their views) and the dispatch until
+                // it completes, and every image rests in the `GENERAL` layout.
+                Some(back) => unsafe { back.record(device, raw) },
+                // SAFETY: as above; the rows are the copy's own, made just now.
+                None => unsafe { copy.record(device, raw, rows.as_ref()) },
+            };
+            self.shadow_command(&mut run, (stages, &uses, copy.writes_truth()), record);
+            if let Some(back) = dispatched {
+                device.shared().counts.shadow_copy_back_dispatched();
+                self.retain(back);
+            }
+            if let Some(sets) = rows.and_then(RowCopies::retained) {
+                self.retain(sets);
+            }
+        }
+        if run.recorded() {
+            self.barrier(Barrier::everything());
+        }
+    }
+
+    /// Record one shadowed texture's copy, of `uses` in `stages`, writing its truth where
+    /// `writes_truth`, by `record`: as any command in an encoder Metal orders, else in `run`,
+    /// after a barrier from everything before where the run takes one ([`ShadowRun::before`]).
+    /// A copy of a detached buffer's bytes records nothing, nor does what follows
+    /// ([`skips`](Self::skips)).
+    fn shadow_command(
+        &mut self,
+        run: &mut ShadowRun,
+        (stages, uses, writes_truth): (vk::PipelineStageFlags2, &[Use<ResourceKey>], bool),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
+    ) {
+        if self.uses.ordered() {
+            self.command(stages, uses, record);
+            return;
+        }
+        if self.skips(uses.iter().map(|used| used.key)) {
+            return;
+        }
+        let aliased = self.aliased(uses);
+        let tracked = aliased.as_deref().unwrap_or(uses);
+        if run.before(tracked, writes_truth) {
+            self.barrier(Barrier::everything());
+        }
+        let Some(raw) = self.recording() else {
+            return;
+        };
+        record(self.device().shared().vk(), raw);
+        self.uses.record(stages, tracked, None);
+        self.touch(uses);
+    }
+
+    /// The `VkCommandBuffer` a render pass holds ([`hold_pass`](Self::hold_pass)), until its
+    /// release.
+    pub(super) fn held_pass(&self) -> Option<vk::CommandBuffer> {
+        self.pass
+    }
+
+    /// Record shadowed textures' `copies` into the command buffer a render pass holds
+    /// ([`hold_pass`](Self::hold_pass)), between two of its render pass instances, as the pass's
+    /// end records them there (`render/inline_splits.rs`): as one run ([`ShadowRun`]) after the
+    /// barrier from everything before that the caller records at the instance's end, with one
+    /// to everything after its last copy; their uses the encoder's, an unordered one's. A copy of
+    /// a detached buffer's bytes records nothing, nor does what follows ([`skips`](Self::skips)).
+    /// Nothing where no pass holds one.
+    pub(super) fn held_shadow_copies(&mut self, copies: &[ShadowCopy]) {
+        let Some(held) = self.pass else {
+            return;
+        };
+        let device = self.device().clone();
+        let raw = device.shared().vk();
+        let mut run = ShadowRun::after_barrier();
+        for copy in copies {
+            let rows = copy.staged_back(&device);
+            let uses = copy.uses_with(rows.as_ref());
+            if self.skips(uses.iter().map(|used| used.key)) {
+                continue;
+            }
+            let aliased = self.aliased(&uses);
+            let tracked = aliased.as_deref().unwrap_or(&uses);
+            let before = run.before(tracked, copy.writes_truth());
+            // SAFETY: the held command buffer is recording outside a render pass instance (the
+            // caller ended the one before), and only this encoder records it; its commands retain
+            // the shadowed textures (and their views) and the rows' set until it completes, and
+            // every image rests in the `GENERAL` layout.
+            unsafe {
+                if before {
+                    Barrier::everything().record(raw, held);
+                }
+                copy.record(raw, held, rows.as_ref());
+            }
+            let stages = copy.stages_with(rows.as_ref());
+            self.uses.record(stages, tracked, None);
+            self.touch(&uses);
+            if let Some(sets) = rows.and_then(RowCopies::retained) {
+                self.retain(sets);
+            }
+        }
+        if run.recorded() {
+            // SAFETY: as above.
+            unsafe { Barrier::everything().record(raw, held) };
         }
     }
 
@@ -772,6 +1264,7 @@ impl EncoderCore {
     /// module's segments). Refused, changing nothing, when the new one cannot be made; a failure
     /// to end the current one abandons the command buffer.
     pub(super) fn defer(&mut self, work: Deferred) -> Result<(), Error> {
+        self.release_pass()?;
         let next = self.continuation()?;
         self.defer_into(next, work)
     }
@@ -796,7 +1289,8 @@ impl EncoderCore {
                 .begin_command_buffer(next, &begin)
         }
         .map_err(vulkan)?;
-        self.device().shared().counts.command_buffer_begun();
+        let counts = &self.device().shared().counts;
+        counts.encoder_command_buffer_begun(Begun::Continuation);
         Ok(Continuation(next))
     }
 
@@ -807,13 +1301,18 @@ impl EncoderCore {
             let copies = self.shadows.leave();
             self.shadow_copies(&copies);
         }
-        // SAFETY: as in `barrier`.
-        if let Err(error) = unsafe { self.device().shared().vk().end_command_buffer(self.raw) } {
-            self.open.command_buffer.state().abandoned = true;
-            return Err(vulkan(error));
+        // None where a pass handed its command buffer over to the work
+        // ([`hand_over_pass`](Self::hand_over_pass)) and no command came since.
+        if self.raw != vk::CommandBuffer::null() {
+            // SAFETY: as in `barrier`.
+            if let Err(error) = unsafe { self.open.command_buffer.end_raw(self.raw) } {
+                self.open.command_buffer.state().abandoned = true;
+                return Err(vulkan(error));
+            }
+            self.ended.push(self.raw);
         }
-        self.ended.push(self.raw);
         self.raw = next.0;
+        self.recorded = false;
         let host = work.gpu_written();
         if host {
             self.uses.split();
@@ -870,19 +1369,34 @@ impl EncoderCore {
         residency: Option<Residency>,
         replay: Option<Replay>,
     ) -> Result<(), Error> {
-        let replay = replay.filter(|_| {
-            self.segments.iter().all(Segment::pends)
+        // A pass ended holds no command buffer (`render.rs`); this one ends here if one did.
+        self.release_pass()?;
+        // A log not kept goes back to the device's spares (`replay.rs`).
+        let replay = replay.and_then(|log| {
+            let keeps = self.segments.iter().all(Segment::pends)
                 && self.fails_command_buffer.is_none()
                 && !self.faults
-                && !self.taken.named_pins().is_empty()
+                && self.taken.names_a_pin();
+            if !keeps {
+                self.device().shared().scheduler.spare_logs().give(log);
+                return None;
+            }
+            Some(log)
         });
+        let sharing = self.shadows.sharing_truth();
+        if sharing > 0 {
+            self.device().shared().counts.shadows_sharing_truth(sharing);
+        }
         let copies = self.shadows.finish();
-        let texels = copies.iter().map(ShadowCopy::texels_back).sum();
-        let counts = &self.device().shared().counts;
-        counts.shadow_copies_planned(copies.len(), texels);
+        self.count_shadow_copies(&copies);
         self.shadow_copies(&copies);
-        // SAFETY: as in `barrier`.
-        unsafe { self.device().shared().vk().end_command_buffer(self.raw) }.map_err(vulkan)?;
+        // Its commands were recorded for one layout of each image it holds
+        // (`texture/held_depth.rs`).
+        if self.uses.broke_hold() {
+            return Err(internal("a held depth used but as its attachment"));
+        }
+        // Its last `VkCommandBuffer` stays recording, the command buffer's tail: its batch's end
+        // may go into it (`CommandBufferShared::close_tail`).
         let EncoderCore {
             mut open,
             raw,
@@ -892,11 +1406,14 @@ impl EncoderCore {
             retained,
             executions,
             keys,
+            attachment_shadows,
+            first_copies,
             mut heaps,
             holds,
             taken,
             fails_command_buffer,
             faults,
+            twin_writes,
             ..
         } = self;
         ended.push(raw);
@@ -908,8 +1425,21 @@ impl EncoderCore {
             .among(keys.iter().copied());
         heaps.extend(keyed);
         let mut state = open.command_buffer.state();
+        if !attachment_shadows.is_empty() {
+            let first = state.shadows_attached(&attachment_shadows);
+            (open.command_buffer.device().shared().counts)
+                .shadow_attachments(attachment_shadows.len(), first);
+        }
+        if !first_copies.is_empty() {
+            let again = state.shadows_copied_in(&first_copies);
+            if again > 0 {
+                (open.command_buffer.device().shared().counts)
+                    .shadow_texels_first_copied_in_again(again);
+            }
+        }
         state.use_heaps(heaps);
         let encoder = state.encoder_ended(kind, keys, residency, taken);
+        state.encoder_holds(encoder, uses.held().to_vec());
         if let Some(error) = fails_command_buffer {
             state.fail_from(encoder, error);
         }
@@ -945,6 +1475,9 @@ impl EncoderCore {
             current.push(segment);
         }
         parts.push((raws.collect(), current));
+        // The writes into ASTC carriers go with the last part (a blit encoder's only one).
+        let count = parts.len();
+        let mut twin_writes = Some(twin_writes);
         for (at, (raws, segments)) in parts.into_iter().enumerate() {
             let summary = summaries
                 .next()
@@ -952,21 +1485,36 @@ impl EncoderCore {
             if at > 0 {
                 state.host_step();
             }
-            state.end_encoder(Recorded {
-                encoder,
-                raws,
-                segments,
-                summary,
-                sparse: Vec::new(),
-            });
+            let twin_writes = match at + 1 == count {
+                true => twin_writes.take().unwrap_or_default(),
+                false => Vec::new(),
+            };
+            state.end_encoder(
+                &open.command_buffer,
+                Recorded {
+                    encoder,
+                    raws,
+                    segments,
+                    summary,
+                    sparse: Vec::new(),
+                    twin_writes,
+                },
+            );
         }
+        // SAFETY: only this call records `raw`, under the state lock, and it records until the
+        // tail ends (at the next part's end or the commit, `close_tail`).
+        unsafe { crate::recorder::reserve_end(raw) };
+        state.tail = Some(raw);
         state.retained.extend(retained.into_entry());
         state.executions.extend(executions);
         if !holds.is_empty() {
             state.holds.push(holds);
         }
         drop(state);
-        drop(unkept);
+        if let Some(log) = unkept {
+            let device = open.command_buffer.device();
+            device.shared().scheduler.spare_logs().give(log);
+        }
         open.ended = true;
         Ok(())
     }
@@ -978,12 +1526,13 @@ impl EncoderCore {
     /// buffer: its first encoding kept none of those, so its place stays as it was.
     pub(super) fn finish_replay(mut self) -> Result<Replayed, Error> {
         let copies = self.shadows.finish();
-        let texels = copies.iter().map(ShadowCopy::texels_back).sum();
-        let counts = &self.device().shared().counts;
-        counts.shadow_copies_planned(copies.len(), texels);
+        self.count_shadow_copies(&copies);
         self.shadow_copies(&copies);
+        if self.uses.broke_hold() {
+            return Err(internal("a held depth used but as its attachment"));
+        }
         // SAFETY: as in `barrier`.
-        unsafe { self.device().shared().vk().end_command_buffer(self.raw) }.map_err(vulkan)?;
+        unsafe { self.open.command_buffer.end_raw(self.raw) }.map_err(vulkan)?;
         let EncoderCore {
             raw,
             mut ended,
@@ -1003,6 +1552,7 @@ impl EncoderCore {
                 "an encoder encoded again differs from its first encoding",
             ));
         }
+        let held = uses.held().to_vec();
         let mut summaries = uses.finish_parts();
         let summary = match (summaries.pop(), summaries.is_empty()) {
             (Some(summary), true) => summary,
@@ -1012,6 +1562,7 @@ impl EncoderCore {
         Ok(Replayed {
             raws: ended,
             summary,
+            held,
             retained,
             executions,
             keys,
@@ -1028,14 +1579,14 @@ impl EncoderCore {
     /// so it uses nothing past its encoder's summary.
     pub(super) fn untracked_segment(
         command_buffer: &CommandBuffer,
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
         retained: Box<dyn Any + Send + Sync>,
     ) -> Result<RecordedSegment, Error> {
         let mut core = EncoderCore::segment_raw(command_buffer, false)?;
         let device = core.device().shared().vk();
         record(device, core.raw);
         // SAFETY: as in `barrier`.
-        unsafe { device.end_command_buffer(core.raw) }.map_err(vulkan)?;
+        unsafe { core.open.command_buffer.end_raw(core.raw) }.map_err(vulkan)?;
         core.retained.boxed(retained);
         let EncoderCore {
             raw,
@@ -1047,7 +1598,7 @@ impl EncoderCore {
             ..
         } = core;
         Ok(RecordedSegment {
-            raw,
+            raws: vec![raw],
             summary: uses.finish(),
             retained,
             executions,
@@ -1062,15 +1613,14 @@ impl EncoderCore {
     /// back are copied back, then a barrier to everything recorded after it.
     pub(super) fn end_segment(mut self) -> Result<RecordedSegment, Error> {
         let copies = self.shadows.finish();
-        let texels = copies.iter().map(ShadowCopy::texels_back).sum();
-        let counts = &self.device().shared().counts;
-        counts.shadow_copies_planned(copies.len(), texels);
+        self.count_shadow_copies(&copies);
         self.shadow_copies(&copies);
         self.barrier(Barrier::everything());
         // SAFETY: as in `barrier`.
-        unsafe { self.device().shared().vk().end_command_buffer(self.raw) }.map_err(vulkan)?;
+        unsafe { self.open.command_buffer.end_raw(self.raw) }.map_err(vulkan)?;
         let EncoderCore {
             raw,
+            mut ended,
             uses,
             retained,
             executions,
@@ -1078,8 +1628,9 @@ impl EncoderCore {
             taken,
             ..
         } = self;
+        ended.push(raw);
         Ok(RecordedSegment {
-            raw,
+            raws: ended,
             summary: uses.finish(),
             retained,
             executions,
@@ -1089,4 +1640,106 @@ impl EncoderCore {
             faults: ReplayFaults::default(),
         })
     }
+}
+
+/// A run of shadowed textures' copies in an encoder whose commands Metal leaves unordered
+/// (`EncoderCore::shadow_copies`, `held_shadow_copies`): one barrier from everything before its
+/// first copy and one to everything after its last order the run against the encoder's other
+/// commands, as a barrier around each copy did, a global barrier's first scope being every
+/// command before it and its second every command after. Inside the run a copy goes after a
+/// barrier only where it needs one:
+///
+/// - **Writes of the truth.** A copy back or a merge writes the texture's truth: a buffer's bytes
+///   (another key's too, where buffers over the same memory are not one key,
+///   `host_aliases.rs`) or a texture's image. It takes a barrier before it and one after it, as
+///   every copy did.
+/// - **The others** (copies in and keeps) write only memory the runtime made for the texture
+///   alone: its shadow, a merge's scratch or kept image, each of a key of its own. One goes after
+///   a barrier where a use of it and a use of a copy since the last barrier name the same key
+///   (aliases added) over ranges that share memory, and one of the two writes it: the tracker's
+///   rule for two commands that must run in order. Copies in of different textures (reads of
+///   their truths, writes of their own shadows) run together; a keep after the copy in of its
+///   texture (the shadow written, then read) takes its barrier.
+///
+/// Every image rests in `GENERAL`, so no barrier the run leaves out carried a layout transition.
+#[derive(Default)]
+struct ShadowRun {
+    /// The uses of the copies since the run's last barrier (aliases added); `None` before its
+    /// first.
+    since: Option<Vec<Use<ResourceKey>>>,
+    /// Whether the last copy wrote its truth: the next copy takes a barrier.
+    fenced: bool,
+    /// Whether a copy was recorded in the run.
+    recorded: bool,
+}
+
+impl ShadowRun {
+    /// A run whose first copy follows a barrier from everything before, which the caller records.
+    fn after_barrier() -> ShadowRun {
+        ShadowRun {
+            since: Some(Vec::new()),
+            fenced: false,
+            recorded: false,
+        }
+    }
+
+    /// Whether the next copy, of `uses` (aliases added), writing its truth where `writes_truth`,
+    /// goes after a barrier (the type's rules); noted as recorded.
+    fn before(&mut self, uses: &[Use<ResourceKey>], writes_truth: bool) -> bool {
+        let barrier = match &self.since {
+            None => true,
+            Some(since) => self.fenced || writes_truth || meets(since, uses),
+        };
+        let since = self.since.get_or_insert_with(Vec::new);
+        if barrier {
+            since.clear();
+        }
+        since.extend(uses.iter().cloned());
+        self.fenced = writes_truth;
+        self.recorded = true;
+        barrier
+    }
+
+    /// Whether a copy was recorded in the run, which then takes a barrier to everything after.
+    fn recorded(&self) -> bool {
+        self.recorded
+    }
+}
+
+/// Whether a use of `later` and one of `earlier` name the same key over ranges that share memory,
+/// and one of the two writes it.
+fn meets(earlier: &[Use<ResourceKey>], later: &[Use<ResourceKey>]) -> bool {
+    later.iter().any(|used| {
+        earlier.iter().any(|before| {
+            before.key == used.key
+                && before.range.overlaps(&used.range)
+                && !(before.write.is_empty() && used.write.is_empty())
+        })
+    })
+}
+
+/// The dispatch that takes the copy in at `copies[i]` and its texture's keep after it together
+/// (`ShadowMerge::keep_in`, `shadow_copy_in.rs`), where `device` takes one: the keep's place in
+/// `copies`, the dispatch and its uses. The copies between them are of other textures' shadows,
+/// so the keep's texels are the copy in's wherever it is recorded. `None` where the two stay
+/// apart.
+fn keep_with_copy_in(
+    device: &Device,
+    copies: &[ShadowCopy],
+    i: usize,
+) -> Option<(usize, CopyIn, Vec<Use<ResourceKey>>)> {
+    let copy = &copies[i];
+    let region = copy.copied_region()?;
+    let shadow = copy.copies.shadow_key;
+    let (j, merge) = copies
+        .iter()
+        .enumerate()
+        .skip(i + 1)
+        .find(|(_, later)| later.copies.shadow_key == shadow)
+        .and_then(|(j, later)| match &later.step {
+            Step::Keep(merge) => Some((j, merge)),
+            _ => None,
+        })?;
+    let both = merge.keep_in(device, &copy.copies, &region)?;
+    Some((j, both, merge.keep_in_uses(&copy.copies)))
 }

@@ -1658,7 +1658,18 @@ fn a_deeply_nested_written_global_is_rebuilt_on_a_small_stack() {
         static_init(&mut m, "init", |f| store(f, five, gaddr));
         let fty = m.fn_ty(void, &[dev]);
         let mut f = m.define("k", fty);
-        let v = load(&mut f, i32t, gaddr);
+        // A volatile read keeps the global: a plain one now reads the rebuilt initializer's leaf
+        // as its constant, and the unused global is pruned.
+        let v = f.push(
+            i32t,
+            InstKind::Load {
+                ptr: gaddr,
+                align: Align::from_bytes(4),
+                volatile: true,
+                atomic: None,
+                range: None,
+            },
+        );
         store(&mut f, v, arg(0));
         f.ret(None);
         let k = f.finish();
@@ -2359,9 +2370,12 @@ fn a_pointer_loaded_from_a_constant_globals_field_is_the_fields_constant() {
             assert!(text.contains(kept) && !text.contains(gone), "{text}");
         }
     }
-    // A field of any other type is left to the memory plan: its load stays.
-    let text = body_text(&picked_field(Some(1), 1).unwrap());
-    assert!(text.contains("getelementptr"), "{text}");
+    // A field of any other first-class type reads the same way: the picked struct's own `i64`.
+    for (flag, kept, gone) in [(1, "333", "444"), (0, "444", "333")] {
+        let text = body_text(&picked_field(Some(flag), 1).unwrap());
+        assert!(!text.contains("getelementptr") && !text.contains("load"), "{text}");
+        assert!(text.contains(kept) && !text.contains(gone), "{text}");
+    }
     // Unsupplied, the select stays undecided, as before.
     assert_eq!(
         picked_field(None, 0).unwrap_err(),
@@ -2975,8 +2989,9 @@ fn refusal(r: Result<Entry, Error>) -> Unsupported {
 
 /// A surviving call is refused at its location in the inlined entry, naming its callee, as its
 /// typed feature (not implemented yet): binding an intersection function table (an undecoded
-/// `air.set_intersection_function_table.*` intrinsic, by its family), a call to link, and an
-/// indirect call; another unknown intrinsic is `UnknownIntrinsic`.
+/// `air.set_intersection_function_table.*` intrinsic, by its family), a multisample imageblock's
+/// operation (imageblocks), a call to link, and an indirect call; another unknown intrinsic is
+/// `UnknownIntrinsic`.
 #[test]
 fn surviving_calls_are_refused_by_family_naming_the_callee() {
     let at = Location::function(DiagName::new("k"), Some(0), Some(0));
@@ -2988,6 +3003,17 @@ fn surviving_calls_are_refused_by_family_naming_the_callee() {
     assert_eq!(
         u.symbol,
         Some(DiagName::new("air.set_intersection_function_table.p1i8"))
+    );
+
+    // A multisample imageblock's operation is imageblocks, naming the operation.
+    let u = refusal(specialize_call(|m, fty| {
+        Callee::UnknownIntrinsic(m.declare("air.get_imageblock_num_colors", fty))
+    }));
+    assert_eq!(u.feature, Feature::Imageblocks);
+    assert_eq!(u.location, Some(at.clone()));
+    assert_eq!(
+        u.symbol,
+        Some(DiagName::new("air.get_imageblock_num_colors"))
     );
 
     let u = refusal(specialize_call(|m, fty| {
@@ -3587,8 +3613,8 @@ fn absent_memory_ops(e: &Entry) -> Vec<AbsentAccess> {
         .collect()
 }
 
-/// Threadgroup memory a function constant removed has no contents Metal defines (measured, EV
-/// GTG-tg-metal: it varies with the validation layer). A load through it, at its own address or one
+/// Threadgroup memory a function constant removed has no contents Metal defines (measured: it
+/// varies with the validation layer). A load through it, at its own address or one
 /// derived from it in one or more steps, and an atomic on it are the absent read of their type (an
 /// atomic's stays though nothing observes it); a store into it, a plain one or an atomic one, is
 /// dropped. The argument leaves the entry point, and no address derived from it stays.

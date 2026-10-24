@@ -39,10 +39,34 @@ fn ftz(x: u64) -> u64 {
     }
 }
 
+/// Whether the exact `a * b + c` of finite `f32`s is nonzero and below `2^-126` in magnitude: the
+/// product is exact in `f64`, and the sum's rounding error is exact (TwoSum), so the sum rounded
+/// to `f64` and its error place the exact value against `2^-126`, a `f64`.
+fn exact_below_normal(a: u64, b: u64, c: u64) -> bool {
+    let (a, b, c) = (f32v(a), f32v(b), f32v(c));
+    if !(a.is_finite() && b.is_finite() && c.is_finite()) {
+        return false;
+    }
+    let p = f64::from(a) * f64::from(b);
+    let c = f64::from(c);
+    let s = p + c;
+    let v = s - p;
+    let e = (p - (s - v)) + (c - v);
+    let normal = f64::from(f32::MIN_POSITIVE);
+    (s != 0.0 && s.abs() < normal) || (s.abs() == normal && e != 0.0 && (e < 0.0) == (s > 0.0))
+}
+
 /// Metal's `fma` (probe cases e98b103f and f7850ba7): denormal operands read as zeros, the one
-/// rounding, a denormal result flushed, and every NaN `0x7FC00000`.
+/// rounding, a result whose exact value is below `2^-126` a zero of its sign before rounding, and
+/// every NaN `0x7FC00000`.
 fn metal_fma32(a: u64, b: u64, c: u64) -> u64 {
-    let r = ftz(fma32(ftz(a), ftz(b), ftz(c)));
+    let (a, b, c) = (ftz(a), ftz(b), ftz(c));
+    let r = fma32(a, b, c);
+    let r = if exact_below_normal(a, b, c) {
+        r & 0x8000_0000
+    } else {
+        r
+    };
     if f32v(r).is_nan() {
         0x7FC0_0000
     } else {
@@ -257,8 +281,9 @@ fn same(f: Form) -> impl Fn(u64, u64) -> bool {
 }
 
 /// Run `fma` over `cases` (through a defined routine when its route has one; on vectors, per
-/// lane through its route's routine on one lane when `per_lane`) and compare with `reference` per
-/// lane: bit for bit when `exact`, else any NaN for a NaN.
+/// lane through its route's routine on one lane when `per_lane`; checked, on operands read as
+/// Metal reads them, as a module flushes them) and compare with `reference` per lane: bit for bit
+/// when `exact`, else any NaN for a NaN.
 fn check_fma(
     what: &str,
     fma: Fma,
@@ -277,9 +302,10 @@ fn check_fma(
             lanes: 1,
         }));
     }
+    // The routine of `OpFmaKHR`'s small results is never defined per lane.
     assert_eq!(
         routine.is_some_and(|r| fma::per_lane(r, &fmas)),
-        per_lane && routine.is_some() && f.lanes > 1,
+        per_lane && routine.is_some_and(|r| r.route != Route::Khr) && f.lanes > 1,
         "{what}"
     );
     let m = kernel_defs(
@@ -296,7 +322,16 @@ fn check_fma(
                 .into_iter()
                 .collect())
         },
-        &|fb, x, funcs| fma::emit(fb, fma, x, funcs.first().copied()),
+        &|fb, x, funcs| {
+            let x = match fma.checked() {
+                true => x
+                    .iter()
+                    .map(|v| crate::lower::arith::denormal::flush(fb, f, *v))
+                    .collect::<BResult<Vec<_>>>()?,
+                false => x.to_vec(),
+            };
+            fma::emit(fb, fma, &x, funcs.first().copied())
+        },
         true,
         false,
     )
@@ -322,22 +357,26 @@ fn check_fma(
 /// routine's sequence on its lanes, and per lane), specials, signed zeros, denormals, overflow, and
 /// the double-rounding hazards included. The routes the translation computes answer Metal's `fma`
 /// bit for bit (its denormal flush and NaN); `OpFmaKHR` is the device's (here the interpreter's
-/// IEEE `fma`).
+/// IEEE `fma`), and checked by either routine, on operands read as Metal reads them, Metal's
+/// but for the NaN's encoding.
 #[test]
 fn float_fused_multiply_add_rounds_once_on_every_route() {
     let triples = float_triples();
-    for (route, reference, exact) in [
-        (Route::Khr, fma32 as fn(u64, u64, u64) -> u64, false),
-        (Route::Wide, metal_fma32, true),
-        (Route::Soft, metal_fma32, true),
+    for (route, tiny, reference, exact) in [
+        (Route::Khr, None, fma32 as fn(u64, u64, u64) -> u64, false),
+        (Route::Khr, Some(Route::Wide), metal_fma32, false),
+        (Route::Khr, Some(Route::Soft), metal_fma32, false),
+        (Route::Wide, None, metal_fma32, true),
+        (Route::Soft, None, metal_fma32, true),
     ] {
         for (lanes, per_lane) in [(1u8, false), (3, false), (3, true)] {
             let fma = Fma {
                 form: floats(lanes),
                 route,
+                tiny,
             };
             check_fma(
-                &format!("fma {route:?} x{lanes}, per lane {per_lane}"),
+                &format!("fma {route:?} checked by {tiny:?} x{lanes}, per lane {per_lane}"),
                 fma,
                 per_lane,
                 &lane_cases(&triples, lanes),
@@ -345,6 +384,159 @@ fn float_fused_multiply_add_rounds_once_on_every_route() {
                 exact,
             );
         }
+    }
+}
+
+/// `OpFmaKHR` checked (`fma::checked`) is Metal's `fma` on every device Vulkan allows, on operands
+/// read as Metal reads them: whether the device keeps a denormal result, flushes it to a zero of
+/// its sign or to `+0`, or flushes an exact value below `2^-126` before rounding, a result above
+/// `2^-126` in magnitude is Metal's, and the routine answers the rest. The triples reach the
+/// results the device rounds up to `2^-126` (`2^-126 * (1 - 2^-24)` among the edges), and the
+/// test counts them.
+#[test]
+fn a_checked_fused_multiply_add_is_metals_in_every_denormal_mode() {
+    let devices: [(&str, fn(u64, u64, u64) -> u64); 4] = [
+        ("kept", fma32),
+        ("flushed", |a, b, c| ftz(fma32(a, b, c))),
+        ("flushed to +0", |a, b, c| {
+            let r = fma32(a, b, c);
+            if r & 0x7F80_0000 == 0 {
+                0
+            } else {
+                r
+            }
+        }),
+        ("flushed before rounding", |a, b, c| {
+            let r = fma32(a, b, c);
+            if exact_below_normal(a, b, c) {
+                r & 0x8000_0000
+            } else {
+                r
+            }
+        }),
+    ];
+    let triples: Vec<[u64; 3]> = float_triples().into_iter().map(|t| t.map(ftz)).collect();
+    let rounded_up = triples
+        .iter()
+        .filter(|[a, b, c]| {
+            exact_below_normal(*a, *b, *c) && fma32(*a, *b, *c) & 0x7FFF_FFFF == 0x0080_0000
+        })
+        .count();
+    assert!(rounded_up >= 1, "{rounded_up} results rounded up to 2^-126");
+    for (what, device) in devices {
+        for [a, b, c] in &triples {
+            let r = device(*a, *b, *c);
+            let small = r & 0x7FFF_FFFF <= 0x0080_0000;
+            let want = metal_fma32(*a, *b, *c);
+            // By the whole routine (the integer route), and by the routine of small results.
+            for (routine, answer) in [
+                ("Metal's fma", metal_fma32(*a, *b, *c)),
+                ("small", small_results(*a, *b, *c, r)),
+            ] {
+                let checked = if small { answer } else { r };
+                assert!(
+                    same(float(32))(checked, want),
+                    "{what}, {routine}: fma({a:#010x}, {b:#010x}, {c:#010x}): {checked:#010x}, \
+                     Metal {want:#010x}"
+                );
+            }
+        }
+    }
+}
+
+/// `fma::small` on one lane, in Rust's IEEE `double`: Metal's `fma` of `a`, `b`, `c` from `r`,
+/// their `OpFmaKHR` on some device, where `r` is at most `2^-126` in magnitude, else `r`.
+fn small_results(a: u64, b: u64, c: u64, r: u64) -> u64 {
+    let read = |x: u64| match x & 0x7F80_0000 {
+        0 => 0.0,
+        _ => f64::from(f32v(x)),
+    };
+    let (x, y, z) = (read(a), read(b), read(c));
+    let p = x * y;
+    let s = p + z;
+    let sp = s - z;
+    let sz = s - sp;
+    let e = (p - sp) + (z - sz);
+    let normal = f64::from(f32::MIN_POSITIVE);
+    let size = s.abs();
+    let tiny = size < normal || (size == normal && e * s < 0.0);
+    match r & 0x7FFF_FFFF <= 0x0080_0000 && tiny {
+        // An exact zero sum: IEEE's sign, on the operands' bits.
+        true if s == 0.0 => (a ^ b) & c & 0x8000_0000,
+        true if s < 0.0 => 0x8000_0000,
+        true => 0,
+        false => r,
+    }
+}
+
+/// The blends' exact `float` multiply-add (`fma::float_fma_exact`, of a `float` output's blend into
+/// an extended-range or 16-bit float attachment) rounds the exact `a * b + c` once on operands below
+/// 2 in magnitude whose parts do not underflow, on one lane and four, and its zero is IEEE's: `-0`
+/// for a negative zero product and a `-0` addend (`-0 · 1 + -0`, the zero alpha Metal stores for a
+/// `float4` output's blend over a `-0` texel), `+0` for opposite zeros and for a product the addend
+/// cancels. The emulation's own sum loses the first (`th + v` adds a `+0` to a `-0`). An infinite
+/// operand's infinite result is that infinity, where the emulation's own steps give a NaN (a
+/// `float4` output's infinity over a texel, which Metal stores as the `half` infinity).
+#[test]
+fn the_blends_float_multiply_add_rounds_once_and_signs_its_zeros() {
+    fn operand(rng: &mut Rng) -> u64 {
+        let r = rng.next();
+        mk32(r & 1, ((r >> 1) % 15) as i32 - 14, (r >> 8) & 0x7F_FFFF)
+    }
+    let edges: [u64; 8] = [
+        0,
+        0x8000_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x3F00_0000,
+        0xBF00_0000,
+        0x3FFF_FFFF,
+        0xBFFF_FFFF,
+    ];
+    let mut triples = Vec::new();
+    for a in edges {
+        for b in edges {
+            for c in edges {
+                triples.push([a, b, c]);
+            }
+        }
+    }
+    // Infinite operands whose results are infinite.
+    triples.extend([
+        [0x7F80_0000, 0x3F80_0000, 0x3F00_0000],
+        [0xFF80_0000, 0x3F00_0000, 0xBF80_0000],
+        [0x3F80_0000, 0x3F00_0000, 0x7F80_0000],
+        [0xBFFF_FFFF, 0x3F80_0000, 0xFF80_0000],
+        [0x7F80_0000, 0x3F80_0000, 0x7F80_0000],
+    ]);
+    let mut rng = Rng(0xB1E0_F32A);
+    for _ in 0..2000 {
+        triples.push([operand(&mut rng), operand(&mut rng), operand(&mut rng)]);
+    }
+    // Products the addend cancels: factors of 12 significand bits, whose product is a `float`.
+    for _ in 0..300 {
+        let (a, b) = (operand(&mut rng) & !0xFFF, operand(&mut rng) & !0xFFF);
+        let p = f32v(a) * f32v(b);
+        triples.push([a, b, u64::from((-p).to_bits())]);
+    }
+    assert!(triples.contains(&[0x8000_0000, 0x3F80_0000, 0x8000_0000]));
+    for lanes in [1u8, 4] {
+        let f = floats(lanes);
+        check(
+            &format!("the blends' float fma x{lanes}"),
+            &[f, f, f],
+            f,
+            &|fb, x| fma::float_fma_exact(fb, f, x[0], x[1], x[2]),
+            &lane_cases(&triples, lanes),
+            &|c| {
+                Some(
+                    (0..c[0].len())
+                        .map(|l| fma32(c[0][l], c[1][l], c[2][l]))
+                        .collect(),
+                )
+            },
+            false,
+        );
     }
 }
 
@@ -480,6 +672,7 @@ fn half_fused_multiply_add_rounds_once() {
         let fma = Fma {
             form: vec(float(16), lanes),
             route: Route::HalfOdd,
+            tiny: None,
         };
         check_fma(
             &format!("fma half x{lanes}, per lane {per_lane}"),
@@ -514,18 +707,39 @@ fn the_half_reference_rounds_the_exact_sum() {
 /// The route follows the profile: `OpFmaKHR` where `shaderFmaFloat32` is enabled, else `double`
 /// where 64-bit floats and integers are, else the integer routine; `half` has its own, the device's
 /// 16-bit `Fma` where the driver is measured to compute it as Metal's `half` `fma` and
-/// `shaderFloat16` is enabled (the MoltenVK captures alone), and `bfloat` and `double` keep their
-/// own lowering.
+/// `shaderFloat16` is enabled (the MoltenVK captures alone), else `OpFmaKHR` on 16 bits where
+/// `shaderFmaFloat16` is enabled and the profile rounds under the 16-bit float controls, under
+/// either policy, and `bfloat` and `double` keep their own lowering.
 ///
 /// Under native device maths (the default policy) a profile whose functions are not Metal's takes
-/// the device's `Fma` ([`Route::Native`]) where it would take a routine.
+/// the device's `Fma` ([`Route::Native`]) where it would take a routine. Under
+/// `FloatMathsPolicy::Exact`, `OpFmaKHR` on a profile whose functions are not Metal's own (not
+/// MoltenVK, whose `fma` is Metal's) is checked by the `double` routine where it is offered, else
+/// the integer one ([`fma::tiny_route`]), whether or not the device reads its denormals as Metal
+/// does (`DriverDeviation::MetalFloatDenormals`): it rounds before it flushes.
 #[test]
 fn the_fused_multiply_add_route_follows_the_profile() {
     use crate::device::profile::FloatFunctions;
     use crate::error::DriverDeviation;
     use crate::pipeline::testing::exact_maths;
     use crate::spirv::testing::{committed_profiles_with, is_moltenvk_capture};
+    // The `half` route a profile offers whatever its policy: Metal's measured `Fma`, or `OpFmaKHR`
+    // on 16 bits under the float controls, or none.
+    let exact_half = |p: &crate::device::DeviceProfile| {
+        let l = &p.fields().leaf;
+        if p.takes_driver_deviation(DriverDeviation::MetalHalfFma) && l.float16 {
+            Some(Route::F16)
+        } else if l.fma16
+            && crate::lower::arith::narrow::quantize_form(p)
+                == crate::spirv::builder::QuantizeForm::Controlled
+        {
+            Some(Route::F16Khr)
+        } else {
+            None
+        }
+    };
     let mut native = 0;
+    let mut khr16 = 0;
     for (stem, p) in committed_profiles().expect("profiles") {
         let l = &p.fields().leaf;
         if p.fields().float_functions != FloatFunctions::Native {
@@ -536,15 +750,17 @@ fn the_fused_multiply_add_route_follows_the_profile() {
         let f = Fma::on(&p, float(32)).expect("float");
         assert_eq!((f.route, f.routine()), (want, None), "{stem}");
         let h = Fma::on(&p, float(16)).expect("half");
-        let half = match p.takes_driver_deviation(DriverDeviation::MetalHalfFma) && l.float16 {
-            true => Route::F16,
-            false => Route::Native,
-        };
+        let half = exact_half(&p).unwrap_or(Route::Native);
         assert_eq!((h.route, h.routine()), (half, None), "{stem}");
+        khr16 += usize::from(half == Route::F16Khr);
     }
     assert!(native >= 10, "{native} profiles take native device maths");
+    assert!(khr16 >= 2, "{khr16} profiles take OpFmaKHR on 16 bits");
     let mut seen = std::collections::BTreeSet::new();
     let mut f16 = Vec::new();
+    let mut checked = 0;
+    let mut flushing = 0;
+    let mut metals = 0;
     for (stem, p) in committed_profiles_with(exact_maths()).expect("profiles") {
         let l = &p.fields().leaf;
         let want = if l.fma32 {
@@ -556,18 +772,30 @@ fn the_fused_multiply_add_route_follows_the_profile() {
         };
         let f = Fma::on(&p, float(32)).expect("float");
         assert_eq!(f.route, want, "{stem}");
+        // Metal's own functions (MoltenVK) take its `fma`, unchecked.
+        let device = p.fields().float_functions == FloatFunctions::Device;
+        let tiny = (want == Route::Khr && device).then_some(if l.float64 && l.int64 {
+            Route::Wide
+        } else {
+            Route::Soft
+        });
+        assert_eq!(f.tiny, tiny, "{stem}");
+        // `OpFmaKHR` checked through `double` calls the routine of its small results alone.
         assert_eq!(
             f.routine(),
-            (want != Route::Khr).then_some(Routine {
-                route: want,
-                lanes: 1
-            }),
+            match want {
+                Route::Khr => tiny.map(|t| if t == Route::Wide { Route::Khr } else { t }),
+                _ => Some(want),
+            }
+            .map(|route| Routine { route, lanes: 1 }),
             "{stem}"
         );
-        let half = match p.takes_driver_deviation(DriverDeviation::MetalHalfFma) && l.float16 {
-            true => Route::F16,
-            false => Route::HalfOdd,
-        };
+        checked += usize::from(tiny.is_some());
+        metals += usize::from(want == Route::Khr && !device);
+        flushing += usize::from(
+            tiny.is_some() && p.takes_driver_deviation(DriverDeviation::MetalFloatDenormals),
+        );
+        let half = exact_half(&p).unwrap_or(Route::HalfOdd);
         let h = Fma::on(&p, float(16)).expect("half");
         assert_eq!(h.route, half, "{stem}");
         assert_eq!(
@@ -592,6 +820,15 @@ fn the_fused_multiply_add_route_follows_the_profile() {
         "every float route is some committed profile's"
     );
     assert!(f16.len() >= 2, "{f16:?}");
+    assert!(checked >= 1, "{checked} profiles check OpFmaKHR");
+    assert!(
+        flushing >= 1,
+        "{flushing} profiles check OpFmaKHR on a device that flushes its denormals"
+    );
+    assert!(
+        metals >= 1,
+        "{metals} profiles take Metal's own OpFmaKHR unchecked"
+    );
 }
 
 /// The words of a module of the functions `defs` defines and an empty entry point.
@@ -620,10 +857,48 @@ fn defined_words(defs: &dyn Fn(&mut ModuleBuilder) -> BResult<()>) -> usize {
 
 /// The routines' words stay within their estimates: each routine's function, defined alone, and
 /// each use; and a routine defined per lane, beside its route's routine on one lane, its type
-/// included. `half`'s in the integer rounding and in the device's quantize.
+/// included. `half`'s in the integer rounding and in the device's quantize. A use of `OpFmaKHR`
+/// checked ([`Fma::checked`]) stays within its own estimate, on one lane and four, by the integer
+/// routine and by the routine of its small results.
 #[test]
 fn fused_multiply_add_routines_fit_their_word_estimates() {
     use crate::spirv::builder::QuantizeForm;
+    let lanes_and_routes = [1u8, 4]
+        .into_iter()
+        .flat_map(|lanes| [(lanes, Route::Soft), (lanes, Route::Wide)]);
+    for (lanes, tiny) in lanes_and_routes {
+        let fma = Fma {
+            form: floats(lanes),
+            route: Route::Khr,
+            tiny: Some(tiny),
+        };
+        let r = fma.routine().expect("a checked use's routine");
+        // The routine and a function of three floats that answers their `fma`, or its first.
+        let module = |uses: bool| {
+            defined_words(&|b| {
+                let id = fma::define(b, r)?;
+                let e = b.ty(Type::Float { width: 32 })?;
+                let t = match lanes {
+                    1 => e,
+                    len => b.ty(Type::Vector { elem: e, len })?,
+                };
+                let mut fb = b.routine(t)?;
+                let xyz = [fb.param(t)?, fb.param(t)?, fb.param(t)?];
+                let v = match uses {
+                    true => fma::emit(&mut fb, fma, &xyz, Some(id))?,
+                    false => xyz[0],
+                };
+                fb.ret(Some(v))?;
+                fb.finish().map(drop)
+            })
+        };
+        let words = module(true) - module(false);
+        assert!(
+            words <= fma.words() as usize,
+            "checked by {tiny:?} x{lanes}: {words} words against the estimate {}",
+            fma.words()
+        );
+    }
     let within = |what: &str, words: usize, estimate: u32| {
         let estimate = estimate as usize;
         assert!(
@@ -658,6 +933,15 @@ fn fused_multiply_add_routines_fit_their_word_estimates() {
                     r.per_lane_words(),
                 );
             }
+        }
+        // The routine of `OpFmaKHR`'s small results, never defined per lane.
+        for lanes in [1u8, 4] {
+            let r = Routine {
+                route: Route::Khr,
+                lanes,
+            };
+            let words = in_q(&|b| fma::define(b, r).map(drop));
+            within(&format!("Khr x{lanes} ({q:?})"), words, r.words(q));
         }
     }
 }
@@ -704,7 +988,7 @@ fn a_route_on_several_lane_counts_holds_its_sequence_once() {
         [r(Route::Wide, 3), r(Route::Soft, 2), r(Route::Soft, 4)]
     );
     // A double route on two vector lane counts gets its one-lane routine too, and so does one on
-    // three, which saves two sequences (EV PERF-sweep4), as does `half`'s on three.
+    // three, which saves two sequences, as does `half`'s on three.
     for lanes in [&[2u8, 4][..], &[2, 3, 4]] {
         let mut double: BTreeSet<Routine> = lanes.iter().map(|&n| r(Route::Wide, n)).collect();
         fma::complete(&mut double, q);
@@ -760,7 +1044,7 @@ fn check_mix(
         &|fb, x, funcs| {
             let id = funcs.first().copied();
             let fused = |fb: &mut FunctionBuilder<'_>, args: &[Value]| fma::emit(fb, fma, args, id);
-            math::metal_mix(fb, f, [x[0], x[1], x[2]], &fused)
+            math::metal_mix(fb, f, [x[0], x[1], x[2]], &fused, false)
         },
         true,
         false,
@@ -848,6 +1132,7 @@ fn mix_is_metals_two_fused_multiply_adds() {
             let fma = Fma {
                 form: floats(lanes),
                 route,
+                tiny: None,
             };
             check_mix(
                 &format!("mix {route:?} x{lanes}"),
@@ -883,6 +1168,7 @@ fn mix_is_metals_two_fused_multiply_adds() {
         let fma = Fma {
             form: vec(float(16), lanes),
             route: Route::HalfOdd,
+            tiny: None,
         };
         check_mix(
             &format!("mix half x{lanes}"),
@@ -1013,7 +1299,7 @@ fn check_dot(
         &|fb, x, funcs| {
             let id = funcs.first().copied();
             let fused = |fb: &mut FunctionBuilder<'_>, args: &[Value]| fma::emit(fb, fma, args, id);
-            math::metal_dot(fb, v, [x[0], x[1]], &fused, flush)
+            math::metal_dot(fb, v, [x[0], x[1]], &fused, (flush, None))
         },
         true,
         false,
@@ -1079,6 +1365,7 @@ fn dot_is_metals_fused_chain() {
         let fma = Fma {
             form: floats(1),
             route,
+            tiny: None,
         };
         for lanes in [2u8, 3, 4] {
             let what = format!("dot {route:?} x{lanes}, flush {flush}");
@@ -1121,6 +1408,7 @@ fn dot_is_metals_fused_chain() {
     let fma = Fma {
         form: float(16),
         route: Route::HalfOdd,
+        tiny: None,
     };
     for lanes in [2u8, 3, 4] {
         let what = format!("dot half x{lanes}");

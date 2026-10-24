@@ -5,7 +5,7 @@
 //! Vulkan copies no multisampled image to or from a buffer. Metal copies such a blit per sample,
 //! the pixel's samples consecutive in the buffer: texel `(x, y)` sample `s` of an `n`-sample
 //! texture lies at `offset + y * bytesPerRow + (x * n + s) * bpp` (measured on an Apple M4 under
-//! macOS 27.0.1, EV ZIN2-bm1-m4). The runtime moves the samples the only way Vulkan can, through
+//! macOS 27.0.1). The runtime moves the samples the only way Vulkan can, through
 //! two images in the unsigned-integer copy format of the texel size ([`PlanesCopy`]), so a
 //! texel's bits cross unchanged:
 //!
@@ -67,6 +67,7 @@ use super::texture_descriptor::{largest_side, TextureDescriptor};
 use super::tracker::{Access, Barrier, Use};
 use super::values::ResourceOptions;
 use super::Device;
+use crate::device::functions::Vk;
 use crate::shader_cache::driver::Making;
 use ash::vk;
 use metal2vulkan::bind::{
@@ -389,7 +390,7 @@ impl Device {
 
 /// The merge's render pass for `copy` at `samples`: one color attachment in the copy format,
 /// `GENERAL` throughout, its render area written whole (`DONT_CARE`, then `STORE`).
-fn merge_pass(raw: &ash::Device, copy: PlanesCopy, samples: u32) -> Result<vk::RenderPass, Error> {
+fn merge_pass(raw: &Vk, copy: PlanesCopy, samples: u32) -> Result<vk::RenderPass, Error> {
     let general = vk::ImageLayout::GENERAL;
     let attachments = [vk::AttachmentDescription::default()
         .format(copy.format().into())
@@ -610,8 +611,9 @@ enum Recorded {
 }
 
 /// The emulated copy: its steps, the resource uses the command barriers over, the stages it
-/// runs in, the band objects, and the scratch and wide textures it holds until the command
-/// buffer completes.
+/// runs in, the band objects, and the textures it holds until the command buffer completes (the
+/// copy's own, its scratch and wide images, and the texture it copies into or out of). The buffer
+/// it copies with is held by the encoder (`EncoderCore::blit_at`).
 pub(super) struct InterleaveCopy {
     steps: Vec<Recorded>,
     pub(super) uses: Vec<Use<ResourceKey>>,
@@ -940,6 +942,9 @@ impl InterleaveCopy {
         };
         uses.push(texture.image_use(level..level + 1, layer..layer + 1, stage, into_texture)?);
         let texture_image = texture.raw_image()?;
+        // The copy holds the texture its steps record on until its command buffer completes, as
+        // it holds its wide and scratch images.
+        textures.push(texture.clone());
         for (bx, by, bw, bh) in tiles {
             let wide_usage = if into_texture {
                 ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_DST
@@ -1124,7 +1129,7 @@ impl InterleaveCopy {
     ///
     /// `command_buffer` is recording outside a render pass, and only the caller records it; the
     /// buffer, the texture, and this copy's images and objects are live until it completes.
-    pub(super) unsafe fn record(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer) {
+    pub(super) unsafe fn record(&self, raw: &Vk, command_buffer: vk::CommandBuffer) {
         for step in &self.steps {
             // SAFETY: the caller's contract; each command's objects were made for this device.
             unsafe {

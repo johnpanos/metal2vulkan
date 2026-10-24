@@ -257,7 +257,7 @@ mod tests {
     }
 
     /// A member's stat as the kernel prints it at each stage. The dead `spirv-val` is the line
-    /// that stopped five attempts as tooling failures in EV WRK-evidence: a member that finished
+    /// that stopped five attempts as tooling failures in our probe: a member that finished
     /// exiting between the group's enumeration and its read is gone, not an unreadable member.
     #[test]
     fn a_members_stat_states_its_group_parent_and_exec() {
@@ -455,7 +455,7 @@ mod tests {
         } else {
             eprintln!(
                 "kcmp refused here: a not-yet-exec'd tool is counted beside its worker \
-                 (the documented fallback, DESIGN D289)"
+                 (the documented fallback)"
             );
             let stop = measured.unwrap_err();
             assert!(measured_at_stop(&stop) >= 600 * MIB, "{stop}");

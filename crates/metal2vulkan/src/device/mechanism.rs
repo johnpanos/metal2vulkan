@@ -38,7 +38,7 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // Keyed by the slots bound in an sRGB format whose raw code the function reads.
         RuntimeFact::SrgbTexture { .. } => Mechanism::Variant,
         // Keyed by the slots bound in a YCbCr format whose filter the function emulates on a
-        // device that samples through Metal's own sampler.
+        // profile that takes the variant (`ProfileFields::ycbcr_variant`).
         RuntimeFact::YCbCrTexture { .. } => Mechanism::Variant,
         RuntimeFact::SamplerCoordinates { .. } => Mechanism::Specialization,
         RuntimeFact::SamplerReduction { .. } => Mechanism::PlanTimeCheck,
@@ -163,6 +163,9 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::SparseTextureWrites { atomic: true, .. } => Mechanism::PlanTimeCheck,
         // The offsets and the tile memory are specialized; the pass binds its tile memory.
         RuntimeFact::TileThreadgroupMemory { .. } => Mechanism::Specialization,
+        // The binder checks the object function's arena with the encoder's lengths, which it
+        // specializes, against the object stage's workgroup memory limit.
+        RuntimeFact::ObjectThreadgroupArena { .. } => Mechanism::PlanTimeCheck,
         // The binder specializes the bound texture buffer's swizzle, which the function applies
         // to its reads.
         RuntimeFact::TextureSwizzle { .. } => Mechanism::Specialization,
@@ -224,6 +227,9 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // Link gives the attachment no Vulkan blend and its input attachment, which the consumer
         // binds as `GraphicsState::input_attachments` states.
         RuntimeFact::ExtendedRangeInputBlend { .. } => Mechanism::RenderPassContract,
+        // Link writes the whole word and gives the attachment its input attachment, which the
+        // consumer binds as `GraphicsState::input_attachments` states.
+        RuntimeFact::WordInputMerge { .. } => Mechanism::RenderPassContract,
         // Keyed by the slots bound in a format of another numeric class than the declared one,
         // whose texels the function reads in that class.
         RuntimeFact::CrossClassReads { .. } => Mechanism::Variant,
@@ -241,5 +247,24 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // The binder holds each half-float member the twin takes there; the consumer announces
         // a member it does not take where its heap holds one.
         RuntimeFact::HeapHalfTexelWrites { .. } => Mechanism::BinderView,
+        // The binder pushes the draw's depth bias; the consumer records its Vulkan bias as zero.
+        RuntimeFact::Depth16Codes { biased: true } => Mechanism::PushConstant,
+        // The function's returned depth, which Metal does not bias: nothing to meet.
+        RuntimeFact::Depth16Codes { biased: false } => Mechanism::None,
+        // A separate compile of the pipeline, which a pass whose depth is or is not
+        // `Depth16Unorm` where the pipeline names otherwise asks for.
+        RuntimeFact::Depth16Pass { .. } => Mechanism::Variant,
+        // A separate compile of the pipeline, which a draw that biases a `Depth16Unorm` depth
+        // asks for where the device stores its biased depths otherwise than Metal.
+        RuntimeFact::Depth16Biased => Mechanism::Variant,
+        // A separate compile of the pipeline, which a draw whose depth bias has a proven side
+        // asks for where the fragment stage adds the bias itself.
+        RuntimeFact::Depth16BiasSide { .. } => Mechanism::Variant,
+        // The pipeline's own stages, which every draw of its class runs; the consumer announces
+        // them.
+        RuntimeFact::SynthesizedGeometry { .. } => Mechanism::None,
+        // The pipeline's exact forms were dropped to fit the device's compiler word bound; the
+        // consumer announces it, and the reduced stages carry their own notes.
+        RuntimeFact::ExactFormsOverCompilerLimit { .. } => Mechanism::None,
     }
 }

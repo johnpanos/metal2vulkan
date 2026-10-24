@@ -1,24 +1,23 @@
 //! Tile dispatches in a render encoder (`dispatchThreadsPerTile:`) and the encoder's tile stage
 //! table.
 //!
-//! - **Checks** (measured by probe RT11-metal-probe-10 on an M3 Max and an M4): the state set is
+//! - **Checks** (measured by our probe on an M3 Max and an M4): the state set is
 //!   a tile pipeline's ("the renderPipelineState was not created with a tileDescriptor"); the
 //!   threads per tile are not empty and fit the pass's tile ("threadsPerTile.width(32) must be
 //!   <= 16"). Threads per tile past Metal's limit for the state, which Metal's validation stops,
-//!   run nothing, as plain Metal runs them (EV TTG-probe1-m4, an M4); those within it but past the
-//!   state's `max_total_threads_per_threadgroup`, where this device's limit is lower, are refused
-//!   typed by the binder. A depth other than 1, which Metal's validation stops
-//!   ("threadsPerTile.depth(2) must be 1"), runs as 1, as plain Metal runs it (a Metal probe on an
-//!   M4: 8x8 threads per tile of depth 2 and 4 ran 64 threads a tile, each `z` 0 and
-//!   `threads_per_threadgroup.z` 1). Threads per tile past the tile stay refused: plain Metal runs
-//!   them, their imageblock cells past the tile landing in the neighbouring tiles' pixels (probe
-//!   RT11-metal-probe-10 `d_32in16`), a layout of Metal's tile memory the runtime does not model. A
-//!   pass is single-sampled: the compile layer stages one sample a pixel, so a tile state of more
-//!   samples is not made (`Unsupported`), and the encoder takes no state of another sample count
-//!   than its pass's. The state's color formats may differ from the pass's past the last color its
-//!   function reaches through its implicit imageblock, which plain Metal runs as it runs matching
-//!   ones (a Metal probe on an M4); before it, or with an explicit imageblock, the encoder refuses
-//!   the state (`DrawProblem::AttachmentFormat`).
+//!   run nothing, as plain Metal runs them (an M4); those within it but past the state's
+//!   `max_total_threads_per_threadgroup`, where this device's limit is lower, are refused typed by
+//!   the binder. A depth other than 1, which Metal's validation stops ("threadsPerTile.depth(2)
+//!   must be 1"), runs as 1, as plain Metal runs it (a Metal probe on an M4: 8x8 threads per tile
+//!   of depth 2 and 4 ran 64 threads a tile, each `z` 0 and `threads_per_threadgroup.z` 1). Threads
+//!   per tile past the tile stay refused: plain Metal runs them, their imageblock cells past the
+//!   tile landing in the neighbouring tiles' pixels, a layout of Metal's tile memory the runtime
+//!   does not model. A pass is single-sampled: the compile layer stages one sample a pixel, so a
+//!   tile state of more samples is not made (`Unsupported`), and the encoder takes no state of
+//!   another sample count than its pass's. The state's color formats may differ from the pass's
+//!   past the last color its function reaches through its implicit imageblock, which plain Metal
+//!   runs as it runs matching ones (a Metal probe on an M4); before it, or with an explicit
+//!   imageblock, the encoder refuses the state (`DrawProblem::AttachmentFormat`).
 //! - **What runs** is what Metal runs: one threadgroup of the threads per tile on each tile of
 //!   the pass's tile size covering the render area, `ceil(area / tile)` of them, whose stores
 //!   reach each tile's pixels past the render area as far as the attachments go (measured: a
@@ -35,7 +34,7 @@
 //!   before the pass's first instance ([`ScratchEdges`]), and never copied to or from the
 //!   attachment, so the pass's dispatches carry them along.
 //! - **Over a region** (`dispatchThreadsPerTile:inRegion:` and its form with a render target
-//!   array index, SPI; measured by probes RT11-metal-probe-19 to -19e on an M3 Max and an M4,
+//!   array index, SPI; measured by our probes on an M3 Max and an M4,
 //!   identically, with no validation stop but the threads per tile's, as above). The tiles that
 //!   run are those from `x / tile` to the end `(x + w + tile - 1) / tile`, in 32-bit arithmetic
 //!   that wraps, each origin and size cut to its low 32 bits, and cut to the pass's tiles
@@ -53,6 +52,9 @@
 //!   stored (`render.rs`'s instances); `end_encoding` records each dispatch between the
 //!   instances it falls between, and a pass whose last command is a dispatch ends with one more
 //!   instance, of no draws, which runs the pass's store actions.
+//! - **Its pipelines.** A region's `VkPipeline` the tile function's variant has not made is made
+//!   on the device's pool while the dispatch goes on, and the pass records once it is made
+//!   (`render/pending_tile.rs`).
 //! - **Attachments.** The tile function stages each attachment it reaches through a storage view
 //!   in its staging format (an integer one, `WriteSource::TileAttachment`), which an
 //!   attachment's own image may lack: the dispatch reads and writes a scratch image of the
@@ -92,6 +94,7 @@
 //!   rounded up to 8 and reads every other word as zero, dropping its writes; the dispatch runs the
 //!   variant that does so (`BindState::kept_imageblock_bytes`).
 
+use super::pending_tile::{TileCall, TilePipelines};
 use super::replay::Samplers;
 use super::shadows::InstanceShadows;
 use super::{draw_problem, DrawProblem, RenderCommandEncoder};
@@ -102,6 +105,8 @@ use crate::blit::TRANSFER;
 use crate::buffer::Buffer;
 use crate::clear_reach;
 use crate::command_buffer::CommandBuffer;
+use crate::degradation::{BoundFormats, CompiledPipeline};
+use crate::device::functions::Vk;
 use crate::encoder::EncoderCore;
 use crate::error::{internal, invalid, Error, Problem, RuntimeGap};
 use crate::execution::{ExecutedPipeline, Execution};
@@ -109,7 +114,7 @@ use crate::fragment_imageblock::PassImageblock;
 use crate::function_table::VisibleFunctionTable;
 use crate::heap_sets;
 use crate::image_plan::ImagePlan;
-use crate::pipeline::{BufferForms, RenderPipelineState, RenderStateKind};
+use crate::pipeline::{BufferForms, RawPipeline, RenderPipelineState, RenderStateKind};
 use crate::render_pass::{PassLayout, Target};
 use crate::render_values::LoadAction;
 use crate::resource::ResourceKey;
@@ -131,7 +136,7 @@ use metal2vulkan::metal::format::{imageblock_sample_length, FormatMapping};
 use metal2vulkan::metal::{RenderStages, TextureType, TextureUsage};
 use metal2vulkan::pipeline::Stage;
 use metal2vulkan::vk::{ImageAspectFlags, ImageCreateFlags, ImageType, ImageUsageFlags};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// One tile dispatch of a pass, made at its call; `end_encoding` records it after the render
 /// pass instance before it.
@@ -146,10 +151,15 @@ pub(super) struct TileDispatch {
     copied: [[u32; 2]; 2],
     layout: vk::PipelineLayout,
     sets: Vec<vk::DescriptorSet>,
+    /// Set 0's writes, where the variant pushes it (`pipeline::objects::pushes_set_zero`):
+    /// pushed with the device's push command (`Vk::push_descriptor`).
+    pushed: Vec<binding::SetWrite>,
     /// Set 1, the command buffer's heap set of the variant, when the variant has one.
     heap: Option<vk::DescriptorSet>,
-    /// Each region's pipeline, push constants and group count.
-    regions: Vec<(vk::Pipeline, Vec<binding::PushWrite>, [u32; 3])>,
+    /// Each region's push constants and group count.
+    regions: Vec<(Vec<binding::PushWrite>, [u32; 3])>,
+    /// Its regions' `VkPipeline`s, made at the call or being made (`render/pending_tile.rs`).
+    pub(super) pipelines: TilePipelines,
     /// The shadowed textures it uses and its uses of buffers' bytes (the module docs).
     pub(super) shadows: InstanceShadows,
 }
@@ -181,20 +191,22 @@ impl TileDispatch {
         Ok(copies)
     }
 
-    /// Record the dispatch in `command_buffer`, outside any render pass instance: each staged
-    /// attachment copied into its scratch (`copies`, from [`TileDispatch::copies`]), the
-    /// dispatch, and the scratch copied back, between barriers from everything before and to
-    /// everything after.
+    /// Record the dispatch in `command_buffer` with `pipelines`, its regions' (its
+    /// [`TilePipelines`] made), outside any render pass instance: each staged attachment copied
+    /// into its scratch (`copies`, from [`TileDispatch::copies`]), the dispatch, and the scratch
+    /// copied back, between barriers from everything before and to everything after.
     ///
     /// # Safety
     ///
     /// `command_buffer` is recording outside a render pass; every object named lives until it
-    /// completes; the images are in the `GENERAL` layout.
+    /// completes; the images are in the `GENERAL` layout; `pipelines` are made with the
+    /// variant's layout, one per region.
     pub(super) unsafe fn record(
         &self,
-        raw: &ash::Device,
+        raw: &Vk,
         command_buffer: vk::CommandBuffer,
         copies: &[Staging],
+        pipelines: &[Arc<RawPipeline>],
     ) {
         // SAFETY: the caller's contract.
         unsafe {
@@ -210,7 +222,15 @@ impl TileDispatch {
                 );
             }
             Barrier::everything().record(raw, command_buffer);
-            if !self.sets.is_empty() {
+            if let Some(push) = raw.push_descriptor().filter(|_| !self.pushed.is_empty()) {
+                binding::push_set(
+                    push,
+                    command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.layout,
+                    &self.pushed,
+                );
+            } else if !self.sets.is_empty() {
                 raw.cmd_bind_descriptor_sets(
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
@@ -230,11 +250,12 @@ impl TileDispatch {
                     &[],
                 );
             }
-            for (index, (pipeline, push, [x, y, z])) in self.regions.iter().enumerate() {
+            let regions = self.regions.iter().zip(pipelines);
+            for (index, ((push, [x, y, z]), pipeline)) in regions.enumerate() {
                 if index > 0 {
                     Barrier::between_dispatches().record(raw, command_buffer);
                 }
-                raw.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, *pipeline);
+                raw.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline.raw);
                 for (stages, offset, bytes) in push {
                     raw.cmd_push_constants(command_buffer, self.layout, *stages, *offset, bytes);
                 }
@@ -597,9 +618,12 @@ impl RenderCommandEncoder {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::Buffer(Table::Tile, buffer.cloned(), offset, index));
+        self.log(|log| {
+            let buffer = buffer.map(|buffer| log.hold_buffer(buffer));
+            RenderCall::Buffer(Table::Tile, buffer, offset, index)
+        });
         self.tile
-            .set_buffer(&self.core, "set_tile_buffer", buffer, offset, index)
+            .set_buffer(&mut self.core, "set_tile_buffer", buffer, offset, index)
     }
 
     /// `setTileBuffers:offsets:withRange:`. Refused as
@@ -619,7 +643,7 @@ impl RenderCommandEncoder {
             )
         });
         self.tile
-            .set_buffers(&self.core, "set_tile_buffers", buffers, offsets, first)
+            .set_buffers(&mut self.core, "set_tile_buffers", buffers, offsets, first)
     }
 
     /// `setTileBufferOffset:atIndex:`. Refused as
@@ -627,7 +651,7 @@ impl RenderCommandEncoder {
     pub fn set_tile_buffer_offset(&mut self, offset: u64, index: u32) -> Result<(), Error> {
         self.log(|_| RenderCall::BufferOffset(Table::Tile, offset, index));
         self.tile
-            .set_buffer_offset(&self.core, "set_tile_buffer_offset", offset, index)
+            .set_buffer_offset(&mut self.core, "set_tile_buffer_offset", offset, index)
     }
 
     /// `setTileBytes:length:atIndex:`: as
@@ -636,15 +660,18 @@ impl RenderCommandEncoder {
     pub fn set_tile_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
         self.log(|log| RenderCall::Bytes(Table::Tile, log.byte_span(bytes), index));
         self.tile
-            .set_bytes(&self.core, "set_tile_bytes", bytes, None, index)
+            .set_bytes(&mut self.core, "set_tile_bytes", bytes, None, index)
     }
 
     /// `setTileTexture:atIndex:` (`None` unbinds the index). Refused as
     /// [`RenderCommandEncoder::set_vertex_texture`] is.
     pub fn set_tile_texture(&mut self, texture: Option<&Texture>, index: u32) -> Result<(), Error> {
-        self.log(|_| RenderCall::Texture(Table::Tile, texture.cloned(), index));
+        self.log(|log| {
+            let texture = texture.map(|texture| log.hold_texture(texture));
+            RenderCall::Texture(Table::Tile, texture, index)
+        });
         self.tile
-            .set_textures(&self.core, "set_tile_texture", &[texture], index)
+            .set_textures(&mut self.core, "set_tile_texture", &[texture], index)
     }
 
     /// `setTileTextures:withRange:`. Refused as
@@ -656,7 +683,7 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|log| RenderCall::Textures(Table::Tile, log.texture_span(textures), first));
         self.tile
-            .set_textures(&self.core, "set_tile_textures", textures, first)
+            .set_textures(&mut self.core, "set_tile_textures", textures, first)
     }
 
     /// `setTileSamplerState:atIndex:` (`None` unbinds the index). Refused as
@@ -666,9 +693,12 @@ impl RenderCommandEncoder {
         sampler: Option<&SamplerState>,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::Sampler(Table::Tile, sampler.cloned(), index));
+        self.log(|log| {
+            let sampler = sampler.map(|sampler| log.hold_sampler(sampler));
+            RenderCall::Sampler(Table::Tile, sampler, index)
+        });
         self.tile.set_samplers(
-            &self.core,
+            &mut self.core,
             "set_tile_sampler_state",
             &[sampler],
             None,
@@ -687,7 +717,7 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|_| RenderCall::Samplers(Table::Tile, Samplers::of(samplers, clamps, first)));
         self.tile.set_samplers(
-            &self.core,
+            &mut self.core,
             "set_tile_sampler_states",
             samplers,
             clamps,
@@ -728,8 +758,8 @@ impl RenderCommandEncoder {
             )))
         });
         // Metal draws into layer `index` of a layered pass and into layer 0 for an index at or
-        // past its layers (probe RT11-metal-probe-19b); the planner refuses a dispatch in a
-        // layered pass, so every pass one runs in has one layer, which every index draws into.
+        // past its layers; the planner refuses a dispatch in a layered pass, so every pass one runs
+        // in has one layer, which every index draws into.
         let _ = render_target_array_index;
         self.dispatch_tiles("dispatch_threads_per_tile_in_region", threads, Some(region))
     }
@@ -750,6 +780,8 @@ impl RenderCommandEncoder {
             _ => RenderStages::empty(),
         };
         self.dispatch_tiles_resident(call, threads, region)?;
+        self.core.device().shared().counts.tile_dispatch_recorded();
+        self.tile_dispatch_calls += 1;
         self.command_encoded(reads);
         Ok(())
     }
@@ -803,7 +835,7 @@ impl RenderCommandEncoder {
             ));
         }
         // Threads per tile past Metal's limit for the state run nothing, as plain Metal runs them
-        // (EV TTG-probe1-m4: a state of 256 threads dispatched 32x32 per tile left every pixel
+        // (a state of 256 threads dispatched 32x32 per tile left every pixel
         // and record as the pass had them; Metal's validation stops it). Threads within it but
         // past this device's lower limit (`max_total_threads_per_threadgroup`) are the device's
         // gap, which Metal runs: the binder refuses them typed below (`Bind`, `Unsupported`), and
@@ -822,10 +854,9 @@ impl RenderCommandEncoder {
         let function_tables = kernel.function_tables();
         // A buffer where the tile function reads a table reads as a null table, and a table
         // where it reads a buffer it does not write as an unbound buffer, as a kernel's and a
-        // drawing stage's do (EV ICR-tilevft2-m4 `buffer`).
-        let stage_table = self
-            .tile
-            .stage_table_reading(Stage::Kernel, kernel.interface());
+        // drawing stage's do.
+        let views = kernel.at_bind_views();
+        let stage_table = (self.tile).stage_table_reading(Stage::Kernel, kernel.interface(), views);
         // Its runtime samplers' address modes as the textures they sample map them.
         let sampler_maps = address_map::sampler_maps(
             kernel.base_layout(),
@@ -838,6 +869,7 @@ impl RenderCommandEncoder {
         let bind_state = |argument_samplers: &[SamplerState]| {
             let mut bind = BindState::default();
             bind.stages.insert(Stage::Kernel, stage_table.clone());
+            bind.view_base_alignment = views.alignment();
             bind.imageblock_size = ImageblockSize::new(tile[0], tile[1]);
             bind.render_area = area;
             // The planner refuses a layered pass's dispatch (`NotImplemented(TileShading)`).
@@ -1040,6 +1072,7 @@ impl RenderCommandEncoder {
                 .map(|blob| (Stage::Kernel, blob))
                 .collect(),
             mesh: None,
+            tessellation: None,
         };
         let stages = [(Stage::Kernel, &self.tile)];
         let mut tables = binding::Tables::new(&stages)
@@ -1070,16 +1103,18 @@ impl RenderCommandEncoder {
             .map(|used| used.key)
             .filter(|key| !uses.resident().contains(key));
         if self.core.skips(named) {
-            self.tile.retain(&mut self.core);
+            self.tile.retain_exclusive(&mut self.core);
             return Ok(());
         }
         // The shadowed textures the dispatch uses, copied around it (the module docs).
         let textures = self.tile.textures.values().chain(self.residency.textures());
         let mut shadows = InstanceShadows::default();
         shadows.add(&shadow::shadow_uses(textures, &uses), &uses);
+        let mut writes = Vec::new();
         let bound = {
             let mut state = self.core.command_buffer().state();
-            binding::bind(call, &device, &mut state, &plan, &command, &tables, None)?
+            let into = (None, &mut writes);
+            binding::bind(call, &device, &mut state, &plan, &command, &tables, into)?
         };
         // The formats its notices name, where the device announces any of its variant's kinds
         // at every occurrence (announced as the dispatch records, below), taken while its
@@ -1112,28 +1147,65 @@ impl RenderCommandEncoder {
             }
         }
         let mut regions = Vec::with_capacity(commands.regions.len());
-        let mut pipelines = Vec::with_capacity(commands.regions.len());
         for region in &commands.regions {
             let push = binding::push_writes(region.push_constants.clone(), &bound.holes)?;
-            let pipeline = variant.region_pipeline(region, &|slot| tables.bound_format(slot))?;
-            regions.push((pipeline.raw, push, region.group_count));
-            pipelines.push(pipeline);
+            regions.push((push, region.group_count));
         }
+        // Each region's `VkPipeline`: made, or handed to the device's pool while the dispatch goes
+        // on, its pass recording once it is made (`render/pending_tile.rs`); an encoder encoded
+        // again waits for it (`replay.rs`), as a compute encoder does.
+        let formats: BoundFormats<'_> = &|slot| tables.bound_format(slot);
+        let creation = self
+            .core
+            .records_executions()
+            .then(|| Arc::new(OnceLock::new()));
+        let pipelines = match self.core.encodes_again() {
+            true => {
+                let mut made = Vec::with_capacity(commands.regions.len());
+                for region in &commands.regions {
+                    made.push(variant.region_pipeline(region, formats)?);
+                }
+                TilePipelines::Made(made)
+            }
+            false => {
+                let call = TileCall {
+                    state: (self.pipeline.clone())
+                        .ok_or_else(|| internal("a tile dispatch without its pipeline state"))?,
+                    encoder: self.core.command_buffer().state().open_encoder_place(),
+                    dispatch: self.tile_dispatch_calls,
+                };
+                let regions = &commands.regions;
+                TilePipelines::begin(
+                    (&kernel, &variant),
+                    regions,
+                    formats,
+                    call,
+                    creation.clone(),
+                )
+            }
+        };
         let objects = Arc::clone(variant.objects());
         // Set 0 per dispatch; set 1 the device's (written below, once nothing refuses).
         let (heap_writes, writes): (Vec<_>, Vec<_>) =
-            bound.writes.into_iter().partition(|write| write.set > 0);
+            writes.into_iter().partition(|write| write.set > 0);
         let set = objects.set_zero(&mut self.core.command_buffer().state().descriptors)?;
-        // SAFETY: the set was just allocated and no command uses it yet; every buffer, view
-        // and sampler written is live (the command buffer retains them below, and a refusal
-        // leaves the set unused in its pool).
-        unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
+        let pushed = match objects.pushes_set_zero() {
+            true => binding::SetWrite::pushed(&writes, objects.immutable_pushes()),
+            false => {
+                // SAFETY: the set was just allocated and no command uses it yet; every buffer,
+                // view and sampler written is live (the command buffer retains them below, and a
+                // refusal leaves the set unused in its pool).
+                unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
+                Vec::new()
+            }
+        };
         let stages = uses
             .iter()
             .fold(vk::PipelineStageFlags2::empty(), |all, used| {
                 all | used.read.stages | used.write.stages
             });
-        self.core.note_reaching(stages, &uses, uses.resident())?;
+        self.core
+            .note_reaching(stages, (&*uses, uses.resident()), None)?;
         self.unordered.add(&uses);
         self.unordered_dispatches.add(&uses);
         let heap_set = match heap {
@@ -1170,14 +1242,21 @@ impl RenderCommandEncoder {
         if let Some(own) = first {
             device.degrade_tile_scratch(own, staged.len(), area);
         }
+        // The pipelines made at the call, held until the command buffer completes.
+        let made_pipelines = match &pipelines {
+            TilePipelines::Made(made) => Some(made.clone()),
+            TilePipelines::Making(_) => None,
+        };
         self.dispatches.push(TileDispatch {
             after: self.earlier.len() + 1,
             staged,
             copied,
             layout: objects.layout(),
             sets: set.into_iter().collect(),
+            pushed,
             heap: heap_set,
             regions,
+            pipelines,
             shadows,
         });
         self.dispatched = true;
@@ -1190,19 +1269,27 @@ impl RenderCommandEncoder {
         self.coverage.everywhere();
         // Nor do its positions run again before the pass (`render/capture.rs`).
         self.keeping = super::capture::Keeping::Stopped;
-        self.core.executed(|| {
-            Execution::new(
-                ExecutedPipeline::Compute(Arc::clone(variant.shared_pipeline())),
-                Arc::new(bind.shape()),
-                pipelines.iter().map(|made| made.created_in).collect(),
-            )
-        });
+        let executed = || ExecutedPipeline::Compute(Arc::clone(variant.shared_pipeline()));
+        match (&made_pipelines, creation) {
+            (Some(made), _) => self.core.executed(|| {
+                let times = made.iter().map(|made| made.created_in).collect();
+                Execution::new(executed(), Arc::new(bind.shape()), times)
+            }),
+            // Its times set once its pipelines are made.
+            (None, Some(creation)) => self
+                .core
+                .executed(|| Execution::made_later(executed(), Arc::new(bind.shape()), creation)),
+            (None, None) => {}
+        }
         // The dispatch binds the variant: the kinds its making announces at every occurrence.
         if let Some(tested) = &bound_each {
             let formats = |slot| tested.iter().find(|(s, _)| *s == slot)?.1;
-            let formats: crate::degradation::BoundFormats<'_> = &formats;
+            let formats: BoundFormats<'_> = &formats;
             objects.announce_bound(
-                (std::slice::from_ref(&variant.pipeline().stage), None),
+                (
+                    std::slice::from_ref(&variant.pipeline().stage),
+                    CompiledPipeline::Kernel(variant.pipeline()),
+                ),
                 commands
                     .regions
                     .iter()
@@ -1211,8 +1298,10 @@ impl RenderCommandEncoder {
         }
         self.core.retain(kernel);
         self.core.retain(objects);
-        self.core.retain(pipelines);
-        self.tile.retain(&mut self.core);
+        if let Some(made) = made_pipelines {
+            self.core.retain(made);
+        }
+        self.tile.retain_exclusive(&mut self.core);
         self.core.retain(bound.samplers);
         // The pass's tile memory, untracked: live until the command buffer completes.
         if let Some(buffer) = tile_memory {
@@ -1231,10 +1320,10 @@ impl RenderCommandEncoder {
 }
 
 /// The tiles `region`'s pixels touch in a pass of `groups` tiles of `tile` pixels, per axis
-/// `(first, count)`, as Metal takes the region (the module docs; probes RT11-metal-probe-19 to
-/// -19e): in 32-bit arithmetic that wraps, the first tile is `x / tile`, the end
-/// `(x + w + tile - 1) / tile`, and the count `end - first`, each origin and size cut to its low
-/// 32 bits; the tiles from the first, cut to the pass's. The region's `z` and depth are not read.
+/// `(first, count)`, as Metal takes the region (the module docs): in 32-bit arithmetic that wraps,
+/// the first tile is `x / tile`, the end `(x + w + tile - 1) / tile`, and the count `end - first`,
+/// each origin and size cut to its low 32 bits; the tiles from the first, cut to the pass's. The
+/// region's `z` and depth are not read.
 fn region_tiles(region: &Region, tile: [u32; 2], groups: [u32; 2]) -> [(u32, u32); 2] {
     let axis = |origin: u64, size: u64, i: usize| {
         // Metal's 32-bit origin and size (measured: an origin of 2^32 + 16 is 16).

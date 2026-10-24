@@ -34,8 +34,8 @@
 //! format), then the grid step `⌊(T + 2^(15 - s)) / 2^(16 - s)⌋`. The truncation moves an sRGB
 //! color lane's sum and a 16-bit format's; an 8-bit format's `16 · code` terms lose nothing, so its
 //! sum is the exact one. A float format's 2D sum merges such an axis too, before its accumulator
-//! (EVs TXN-edgeprobe-m3 and -m4, every 2D channel past the edges of `RGBA16Float`, `RGBA32Float`,
-//! `RG11B10Float`, and `RGB9E5Float`).
+//! (every 2D channel past the edges of `RGBA16Float`, `RGBA32Float`, `RG11B10Float`, and
+//! `RGB9E5Float`).
 //!
 //! **A 3D texture's filter** (Apple M4, macOS 27.0.1, and Apple M3 Max, macOS 26.7, byte-identical;
 //! the 3D probes) reads each of the three axes as above and weighs its eight taps differently from
@@ -52,7 +52,7 @@
 //!   16-bit format's code, toward negative infinity for a signed one), then the grid step `⌊(T +
 //!   2^(15 - s)) / 2^(16 - s)⌋`. A float format's sum is the accumulator's under the 16-bit
 //!   weights, its non-finite taps those of nonzero product weight `wx · wy · wz`, a tap whose
-//!   weight rounds to zero among them (EV TXN-pknf-m3, `RG11B10Float`'s infinities).
+//!   weight rounds to zero among them (`RG11B10Float`'s infinities).
 //!
 //! **A cube's filter** (`cube`; the cube probes, Apple M4 and Apple M3 Max, byte-identical) reads
 //! the face of the direction's major axis at Metal's face position (`face::position`), quantized as
@@ -82,31 +82,32 @@
 //! the branch and the device's sample. A heap image's emulation is the site's own code.
 //!
 //! **A runtime sampler**. Metal filters a sample through a sampler bound to a slot or held in an
-//! argument buffer exactly as through a constexpr sampler of the same state (EV MSFZ-m4-probe1,
-//! Apple M4, macOS 27.0.1: 24 cases, 2D linear under every address mode with normalized and pixel
-//! coordinates, 2D nearest, 3D, 1D, and cube, on `RGBA8Unorm` and `RGBA32Float`, every lane bit for
-//! bit). So a sample through a runtime sampler slot of the shapes the emulation reaches is planned
-//! for it too ([`LinearState::Slot`]), and the slot's `SamplerState` specialization carries the
-//! word's [`SamplerWord::LINEAR_STATE`] fields: the branch also tests that the word states the
-//! measured filter (`reaches_word`), and the taps follow the word's address modes, border color,
-//! and coordinates, computed in the function from the specialization (each tap's index under every
+//! argument buffer exactly as through a constexpr sampler of the same state (Apple M4, macOS
+//! 27.0.1: 24 cases, 2D linear under every address mode with normalized and pixel coordinates, 2D
+//! nearest, 3D, 1D, and cube, on `RGBA8Unorm` and `RGBA32Float`, every lane bit for bit). So a
+//! sample through a runtime sampler slot of the shapes the emulation reaches is planned for it too
+//! ([`LinearState::Slot`]), and the slot's `SamplerState` specialization carries the word's
+//! [`SamplerWord::LINEAR_STATE`] fields: the branch also tests that the word states the measured
+//! filter (`reaches_word`), and the taps follow the word's address modes, border color, and
+//! coordinates, computed in the function from the specialization (each tap's index under every
 //! mode, selected by the axis's mode; a cube's face wrap by its `s` and `t` modes), so once a
 //! device specializes the module the arithmetic folds to the bound sampler's. A `MirrorClampToEdge`
 //! axis, which only a runtime sampler states, reflects each tap's index once, `-1 - i` for a
 //! negative `i`, and clamps it into the level, under pixel and normalized coordinates alike, its
-//! constant texel offset placed as on a repeating axis (RRP-probe1-m4 and RRP-probe5-m4, Apple M4:
-//! every lane of nearest and linear samples, gathers and depth comparisons of textures 1 to 8
-//! texels wide); the emulation reaches it on a 1D or 2D texture, and the device filters it on a 3D
-//! texture or a cube, where no probe measured it ([`Linear::mirror_clamp_reached`]).
-//! Argument-buffer samplers are not reached: their textures are heap elements, whose format no
-//! specialization states; the device filters them, under the notes. A slot under its 8-bit sRGB
-//! variant is (EVs TXN-srgbprobe-m3 and -m4, Metal's samples of `RGBA8Unorm_sRGB` and
-//! `BGRA8Unorm_sRGB` through a runtime sampler are its constexpr sampler's of the same state, bit
-//! for bit, in 1D, 2D, and 3D): the emulation sums the raw codes fetched through the slot's raw
-//! view (`Linear::fetch`) where the word reaches it, and elsewhere the device samples the slot's
-//! own binding, the decoding view, under `PrecisionNote::SrgbTexelDecode` ([`decode_when`]). A
-//! cube's is inferred from the same equality on the other formats and from its constexpr
-//! sampler's raw emulation.
+//! constant texel offset placed as on a repeating axis (Apple M4: every lane of nearest and linear
+//! samples, gathers and depth comparisons of textures 1 to 8 texels wide); the emulation reaches it
+//! on a 1D or 2D texture, and the device filters it on a 3D texture or a cube, where no probe
+//! measured it ([`Linear::mirror_clamp_reached`]). Argument-buffer samplers are not reached: their
+//! textures are heap elements, whose format no specialization states; the device filters them,
+//! under the notes. A slot under its 8-bit sRGB variant is (Metal's samples of `RGBA8Unorm_sRGB`
+//! and `BGRA8Unorm_sRGB` through a runtime sampler are its constexpr sampler's of the same state,
+//! bit for bit, in 1D, 2D, and 3D): the emulation sums the raw codes fetched through the slot's raw
+//! view (`Linear::fetch`) where the word reaches it; where the word reads one texel the device
+//! samples the raw view through the same sampler, and Metal's table decodes the code, as a
+//! constexpr nearest sample's raw read does; elsewhere the device samples the slot's own binding,
+//! the decoding view, under `PrecisionNote::SrgbTexelDecode` ([`decode_when`]). A cube's is
+//! inferred from the same equality on the other formats and from its constexpr sampler's raw
+//! emulation; its word that reads one texel samples the decoding view too.
 //!
 //! **Where it is exact**, on the probes: in 1D and 2D for every measured format (a 16-bit
 //! normalized format's 2D sum on every channel of probes, under `clamp_to_edge`, `repeat`,
@@ -130,7 +131,7 @@
 //! (`PrecisionNote::HalfSampleFilter`, `PrecisionNote::FloatSampleFilter`), with every sample the
 //! emulation does not reach (its selection, `select`).
 //!
-//! **The packed formats** (EVs TXN-pkprobe-m3 and -m4, an Apple M3 Max on macOS 26.7 and an Apple
+//! **The packed formats** (an Apple M3 Max on macOS 26.7 and an Apple
 //! M4 on macOS 27.0.1, byte-identical; `metal::texel_format`). A packed normalized format sums as
 //! an 8-bit format does, each channel on its own 12-bit grid (`16 · 255`, `4 · 1023`, or `4095`,
 //! the code widened by replicating its bits), its terms truncated onto `2^-4` of a step: the exact
@@ -139,22 +140,25 @@
 //! residue above. A packed normalized format's cube sample is not measured and keeps the device's
 //! filter (`TexelFormat::packed_exact`).
 //!
-//! **The 8-bit 4:2:0 YCbCr format** (EVs TXN2-ycf1-m3 and -m4, byte-identical) sums its converted
-//! color's steps `k / 2048` on the grid `2048`, each 2D term truncated by `2^7`
+//! **The 8-bit 4:2:0 YCbCr format** (byte-identical) sums its converted color's steps `k / 2048` on
+//! the grid `2048`, each 2D term truncated by `2^7`
 //! (`metal::texel_format::PackedTexels::YCbCr2048`): the exact routine, every channel of the
 //! probes. Such a texture has one level (Metal makes it only over an IOSurface plane), and Metal's
 //! sample of it through a mip filter is its sample through none, whatever the level, bias or
-//! gradient (EVs TXN2-ycm1-m4 and -m3): the emulation reaches a runtime sampler's mip filter on its
+//! gradient: the emulation reaches a runtime sampler's mip filter on its
 //! class (`PackedTexels::one_level`, `reaches_word`). A constexpr sampler with a mip filter keeps
 //! the device's filter, noted.
 //!
-//! On a device that samples through Metal's own sampler such a slot's emulation is its YCbCr
-//! variant's alone ([`Linear::exact_only`]): the binder binds a two-plane YCbCr format there, whose
-//! class is `EXACT` or measured by no family, so only an `EXACT` class takes the emulation, through
-//! the exact routine alone, and every other class the device's sample, which is Metal's own filter
-//! on that device.
+//! On a device whose sampler answers the module's samples such a slot's emulation is its YCbCr
+//! variant's alone ([`Linear::exact_only`]), on a profile that takes the variant
+//! (`ProfileFields::ycbcr_variant`: under `YCbCrFilterPolicy::Exact`, and on a device that samples
+//! through Metal's own sampler also under `SamplingPolicy::Exact`; elsewhere the device filters
+//! the slot as any other, `YCbCrFilterPolicy::Device`, noted): the binder binds a two-plane YCbCr
+//! format there, whose class is `EXACT` or measured by no family, so only an `EXACT` class takes
+//! the emulation, through the exact routine alone, and every other class the device's sample,
+//! which is Metal's own filter on that device.
 //!
-//! **Depth textures and comparisons** (the RT13-px2, px3 and px4 probes, Apple M4 on macOS 27.0.1).
+//! **Depth textures and comparisons** (the probe, px3 and px4 probes, Apple M4 on macOS 27.0.1).
 //! A depth texture's linear sample is its color class's (`metal::texel_format`: `Depth32Float` an
 //! `R32Float`'s, `Depth16Unorm` an `R16Unorm`'s), so the emulation answers it by the class, its
 //! value the sum's first channel. A linear comparison is an `r8Unorm` sample of the taps' passes as
@@ -162,7 +166,7 @@
 //! the emulation compares each tap in the shader and sums the passes through the exact routine
 //! under `r8Unorm`'s bits, through a constexpr sampler of a 2D texture or array or a cube or cube
 //! array (a cube's corner tap the format's: `Depth32Float`'s the `x` face's texel, `Depth16Unorm`'s
-//! the made-up code, compared as a texel; RT13-px5-probe-m4).
+//! the made-up code, compared as a texel).
 //!
 //! **On a device that samples through Metal's own sampler** (`VkProperty::MetalSampler`: MoltenVK
 //! on Apple's GPU) the device's filter is Metal's, so no sample is emulated: the module leaves
@@ -222,8 +226,9 @@ pub struct Linear {
     /// variant: each tap's color lanes become the table's steps (`srgb_raw_tap`), and the exact
     /// routine sums them on the sRGB grids (`BicubicTexels::SRGB`), whatever the device. Through a
     /// runtime sampler slot it does so where the word reaches the emulation, its taps fetched
-    /// through [`fetch`](Self::fetch), the slot's raw view; the sample's own binding is the
-    /// decoding view, which its device arm samples elsewhere.
+    /// through [`fetch`](Self::fetch), the slot's raw view, which its device arm samples where the
+    /// word reads one texel; the sample's own binding is the decoding view, which its device arm
+    /// samples elsewhere.
     pub raw: bool,
     /// A cube's sample (`cube`), with its face position's routines: its taps are fetched from the
     /// faces of the slot's 2D-array view (its raw view where `raw`), its state's addressing is its
@@ -245,10 +250,10 @@ pub struct Linear {
     /// raw view (`BindingKey::raw`). `None`: the taps are fetched through the sample's binding (a
     /// cube's through its faces' view).
     pub fetch: Option<super::BindingKey>,
-    /// The emulation of a slot under its YCbCr variant on a device that samples through Metal's
-    /// own sampler (`VkProperty::MetalSampler`): only an `EXACT` class takes it, through the exact
-    /// routine alone, and every other class the device's sample, Metal's own filter. The binder
-    /// puts a slot in the variant only where it binds a two-plane YCbCr format there
+    /// The emulation of a slot under its YCbCr variant on a device whose sampler answers the
+    /// module's samples (`DeviceProfile::device_samples`): only an `EXACT` class takes it, through
+    /// the exact routine alone, and every other class the device's sample, Metal's own filter. The
+    /// binder puts a slot in the variant only where it binds a two-plane YCbCr format there
     /// (`bind::plan::slots::ycbcr_variant`), whose class is `EXACT` or measured by no family
     /// (`metal::texel_format`'s `two_plane_family`), never the accumulated routine's: so the
     /// emulated routine, which no such class reads, is not called.
@@ -313,10 +318,10 @@ impl Linear {
     }
 
     /// Whether the emulation reaches a runtime sampler whose word states `MirrorClampToEdge` on a
-    /// plane axis: a 1D or 2D texture's, an array's or not (RRP-probe1-m4 and RRP-probe5-m4,
-    /// Metal reflects each tap's index once, `-1 - i` for a negative `i`, then clamps it into the
-    /// level, under pixel and normalized coordinates alike, its constant texel offset placed as on
-    /// a repeating axis); not a 3D texture's, whose mirrored `t` axis's tie rule no probe measured
+    /// plane axis: a 1D or 2D texture's, an array's or not (Metal reflects each tap's index once,
+    /// `-1 - i` for a negative `i`, then clamps it into the level, under pixel and normalized
+    /// coordinates alike, its constant texel offset placed as on a repeating axis); not a 3D
+    /// texture's, whose mirrored `t` axis's tie rule no probe measured
     /// under the mode, nor a cube's.
     pub(super) fn mirror_clamp_reached(&self) -> bool {
         self.cube.is_none() && self.plane_axes() <= 2
@@ -479,7 +484,7 @@ pub(super) const BLOCK_WORDS: u32 = 1152;
 ///
 /// A sample of the same shapes through a runtime sampler slot is planned for the emulation too
 /// ([`LinearState::Slot`]): Metal filters through a runtime sampler as through a constexpr sampler
-/// of the same state (EV MSFZ-m4-probe1), and whether the bound sampler's state is the one the
+/// of the same state, and whether the bound sampler's state is the one the
 /// emulation reaches (its filter, and for a 3D texture or a cube on each plane axis an address mode
 /// other than `MirrorClampToEdge`) is read from the slot's `SamplerState` specialization in the
 /// function (`reaches_word`). Under a slot's 8-bit sRGB variant the caller makes the emulation raw,
@@ -489,7 +494,7 @@ pub(super) const BLOCK_WORDS: u32 = 1152;
 /// constexpr sampler, a runtime sampler slot, or an argument buffer's sampler
 /// ([`LinearState::Argument`], whose entry's word states what a slot's does) is planned for the
 /// emulation too ([`LinearImage::Heap`]): Metal filters a texture bound through an argument buffer
-/// as one bound to a slot (EV MSFZ-m4-probe1 sampled heap textures through its argument buffers'
+/// as one bound to a slot (our probe sampled heap textures through its argument buffers'
 /// samplers), and the class the emulation reads is the one the handle carries
 /// (`AccessPlan::heap_class`): a slot's class for a texture without a swizzle, else
 /// `TexelFormat::OTHER`, which the device filters.
@@ -525,7 +530,8 @@ pub(super) fn select(
     };
     // On a device that samples through Metal's own sampler, the device's filter is Metal's, but
     // for a slot under its YCbCr variant; on one that samples natively, the device's filter is the
-    // answer.
+    // answer, but for a slot under its YCbCr variant where the policy asks for Metal's filter of
+    // the format (`ProfileFields::ycbcr_variant`).
     let metal_sampler = cx.profile.device_samples();
     if metal_sampler && !crate::lower::texture::ycbcr_texture(cx, image, shape)? {
         cx.families.sampler.metal_sampler = true;
@@ -569,7 +575,7 @@ pub(super) fn select(
     let offset = match offset {
         None => None,
         Some(Offset::Const(k)) => Some(k.clone()),
-        Some(Offset::Dynamic(_)) => return Ok(None),
+        Some(Offset::Dynamic(..)) => return Ok(None),
     };
     if clamped || observed {
         return Ok(None);
@@ -668,7 +674,9 @@ pub(super) fn select(
 /// `float` one (a depth texture's and a comparison's included); `None` for a sample that is not
 /// filtered (a constexpr sampler that reads one texel of one level, [`unfiltered`]), one of another
 /// result, and every sample on a device with the property but a slot's under its YCbCr variant,
-/// whose filter the device's is not. Where it holds is [`filter_when`]'s.
+/// whose filter the device's is not, and a slot's whose two-plane YCbCr format the profile leaves
+/// to Metal's own sampler. Where it holds is [`filter_when`]'s, for such a slot
+/// [`metal_filtered_ycbcr`]'s.
 pub(super) fn filter_note(
     cx: &SelectCx<'_>,
     op: &SampleOp,
@@ -689,8 +697,41 @@ pub(super) fn filter_note(
         }
     }
     let metal = cx.profile.device_samples();
-    let device_metal = metal && !crate::lower::texture::ycbcr_slot(cx, image)?;
+    let device_metal = metal
+        && !crate::lower::texture::ycbcr_slot(cx, image)?
+        && metal_filtered_ycbcr(cx, image).is_none();
     Ok((!device_metal).then_some(note))
+}
+
+/// On a device that samples through Metal's own sampler (`VkProperty::MetalSampler`) under
+/// `YCbCrFilterPolicy::Device` (no `ProfileFields::ycbcr_variant`), the clauses under which a
+/// filtered sample of texture slot `image` is not Metal's filter of the format bound there: where
+/// that format is two-plane YCbCr (its class's `TexelFormat::PACKED` field one of
+/// [`PackedTexels::YCbCr2048`], [`PackedTexels::YCbCr8192`] and
+/// [`PackedTexels::YCbCrExtended8192`]), whose view holds Metal's reads exactly but which Metal's
+/// sampler then filters as an `RGBA16Float` or `RGBA32Float` texture's texels, not on the format's
+/// own grid. The runtime reads the bound format (`SpecKey::BoundTexelFormat`) and announces it as
+/// `ycbcr-filter-not-exact`, through a runtime sampler whatever its word states. `None` on any
+/// other device or profile, and for a heap's texture, which never takes the variant.
+pub(super) fn metal_filtered_ycbcr(cx: &SelectCx<'_>, image: ImageRef) -> Option<Vec<NoteClause>> {
+    let ImageRef::Slot(index) = image else {
+        return None;
+    };
+    let fields = cx.profile.fields();
+    let metal = fields
+        .enabled
+        .properties
+        .contains(&crate::device::requirements::VkProperty::MetalSampler);
+    (metal && !fields.ycbcr_variant).then(|| {
+        any_of(
+            [
+                PackedTexels::YCbCr2048,
+                PackedTexels::YCbCr8192,
+                PackedTexels::YCbCrExtended8192,
+            ]
+            .map(|p| NoteTest::equal(NoteOn::Bound(index), TexelFormat::PACKED_MASK, p.class().0)),
+        )
+    })
 }
 
 /// Where the filter note ([`filter_note`]) of a sample through `sampler` (`None`: an argument
@@ -699,10 +740,9 @@ pub(super) fn filter_note(
 ///
 /// - No emulation: the device filters. Through a runtime sampler slot, wherever its word filters
 ///   ([`word_filters`]); otherwise always.
-/// - A raw emulation (an 8-bit sRGB slot's variant): the raw codes' exact sums, in 1D, 2D, and 3D
-///   (EVs TXN-srgbprobe-m3 and -m4). Through a constexpr sampler it has no device arm, so never;
-///   through a runtime sampler slot the device filters the decoding view where the word filters but
-///   the emulation does not reach it.
+/// - A raw emulation (an 8-bit sRGB slot's variant): the raw codes' exact sums, in 1D, 2D, and 3D.
+///   Through a constexpr sampler it has no device arm, so never; through a runtime sampler slot the
+///   device filters the decoding view where the word filters but the emulation does not reach it.
 /// - Otherwise the emulation runs where the class names a measured family (for a cube, not a
 ///   packed normalized format's, `TexelFormat::packed_exact`) and, through a runtime sampler, the
 ///   word states a filter the emulation reaches (`reaches_word`); the device's arm runs
@@ -762,11 +802,17 @@ pub(super) fn device_when(l: &Linear) -> Vec<NoteClause> {
 }
 
 /// Where a raw emulation `l` through a runtime sampler slot hands its sample to the device's
-/// decoding view (`PrecisionNote::SrgbTexelDecode`): wherever the word does not reach the
-/// emulation, a word that reads one texel included. Never for another emulation.
+/// decoding view (`PrecisionNote::SrgbTexelDecode`): where the word does not reach the emulation
+/// and filters, since a word that reads one texel samples the slot's raw view ([`Linear::fetch`]);
+/// a cube's (no such view) wherever the word does not reach it. Never for another emulation.
 pub(super) fn decode_when(l: &Linear) -> Vec<NoteClause> {
-    match (&l.state, l.raw) {
-        (LinearState::Slot { sampler, .. }, true) => unreached(l, *sampler),
+    match (&l.state, l.raw, &l.cube) {
+        // A word that reads one texel samples the raw view ([`emit`], [`emit_shared`]): the
+        // device decodes only where the word filters too.
+        (LinearState::Slot { sampler, .. }, true, None) => {
+            both(&unreached(l, *sampler), &word_filters(*sampler))
+        }
+        (LinearState::Slot { sampler, .. }, true, Some(_)) => unreached(l, *sampler),
         _ => Vec::new(),
     }
 }
@@ -919,8 +965,9 @@ fn reaches(s: &SamplerState) -> bool {
 /// binding's sampled image (a `vec4` of `f32`), converted as a sample's for a `half` result: a
 /// branch on the slot's `TexelFormat` specialization, so only one of them runs, and once a device
 /// specializes the module the other is dead. A raw emulation runs alone through a constexpr
-/// sampler, and through a runtime sampler where its word reaches it, the device's sample of the
-/// binding's decoding view elsewhere. Each arm loads the binding's sampled image, which is consumed
+/// sampler, and through a runtime sampler where its word reaches it; elsewhere the device samples
+/// the slot's raw view where the word reads one texel, decoded through Metal's table, and the
+/// binding's decoding view otherwise. Each arm loads the binding's sampled image, which is consumed
 /// in the block that loads it, or a cube's emulation the slot's 2D-array view at `plane`, the
 /// direction the device's sample reads (its ties broken as Metal breaks them). A `half` result is
 /// the held `half` texel.
@@ -1034,6 +1081,19 @@ pub(super) fn emit(
                 device(fb, si)?
             }
         };
+        // Under the slot's twin variant the device sampled the codes: decoded through the table,
+        // exactly where the sampler read one texel.
+        let x = match s.srgb_codes {
+            true => {
+                let four = crate::lower::texture::TexelForm {
+                    lanes: 4,
+                    conv: crate::lower::texture::TexelConv::F32,
+                };
+                let color = crate::lower::texture::SRGB_TEXEL;
+                crate::lower::texture::srgb_filtered_texel(cx, fb, four, x, color)?
+            }
+            false => x,
+        };
         let x = match (h, float) {
             (Some(HalfArm::Class(h)), _) => {
                 let lanes = super::emit::sample_lanes(cx, fb, s)?;
@@ -1056,11 +1116,55 @@ pub(super) fn emit(
         };
         Ok(ArmEnd::FallThrough(vec![x]))
     });
-    let Merged(merged) = fb.if_(cx, measured, emulated, Some(filtered))?;
+    // A raw emulation's device arm, where the runtime sampler's word reads one texel (nearest
+    // minification and magnification, no linear mip filter, isotropic): the device's sample of the
+    // slot's raw view, through the same sampler, reads that texel's code, which Metal's table
+    // decodes exactly, as a constexpr nearest sample's raw read does. Every other word samples the
+    // decoding view ([`decode_when`]). Under the slot's twin variant the decoding view holds the
+    // codes already.
+    let device_arm: ArmFn<'_, EmitCx<'_>> = match (l.raw, word, &l.cube, s.srgb_codes) {
+        (true, Some(word), None, false) => {
+            let (Some(raw_key), Some(form)) = (l.fetch, s.texel) else {
+                return Err(cx.fail("a raw sample's device arm without its raw view"));
+            };
+            let Some(&(raw_binding, _)) = cx.decl.families.sampler.combined.get(&raw_key) else {
+                return Err(cx.fail(format!("raw binding {raw_key:?} is not declared")));
+            };
+            let raw: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
+                let si = raw_binding.sampled_image(fb)?;
+                let x = device(fb, si)?;
+                let color = crate::lower::texture::SRGB_TEXEL;
+                let x = crate::lower::texture::srgb_raw_texel(cx, fb, form, x, color)?;
+                Ok(ArmEnd::FallThrough(vec![x]))
+            });
+            one_texel_arm(word, raw, filtered)
+        }
+        _ => filtered,
+    };
+    let Merged(merged) = fb.if_(cx, measured, emulated, Some(device_arm))?;
     match merged[..] {
         [x] => Ok(x),
         _ => Err(cx.fail("a linear sample's branch without its texel")),
     }
+}
+
+/// A raw emulation's device arm through runtime sampler word `word`: `raw`'s texel (the device's
+/// sample of the slot's raw view, decoded through Metal's table) where the word reads one texel
+/// (`compared::one_texel`), else `filtered`'s (the device's sample of the decoding view).
+fn one_texel_arm<'a, 'c: 'a>(
+    word: SValue,
+    raw: ArmFn<'a, EmitCx<'c>>,
+    filtered: ArmFn<'a, EmitCx<'c>>,
+) -> ArmFn<'a, EmitCx<'c>> {
+    Box::new(move |fb, cx| {
+        let t = Tys::new(fb)?;
+        let (one, _) = super::compared::one_texel(fb, &t, word)?;
+        let Merged(merged) = fb.if_(cx, one, raw, Some(filtered))?;
+        match merged[..] {
+            [x] => Ok(ArmEnd::FallThrough(vec![x])),
+            _ => Err(cx.fail("a raw sample's device arm without its texel")),
+        }
+    })
 }
 
 /// The gathered texel of cube gather `s` by `g` (`cube`) of channel `component`, along `plane` (the
@@ -1200,7 +1304,34 @@ pub(super) fn emit_shared(
         };
         Ok(ArmEnd::FallThrough(vec![x]))
     });
-    let Merged(merged) = fb.if_(cx, measured, emulated, Some(filtered))?;
+    // A raw emulation's device arm reads each arm's raw view where the word reads one texel, as
+    // [`emit`]'s does; a null arm's zero decodes to zero.
+    let device_arm: ArmFn<'_, EmitCx<'_>> = match (l.raw, word, &l.cube, s.srgb_codes) {
+        (true, Some(word), None, false) => {
+            let (Some(_), Some(form)) = (l.fetch, s.texel) else {
+                return Err(cx.fail("a shared raw sample's device arm without its raw view"));
+            };
+            let raw: ArmFn<'_, EmitCx<'_>> = Box::new(move |fb, cx| {
+                let read = |cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, a: &Sampling| {
+                    let si = c.fetch_sampled_image(cx, fb, a)?;
+                    Ok(vec![device(fb, si)?])
+                };
+                let null = |_: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>| {
+                    let z = fb.module().constant(Constant::Null { ty: t.vec4 })?;
+                    Ok(vec![value(fb, z)?])
+                };
+                let [x] = c.each(cx, fb, &read, &null)?[..] else {
+                    return Err(cx.fail("a shared raw sample's device texel"));
+                };
+                let color = crate::lower::texture::SRGB_TEXEL;
+                let x = crate::lower::texture::srgb_raw_texel(cx, fb, form, x, color)?;
+                Ok(ArmEnd::FallThrough(vec![x]))
+            });
+            one_texel_arm(word, raw, filtered)
+        }
+        _ => filtered,
+    };
+    let Merged(merged) = fb.if_(cx, measured, emulated, Some(device_arm))?;
     match merged[..] {
         [x] => Ok(x),
         _ => Err(cx.fail("a linear sample's branch without its texel")),

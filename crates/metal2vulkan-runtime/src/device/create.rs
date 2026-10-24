@@ -36,7 +36,9 @@ use super::{device_error, lock, Device, DeviceShared, InstanceShared, Parts};
 use crate::degradation::{Degradation, DegradeNotice};
 use crate::enables::{host_image_copy_names, listed_reported, listed_structures, Enables};
 use crate::error::{vulkan, Error, InstanceApiVersion, LoaderNotFound};
+use crate::exit_guard;
 use crate::gpu_time;
+use crate::image_barrier::MemoryReads;
 use crate::loader_word::LoaderWord;
 use crate::metal_level::{choose, Chosen, Host};
 use crate::release;
@@ -488,6 +490,24 @@ pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
     Err(Error::LoaderNotFound(LoaderNotFound { tried }))
 }
 
+/// `vkCreateInstance` of `info` from `entry`: every instance the runtime creates, its devices' and
+/// the drivers' keeper's (`keeper.rs`), is made here, and the exit guard's hook registers again
+/// after it, whatever it answered ([`exit_guard::instance_made`]): a layer registers an exit
+/// handler at each such call.
+///
+/// # Safety
+///
+/// `info` and everything it points at live for the call.
+pub(super) unsafe fn new_instance(
+    entry: &ash::Entry,
+    info: &vk::InstanceCreateInfo<'_>,
+) -> ash::prelude::VkResult<ash::Instance> {
+    // SAFETY: the caller's.
+    let made = unsafe { entry.create_instance(info, None) };
+    exit_guard::instance_made();
+    made
+}
+
 /// The instance of `options`.
 fn create_instance(options: &DeviceOptions) -> Result<Arc<InstanceShared>, Error> {
     let entry = open_loader(options.loader.as_deref())?;
@@ -564,7 +584,7 @@ fn create_instance(options: &DeviceOptions) -> Result<Arc<InstanceShared>, Error
         info = info.push_next(&mut settings_info);
     }
     // SAFETY: `info` and everything it points at live for the call.
-    let raw = match unsafe { entry.create_instance(&info, None) } {
+    let raw = match unsafe { new_instance(&entry, &info) } {
         Ok(raw) => raw,
         Err(vk::Result::ERROR_INCOMPATIBLE_DRIVER) => return Err(Error::NoDevice),
         Err(error) => return Err(vulkan(error)),
@@ -878,7 +898,7 @@ pub(super) unsafe fn graphics_pipeline_library_supported(
 /// is core, and has the feature (`supported`, asked only then). Below Vulkan 1.3 too, where it
 /// lists `VK_KHR_format_feature_flags2`, which it enables with it
 /// (`enables::linear_color_attachment_names`); the runtime's instance is at Vulkan 1.2 unless the
-/// consumer asks another, so NVIDIA's devices never enabled it (the consumer's ZIN2-mc1).
+/// consumer asks another, so NVIDIA's devices never enabled it (the consumer's probe).
 pub(crate) fn linear_color_attachment(
     api: ApiVersion,
     listed: &BTreeSet<CString>,
@@ -1083,16 +1103,6 @@ fn create_on(
     // The runtime's own need, outside the vocabulary, where listed: GPU times on the host's
     // clock (`gpu_time.rs`).
     let calibration = gpu_time::Extension::among(&listed);
-    // The runtime's own need, outside the vocabulary, where listed beside the host imports it
-    // serves: a texture over a no-copy buffer as a Metal texture over the import's `MTLBuffer`
-    // on a driver that runs on Metal (`metal_texture.rs`).
-    let metal_name = ash::ext::metal_objects::NAME;
-    let metal_objects =
-        listed.contains(metal_name) && set.extensions.contains(&VkExtension::ExtExternalMemoryHost);
-    let metal_asked = options
-        .device_extensions
-        .iter()
-        .any(|name| name.as_c_str() == metal_name);
     // The runtime's own need, outside the vocabulary, wherever listed (Not only on a driver that
     // compiles every library of saved cache data at load): which stages a variant's cache held
     // (`shader_cache/variant.rs`), and whether the driver's cache held a pipeline
@@ -1112,7 +1122,6 @@ fn create_on(
         .iter()
         .cloned()
         .chain(calibration.map(|extension| extension.name().to_owned()))
-        .chain((metal_objects && !metal_asked).then(|| metal_name.to_owned()))
         .chain((creation_feedback && !feedback_asked).then(|| feedback_name.to_owned()))
         .chain(dma_buf.into_iter().flatten().map(CStr::to_owned))
         .chain(dma_buf_images.into_iter().flatten().map(CStr::to_owned))
@@ -1232,6 +1241,11 @@ fn create_on(
         .map_err(vulkan)?;
     // SAFETY: the device was just created: its word is the loader's.
     let loader_word = unsafe { LoaderWord::of_device(raw.handle()) };
+    let primary = families.get(queue_family as usize);
+    let memory_reads = MemoryReads::of(
+        primary.map_or(vk::QueueFlags::empty(), |family| family.queue_flags),
+        enables.names(),
+    );
     let parts = Parts {
         instance: Arc::clone(instance),
         physical,
@@ -1253,11 +1267,11 @@ fn create_on(
         host_image_copy,
         linear_color_attachment,
         graphics_pipeline_library,
-        metal_objects: metal_objects || metal_asked,
         creation_feedback: creation_feedback || feedback_asked,
         dma_buf: dma_buf.is_some(),
         dma_buf_images: dma_buf_images.is_some(),
         sparse_features,
+        memory_reads,
         owned: true,
         cache: cache.clone(),
         metal_level: level,

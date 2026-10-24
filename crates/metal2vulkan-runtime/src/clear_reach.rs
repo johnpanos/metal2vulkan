@@ -2,10 +2,8 @@
 //! render area, and what a `DontCare` load leaves.
 //!
 //! **Metal**, measured on the M3 Max (macOS 26.7) and an M4 (macOS 27.0.1), every answer the
-//! same on both, each case with and without API validation, which takes every one (EVs
-//! RRS-probe-2-m3 and RRS-probe-2-m4, 44 cases; RRS-probe-5-m3, RRS-probe-5-m4 and
-//! RRS-probe-5b-m4). A pass
-//! renders over its render area, from the origin (the smallest attachment's extent, or the
+//! same on both, each case with and without API validation, which takes every one (44 cases). A
+//! pass renders over its render area, from the origin (the smallest attachment's extent, or the
 //! descriptor's target size), but its attachments' stores reach past it:
 //!
 //! - **A `Clear` load** of an attachment the pass stores clears it from the origin over the render
@@ -45,8 +43,12 @@
 //!   pass, and loads: every other tile keeps its texels, Metal's answer (a draw writes no pixel
 //!   outside them), and a pass whose draws reach no pixel loads, as one whose draws draw nothing.
 //! - A `DontCare`-loaded memoryless color attachment clears to zero in a pass whose draws reach a
-//!   tile: Metal's answer in every tile a fragment reads it (an Apple M4, EV ZIN-zp1-m4), and it is
+//!   tile: Metal's answer in every tile a fragment reads it (an Apple M4), and it is
 //!   never stored, so the answer is exact.
+//! - A pass without a draw call whose attachments all load with `Load` or `DontCare` and store
+//!   with `Store` or `DontCare`, resolving nothing, and that sets no depth/stencil state with depth
+//!   writes, changes no texel: it records nothing (`render/untouched.rs`), before any of the steps
+//!   here.
 //! - Each `Clear`-loaded attachment (a converted one too) whose clear reaches past the render
 //!   area ([`reach`]) is cleared there before the pass by a render pass of its own: the attachment
 //!   alone, loaded and stored, over the pass's layers, `vkCmdClearAttachments` clearing the reach
@@ -54,10 +56,14 @@
 //!   is a load operation's clear: on a device that renders through Metal (MoltenVK) that clears
 //!   a pass without a draw over the whole attachment, as Metal does, so the reach pass's would,
 //!   and the pass's own would in a pass whose draw calls draw nothing (lane `clear_reach` on
-//!   MoltenVK, EVs RRS-lane9-mvk3 and RRS-lane11-mvk3). A stand-in's copy back to its texture
-//!   covers the reach (`attachment_stand_in.rs`). So is a cleared attachment the pass's first
-//!   instance leaves out where no whole-subresource clear may stand for its load operation
-//!   (`render.rs`'s `cleared_ahead`), over the render area where it stores nothing.
+//!   MoltenVK). A stand-in's copy back to its texture covers the reach (`attachment_stand_in.rs`).
+//!   So is a cleared attachment the pass's first instance leaves out where no whole-subresource
+//!   clear may stand for its load operation (`render.rs`'s `cleared_ahead`), over the render area
+//!   where it stores nothing.
+//! - A pass whose first instance records inline clears none before it: that instance, begun at a
+//!   draw that records (of a vertex and an instance at least), renders over the reach its colors
+//!   share, and its load operations' clear reaches it (`render/inline_first.rs`). Unmeasured on
+//!   MoltenVK past the render area.
 
 use super::clear_value;
 use super::encoder::EncoderCore;
@@ -76,8 +82,8 @@ use std::collections::BTreeSet;
 
 /// The side, in pixels, of the tiles a `Clear` load's clear reaches past the render area in, on
 /// both axes: Metal's on the M3 Max and an M4, the same at every format, sample count and tile
-/// size measured (the module docs; EVs RRS-probe-2-m3 and RRS-probe-2-m4). The one place the
-/// runtime states it: every device clears as Metal's do.
+/// size measured (the module docs). The one place the runtime states it: every device clears as
+/// Metal's do.
 pub(super) const TILE: u32 = 32;
 
 /// The extent from the origin that a `Clear` load of an attachment of `extent` clears in a pass
@@ -118,15 +124,13 @@ pub(super) fn stores(store: StoreAction) -> bool {
 pub(super) enum PassReach {
     /// No tile: the pass has no draw call, or its draw calls draw nothing (of no vertex or no
     /// instance, or through a pipeline that rasterizes nothing) and no attachment is cleared
-    /// and stored (EVs RRS3-reach1, -reach2 and -reach4c: `nodraw`, `instances0_t11`,
-    /// `no_raster_t11`, `clear_c1_store_nodraw`).
+    /// and stored (`nodraw`, `instances0_t11`, `no_raster_t11`, `clear_c1_store_nodraw`).
     Nothing,
     /// Every tile, within the render area rounded up to whole tiles: a pass of one layer with a
-    /// draw call (one that draws nothing too) and an attachment loaded `Clear` and stored (EV
-    /// RRS3-reach3: a color, depth and stencil attachment, `clear_c1_store_instances0` and
-    /// `clear_depth_store_instances0` of no instance). A `Clear` load with another store, a
-    /// separate depth or stencil texture's, and a pass of more layers are unmeasured: none of
-    /// them decides it.
+    /// draw call (one that draws nothing too) and an attachment loaded `Clear` and stored (a color,
+    /// depth and stencil attachment, `clear_c1_store_instances0` and `clear_depth_store_instances0`
+    /// of no instance). A `Clear` load with another store, a separate depth or stencil texture's,
+    /// and a pass of more layers are unmeasured: none of them decides it.
     Every,
     /// The tiles the draws' primitives reach, which the host does not know: each use of it
     /// takes every tile and announces it (until the reach is captured).
@@ -206,7 +210,7 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
             continue;
         };
         // A memoryless color reads zero in every tile a draw touches, the only tiles where a
-        // fragment reads it (an Apple M4, EV ZIN-zp1-m4: a framebuffer fetch of one read 0 in
+        // fragment reads it (an Apple M4: a framebuffer fetch of one read 0 in
         // 52 runs of 52, also after a pass that cleared other bytes into the tiles), and it is
         // never stored: a clear to zero is Metal's answer exactly, in a pass that draws.
         if color.load == LoadAction::DontCare && color.memoryless {
@@ -280,10 +284,14 @@ impl DontCareLoads {
 /// The most distinct pixel rectangles [`DrawnArea`] keeps; past them it is the whole render area.
 const MOST_RECTS: usize = 1024;
 
+/// The words of a row of tiles in [`DrawnArea::covered_tiles`]: 512 tiles, the 16384 pixels of
+/// the widest render area.
+const ROW_WORDS: usize = 8;
+
 /// The pixels a pass's draws may write, as far as the host bounds them: each draw that draws
 /// writes only inside its viewports' pixels within their scissor rectangles
 /// (`EncoderState::vk_scissors`), so a tile none of those reaches is one Metal's draws do not,
-/// and keeps its texels (EV XRB-pdc2 on an Apple M4 under macOS 27.0.1: a sub-rectangle of the
+/// and keeps its texels (on an Apple M4 under macOS 27.0.1: a sub-rectangle of the
 /// viewport or of the scissor zeroes exactly the `DontCare`-loaded tiles it overlaps, and every
 /// other tile keeps its texels). The whole render area where a draw's pixels are not bounded so:
 /// an execution of render commands, a tile dispatch, a pass through a rasterization-rate map, or
@@ -291,15 +299,50 @@ const MOST_RECTS: usize = 1024;
 #[derive(Clone, Debug, Default)]
 pub(super) struct DrawnArea {
     /// Each distinct `[x0, y0, x1, y1]`, half-open, inside the render area.
-    rects: BTreeSet<[u32; 4]>,
+    rects: Rects,
     whole: bool,
+}
+
+/// Distinct pixel rectangles: the first held in place, as a pass's draws mostly reach one (its
+/// render area), so such a pass allocates none for them; the others in a set.
+#[derive(Clone, Debug, Default)]
+struct Rects {
+    first: Option<[u32; 4]>,
+    /// Empty while `first` is `None`; never holds `first`.
+    rest: BTreeSet<[u32; 4]>,
+}
+
+impl Rects {
+    /// Add `rect`, where it is not here yet.
+    fn insert(&mut self, rect: [u32; 4]) {
+        match self.first {
+            None => self.first = Some(rect),
+            Some(first) if first == rect => {}
+            Some(_) => {
+                self.rest.insert(rect);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u32; 4]> {
+        self.first.iter().chain(&self.rest)
+    }
+
+    fn clear(&mut self) {
+        self.first = None;
+        self.rest.clear();
+    }
 }
 
 impl DrawnArea {
     /// An area that bounds nothing, an execution's commands' (which the host does not bound).
     pub(super) fn unbounded() -> DrawnArea {
         DrawnArea {
-            rects: BTreeSet::new(),
+            rects: Rects::default(),
             whole: true,
         }
     }
@@ -335,6 +378,57 @@ impl DrawnArea {
             .reduce(|[a0, a1, a2, a3], [b0, b1, b2, b3]| {
                 [a0.min(b0), a1.min(b1), a2.max(b2), a3.max(b3)]
             })
+    }
+
+    /// Of the tiles of [`TILE`] pixels a side, from the render area's origin, that
+    /// [`bounds`](Self::bounds) reaches, how many its rectangles reach, and how many it reaches:
+    /// `None` where it bounds nothing. A count (`WorkCounts::shadow_attachment_tiles_covered`):
+    /// what a copy cut to the rectangles' tiles would leave out of one cut to their bounds.
+    pub(super) fn covered_tiles(&self) -> Option<(u64, u64)> {
+        let [x0, y0, x1, y1] = self.bounds()?;
+        let (tx0, ty0) = (x0 / TILE, y0 / TILE);
+        let (tx1, ty1) = (x1.div_ceil(TILE), y1.div_ceil(TILE));
+        let bounded = u64::from(tx1 - tx0) * u64::from(ty1 - ty0);
+        // A row of tiles in the bits of `ROW_WORDS` words; a wider one, which no render area
+        // has, counts as covered.
+        if (tx1 - tx0) as usize > ROW_WORDS * 64 {
+            return Some((bounded, bounded));
+        }
+        let mut covered = 0;
+        for ty in ty0..ty1 {
+            let (top, bottom) = (ty * TILE, (ty + 1) * TILE);
+            let mut row = [0u64; ROW_WORDS];
+            for &[rx0, ry0, rx1, ry1] in self.rects.iter() {
+                if rx0 >= rx1 || ry0 >= ry1 || ry0 >= bottom || ry1 <= top {
+                    continue;
+                }
+                for tile in rx0 / TILE - tx0..rx1.div_ceil(TILE) - tx0 {
+                    row[(tile / 64) as usize] |= 1 << (tile % 64);
+                }
+            }
+            covered += row
+                .iter()
+                .map(|word| u64::from(word.count_ones()))
+                .sum::<u64>();
+        }
+        Some((covered, bounded))
+    }
+
+    /// Add `other`'s rectangles: anywhere where it bounds nothing.
+    pub(super) fn join(&mut self, other: &DrawnArea) {
+        if other.whole {
+            self.everywhere();
+            return;
+        }
+        if self.whole {
+            return;
+        }
+        for &rect in other.rects.iter() {
+            self.rects.insert(rect);
+        }
+        if self.rects.len() > MOST_RECTS {
+            self.everywhere();
+        }
     }
 
     /// Bound nothing: the draws may write anywhere in the render area.
@@ -373,7 +467,7 @@ impl DrawnArea {
             rows,
             words: vec![0; (per_row as usize * rows as usize).div_ceil(32)],
         };
-        for &[x0, y0, x1, y1] in &self.rects {
+        for &[x0, y0, x1, y1] in self.rects.iter() {
             for ty in y0 / tile[1]..y1.div_ceil(tile[1]).min(rows) {
                 for tx in x0 / tile[0]..x1.div_ceil(tile[0]).min(per_row) {
                     let t = (ty * per_row + tx) as usize;
@@ -751,6 +845,42 @@ mod tests {
         for rule in [ClearRoute::ThroughHalf, ClearRoute::Straight] {
             assert_eq!(form.clear_texel([0.0; 4], rule), [0; 4], "{rule:?}");
         }
+    }
+
+    /// The tiles the rectangles cover, against those their bounding rectangle reaches, are
+    /// counted in 32-pixel tiles from the origin: two rectangles far apart cover their own
+    /// tiles alone, where their bounds reach every tile between them.
+    #[test]
+    fn covered_tiles_count_the_rectangles_tiles_against_their_bounds() {
+        let rect = |x: i32, y: i32, w: u32, h: u32| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        };
+        let cases: [(Vec<vk::Rect2D>, Option<(u64, u64)>); 6] = [
+            (vec![], None),
+            // A 1920x1080 render area's every tile: 60 by 34.
+            (vec![rect(0, 0, 1920, 1080)], Some((2040, 2040))),
+            // Off the grid: tiles 0 to 2 by 0 to 1.
+            (vec![rect(31, 1, 34, 32)], Some((6, 6))),
+            // Two corners at either end of a 1920x1080 area, four tiles each.
+            (
+                vec![rect(0, 0, 64, 64), rect(1856, 1024, 64, 56)],
+                Some((8, 2040)),
+            ),
+            // Overlapping rectangles count each tile once.
+            (vec![rect(0, 0, 96, 32), rect(32, 0, 96, 32)], Some((4, 4))),
+            // An L: the bounds reach the corner the rectangles leave out.
+            (vec![rect(0, 0, 64, 32), rect(0, 32, 32, 32)], Some((3, 4))),
+        ];
+        for (case, (rects, expected)) in cases.iter().enumerate() {
+            let mut area = DrawnArea::default();
+            area.add(rects);
+            assert_eq!(area.covered_tiles(), *expected, "case {case}");
+        }
+        assert_eq!(DrawnArea::unbounded().covered_tiles(), None);
     }
 
     /// The tiles a pass's rectangles reach are the tiles each overlaps, whether one of them

@@ -17,7 +17,10 @@
 //!   of the texture's uses, nor for copies, lacks the format: the texture is refused, naming it.
 //!   Metal's `Unknown` usage is the usage Metal gives it
 //!   (`texture_descriptor::effective_usage`). Transfer usage is always asked for where the format
-//!   has it, because Metal copies every texture with blits, `replaceRegion` and `getBytes`.
+//!   has it, because Metal copies every texture with blits, `replaceRegion` and `getBytes`. A
+//!   single-sample depth attachment the runtime makes also takes sampled usage where its driver
+//!   keeps a depth image's hierarchical depth in `GENERAL` only for a sampled image
+//!   ([`hiz_candidate`], `DriverFact::SampledDepthKeepsHiZ`: ANV on the Iris Xe, measured).
 //! - **`ulong` atomics.** A `RG32Uint` texture (Metal's `ulong` texture) made with `ShaderAtomic`
 //!   also takes the `R64_UINT` view its `ulong` atomics update, where the device has that format's
 //!   storage atomics.
@@ -74,13 +77,14 @@ use metal2vulkan::error::{
     Capability, Error as CompileError, Feature, Needs, RuntimeDriverDefect, Unsupported,
 };
 use metal2vulkan::metal::format::{
-    direct_format, image_type, is_depth_stencil, srgb_raw_twin, storage_image_choice,
-    storage_view_formats, vk_format, FormatEmulation, FormatMapping,
+    alpha_in_red, alpha_in_red_format, direct_format, image_type, is_depth_stencil, srgb_raw_twin,
+    storage_image_choice, storage_view_formats, vk_format, FormatEmulation, FormatMapping,
+    WordAttachment,
 };
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan::vk::{
-    Format, FormatBlock, FormatFeatureFlags2, ImageCreateFlags, ImageType, ImageUsageFlags,
-    NumericType, SampleCountFlags,
+    ColorComponentFlags, Format, FormatBlock, FormatFeatureFlags2, ImageCreateFlags, ImageType,
+    ImageUsageFlags, NumericType, SampleCountFlags,
 };
 use std::collections::BTreeSet;
 
@@ -113,6 +117,10 @@ pub(super) struct DepthImageFacts {
     pub(super) outside_unit_range: bool,
     /// `DriverFact::DepthTestKeepsDenormals`.
     pub(super) test_denormals: bool,
+    /// `DriverFact::DepthTestComparesMagnitudes`: the depth test is Metal's for every value a
+    /// `D32_SFLOAT` image holds, so no target renders over a magnitude stand-in
+    /// (`texture/signed_depth.rs`).
+    pub(super) test_magnitudes: bool,
 }
 
 impl DepthImageFacts {
@@ -122,6 +130,7 @@ impl DepthImageFacts {
             denormals: facts.contains(&DriverFact::DepthImageKeepsDenormals),
             outside_unit_range: facts.contains(&DriverFact::DepthImageKeepsValuesOutsideUnitRange),
             test_denormals: facts.contains(&DriverFact::DepthTestKeepsDenormals),
+            test_magnitudes: facts.contains(&DriverFact::DepthTestComparesMagnitudes),
         }
     }
 }
@@ -467,6 +476,21 @@ pub(super) fn compatible(image: Format, view: Format, family: bool) -> bool {
     !is_compressed(&a) || family
 }
 
+/// Whether Vulkan copies texels between images of color formats `a` and `b` of one texel block
+/// size (`vkCmdCopyImage`, `VUID-vkCmdCopyImage-srcImage-01548`): "Color formats with the same
+/// texel block size are considered size-compatible as long as neither or both are alpha formats
+/// (e.g., VK_FORMAT_A8_UNORM)" (the Formats chapter's "Size Compatibility"). An alpha format's
+/// one component is alpha. Elsewhere the copy goes through a buffer, whose copies take each
+/// image's texel block size alone.
+pub(super) fn copies_between(a: Format, b: Format) -> bool {
+    let alpha = |format: Format| {
+        format
+            .block()
+            .is_some_and(|block| block.color_components == ColorComponentFlags::A)
+    };
+    alpha(a) == alpha(b)
+}
+
 /// Whether a color format's block is a compressed block: more than one texel, or (Vulkan's
 /// registry counts a PVRTC block as one texel) components that share no width and pack into no
 /// word.
@@ -509,8 +533,7 @@ pub(super) fn plan_texture_images(
 /// is given (`metal::format::padded_only_over_memory`: `R10Unorm_X6`, `RG10Unorm_X12` and their
 /// `_sRGB` twins) is
 /// refused `NotImplemented(Format)` naming it, since Metal's texture of a descriptor alone
-/// stores nothing (EVs XRR2-x6a and -x6b). A texture over an IOSurface's plane or a caller's
-/// buffer does not ask it.
+/// stores nothing. A texture over an IOSurface's plane or a caller's buffer does not ask it.
 pub(super) fn check_own_memory(pf: PixelFormat) -> Result<(), Unsupported> {
     match metal2vulkan::metal::format::padded_only_over_memory(pf) {
         true => Err(Unsupported::not_implemented(Feature::Format).naming_format(pf)),
@@ -569,9 +592,9 @@ fn plan_held(
     let samples = sample_count(layout.samples).ok_or_else(|| {
         ImageRefusal::Unsupported(Unsupported::not_representable(Feature::TextureSampleCount))
     })?;
-    // Metal makes a multisample array, memoryless ones included (RT6 probe 6c); a device whose
-    // portability subset withholds `multisampleArrayImage` makes no multisampled image of more
-    // than one layer's type (`VUID-VkImageCreateInfo-multisampleArrayImage-04460`).
+    // Metal makes a multisample array, memoryless ones included (a Metal probe on an M4); a device
+    // whose portability subset withholds `multisampleArrayImage` makes no multisampled image of
+    // more than one layer's type (`VUID-VkImageCreateInfo-multisampleArrayImage-04460`).
     if layout.texture_type == TextureType::Type2DMultisampleArray
         && profile
             .enabled()
@@ -587,6 +610,15 @@ fn plan_held(
         if let Some(plan) = plan_blocks(layout, usage, facts) {
             return Ok(plan);
         }
+        // An ASTC texture the device has no block for holds its blocks in a carrier, sampled
+        // through a decoded twin (`astc.rs`).
+        if let Some(plan) = super::astc::plan_blocks(layout, usage, facts) {
+            return Ok(plan);
+        }
+        // So does an ETC2 or EAC texture on a device without the formats (`etc.rs`).
+        if let Some(plan) = super::etc::plan_blocks(layout, usage, facts) {
+            return Ok(plan);
+        }
         // A 4:2:2 texture holds its texels in a carrier (`chroma_pairs.rs`).
         if let Some(plan) = plan_pairs(layout, usage, facts) {
             return Ok(plan);
@@ -595,7 +627,12 @@ fn plan_held(
     // `vk_format` with no usage names the refusal of a format without a representation (not
     // representable, not implemented, or no format at all).
     let any = vk_format(pf, &BTreeSet::new(), profile).map_err(ImageRefusal::of)?;
-    let direct = direct_format(pf).unwrap_or(any.format);
+    // An `A8Unorm` texture on a device that holds no `A8_UNORM` image is held in `R8_UNORM`, its
+    // alpha in red, for every use (`metal::format::alpha_in_red`): that is its direct format here.
+    let direct = match alpha_in_red_format(pf).filter(|_| alpha_in_red(pf, profile)) {
+        Some(red) => red,
+        None => direct_format(pf).unwrap_or(any.format),
+    };
     let depth_stencil = is_depth_stencil(pf);
     let attachment_usage = if depth_stencil {
         FormatUsage::DepthStencilAttachment
@@ -673,9 +710,10 @@ fn plan_held(
         });
     // Apple's private `BlockWritesOnly` (0x10000) is a usage Metal writes through as through
     // `ShaderWrite`: its validation takes every write form into a texture of it, and plain Metal
-    // stores them (EV XRR2-usw1; CoreAnimation's blur textures are `ShaderRead | RenderTarget |
-    // BlockWritesOnly`). Its image takes the storage usage where the device stores the format;
-    // elsewhere a binding takes the usage shadow (`texture/usage_shadow.rs`).
+    // stores them (CoreAnimation's blur textures are
+    // `ShaderRead | RenderTarget | BlockWritesOnly`). Its image takes the storage usage where the
+    // device stores the format; elsewhere a binding takes the usage shadow
+    // (`texture/usage_shadow.rs`).
     let stored = (wants(TextureUsage::SHADER_WRITE)
         || wants(TextureUsage::SHADER_ATOMIC)
         || wants(TextureUsage::BLOCK_WRITES_ONLY))
@@ -684,20 +722,46 @@ fn plan_held(
         .then(|| storage_image_choice(pf, profile).ok())
         .flatten();
     // A format no slot both reads and writes on the device, whose written-only binding's view
-    // the device stores (`BGRA8Unorm_sRGB` on ANV: its UNORM twin is stored without a format for
-    // writes alone, and SPIR-V names no BGRA format), still takes that view: a slot that only
+    // the device stores (on ANV, which reads no storage image without a format, a format SPIR-V
+    // names no image format for and no alias serves), still takes that view: a slot that only
     // writes the texture binds, and one that reads it too is refused at its binding.
     let written_only = match (stored, &storage) {
         (true, None) => storage_view_formats(pf, profile),
         _ => Vec::new(),
     };
     let wants_attachment = wants(TextureUsage::RENDER_TARGET) && attachment.is_some();
+    // A format the device samples but does not render, whose word it renders, renders through a
+    // view of the word (`metal::format::WordAttachment`): its image keeps the format (an 8-bit
+    // sRGB format the device holds no image of, its UNORM twin), mutable, with the attachment
+    // usage extended to the word's view.
+    let word = match (
+        wants(TextureUsage::RENDER_TARGET),
+        attachment,
+        depth_stencil,
+    ) {
+        (true, None, false) => WordAttachment::of(pf, profile).map(|w| w.word_format()),
+        _ => None,
+    };
+    // An 8-bit sRGB texture whose format the device holds no image of at all (`R8G8_SRGB` on
+    // NVIDIA) is held in its UNORM twin (`srgb_raw_twin`), which is its storage alias's own view:
+    // the twin serves the storage too. Where the device holds the sRGB format, it stays the
+    // image's own, and only the storage view is the alias.
+    let direct_held = !facts.optimal(direct).is_empty();
+    let unorm_twin = srgb_raw_twin(pf).and_then(direct_format);
+    let twin_stored = |m: &FormatMapping| {
+        Some(m.format) == unorm_twin
+            && !direct_held
+            && storage
+                .as_ref()
+                .is_some_and(|c| c.alias.is_some() && c.vk_format == m.format)
+    };
 
     // The image format: the sampled representation, unless a storage view or an attachment needs
     // the direct format, or nothing samples the texture.
     let mapping = match (sampled, attachment) {
         (Some(m), _)
             if m.format == direct
+                || twin_stored(&m)
                 || !(storage.is_some() || !written_only.is_empty() || wants_attachment) =>
         {
             m
@@ -708,8 +772,13 @@ fn plan_held(
         // one.
         _ => any,
     };
-    if mapping.emulation == FormatEmulation::DepthWidened {
-        // 24-bit depth held as 32-bit float depth is not exact: the texture needs its own format.
+    // 24-bit depth held as 32-bit float depth is not exact, and an ASTC, PVRTC, ETC2 or EAC
+    // format's decoded twin's view holds no blocks (a memoryless texture, or a device with no
+    // carrier, `astc.rs`, `pvrtc.rs`, `etc.rs`): the texture needs its own format.
+    if matches!(
+        mapping.emulation,
+        FormatEmulation::DepthWidened | FormatEmulation::Decoded
+    ) {
         return Err(ImageRefusal::Unsupported(Unsupported::needs(
             Feature::Format,
             Capability::Format {
@@ -736,7 +805,11 @@ fn plan_held(
     // hold (roadmap-2022 states no `A2R10G10B10` at all, whose `BGR10A2Unorm` storage its
     // `A2B10G10R10` view would otherwise serve).
     let held = !facts.optimal(format).is_empty();
-    match storage.filter(|c| format == direct && (c.alias.is_none() || held)) {
+    let twin = Some(format) == unorm_twin
+        && storage
+            .as_ref()
+            .is_some_and(|c| c.alias.is_some() && c.vk_format == format);
+    match storage.filter(|c| twin || (format == direct && (c.alias.is_none() || held))) {
         Some(choice) => {
             usage_flags |= ImageUsageFlags::STORAGE;
             views.insert(match choice.alias {
@@ -778,6 +851,9 @@ fn plan_held(
             if depth_stencil {
                 flags |= compatible_depth(profile, format, samples);
             }
+        } else if let Some(word) = word.filter(|_| format == direct || Some(format) == unorm_twin) {
+            usage_flags |= attachment_flag(false, profile);
+            views.insert(word);
         } else {
             unavailable |= usage.intersection(TextureUsage::RENDER_TARGET);
         }
@@ -791,7 +867,7 @@ fn plan_held(
     // samples: MoltenVK gives a mutable image's Metal texture `PixelFormatView` usage only where
     // the image has a view usage (sampled, storage, input or color attachment; MoltenVK 1.4.1's
     // `MVKPixelFormats::getMTLTextureUsage`); without one it made a compressed texture, larger
-    // than Metal's (a `PixelFormatView` texture alone, the consumer's M3 Max; EV API-hsm1-mvk4).
+    // than Metal's (a `PixelFormatView` texture alone, the consumer's M3 Max).
     let any_format = usage.contains(TextureUsage::PIXEL_FORMAT_VIEW)
         || (metal_keeps_uncompressed(!depth_stencil, usage)
             && !usage_flags.contains(ImageUsageFlags::STORAGE));
@@ -844,20 +920,28 @@ fn plan_held(
             views.insert(raw);
         }
     }
-    // The sRGB twin's views, which Metal makes without `PixelFormatView`.
+    // The sRGB twin's views, which Metal makes without `PixelFormatView`; not the view of the
+    // twin's word (`WordAttachment`), which would make every such render target mutable for a view
+    // few textures take: an attachment view of the twin the device renders only through its word
+    // is refused, as without the word.
     if let Some(twin) = srgb_twin(pf) {
+        let twin_word = WordAttachment::of(twin, profile).map(|w| w.word_format());
         views.extend(
             view_formats(twin, usage_flags, profile)
                 .into_iter()
-                .filter(|&f| compatible(format, f, true)),
+                .filter(|&f| compatible(format, f, true) && Some(f) != twin_word),
         );
     }
     views.insert(format);
     // A usage the image's own format lacks, which a view format has (a storage alias, a sampled
-    // twin), needs extended usage.
+    // twin, a word attachment), needs extended usage.
     let extended = [
         (ImageUsageFlags::SAMPLED, FormatUsage::SampledImage),
         (ImageUsageFlags::STORAGE, FormatUsage::StorageImage),
+        (
+            ImageUsageFlags::COLOR_ATTACHMENT,
+            FormatUsage::ColorAttachment,
+        ),
     ]
     .iter()
     .any(|&(bit, need)| usage_flags.contains(bit) && !profile.supports_format(format, need));
@@ -965,7 +1049,8 @@ fn plan_depth_twin(
 
 /// The formats of the views the runtime makes of a texture of `pf` for the Vulkan usages in
 /// `usage` on `profile`: its sampled representation, its storage view (the alias, or the direct
-/// format), and its attachment format (the direct format). A view the device cannot make for `pf`
+/// format), and its attachment format (the direct format, or the view of its word where the device
+/// renders that and not the format, `WordAttachment`). A view the device cannot make for `pf`
 /// is left out: a format list naming a format the device lacks is one some drivers make no image
 /// of (ANV, for an `RG8Unorm` render target listing its twin's `R8G8_SRGB`).
 pub(super) fn view_formats(
@@ -993,6 +1078,10 @@ pub(super) fn view_formats(
             FormatUsage::ColorAttachment
         };
         out.extend(direct_format(pf).filter(|&f| profile.supports_format(f, need)));
+        // A format the device samples but does not render renders through its word's view.
+        if usage.contains(ImageUsageFlags::COLOR_ATTACHMENT) {
+            out.extend(WordAttachment::of(pf, profile).map(|w| w.word_format()));
+        }
     }
     out
 }
@@ -1016,6 +1105,15 @@ pub(super) fn takes_views_of(plan: &ImagePlan, pf: PixelFormat, profile: &Device
     })
 }
 
+/// The cube compatibility a sampled image of a texture of `layout` takes: a cube's, and a square
+/// 2D array's of six layers or more ([`cube_compatible`]), which a cube view may present.
+pub(super) fn cube_flags(layout: &TextureLayout) -> ImageCreateFlags {
+    match cube_compatible(layout) {
+        true => ImageCreateFlags::CUBE_COMPATIBLE,
+        false => ImageCreateFlags::empty(),
+    }
+}
+
 /// Whether the image of `layout` is cube-compatible: a cube or cube array, or a square 2D array
 /// of at least six single-sample layers (Metal views those as cubes).
 pub(super) fn cube_compatible(layout: &TextureLayout) -> bool {
@@ -1026,6 +1124,37 @@ pub(super) fn cube_compatible(layout: &TextureLayout) -> bool {
         }
         _ => false,
     }
+}
+
+/// `plan` with sampled usage, where its driver keeps a single-sample depth image's hierarchical
+/// depth in `GENERAL` only for a sampled image (`keeps_hiz`: the cost fact
+/// [`DriverFact::SampledDepthKeepsHiZ`]): a single-sample depth attachment with a depth aspect,
+/// not transient and not yet sampled, of a format the device samples. The image holds the same
+/// texels either way; every image rests in `GENERAL` (`tracker.rs`) and takes transfer-source
+/// usage, which on such a driver turns the hierarchical depth off there. `Device::with_free_usage`
+/// gives the image the usage wherever the device makes it, though it may enlarge the image (ANV
+/// keeps the write-through form's state in the image's memory), so a heap's size answer, which
+/// reads the same plan, is that image's. `None` otherwise.
+pub(super) fn hiz_candidate(
+    plan: &ImagePlan,
+    profile: &DeviceProfile,
+    keeps_hiz: bool,
+) -> Option<ImagePlan> {
+    let usage = plan.usage;
+    let depth = plan
+        .format
+        .block()
+        .is_some_and(|block| block.depth.is_some());
+    let candidate = keeps_hiz
+        && depth
+        && plan.samples.as_raw() == 1
+        && usage.contains(ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        && !usage.intersects(ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSIENT_ATTACHMENT)
+        && profile.supports_format(plan.format, FormatUsage::SampledImage);
+    candidate.then(|| ImagePlan {
+        usage: usage | ImageUsageFlags::SAMPLED,
+        ..plan.clone()
+    })
 }
 
 fn attachment_flag(depth_stencil: bool, profile: &DeviceProfile) -> ImageUsageFlags {

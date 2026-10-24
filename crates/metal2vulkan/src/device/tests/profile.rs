@@ -1,9 +1,7 @@
 //! `Device::new`, profile derivation, the fingerprint, and `requirements ⊆ profile`.
 
 use super::*;
-use crate::device::profile::{
-    BufferAccess, Containment, FramebufferFetchPolicy, GuestIsolation, Independence, Robustness,
-};
+use crate::device::profile::{BufferAccess, Containment, GuestIsolation, Independence, Robustness};
 use crate::device::requirements::{Requirements, StageCreateFlag, VkLimit, VkProperty};
 use crate::error::{Capability, Feature, Needs};
 
@@ -51,13 +49,13 @@ fn every_committed_profile_derives() {
 }
 
 /// `occlusionQueryPrecise` is read from each committed profile whose source states it, and enabled
-/// there: every venue's source does; the two derived Vulkan 1.2 floors, whose base
-/// (`VP_LUNARG_minimum_requirements_1_2`) does not require it, leave it unstated.
+/// there: every venue's source does; the derived Vulkan 1.2 floor, whose base
+/// (`VP_LUNARG_minimum_requirements_1_2`) does not require it, leaves it unstated.
 #[test]
 fn occlusion_query_precise_follows_each_source() {
     for (stem, text) in committed_profiles() {
         let stated = text.contains("\"occlusionQueryPrecise\": true");
-        assert_eq!(stated, !stem.starts_with("vk12-"), "{stem}");
+        assert_eq!(stated, stem != "vk12-floor", "{stem}");
         let desc = DeviceDescription::from_khronos_json(&text, None).unwrap();
         assert_eq!(
             desc.features.contains(&VkFeature::OcclusionQueryPrecise),
@@ -150,7 +148,7 @@ fn find_structure(v: &serde_json::Value, name: &str, out: &mut Option<serde_json
 #[test]
 fn memory_profiles_follow_bda_and_int64() {
     // roadmap-2022 requires device addresses but not shaderInt64.
-    for stem in ["vk12-bare", "vk12-floor", "roadmap-2022"] {
+    for stem in ["vk12-floor", "roadmap-2022"] {
         assert_eq!(
             device(stem).profile().fields().buffer_access,
             BufferAccess::Floor,
@@ -178,13 +176,10 @@ fn memory_profiles_follow_bda_and_int64() {
 fn addressed_needs_name_only_the_missing_features() {
     let bda = Capability::Feature(VkFeature::BufferDeviceAddress);
     let int64 = Capability::Feature(VkFeature::ShaderInt64);
-    for stem in ["vk12-bare", "vk12-floor"] {
-        assert_eq!(
-            device(stem).profile().addressed_needs(),
-            vec![bda.clone(), int64.clone()],
-            "{stem}"
-        );
-    }
+    assert_eq!(
+        device("vk12-floor").profile().addressed_needs(),
+        vec![bda, int64.clone()]
+    );
     // roadmap-2022 has device addresses; only the 64-bit integers are missing.
     assert_eq!(
         device("roadmap-2022").profile().addressed_needs(),
@@ -193,8 +188,8 @@ fn addressed_needs_name_only_the_missing_features() {
 }
 
 #[test]
-fn vk12_bare_derives_a_floor_profile() {
-    let dev = device("vk12-bare");
+fn vk12_floor_derives_a_floor_profile() {
+    let dev = device("vk12-floor");
     let f = dev.profile().fields();
     assert_eq!(
         f.containment,
@@ -284,7 +279,7 @@ fn robustness2_selects_the_rba2_encoding() {
 
 #[test]
 fn below_1_2_and_contradictory_policies_are_refused() {
-    let mut desc = profile("vk12-bare");
+    let mut desc = profile("vk12-floor");
     desc.api_version = ApiVersion { major: 1, minor: 1 };
     match Device::new(desc, DevicePolicy::default()) {
         Err(Error::Unsupported(u)) => {
@@ -301,23 +296,24 @@ fn below_1_2_and_contradictory_policies_are_refused() {
         ..DevicePolicy::default()
     };
     assert!(matches!(
-        Device::new(profile("vk12-bare"), unsafe_on),
+        Device::new(profile("vk12-floor"), unsafe_on),
         Err(Error::InvalidDescriptor(
             DescriptorError::DeviceDescription { .. }
         ))
     ));
     unsafe_on.isolation = GuestIsolation::Off;
-    let dev = Device::new(profile("vk12-bare"), unsafe_on).unwrap();
+    let dev = Device::new(profile("vk12-floor"), unsafe_on).unwrap();
     assert_eq!(dev.profile().fields().containment, Containment::UnsafeOff);
 }
 
 /// Each of the policy's choices between the device's answer and Metal's, with a function that
 /// flips it alone: the maths functions, the texel conversions, the `half` rounding, the NaN and
-/// minimum and maximum, the rounding order, and the 16-bit float blend of a `half` output.
-fn exactness_flips() -> [(&'static str, fn(DevicePolicy) -> DevicePolicy); 6] {
+/// minimum and maximum, the rounding order, the 16-bit float blend of a `half` output, and the
+/// filter of a two-plane YCbCr texture.
+fn exactness_flips() -> [(&'static str, fn(DevicePolicy) -> DevicePolicy); 7] {
     use crate::device::{
         FloatMathsPolicy as F, HalfBlendPolicy as B, HalfRoundingPolicy as H, NanMinMaxPolicy as N,
-        RoundingOrderPolicy as R, TexelConversionPolicy as T,
+        RoundingOrderPolicy as R, TexelConversionPolicy as T, YCbCrFilterPolicy as Y,
     };
     [
         ("float_maths", |p| DevicePolicy {
@@ -362,15 +358,25 @@ fn exactness_flips() -> [(&'static str, fn(DevicePolicy) -> DevicePolicy); 6] {
             },
             ..p
         }),
+        ("ycbcr_filter", |p| DevicePolicy {
+            ycbcr_filter: match p.ycbcr_filter {
+                Y::Device => Y::Exact,
+                Y::Exact => Y::Device,
+            },
+            ..p
+        }),
     ]
 }
 
 /// On MoltenVK on the M3, whose functions, NaN, minimum and maximum and `half` rounding are
 /// measured to be Metal's, the maths functions', the `half` rounding's and the rounding order's
-/// choices change nothing, so each keys as the default does; the texel conversions' is the policy's
-/// own field there, as the 16-bit float blend's is (MoltenVK's blend is measured to store Metal's
-/// bytes, but no profile fact states it), and the NaN and minimum and maximum's moves the texel NaN
-/// route (`TexelNanRoute`): a texel's NaN is the image's decode, which no arithmetic fact covers.
+/// choices change nothing, so each keys as the default does; the texel conversions' is the
+/// policy's own field there, as the 16-bit float blend's is (MoltenVK's blend is measured to store
+/// Metal's bytes, but no profile fact states it), the NaN and minimum and maximum's moves the texel
+/// NaN route (`TexelNanRoute`): a texel's NaN is the image's decode, which no arithmetic fact
+/// covers, and the YCbCr filter's moves whether a two-plane YCbCr slot takes its variant
+/// (`ProfileFields::ycbcr_variant`), Metal's sampler filtering such a texture's converted texels
+/// otherwise.
 #[test]
 fn metal_s_own_answers_key_the_same_under_either_choice() {
     let desc = profile("moltenvk-m3");
@@ -384,7 +390,10 @@ fn metal_s_own_answers_key_the_same_under_either_choice() {
     for (name, flip) in exactness_flips() {
         assert_eq!(
             fp(flip(base)) == fp(base),
-            !matches!(name, "texel_conversion" | "half_blend" | "nan_and_min_max"),
+            !matches!(
+                name,
+                "texel_conversion" | "half_blend" | "nan_and_min_max" | "ycbcr_filter"
+            ),
             "{name}"
         );
     }
@@ -407,9 +416,6 @@ fn fingerprint_covers_every_policy_field() {
     variants.push(("isolation", p));
     p.containment = ContainmentPolicy::UnsafeOff;
     variants.push(("containment", p));
-    let mut p = base;
-    p.framebuffer_fetch = FramebufferFetchPolicy::AcceptUnordered;
-    variants.push(("framebuffer_fetch", p));
     // Metal's sampler emulated exactly in place of native device sampling.
     let mut p = base;
     p.sampling = crate::device::SamplingPolicy::Exact;
@@ -479,9 +485,11 @@ fn streamed_fingerprint_equals_the_hash_of_the_rendering() {
 /// Two committed profiles share a fingerprint only when their descriptions differ in nothing a
 /// translation reads: at most in the device's identity (vendor, device, driver version, type) and
 /// its allocation sizes, as two captures of one GPU family on one driver do
-/// (`intel-irisxe-rplp-anv` and `intel-uhd770-rpls-anv`, the one Intel venue), and `moltenvk-m3`
-/// and `moltenvk-m4` (MoltenVK 1.4.1 on the Apple M3 Max and the Apple M4 under macOS 27, whose
-/// `deviceID` MoltenVK makes one: the macOS release and the GPU family).
+/// (`intel-irisxe-rplp-anv` and `intel-uhd770-rpls-anv`, the one Intel venue), two of one GPU
+/// under its two `deviceID`s (`amd-780m-hawkpoint-radv` and `amd-780m-radv`, the Radeon 780M of
+/// Hawk Point and of Phoenix), and `moltenvk-m3` and `moltenvk-m4` (MoltenVK 1.4.1 on the Apple
+/// M3 Max and the Apple M4 under macOS 27, whose `deviceID` MoltenVK makes one: the macOS release
+/// and the GPU family).
 #[test]
 fn fingerprints_distinguish_committed_profiles() {
     let translated = |stem: &str| {
@@ -506,6 +514,10 @@ fn fingerprints_distinguish_committed_profiles() {
     assert_eq!(
         shared,
         [
+            (
+                "amd-780m-hawkpoint-radv".to_string(),
+                "amd-780m-radv".to_string()
+            ),
             (
                 "intel-irisxe-rplp-anv".to_string(),
                 "intel-uhd770-rpls-anv".to_string()
@@ -573,7 +585,7 @@ fn check_reports_the_first_missing_capability() {
     );
     assert_eq!(
         need(Requirements {
-            features: [VkFeature::ShaderInt16, VkFeature::ShaderInt64].into(),
+            features: [VkFeature::RobustBufferAccess, VkFeature::ShaderInt64].into(),
             ..Requirements::default()
         }),
         Err(Capability::Feature(VkFeature::ShaderInt64))
@@ -694,7 +706,12 @@ fn storage_without_format_follows_each_format() {
         buffer: F::STORAGE_TEXEL_BUFFER | buffer,
         ..Default::default()
     };
+    // The floor states neither formatless feature: the test grants both.
     let mut desc = profile("vk12-floor");
+    desc.features
+        .insert(VkFeature::ShaderStorageImageReadWithoutFormat);
+    desc.features
+        .insert(VkFeature::ShaderStorageImageWriteWithoutFormat);
     assert!(!desc.has_format_feature_flags2());
     desc.formats.formats.clear();
     desc.formats
@@ -822,14 +839,18 @@ fn moltenvk_on_apple_carries_the_early_tests_image_write_defect() {
             W::FunctionsInlinedAtEveryCall,
             W::LoadsForwardedIntoLoops,
             W::LocalizedLoadsForwardedPastAtomicsAndCalls,
-            W::ClippedCoverageNotMetals
+            W::ClippedCoverageNotMetals,
+            W::TessellatorNotMetals
         ]
     );
     desc.vendor_id = 0x106B;
     desc.driver_id = Some(vk::DriverId::MESA_RADV);
     // Every rasterizer but Apple's hands a clipped primitive's fragments other coverage than
-    // Metal's pieces.
-    assert_eq!(workarounds(&desc), [W::ClippedCoverageNotMetals]);
+    // Metal's pieces, and every tessellator but Apple's orders a patch's triangles its own way.
+    assert_eq!(
+        workarounds(&desc),
+        [W::ClippedCoverageNotMetals, W::TessellatorNotMetals]
+    );
 }
 
 /// `DriverWorkaround::BothBarycentricFormsRejected`,
@@ -993,37 +1014,48 @@ fn the_profile_holds_the_largest_whole_point_size() {
     }
 }
 
-/// Every driver carries `DriverWorkaround::ClippedCoverageNotMetals` but MoltenVK on an Apple GPU,
-/// which draws through Metal and splits a clipped primitive as Metal does: MoltenVK on another
-/// vendor's GPU carries it, and so does every other driver on an Apple vendor ID.
+/// Every driver carries `DriverWorkaround::ClippedCoverageNotMetals` and
+/// `DriverWorkaround::TessellatorNotMetals` but MoltenVK on an Apple GPU, which draws through Metal
+/// and splits a clipped primitive and orders a patch's triangles as Metal does: MoltenVK on another
+/// vendor's GPU carries them, and so does every other driver on an Apple vendor ID.
 #[test]
-fn every_rasterizer_but_apples_hands_other_clipped_coverage() {
+fn every_rasterizer_and_tessellator_but_apples_answer_their_own_way() {
     use crate::device::profile::DriverWorkaround;
-    let answer = DriverWorkaround::ClippedCoverageNotMetals;
-    let carries = |desc: &DeviceDescription| {
-        Device::new(desc.clone(), DevicePolicy::default())
-            .unwrap()
-            .profile()
-            .fields()
-            .workarounds
-            .contains(&answer)
-    };
-    for stem in [
-        "nvidia-rtx5080-laptop",
-        "amd-rdna3-radv",
-        "intel-irisxe-rplp-anv",
-        "lavapipe",
-        "swiftshader",
+    for answer in [
+        DriverWorkaround::ClippedCoverageNotMetals,
+        DriverWorkaround::TessellatorNotMetals,
     ] {
-        assert!(carries(&profile(stem)), "{stem}");
+        let carries = |desc: &DeviceDescription| {
+            Device::new(desc.clone(), DevicePolicy::default())
+                .unwrap()
+                .profile()
+                .fields()
+                .workarounds
+                .contains(&answer)
+        };
+        for stem in [
+            "nvidia-rtx5080-laptop",
+            "amd-rdna3-radv",
+            "intel-irisxe-rplp-anv",
+            "lavapipe",
+            "swiftshader",
+        ] {
+            assert!(carries(&profile(stem)), "{answer:?} {stem}");
+        }
+        let mut desc = profile("moltenvk-m3");
+        assert!(!carries(&desc), "{answer:?}: MoltenVK on an Apple GPU");
+        desc.vendor_id = 0x1002;
+        assert!(
+            carries(&desc),
+            "{answer:?}: MoltenVK on another vendor's GPU"
+        );
+        desc.vendor_id = 0x106B;
+        desc.driver_id = Some(vk::DriverId::MESA_RADV);
+        assert!(
+            carries(&desc),
+            "{answer:?}: another driver on an Apple vendor ID"
+        );
     }
-    let mut desc = profile("moltenvk-m3");
-    assert!(!carries(&desc), "MoltenVK on an Apple GPU");
-    desc.vendor_id = 0x1002;
-    assert!(carries(&desc), "MoltenVK on another vendor's GPU");
-    desc.vendor_id = 0x106B;
-    desc.driver_id = Some(vk::DriverId::MESA_RADV);
-    assert!(carries(&desc), "another driver on an Apple vendor ID");
 }
 
 /// Lavapipe carries `DriverWorkaround::ClippedTrianglesSplitPixelFragments` (the defect is the
@@ -1044,11 +1076,13 @@ fn lavapipe_carries_the_split_pixel_fragments_defect() {
     // The committed lavapipe's release (Mesa 26.2.3) also carries the mesh index defect, kept
     // past the release measured with it (`lavapipe_carries_the_mesh_index_defect_from_its_
     // measured_release`).
-    // And, as every rasterizer but Apple's, `ClippedCoverageNotMetals`.
+    // And, as every rasterizer and tessellator but Apple's, `ClippedCoverageNotMetals` and
+    // `TessellatorNotMetals`.
     let both = [
         defect,
         DriverWorkaround::MeshIndexComponentStoresMisplaced,
         DriverWorkaround::ClippedCoverageNotMetals,
+        DriverWorkaround::TessellatorNotMetals,
     ];
     let mut desc = profile("lavapipe");
     assert_eq!(desc.driver_id, Some(vk::DriverId::MESA_LLVMPIPE));
@@ -1130,6 +1164,42 @@ fn only_nvidia_on_ampere_ga10x_carries_the_narrow_mask_defect() {
     assert!(!carries(&desc));
 }
 
+/// `DriverWorkaround::HalfConversionPairFolded` is keyed on NVIDIA's driver whatever its GPU and on
+/// nothing else: every committed NVIDIA profile carries it (the RTX 3090's generation and the RTX
+/// 50 series alike) and no other committed profile does; the RTX 5080 laptop GPU's description
+/// under Mesa's NVK does not. Where it is carried, a profile whose float controls would make the
+/// conversion Metal's rounds a `half` in another form (`narrow::controlled_modes` is `None`).
+#[test]
+fn nvidia_carries_the_folded_half_conversion_pair() {
+    use crate::device::profile::DriverWorkaround;
+    let defect = DriverWorkaround::HalfConversionPairFolded;
+    let carries = |desc: &DeviceDescription| {
+        Device::new(desc.clone(), DevicePolicy::default())
+            .unwrap()
+            .profile()
+            .fields()
+            .workarounds
+            .contains(&defect)
+    };
+    for (stem, text) in committed_profiles() {
+        let desc = DeviceDescription::from_khronos_json(&text, None).unwrap();
+        let nvidia = desc.driver_id == Some(vk::DriverId::NVIDIA_PROPRIETARY);
+        assert_eq!(carries(&desc), nvidia, "{stem}");
+    }
+    let mut desc = profile("nvidia-rtx5080-laptop");
+    let p = Device::new(desc.clone(), DevicePolicy::default())
+        .unwrap()
+        .profile()
+        .clone();
+    let half = p.fields().float_controls.f16;
+    assert!(half.rounding_rte && half.denorm_preserve && half.signed_zero_inf_nan_preserve);
+    assert!(crate::lower::arith::narrow::controlled_modes(&p).is_none());
+    desc.device_id = 0x2204;
+    assert!(carries(&desc));
+    desc.driver_id = Some(vk::DriverId::MESA_NVK);
+    assert!(!carries(&desc));
+}
+
 /// `DriverWorkaround::UniformReadsOutpaceStorageReads` is keyed on ANV, whatever its GPU, and on
 /// lavapipe at `subgroupSize` 4 (128-bit vectors): every committed ANV profile carries it (the
 /// Intel venue's two devices alike, so they keep one translation key), and of the lavapipes the
@@ -1165,6 +1235,41 @@ fn uniform_reads_outpace_storage_reads_on_anv_and_narrow_lavapipe() {
     assert!(!carries(&desc));
 }
 
+/// `DriverWorkaround::RegisterAllocatorOverflowsLargeModules` is keyed on ANV, whatever its GPU
+/// and release; every committed ANV profile carries it and gives a 400,000-word module bound, and
+/// no other profile carries it or bounds a module. The UHD 770's description under RADV or
+/// NVIDIA's driver loses it.
+#[test]
+fn register_allocator_overflow_is_keyed_on_anv() {
+    use crate::device::profile::{DriverWorkaround, REGISTER_ALLOCATOR_MODULE_WORD_BOUND};
+    let fact = DriverWorkaround::RegisterAllocatorOverflowsLargeModules;
+    let profile_of = |desc: &DeviceDescription| {
+        Device::new(desc.clone(), DevicePolicy::default())
+            .unwrap()
+            .profile()
+            .clone()
+    };
+    for (stem, text) in committed_profiles() {
+        let desc = DeviceDescription::from_khronos_json(&text, None).unwrap();
+        let anv = desc.driver_id == Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA);
+        let p = profile_of(&desc);
+        assert_eq!(p.workarounds().contains(&fact), anv, "{stem}");
+        assert_eq!(
+            p.module_word_bound(),
+            anv.then_some(REGISTER_ALLOCATOR_MODULE_WORD_BOUND),
+            "{stem}"
+        );
+    }
+    let mut desc = profile("intel-irisxe-rplp-anv");
+    assert!(profile_of(&desc).workarounds().contains(&fact));
+    for other in [vk::DriverId::MESA_RADV, vk::DriverId::NVIDIA_PROPRIETARY] {
+        desc.driver_id = Some(other);
+        let p = profile_of(&desc);
+        assert!(!p.workarounds().contains(&fact), "{other:?}");
+        assert_eq!(p.module_word_bound(), None, "{other:?}");
+    }
+}
+
 /// The Function storage a thread holds is the measured value of the device's identity, and on every
 /// committed profile of a device not measured the assumed floor, 16 KiB. It is keyed on the driver,
 /// the vendor, and the device ID together: the Radeon 780M's description under the RX 7900 XTX's
@@ -1176,6 +1281,7 @@ fn function_storage_is_the_measured_value_of_the_device() {
     use crate::device::profile::FunctionStorage::{Assumed, Measured};
     let kib = 1024;
     let measured = [
+        ("amd-780m-hawkpoint-radv", 96 * kib),
         ("amd-780m-radv", 96 * kib),
         ("intel-irisxe-rplp-anv", 32 * kib),
         ("intel-uhd770-rpls-anv", 32 * kib),
@@ -1208,49 +1314,6 @@ fn function_storage_is_the_measured_value_of_the_device() {
     desc.device_id = 0x15bf;
     desc.driver_id = Some(vk::DriverId::AMD_OPEN_SOURCE);
     assert_eq!(storage(desc), Assumed(16 * kib));
-}
-
-/// `DriverWorkaround::InterpolationNotMetals` is keyed on NVIDIA's driver from the release measured
-/// with it (615.71.09, the C3 venue's) on NVIDIA's vendor ID, for every GPU of it: both committed
-/// profiles at that release carry it, a newer release keeps it, and an older release (the committed
-/// Pascal profile's 580), another vendor's ID, or another driver does not.
-#[test]
-fn nvidia_carries_the_interpolation_answer_from_its_measured_release() {
-    use crate::device::driver_facts::nvidia;
-    use crate::device::profile::DriverWorkaround;
-    let fact = DriverWorkaround::InterpolationNotMetals;
-    let carries = |desc: &DeviceDescription| {
-        Device::new(desc.clone(), DevicePolicy::default())
-            .unwrap()
-            .profile()
-            .fields()
-            .workarounds
-            .contains(&fact)
-    };
-    let mut desc = profile("nvidia-rtx5080-laptop");
-    assert_eq!(desc.driver_id, Some(vk::DriverId::NVIDIA_PROPRIETARY));
-    assert_eq!(desc.driver_version, nvidia(615, 71, 9));
-    assert!(carries(&desc));
-    desc.device_id = 0x2204;
-    assert!(carries(&desc), "on another NVIDIA GPU");
-    desc.driver_version = nvidia(620, 1, 0);
-    assert!(carries(&desc), "620.01");
-    desc.driver_version = nvidia(615, 71, 8);
-    assert!(!carries(&desc), "615.71.08");
-    desc.driver_version = nvidia(615, 71, 9);
-    desc.vendor_id = 0x1002;
-    assert!(!carries(&desc), "on another vendor's ID");
-    desc.vendor_id = 0x10de;
-    desc.driver_id = Some(vk::DriverId::MESA_NVK);
-    assert!(!carries(&desc), "under NVK");
-    for (stem, text) in committed_profiles() {
-        let desc = DeviceDescription::from_khronos_json(&text, None).unwrap();
-        let nv = desc.driver_id == Some(vk::DriverId::NVIDIA_PROPRIETARY)
-            && desc.driver_version >= nvidia(615, 71, 9);
-        assert_eq!(carries(&desc), nv, "{stem}");
-    }
-    assert!(carries(&profile("nvidia-rtx50-linux")));
-    assert!(!carries(&profile("nvidia-pascal-linux")));
 }
 
 /// `DriverWorkaround::VertexGroupingNotApples` is keyed on ANV from the release measured with it
@@ -1295,10 +1358,11 @@ fn anv_carries_the_vertex_grouping_from_its_measured_release() {
     assert!(!carries(&profile("intel-irisxe-anv")));
 }
 
-/// `DriverWorkaround::DontInlineKeepsCalls`, a cost fact, is keyed on the identity measured with
-/// it: NVIDIA's driver at 615.71.09 (EV SHB-g1) on the RTX 3090. Another GPU of the vendor (the RTX
-/// 5080 Laptop GPU's committed profile, the desktop RTX 50's, Pascal's), an older release, another
-/// vendor's ID, or another driver (NVK, Mesa's, MoltenVK) does not carry it.
+/// `DriverWorkaround::DontInlineKeepsCalls`, a cost fact, is keyed on the identities measured with
+/// it: NVIDIA's driver at 615.71.09 on the RTX 3090 and on the RTX 5080 Laptop GPU
+/// (`scripts/making-bench`). Another GPU of the vendor (the desktop RTX 50's committed profile,
+/// Pascal's), an older release, another vendor's ID, or another driver (NVK, Mesa's, MoltenVK)
+/// does not carry it.
 #[test]
 fn nvidia_keeps_dont_inline_calls_on_its_measured_gpu() {
     use crate::device::driver_facts::nvidia;
@@ -1315,7 +1379,10 @@ fn nvidia_keeps_dont_inline_calls_on_its_measured_gpu() {
     let mut desc = profile("nvidia-rtx5080-laptop");
     assert_eq!(desc.driver_id, Some(vk::DriverId::NVIDIA_PROPRIETARY));
     assert_eq!(desc.driver_version, nvidia(615, 71, 9));
-    assert!(!carries(&desc), "on the RTX 5080 Laptop GPU, not measured");
+    assert!(
+        carries(&desc),
+        "on the RTX 5080 Laptop GPU, where it was measured"
+    );
     desc.device_id = crate::device::driver_facts::NVIDIA_RTX_3090;
     assert!(carries(&desc), "on the RTX 3090, where it was measured");
     desc.driver_version = nvidia(615, 71, 8);
@@ -1328,9 +1395,10 @@ fn nvidia_keeps_dont_inline_calls_on_its_measured_gpu() {
     assert!(!carries(&desc), "under NVK");
     for (stem, text) in committed_profiles() {
         let desc = DeviceDescription::from_khronos_json(&text, None).unwrap();
-        assert!(
-            !carries(&desc),
-            "{stem}: no committed profile is the RTX 3090's"
+        assert_eq!(
+            carries(&desc),
+            stem == "nvidia-rtx5080-laptop",
+            "{stem}: the RTX 5080 Laptop GPU's is the one committed profile of a measured GPU"
         );
     }
     assert!(!carries(&profile("nvidia-pascal-linux")));

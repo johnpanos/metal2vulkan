@@ -34,6 +34,7 @@ use metal2vulkan::metal::{
     SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter,
 };
 use metal2vulkan::pipeline::FunctionDescriptor;
+use metal2vulkan::vk::DriverId;
 use metal2vulkan::Budget;
 use metal2vulkan_runtime::{Buffer, CommandBufferStatus, ComputeCommandEncoder, Device, Error};
 use std::collections::BTreeMap;
@@ -107,8 +108,7 @@ fn kernels_with_textures_and_samplers_match_metal(shard: usize) {
 }
 
 /// The pieces `kernels_with_textures_and_samplers_match_metal` is split into. As one test it took
-/// 63-164 s on the M4 under the validation layer (EVs CPF-ktex-tip-mvk4 and CPF-ktex-base-mvk4),
-/// past the Mac lane's 60 s a test.
+/// 63-164 s on the M4 under the validation layer, past the Mac lane's 60 s a test.
 const TEXTURE_SHARDS: usize = 16;
 
 census_shards!(
@@ -243,8 +243,7 @@ type Answers = (u32, u32, u32, bool);
 /// committed public kernel case of the census whose function, compiled under no lowering inputs,
 /// asks for a format. A case whose own formats do not compile is printed, not compared. In
 /// `STAND_IN_SHARDS` tests (`in_shard`): as one, compiling every texture case's function took 60 s
-/// on the M4 and 68 s on the 780M (EVs CPF2-lane3-mvk4, CPF2-lane3-radv), at the Mac lane's 60 s
-/// a test.
+/// on the M4 and 68 s on the 780M, at the Mac lane's 60 s a test.
 fn stand_in_states_answer_queries_as_their_formats_compile(shard: usize) {
     let cases = public_cases(in_shard(binds_textures, shard, STAND_IN_SHARDS)).unwrap();
     assert!(
@@ -549,9 +548,20 @@ fn dispatch(encoder: &mut ComputeCommandEncoder, case: &PublicCase) -> Result<()
 /// A kernel whose texture and sampler slots nothing is bound to reads and writes the device's
 /// neutral resources: its dispatches complete with a clean execution report and the validation
 /// layer reports nothing (what Metal reads there is undefined, so the bytes are not compared).
+///
+/// The neutral images its pipeline state's making made take no memory block of their own
+/// (`WorkCounts::dedicated_memory_blocks_live` unchanged) where the driver binds memory that
+/// queued work uses without waiting for it (ANV and RADV, the runtime's `memory.rs` `Fit`), and
+/// blocks of their own elsewhere.
 #[test]
 fn unbound_texture_and_sampler_slots_use_neutrals() {
     on_device(|device, _| {
+        let pooled = matches!(
+            device.properties().description.driver_id,
+            Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV)
+        );
+        let dedicated = || device.work_counts().dedicated_memory_blocks_live;
+        let before = dedicated();
         for name in [SAMPLED, STORED] {
             let case = public_case(name).unwrap();
             let pipeline = pipeline_state(device, &case).unwrap();
@@ -580,6 +590,12 @@ fn unbound_texture_and_sampler_slots_use_neutrals() {
                 Some(StatusReport::default()),
                 "{name}"
             );
+        }
+        let made = dedicated() - before;
+        println!("NEUTRAL-BLOCKS on {}: {made} dedicated", device.name());
+        match pooled {
+            true => assert_eq!(made, 0, "a neutral took a block of its own"),
+            false => assert!(made > 0, "no neutral took a block of its own"),
         }
     });
 }

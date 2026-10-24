@@ -85,10 +85,43 @@ impl DeviceProfile {
         &self.fields.images
     }
 
+    /// Whether the profile reads and writes a storage image or storage texel buffer through a
+    /// declaration without a format by its format's own `STORAGE_READ_WITHOUT_FORMAT` /
+    /// `STORAGE_WRITE_WITHOUT_FORMAT` bit, whatever `shaderStorageImage{Read,Write}WithoutFormat`
+    /// say: at Vulkan 1.3, or with `VK_KHR_format_feature_flags2` enabled, each an enablement of
+    /// the SPIR-V capabilities `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat`
+    /// beside the features. The format tables then hold the bits
+    /// (`DeviceDescription::has_format_feature_flags2`), which govern each format's access.
+    pub(crate) fn without_format_by_format_bits(&self) -> bool {
+        self.fields.api_version >= ApiVersion::V1_3
+            || self
+                .fields
+                .enabled
+                .extensions
+                .contains(&VkExtension::KhrFormatFeatureFlags2)
+    }
+
+    /// Whether the profile can read (`read`) and write (`write`) storage through a declaration
+    /// without a format at all: by the device's `shaderStorageImage{Read,Write}WithoutFormat`, or
+    /// by the formats' own bits ([`DeviceProfile::without_format_by_format_bits`]). Which formats
+    /// it may then view is the format tables' (`metal::format::without_format_gaps`).
+    pub(crate) fn accesses_without_format(&self, read: bool, write: bool) -> bool {
+        let images = &self.fields.images;
+        let bits = self.without_format_by_format_bits();
+        (!read || images.storage_read_without_format || bits)
+            && (!write || images.storage_write_without_format || bits)
+    }
+
     /// The descriptor and addressing capabilities the profile enables: whether it reaches buffers
     /// by device address, binds descriptors after binding, and so on.
     pub fn descriptors(&self) -> &DescriptorCaps {
         &self.fields.descriptors
+    }
+
+    /// The Function storage a thread holds correctly on the device: its measured value, or the
+    /// floor of a device not measured. No Vulkan property states it; Metal states none either.
+    pub fn function_storage(&self) -> FunctionStorage {
+        self.fields.function_storage
     }
 
     /// The profile's subgroup model: each Metal stage's subgroup sizes, operations, and whether it
@@ -146,6 +179,22 @@ impl DeviceProfile {
         &self.fields.workarounds
     }
 
+    /// The stage-module word count a pipeline's largest stage must fit for this device, where its
+    /// driver faults compiling a module past it
+    /// ([`DriverWorkaround::RegisterAllocatorOverflowsLargeModules`]); `None` where no such bound
+    /// is measured. A compile of any pipeline kind over the bound retranslates with the consumer's
+    /// exact forms dropped to fit
+    /// ([`Device::fit_render_variant`](crate::device::Device::fit_render_variant),
+    /// [`fit_mesh_variant`](crate::device::Device::fit_mesh_variant),
+    /// [`fit_compute_pipeline`](crate::device::Device::fit_compute_pipeline),
+    /// [`fit_tile_pipeline`](crate::device::Device::fit_tile_pipeline)).
+    pub fn module_word_bound(&self) -> Option<u32> {
+        self.fields
+            .workarounds
+            .contains(&DriverWorkaround::RegisterAllocatorOverflowsLargeModules)
+            .then_some(REGISTER_ALLOCATOR_MODULE_WORD_BOUND)
+    }
+
     /// The driver deviations the profile takes at a driver release newer than the last one
     /// measured, each with that release's `driverVersion` (`device::driver_facts`): a module
     /// compiled for the profile records each as
@@ -185,6 +234,9 @@ impl DeviceProfile {
             }
             DriverDeviation::GraphicsCubeGradientRoute => {
                 f.cube_gradients.graphics == CubeGradientRoute::AppleSwizzled
+            }
+            DriverDeviation::GraphicsCubeGradientTangents => {
+                f.cube_gradients.graphics == CubeGradientRoute::AppleProjected
             }
             DriverDeviation::SimdgroupLockstep => f
                 .enabled
@@ -282,6 +334,22 @@ impl DeviceProfile {
                 .enabled
                 .properties
                 .contains(&VkProperty::Unorm8LinearFilter),
+            DriverDeviation::MetalDepth16Stores => f
+                .enabled
+                .properties
+                .contains(&VkProperty::MetalDepth16Stores),
+            DriverDeviation::MetalDepth16BiasedStores => f
+                .enabled
+                .properties
+                .contains(&VkProperty::MetalDepth16BiasedStores),
+            DriverDeviation::MetalInterpolation => f
+                .enabled
+                .properties
+                .contains(&VkProperty::MetalInterpolation),
+            DriverDeviation::MetalFirstVertexIndices => f
+                .enabled
+                .properties
+                .contains(&VkProperty::MetalFirstVertexIndices),
         }
     }
 
@@ -342,7 +410,30 @@ impl DeviceProfile {
     /// The rendering streams into the hash: every compile takes the fingerprint for its key, and a
     /// materialized rendering of a profile with a format table is tens of kilobytes that no
     /// input-scaled ledger charge accounts for.
+    ///
+    /// Every compile takes it, and rendering a profile with a format table cost a twentieth of a
+    /// pipeline's translation, so the last few profiles' fingerprints are kept and found again by
+    /// equality of the fields, which is a structural comparison and holds under any mutation.
     pub fn fingerprint(&self) -> Hash256 {
+        static KEPT: std::sync::Mutex<Vec<(ProfileFields, Hash256)>> =
+            std::sync::Mutex::new(Vec::new());
+        {
+            let kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((_, h)) = kept.iter().find(|(f, _)| *f == self.fields) {
+                return *h;
+            }
+        }
+        let h = self.render_fingerprint();
+        let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if kept.len() >= 4 {
+            kept.remove(0);
+        }
+        kept.push((self.fields.clone(), h));
+        h
+    }
+
+    /// [`DeviceProfile::fingerprint`], rendered.
+    fn render_fingerprint(&self) -> Hash256 {
         use sha2::{Digest, Sha256};
         use std::fmt::Write as _;
         struct Hashing(Sha256);
@@ -370,7 +461,6 @@ pub struct ProfileFields {
     pub handle_domain: HandleDomain,
     pub containment: Containment,
     pub isolation: GuestIsolation,
-    pub framebuffer_fetch: FramebufferFetchPolicy,
     /// Whether a texel's value is the device's conversion or Metal's (the policy's).
     pub texel_conversion: crate::device::policy::TexelConversionPolicy,
     /// Whether a `half4` output of a module without fast math blends into a 16-bit float
@@ -422,6 +512,13 @@ pub struct ProfileFields {
     /// class of the texture bound, where the policy's `NanMinMaxPolicy::Exact` asks for it, on
     /// every device, or the device's decode (the default).
     pub texel_nans: TexelNanRoute,
+    /// Whether a linear sample the device's sampler answers (`DeviceProfile::device_samples`)
+    /// takes Metal's filter of a two-plane YCbCr texture bound at its slot, through the slot's
+    /// YCbCr variant (`RuntimeFact::YCbCrTexture`): under the policy's `YCbCrFilterPolicy::Exact`,
+    /// and on a device that samples through Metal's own sampler also under `SamplingPolicy::Exact`.
+    /// Elsewhere the device filters such a texture as any other. Derived, so a profile that answers
+    /// alike under both policies keys the same.
+    pub ycbcr_variant: bool,
     /// Whose operand Metal's minimum and maximum functions pick (`lower::arith::native_min_max`):
     /// Metal's, or the device's `NMin`, `NMax` and `NClamp` as they are (the policy's
     /// `NanMinMaxPolicy::Native`). Derived, so a device that keeps Metal's picks keys the same
@@ -433,11 +530,13 @@ pub struct ProfileFields {
     pub rounding_order: RoundingOrderRoute,
     /// The Function storage a thread holds correctly (`device::function_storage`): a stage's
     /// private memory, its call stacks included, may take this much a thread
-    /// (`VkLimit::FunctionStorageBytesPerThread`).
+    /// (`VkLimit::FunctionStorageBytesPerThread`), and a vertex or fragment function on a device
+    /// not measured more ([`FunctionStorage::Assumed`]).
     pub function_storage: FunctionStorage,
     /// How the driver hands a cube sample's explicit gradients to the GPU, in a graphics and in
     /// a compute pipeline: Vulkan's cube derivative rule unless the driver's release is measured
-    /// with another (`DriverDeviation::CubeGradientRoute`).
+    /// with another (`DriverDeviation::CubeGradientRoute`, `GraphicsCubeGradientRoute` and
+    /// `GraphicsCubeGradientTangents`).
     pub cube_gradients: CubeGradients,
     /// The driver's deviations the profile takes at a release newer than the last one measured
     /// (`device::driver_facts`), each with that release's `driverVersion`: taken, and recorded
@@ -448,9 +547,9 @@ pub struct ProfileFields {
 
 /// How a driver hands a cube sample's explicit gradients to the GPU
 /// ([`ProfileFields::cube_gradients`]), per pipeline kind, each decided by the driver's measured
-/// deviation (`DriverDeviation::GraphicsCubeGradientRoute` and
-/// `DriverDeviation::CubeGradientRoute`); without it, Vulkan's rule, but
-/// [`CubeGradientRoute::Unmeasured`] on a MoltenVK `driver_id`.
+/// deviations (`DriverDeviation::GraphicsCubeGradientRoute`,
+/// `DriverDeviation::GraphicsCubeGradientTangents` and `DriverDeviation::CubeGradientRoute`);
+/// without them, Vulkan's rule, but [`CubeGradientRoute::Unmeasured`] on a MoltenVK `driver_id`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CubeGradients {
@@ -460,26 +559,44 @@ pub struct CubeGradients {
     pub compute: CubeGradientRoute,
 }
 
-/// The route of a cube sample's explicit gradients to the GPU ([`CubeGradients`]).
+/// The route of a cube sample's explicit gradients to the GPU ([`CubeGradients`]). Metal's
+/// footprint is the one the Apple M3 Max reads under macOS 27 (`lower::sampler::CubeFootprint`):
+/// each gradient's two tangent components on the face, its normal component dropped.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CubeGradientRoute {
-    /// Vulkan's rule ("Cube Map Derivative Transformation") reads the footprint from them.
+    /// Vulkan's rule ("Cube Map Derivative Transformation") reads the footprint from them: the
+    /// function hands an isotropic sample Metal's length of the two tangent components on one
+    /// tangent, and an anisotropic one Metal's face gradients without their normal component
+    /// (`lower::sampler::CubeFootprint::Length` and `Face`); the level and the anisotropic filter
+    /// are the device's (`PrecisionNote::CubeGradientFootprint`).
     Vulkan,
     /// SPIRV-Cross's `spvGradientCube` (its `agx_manual_cube_grad_fixup`) projects each onto the
     /// face as Vulkan's rule does and swizzles the two values into the components Apple's
-    /// isotropic reading takes, then hands them to Metal's `gradientcube`, whose anisotropic
-    /// reading on the Apple M3 Max takes them transposed
-    /// (`lower::sampler::CubeFootprint::AnisotropicSwizzled`).
+    /// isotropic reading took under macOS 26.7, then hands them to Metal's `gradientcube`, whose
+    /// anisotropic reading on the Apple M3 Max there takes them transposed: that GPU's macOS 26.7
+    /// footprint (`lower::sampler::CubeFootprint::Isotropic` and `AnisotropicSwizzled`), measured
+    /// on that identity alone.
     AppleSwizzled,
+    /// The same fixup under macOS 27, whose Metal reads the face's two tangents of what it is
+    /// handed: an `x` or `z` face's gradient without its normal component reaches Metal as its
+    /// own, exactly; on a `y` face the fixup writes the face's `x` tangent on both, so the function
+    /// hands Metal's length there, which keeps an isotropic sample's footprint and lays an
+    /// anisotropic one's ellipse on the diagonal (`lower::sampler::CubeFootprint::Projected`,
+    /// `PrecisionNote::CubeGradientFootprint`).
+    AppleProjected,
     /// They reach Metal's `gradientcube` as given, which the GPU reads by Metal's own rule, so
     /// the function hands Metal's own (`lower::sampler::CubeFootprint::Metal`).
     Metal,
     /// The driver hands them to Metal by a route its description does not state: a MoltenVK
     /// `driver_id` at a release no measurement covers, or a document of one that states no
-    /// route. The isotropic form keeps its footprint's length under every route above, so an
-    /// isotropic sample takes it (`PrecisionNote::CubeGradientFootprint`); an anisotropic
-    /// constexpr sampler's is refused (`Needs::UnmeasuredDeviation`).
+    /// route. The function takes Metal's footprint itself where its emulation reaches the sample
+    /// (`lower::sampler::anisotropic`): Metal's level, and an anisotropic sampler's taps, each an
+    /// explicit level of Metal's own sampler, which no route alters
+    /// (`PrecisionNote::AnisotropicFilter` for the taps). Elsewhere it hands the isotropic form's
+    /// length, on one tangent, which every route above reads alike (but a `y` face's through
+    /// [`CubeGradientRoute::AppleProjected`]'s fixup), through an isotropic sampler
+    /// (`metal::sampler::SamplerUse::cube_gradient`, `PrecisionNote::CubeGradientFootprint`).
     Unmeasured,
 }
 
@@ -491,24 +608,21 @@ impl CubeGradients {
             _ => self.graphics,
         }
     }
-
-    /// The driver deviation that decides the route of a function of `stage`.
-    pub(crate) fn deviation(stage: crate::pipeline::sym::Stage) -> DriverDeviation {
-        match stage {
-            crate::pipeline::sym::Stage::Kernel => DriverDeviation::CubeGradientRoute,
-            _ => DriverDeviation::GraphicsCubeGradientRoute,
-        }
-    }
 }
 
-/// The Function storage a thread holds correctly ([`ProfileFields::function_storage`]), in bytes.
+/// The Function storage a thread holds correctly ([`DeviceProfile::function_storage`]), in bytes:
+/// how much private memory a stage may keep a thread (its `thread` variables and arrays, its call
+/// stacks, and the constants it holds per thread), which a driver backs with scratch memory and
+/// past which it can answer wrongly or hang with no error. Measured per device, since no Vulkan
+/// property states it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FunctionStorage {
     /// Measured on the device: a thread holds this many bytes correctly.
     Measured(u64),
-    /// The device was not measured: translation assumes it holds this many, the floor, and a
-    /// stage that keeps private memory records `PrecisionNote::FunctionStorageAssumed`.
+    /// The device was not measured: it holds this many, the floor, with no note. A vertex or
+    /// fragment function may keep more, up to the 192 KiB a thread Metal was measured to hold, and
+    /// records `PrecisionNote::FunctionStorageAssumed`; any other stage past the floor is refused.
     Assumed(u64),
 }
 
@@ -698,17 +812,6 @@ pub enum GuestIsolation {
     Off,
 }
 
-/// Framebuffer-fetch ordering policy.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum FramebufferFetchPolicy {
-    /// Refuse without rasterization-order attachment access.
-    RequireOrdered,
-    /// Accept unordered input-attachment reads and record a precision note.
-    AcceptUnordered,
-}
-
 /// Leaf arithmetic, storage, and atomic capabilities.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LeafCaps {
@@ -741,6 +844,8 @@ pub struct LeafCaps {
     pub zero_initialize_workgroup_memory: bool,
     /// `OpFmaKHR` on 32-bit floats (`shaderFmaFloat32`): a correctly rounded fused multiply-add.
     pub fma32: bool,
+    /// `OpFmaKHR` on 16-bit floats (`shaderFmaFloat16`): a correctly rounded fused multiply-add.
+    pub fma16: bool,
 }
 
 /// Image and sampler capabilities ([`DeviceProfile::images`]). Each field without its own note is
@@ -1004,6 +1109,15 @@ pub struct Limits {
     /// `maxTessellationPatchSize`: the most control points a patch may have (0 without
     /// `tessellationShader`).
     pub max_tessellation_patch_size: u32,
+    /// `maxGeometryInputComponents`: the scalar components of a geometry stage's user inputs per
+    /// vertex (0 without `geometryShader`).
+    pub max_geometry_input_components: u32,
+    /// `maxGeometryOutputComponents`: the scalar components of a geometry stage's user outputs
+    /// per vertex (0 without `geometryShader`).
+    pub max_geometry_output_components: u32,
+    /// `maxGeometryTotalOutputComponents`: the scalar components of every vertex a geometry stage
+    /// emits for one input primitive, together (0 without `geometryShader`).
+    pub max_geometry_total_output_components: u32,
     /// `supportedDepthResolveModes` (`VkPhysicalDeviceDepthStencilResolveProperties`, Vulkan
     /// 1.2): the modes a depth attachment may resolve by.
     pub supported_depth_resolve_modes: vk::ResolveModeFlags,
@@ -1094,6 +1208,13 @@ pub struct FormatTable {
     pub formats: BTreeMap<vk::Format, BTreeSet<FormatUsage>>,
 }
 
+/// The stage-module word bound for a device whose driver faults compiling a module past it
+/// ([`DriverWorkaround::RegisterAllocatorOverflowsLargeModules`], ANV's register allocator):
+/// its overflow is a 32-bit triangular pair index, and 400,000 words sits below the smallest
+/// module observed to fault with margin. [`DeviceProfile::module_word_bound`] returns it where the
+/// workaround is taken.
+pub(crate) const REGISTER_ALLOCATOR_MODULE_WORD_BOUND: u32 = 400_000;
+
 /// A typed driver workaround: a defect of the driver measured on it, which changes a leaf
 /// encoding or refuses the construct the driver runs wrong ([`Needs::DriverDefect`]), never the
 /// pointer model or a semantic; or a measured answer of the driver's that the specifications allow
@@ -1142,22 +1263,34 @@ pub enum DriverWorkaround {
     /// or `SClamp`) of a sum or difference of two values sign-extended from `N` bits: the
     /// result comes out sign-extended. Measured on the GeForce RTX 3090 (`deviceID` 0x2204,
     /// Ampere GA102) under NVIDIA's 615.71.09 (`VK_DRIVER_ID_NVIDIA_PROPRIETARY`), by
-    /// the bare-Vulkan probes WRG-0d-probe-3090 and WRG-0d-probe2-3090: at `N` = 16 and 8, scalar
-    /// and three lanes, every such program answered sign-extended, while `OpBitFieldUExtract(x, 0,
-    /// N)` in place of the mask answered right; the RTX 5080 (Blackwell) on the same release
-    /// answered every program right. Derived for NVIDIA's driver on the 3090's generation, GA10x
+    /// our bare-Vulkan probes: at `N` = 16 and 8, scalar and three lanes, every such program
+    /// answered sign-extended, while `OpBitFieldUExtract(x, 0, N)` in place of the mask answered
+    /// right; the RTX 5080 (Blackwell) on the same release answered every program right. Derived
+    /// for NVIDIA's driver on the 3090's generation, GA10x
     /// ([`NVIDIA_AMPERE_GA10X`](crate::device::NVIDIA_AMPERE_GA10X)), which its compiler
     /// targets alike. Every narrow integer's mask in a 32-bit container is
     /// emitted as `OpBitFieldUExtract(x, 0, N)` there (`lower::arith::ops::mask`), which is the
     /// same bits on every device.
     NarrowMaskAfterSignedClamp,
+    /// The driver's compiler folds a `half` round trip, an `OpFConvert` from 32- to 16-bit floats
+    /// and its widening back, each decorated `NoContraction`, into the 32-bit value it started
+    /// from, in an entry declaring `RoundingModeRTE`, `DenormPreserve` and
+    /// `SignedZeroInfNanPreserve` for 16 bits. Vulkan assumes no value-changing transform of an
+    /// operation decorated `NoContraction`, and rounds a conversion between types correctly
+    /// ("Precision and Operation of SPIR-V Instructions"). Measured on the GeForce RTX 3090
+    /// (`deviceID` 0x2204) under NVIDIA's 615.71.09 (`VK_DRIVER_ID_NVIDIA_PROPRIETARY`): of the
+    /// 2^32 `f32` values, the round trip left 2,231,288,832 off Metal's `half(float)`, under each
+    /// combination of those modes and with or without the decoration. Keyed on NVIDIA's driver
+    /// on every GPU, the others unmeasured. Such a profile rounds a `half` in another form
+    /// (`lower::arith::narrow::controlled_modes`).
+    HalfConversionPairFolded,
     /// The driver refuses a fragment shader that reads both barycentric builtins,
     /// `BaryCoordKHR` and `BaryCoordNoPerspKHR`, at pipeline creation, where Metal compiles a
     /// fragment function that declares both `[[barycentric_coord, center_perspective]]` and
     /// `[[barycentric_coord, center_no_perspective]]`. MoltenVK (`VK_DRIVER_ID_MOLTENVK`)
     /// 1.4.1 converts the shader with SPIRV-Cross `adec7acb`, which throws "Cannot declare both
     /// BaryCoordNV and BaryCoordNoPerspNV in same shader in MSL." whatever the GPU (measured on
-    /// an Apple M4: `corpus-pipeline --fixtures` on `moltenvk-m4`, EV MLO-mvk1). It is keyed on
+    /// an Apple M4: `corpus-pipeline --fixtures` on `moltenvk-m4`). It is keyed on
     /// the driver's release (`device::driver_facts`): a newer release keeps it until a
     /// measurement says otherwise. Such a fragment function is refused there
     /// (`lower::stage_io`'s input builtins); one form alone compiles.
@@ -1167,35 +1300,34 @@ pub enum DriverWorkaround {
     /// `SampleMask`: Metal runs a fragment function that writes memory once per covered sample, and
     /// MoltenVK (`VK_DRIVER_ID_MOLTENVK`) on an Apple GPU (`vendor_id` 0x106B) hands Metal such a
     /// shader as such a function. Measured on the Apple M3 Max (macOS 26.7) and the M4 (27.0.1),
-    /// MoltenVK 1.4.1 (EVs VSM-cov-m3, VSM-covmvk-m4): the loop over the covered samples ran each
-    /// pass once per covered sample of each covered sample, at 2 and 4 samples, in both legs. It is
-    /// keyed on the driver's release and Apple's vendor ID (`device::driver_facts`): a newer
-    /// release keeps it until a measurement says otherwise. There a function that reads
-    /// `[[sample_mask]]` and writes memory runs as written, without the loop and without sample
-    /// shading (`CoverageLoop::DriverRunsPerSample`, `lower::fragment::coverage`); one that reads
-    /// `[[position]]` beside its sample index or a sample-qualified varying is refused as this
-    /// defect at more than one sample, as SPIRV-Cross then masks the coverage with
-    /// `1 << gl_SampleID`.
+    /// MoltenVK 1.4.1: the loop over the covered samples ran each pass once per covered sample of
+    /// each covered sample, at 2 and 4 samples, in both legs. It is keyed on the driver's release
+    /// and Apple's vendor ID (`device::driver_facts`): a newer release keeps it until a measurement
+    /// says otherwise. There a function that reads `[[sample_mask]]` and writes memory runs as
+    /// written, without the loop and without sample shading (`CoverageLoop::DriverRunsPerSample`,
+    /// `lower::fragment::coverage`); one that reads `[[position]]` beside its sample index or a
+    /// sample-qualified varying is refused as this defect at more than one sample, as SPIRV-Cross
+    /// then masks the coverage with `1 << gl_SampleID`.
     MemoryWritingFragmentsRunPerSample,
     /// The driver's `InterpolateAtSample`, and its `InterpolateAtOffset` at an offset other than
     /// (0, 0), read values that are not the input's in control flow that some invocations of the
     /// quad have left, as the helper invocations of a partly covered quad leave a loop over their
     /// coverage, which is empty. Measured on RADV (`VK_DRIVER_ID_MESA_RADV`), Mesa 26.0.8 and
-    /// 26.2.4, on the Radeon 780M with a bare Vulkan program (EVs VSM-radvrepro2-mesa260 and
-    /// VSM-radvrepro2-radv): in a 1x1 framebuffer, whose quad holds three helpers, a computed or a
-    /// constant sample index, or a nonzero offset, inside such a loop or branch read garbage, with
-    /// or without sample shading, while the same reads in control flow the whole quad runs, or in a
-    /// quad of four covered pixels, read the sample's position; an offset of (0, 0) reads the
-    /// center inside the branch too. It is keyed on the driver's release (`device::driver_facts`).
-    /// There the loop over the covered samples reads each sample-qualified varying at every sample
-    /// a pipeline of the device may have before the loop, where the whole quad runs, and each
-    /// pass reads its sample's value (`lower::fragment::coverage`).
+    /// 26.2.4, on the Radeon 780M with a bare Vulkan program: in a 1x1 framebuffer, whose quad
+    /// holds three helpers, a computed or a constant sample index, or a nonzero offset, inside such
+    /// a loop or branch read garbage, with or without sample shading, while the same reads in
+    /// control flow the whole quad runs, or in a quad of four covered pixels, read the sample's
+    /// position; an offset of (0, 0) reads the center inside the branch too. It is keyed on the
+    /// driver's release (`device::driver_facts`). There the loop over the covered samples reads
+    /// each sample-qualified varying at every sample a pipeline of the device may have before the
+    /// loop, where the whole quad runs, and each pass reads its sample's value
+    /// (`lower::fragment::coverage`).
     InterpolationNeedsTheWholeQuad,
     /// The driver reads a mesh shader's store into one component of a vector output (an
     /// `OpAccessChain` to a component of `PrimitiveLineIndicesEXT` or
     /// `PrimitiveTriangleIndicesEXT`) as a store into a later output slot, so the primitive keeps
     /// none of the index and another output takes it. Measured on lavapipe
-    /// (`VK_DRIVER_ID_MESA_LLVMPIPE`), Mesa 26.0.8, x86 (the Linux gate's; EV MESH-lane1-lvpx86):
+    /// (`VK_DRIVER_ID_MESA_LLVMPIPE`), Mesa 26.0.8, x86 (the Linux gate's):
     /// every triangle a mesh function wrote one index at a time (`set_index`) drew nothing, and
     /// RADV and NVIDIA drew every one. Mesa's source names the cause and its fix in 26.2.0
     /// ("lavapipe: lower array-deref-of-vec for mesh shader outputs", f5e42331). It is keyed on
@@ -1204,49 +1336,35 @@ pub enum DriverWorkaround {
     /// workgroup words, which its entry wrapper writes to the indices whole, one vector per
     /// primitive, after the body (`lower::mesh`).
     MeshIndexComponentStoresMisplaced,
-    /// The driver's interpolation of a varying is not Metal's: an interpolated value that is
-    /// exactly representable comes out one `f32` ulp toward zero where Metal, and every other
-    /// venue, gives it exactly. Vulkan states no precision for interpolation, so this is the
-    /// device's answer, not a defect of the specification's. Measured on NVIDIA's driver
-    /// (`VK_DRIVER_ID_NVIDIA_PROPRIETARY`) 615.71.09 on the GeForce RTX 5080 Laptop GPU (the C3
-    /// venue `nvidia-rtx5080-laptop`): authored case `c011369b`, whose varyings are affine in
-    /// screen position with exact vertices, reads -0.99999994, -0.74999994 and -2.74999976 for
-    /// -1, -0.75 and -2.75 on 12 of its 64 words, in both legs. It is keyed on the driver's
-    /// release and NVIDIA's vendor ID (`device::driver_facts`), for every NVIDIA GPU under it:
-    /// it changes no code, only what a module records, so taking it on a GPU not measured
-    /// announces a difference that GPU may not have rather than hiding one it has. A fragment
-    /// function that reads a varying the device interpolates records
-    /// `PrecisionNote::DeviceInterpolation` there (`lower::stage_io`).
-    InterpolationNotMetals,
     /// The driver's shader converter writes an `OpCompositeInsert` into the composite it reads
     /// (`c.x = v;`, and the result names `c`) wherever no later read of the composite in the
     /// text it writes stops it, so in a loop a composite defined before the loop is overwritten
     /// and the next iteration reads the inserted element where the module reads the original.
     /// MoltenVK (`VK_DRIVER_ID_MOLTENVK`) 1.4.1 converts with SPIRV-Cross `adec7acb`, whose MSL
     /// backend does this whatever the GPU (its `OpCompositeInsert` case, `can_modify_in_place`):
-    /// measured on the Apple M3 Max and the M4 (EVs RVC-v2-mvk and RVC-v2-mvkm4, the dumped MSL
-    /// of EV RVC-v2d-mvkm4: `_174.x = (_332 + _207) + _174.x;` in the loop), where three
-    /// authored cases whose loop builds each iteration's coordinate from one vector wrote their
-    /// second iteration at `32 + 2 * lane` instead of `32 + lane`. It is keyed on the driver's
-    /// release (`device::driver_facts`): a newer release keeps it until a measurement says
-    /// otherwise. There the serializer inserts into a copy made where the insert stands when the
-    /// composite is defined outside the innermost loop holding the insert
-    /// (`spirv::serialize::serialize_for`), which SPIRV-Cross declares in the loop.
+    /// measured on the Apple M3 Max and the M4 (the dumped MSL of our probe: `_174.x =
+    /// (_332 + _207) + _174.x;` in the loop), where three authored cases whose loop builds each
+    /// iteration's coordinate from one vector wrote their second iteration at `32 + 2 * lane`
+    /// instead of `32 + lane`. It is keyed on the driver's release (`device::driver_facts`): a
+    /// newer release keeps it until a measurement says otherwise. There the serializer inserts into
+    /// a copy made where the insert stands when the composite is defined outside the innermost loop
+    /// holding the insert (`spirv::serialize::serialize_for`), which SPIRV-Cross declares in the
+    /// loop.
     CompositeInsertsWrittenInPlace,
     /// The driver's shader converter writes every function the module defines as one to inline
     /// at each call (`static inline __attribute__((always_inline))`), whatever its function
     /// control, so the GPU's compiler compiles a routine's body once per call. MoltenVK
     /// (`VK_DRIVER_ID_MOLTENVK`) 1.4.1 converts with SPIRV-Cross `adec7acb`, whose MSL backend
-    /// does this whatever the GPU: measured on the Apple M3 Max and the M4 (EVs UNM-cc2-m3 and
-    /// UNM-cc2-m4, about half of corpus row `69a35b6f`'s compile; EV UNM-scdi-m3, a synthetic
-    /// routine called 300 times compiled in 0.54 to 0.58 s against 0.11 to 0.13 s as calls).
-    /// It is keyed on the driver's release (`device::driver_facts`). There each routine
-    /// (`spirv::builder::ModuleBuilder::routine`: the math routines, and the texel conversions, the
-    /// filters' sums and the cube's face fold) is declared `DontInline`, the standard SPIR-V
-    /// statement that its calls stay calls, for a converter that honours it; elsewhere a routine
-    /// takes no function control, since NVIDIA's 615.71.09 honours `DontInline` and ran a
-    /// routine-heavy kernel 8.1 times as long with it on the RTX 3090 (EV UNM-gt2-nv3090), and
-    /// Mesa's drivers inline every function whatever the control. It changes no answer.
+    /// does this whatever the GPU: measured on the Apple M3 Max and the M4 (about half of corpus
+    /// row `69a35b6f`'s compile; a synthetic routine called 300 times compiled in 0.54 to 0.58 s
+    /// against 0.11 to 0.13 s as calls). It is keyed on the driver's release
+    /// (`device::driver_facts`). There each routine (`spirv::builder::ModuleBuilder::routine`: the
+    /// math routines, and the texel conversions, the filters' sums and the cube's face fold) is
+    /// declared `DontInline`, the standard SPIR-V statement that its calls stay calls, for a
+    /// converter that honours it; elsewhere a routine takes no function control, since NVIDIA's
+    /// 615.71.09 honours `DontInline` and ran a routine-heavy kernel 8.1 times as long with it on
+    /// the RTX 3090, and Mesa's drivers inline every function whatever the control. It changes no
+    /// answer.
     FunctionsInlinedAtEveryCall,
     /// The driver's shader converter writes a value loaded before a loop into the text of each
     /// instruction in the loop that reads it, so the loop reads that memory again on every
@@ -1270,62 +1388,59 @@ pub enum DriverWorkaround {
     /// declares those variables in the entry point and so leaves them out of the variables whose
     /// forwarded loads an atomic or a call invalidates (a plain store invalidates its own
     /// variable's), whatever the GPU: measured on authored case `8b812530` on the Apple M3 Max
-    /// and the M4 (EVs RVC-v4-mvk, RVC-v4-mvkm4; EV RVC-scmsl-m4 logged its MSL, which reads a
-    /// threadgroup counter after the sub-word store's atomics that overwrite it), and in the MSL
-    /// the `spirv-cross` CLI writes for synthetic modules of our own, where GLSL and a device
-    /// buffer are written right. It is keyed on the driver's release (`device::driver_facts`): a
-    /// newer release keeps it until a measurement says otherwise. There the serializer
-    /// materializes each load from such a variable in a function holding such a write, where it
-    /// is defined (`spirv::serialize::serialize_for`), which SPIRV-Cross declares there.
+    /// and the M4 (our probe logged its MSL, which reads a threadgroup counter after the
+    /// sub-word store's atomics that overwrite it), and in the MSL the `spirv-cross` CLI writes for
+    /// synthetic modules of our own, where GLSL and a device buffer are written right. It is keyed
+    /// on the driver's release (`device::driver_facts`): a newer release keeps it until a
+    /// measurement says otherwise. There the serializer materializes each load from such a variable
+    /// in a function holding such a write, where it is defined (`spirv::serialize::serialize_for`),
+    /// which SPIRV-Cross declares there.
     LocalizedLoadsForwardedPastAtomicsAndCalls,
     /// The driver groups a draw's vertices into subgroups otherwise than Apple's GPUs group them
     /// into simdgroups: ANV (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`) on Mesa 26.2.4 ran the
     /// vertex fixtures `rvc_simd_vertex` and `rvc_simd_vertex_fill` (forty points) in subgroups
     /// of 8 vertices, interleaved (vertices 0, 2, ..., 14 in one, 1, 3, ..., 15 in another),
     /// where the Apple M4 fills a simdgroup with 32 consecutive vertices and RADV and NVIDIA ran
-    /// them as the M4 does (EVs RVC-vx-anv, RVC-vx-radv, RVC-vx-nv5080). Each such subgroup is a
-    /// Metal simdgroup of 8 active lanes, which Metal's API allows, since it does not fix which
-    /// vertices share one. It is keyed on the driver's release (`device::driver_facts`): a newer
-    /// release keeps it until a measurement says otherwise. Where the vertex stage also takes no
-    /// required subgroup size, a vertex function that runs a simdgroup or quad operation records
-    /// `PrecisionNote::VertexSimdgroupGrouping` (`lower::simd::finish`); no exact path exists.
+    /// them as the M4 does. Each such subgroup is a Metal simdgroup of 8 active lanes, which
+    /// Metal's API allows, since it does not fix which vertices share one. It is keyed on the
+    /// driver's release (`device::driver_facts`): a newer release keeps it until a measurement says
+    /// otherwise. Where the vertex stage also takes no required subgroup size, a vertex function
+    /// that runs a simdgroup or quad operation records `PrecisionNote::VertexSimdgroupGrouping`
+    /// (`lower::simd::finish`); no exact path exists.
     VertexGroupingNotApples,
     /// The driver reads a uniform buffer at its lanes' different addresses faster than a
     /// storage buffer. Measured with a fragment function's sRGB color writes, whose lanes read
-    /// the color table at their own channel's byte (EVs RRS2-ccost4-*): ANV
-    /// (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`) on the UHD 770 of RPL-S and the Iris Xe of RPL-P
-    /// drew them in up to 1.5 and 4.0 times the time from a storage buffer as from a uniform
-    /// buffer, and lavapipe (`VK_DRIVER_ID_MESA_LLVMPIPE`) on 128-bit vectors (`subgroupSize`
-    /// 4, an arm64 host) in up to 1.3 times; NVIDIA's driver (the RTX 3090, the RTX 5080 Laptop
-    /// GPU) drew them in 3.5 to 8.6 times the time from the uniform buffer, lavapipe on 256-bit
-    /// vectors (`subgroupSize` 8, x86_64) in up to 1.5 times, and RADV in the same time from
-    /// either. Keyed on ANV whatever its GPU, and on lavapipe at `subgroupSize` 4. There the
-    /// color table lives in a uniform buffer (`lower::arith::srgb::ColorTable`). It changes no
-    /// answer.
+    /// the color table at their own channel's byte: ANV (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`) on
+    /// the UHD 770 of RPL-S and the Iris Xe of RPL-P drew them in up to 1.5 and 4.0 times the time
+    /// from a storage buffer as from a uniform buffer, and lavapipe (`VK_DRIVER_ID_MESA_LLVMPIPE`)
+    /// on 128-bit vectors (`subgroupSize` 4, an arm64 host) in up to 1.3 times; NVIDIA's driver
+    /// (the RTX 3090, the RTX 5080 Laptop GPU) drew them in 3.5 to 8.6 times the time from the
+    /// uniform buffer, lavapipe on 256-bit vectors (`subgroupSize` 8, x86_64) in up to 1.5 times,
+    /// and RADV in the same time from either. Keyed on ANV whatever its GPU, and on lavapipe at
+    /// `subgroupSize` 4. There the color table lives in a uniform buffer
+    /// (`lower::arith::srgb::ColorTable`). It changes no answer.
     UniformReadsOutpaceStorageReads,
     /// The GPU's compiler drops the texture writes of every live thread of a simdgroup that
     /// holds a discarded thread, where the fragment function discards (`discard_fragment()`),
     /// then writes a texture, samples a texture bound through an argument buffer, and calls a
     /// `[[clang::optnone]]` function in a branch only discarded threads enter. Measured in plain
-    /// Metal on an Apple M4 (macOS 27.0.1, probes, EVs DSX-rog1-m4 to DSX-rog6b-m4 and
-    /// DSX-apple1-m4): the MSL MoltenVK wrote for a storage-form fragment of our own, which
-    /// discards twice, samples a noise texture and writes its color attachment's storage image,
-    /// lost the writes in whole 8-by-4-pixel blocks along its discarded pixels, three runs alike,
-    /// with or without the raster order group, the fence, or the helper guard on the write;
-    /// without the sample, with
-    /// the `optnone` call plain, in straight-line code or in a branch live threads enter too,
-    /// with the sampled texture bound directly, or with the discard recorded and taken after the
-    /// write, every write landed, and color outputs landed in every form. MoltenVK
-    /// (`VK_DRIVER_ID_MOLTENVK`) on an Apple GPU (`vendor_id` 0x106B) binds through argument
-    /// buffers and writes both a demote and a terminate as `discard_fragment()`, and an `OpFAdd`
-    /// decorated `NoContraction` as its `optnone` `spvFAdd`, so it has the defect. There a
-    /// fragment function that writes storage after such a discard predicates it and is killed
-    /// past those writes (`lower::fragment::discard`).
+    /// Metal on an Apple M4 (macOS 27.0.1, probes): the MSL MoltenVK wrote for a storage-form
+    /// fragment of our own, which discards twice, samples a noise texture and writes its color
+    /// attachment's storage image, lost the writes in whole 8-by-4-pixel blocks along its discarded
+    /// pixels, three runs alike, with or without the raster order group, the fence, or the helper
+    /// guard on the write; without the sample, with the `optnone` call plain, in straight-line code
+    /// or in a branch live threads enter too, with the sampled texture bound directly, or with the
+    /// discard recorded and taken after the write, every write landed, and color outputs landed in
+    /// every form. MoltenVK (`VK_DRIVER_ID_MOLTENVK`) on an Apple GPU (`vendor_id` 0x106B) binds
+    /// through argument buffers and writes both a demote and a terminate as `discard_fragment()`,
+    /// and an `OpFAdd` decorated `NoContraction` as its `optnone` `spvFAdd`, so it has the defect.
+    /// There a fragment function that writes storage after such a discard predicates it and is
+    /// killed past those writes (`lower::fragment::discard`).
     ///
     /// The defect needs no discard: the quad helpers past a primitive's right and bottom edges are
     /// threads only of their own branch too. Without any discard, the same fragment lost 1,040 to
     /// 1,063 of its 2,584 texels a run in 98 or 99 blocks where only those helpers took the branch
-    /// with the `optnone` call (the EV DSX-rog8-m4). There the selections whose arms hold such a
+    /// with the `optnone` call (the probe). There the selections whose arms hold such a
     /// call before a storage write send their helper invocations to another arm where that is exact
     /// (`spirv::helper_branches`).
     DiscardDropsSimdgroupStores,
@@ -1334,29 +1449,63 @@ pub enum DriverWorkaround {
     /// call and compiles each copy. A measured cost, not a defect: NVIDIA's
     /// (`VK_DRIVER_ID_NVIDIA_PROPRIETARY`) 615.71.09 on the RTX 3090 created a fragment of 256
     /// calls of one sample emulation in 0.39 to 0.40 s with the routine `DontInline` and in 10.1
-    /// to 10.2 s without (EV SHB-g1, a probe, two rounds, shader caches off), and drew it in 15.2
-    /// against 10.3 ms; and its creation of the linear sums kept as calls fell from tens of seconds
-    /// (EVs SUB-xt3 and SUB-xc1). Mesa's drivers inline every function whatever its control, so the
-    /// control changes nothing there, and MoltenVK states it on every routine already
-    /// (`FunctionsInlinedAtEveryCall`). It is keyed on the driver's release
-    /// (`device::driver_facts`) and on the GPU measured with it alone, as every cost fact is: a
-    /// release or a GPU not measured takes no control, the default, whose code and answers are the
-    /// same. There each sampling routine (`spirv::builder::ModuleBuilder::sampling_routine`) is
-    /// declared `DontInline` (`spirv::serialize::serialize_for`). It changes no answer, only the
+    /// to 10.2 s without (a probe, two rounds, shader caches off), and drew it in 15.2 against 10.3
+    /// ms; and its creation of the linear sums kept as calls fell from tens of seconds; the RTX
+    /// 5080 Laptop GPU's, its measurement in `device::driver_facts`. Mesa's drivers inline every
+    /// function whatever its control, so the control changes nothing there, and MoltenVK states it
+    /// on every routine already (`FunctionsInlinedAtEveryCall`). It is keyed on the driver's
+    /// release (`device::driver_facts`) and on the GPU measured with it alone, as every cost fact
+    /// is: a release or a GPU not measured takes no control, the default, whose code and answers
+    /// are the same. There each sampling routine
+    /// (`spirv::builder::ModuleBuilder::sampling_routine`) is declared `DontInline`
+    /// (`spirv::serialize::serialize_for`). It changes no answer, only the
     /// making's and the draw's time.
     DontInlineKeepsCalls,
     /// The device's rasterizer does not split a primitive it clips as Apple's does: Apple's GPU
     /// draws a triangle that extends past the viewport as pieces whose shared edges cross pixels,
     /// and such a pixel's fragments can run once per piece, each reading that piece's coverage as
-    /// `[[sample_mask]]` (EVs VSM-metal-cov1/-cov2/-cov3 on an M3 Max and an M4), where a Vulkan
-    /// rasterizer hands the pixel's one fragment its coverage by the whole primitive (and lavapipe
-    /// splits along its own seams, `ClippedTrianglesSplitPixelFragments`). Vulkan states no split,
+    /// `[[sample_mask]]` (on an M3 Max and an M4), where a Vulkan rasterizer hands the pixel's one
+    /// fragment its coverage by the whole primitive (and lavapipe splits along its own seams,
+    /// `ClippedTrianglesSplitPixelFragments`). Vulkan states no split,
     /// and no Vulkan mechanism follows Apple's clipper, so this is the device's answer, not a
     /// defect. Every driver has it but MoltenVK (`VK_DRIVER_ID_MOLTENVK`) on an Apple GPU
     /// (`vendor_id` 0x106B), which draws through Metal and splits as Metal does. A fragment
     /// function compiled for a multisampled pipeline that reads `[[sample_mask]]` records
     /// `PrecisionNote::ClippedCoverageSplit` there (`lower::fragment::coverage`).
     ClippedCoverageNotMetals,
+    /// The device's tessellator does not draw a patch's triangles as Apple's does: Metal's
+    /// tessellator draws the D3D11 reference's triangles in its own order, each one's first corner
+    /// by its stitch step (`lower::tessellation::tessellator`), where Vulkan leaves a patch's
+    /// triangle order, first corners and ring triangulation to the implementation (every patch
+    /// differs on the RTX 3090, 55-95% of them on RADV and lavapipe). The device's answer, not a
+    /// defect. Every driver has it but MoltenVK (`VK_DRIVER_ID_MOLTENVK`) on an Apple GPU
+    /// (`vendor_id` 0x106B), which hands the patches to Metal's tessellator. A pipeline drawn
+    /// through the device's tessellation stages records `PrecisionNote::TessellationTriangleOrder`
+    /// there (`link::tessellation::note_evaluation_stage`).
+    TessellatorNotMetals,
+    /// The driver's shader compiler faults creating a pipeline from a stage module past a word
+    /// bound, so a module the consumer's exact forms grow beyond it is retranslated with those
+    /// forms dropped until its largest stage fits ([`DeviceProfile::module_word_bound`]): the one
+    /// workaround that changes no leaf encoding and refuses nothing, but bounds a module's size by
+    /// trading exactness for the fast form, device by device.
+    ///
+    /// ANV (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`), Mesa 26.2.4, faults in its `brw` backend's
+    /// register allocator: a bitset indexed by the triangular pair index `n·(n-1)/2` of two live
+    /// ranges, computed in 32 bits, which overflows once the function's live-range count is large
+    /// and reads outside the allocation (`libvulkan_intel.so`, `SEGV_ACCERR`). Measured on the
+    /// Iris Xe of RPL-P with a synthetic compute module whose one function keeps a sliding window
+    /// of `W` live `float` values: `vkCreateComputePipelines` compiled `W` = 50,000 (750,107 words)
+    /// and faulted `W` = 60,000, 65,000 and 92,000 (900,107 words and up); and with the consumer's
+    /// fragments, where a module carrying exact sampling alone (455,402 words) compiled but one
+    /// carrying every exact answer faulted. The bound is 400,000 words, below the smallest module
+    /// observed to combine enough exact forms to fault, with margin: a module carrying exact
+    /// sampling alone above it is reduced too, since the fault point for a module's register
+    /// pressure is not known exactly and the fault is unrecoverable, where the reduction is a
+    /// logged precision note. Keyed on the driver whatever its GPU, whatever its release, in
+    /// `device::derive`; a release that fixes the overflow keeps it until a measurement raises or
+    /// removes the bound, and the fast-default form of every module stays below it. The consumer
+    /// announces each reduced pipeline (`RuntimeFact::ExactFormsOverCompilerLimit`).
+    RegisterAllocatorOverflowsLargeModules,
 }
 
 #[cfg(test)]

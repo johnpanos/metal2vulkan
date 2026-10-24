@@ -18,18 +18,28 @@
 //!   order it schedules the command buffers, which is this order. Untracked resources are the
 //!   program's to order, through fences, barriers and events, and the summary leaves them out.
 //!   Metal evaluates a fence at submission, so a wait orders after the fence's last update in
-//!   submission order.
+//!   submission order. A render encoder's wait and update cover the draw stages its call names
+//!   ([`FenceUse`]): a wait before the fragment stage alone lets the draws' earlier stages run
+//!   before the update, and an update after the vertex stage alone lets a later wait run before
+//!   the draws' fragments, as an M3 Max's did (`fence.rs`).
 //!
 //! **Barriers and waits.** Every image rests in `VK_IMAGE_LAYOUT_GENERAL` outside render passes,
-//! so nothing here changes a layout. An access after one of the same `VkQueue` needs a
-//! [`Barrier`]: one global memory barrier, everything in `src` before everything in `dst`, which
-//! orders buffer and image memory alike; Vulkan's submission order on one `VkQueue` makes it cover
-//! the earlier batches of every logical queue there. An access after one of another `VkQueue`
-//! needs a [`Wait`] of its batch for that queue's timeline semaphore at the earlier batch's
-//! [`Point`]: the signal makes the earlier writes available and the wait makes them visible to
-//! the waiting stages of this batch and of every later one of its queue. That batch was submitted
-//! before, so the wait never waits on an unsubmitted signal. Both may order more than Metal
-//! requires, never less.
+//! so nothing here changes a layout; but for a held multisampled depth (`texture/held_depth.rs`),
+//! whose moves between encoders the scheduler plans with the encoders, each a write of the whole
+//! image outside them, which the plan orders as any other. An access after one of the same
+//! `VkQueue` needs a [`Barrier`]: one global memory barrier, everything in `src` before everything
+//! in `dst`, which orders buffer and image memory alike; Vulkan's submission order on one
+//! `VkQueue` makes it cover the earlier batches of every logical queue there. A tracker that
+//! orders batches by their ends ([`Tracker::by_ends`], `batch_order.rs`) plans none after an
+//! access of an earlier batch of the same `VkQueue`: every batch there ends with
+//! [`Barrier::to_all`], every write before every access of every later command, which submission
+//! order makes cover the later batches of every logical queue (an execution dependency on every
+//! stage, so a write after an earlier batch's read is ordered too). An access after one
+//! of another `VkQueue` needs a [`Wait`] of its batch for that queue's timeline semaphore at the
+//! earlier batch's [`Point`]: the signal makes the earlier writes available and the wait makes
+//! them visible to the waiting stages of this batch and of every later one of its queue. That
+//! batch was submitted before, so the wait never waits on an unsubmitted signal. Both may order
+//! more than Metal requires, never less.
 //!
 //! **The state.** Per resource, per range: the last write on each queue that wrote it (one queue's
 //! unless entries were merged), with the stages and access types it is already visible to on its
@@ -41,8 +51,11 @@
 //! entries has them merged into one per kind of range, which orders more and stays exact. A
 //! write or read retires once its batch completed and the host saw it ([`Tracker::completed`]);
 //! each `VkQueue`'s batches complete in its timeline's order. A queue submission orders
-//! everything that happened before it on the host, and every batch starts with
-//! [`Barrier::after_completed`], so later work needs no barrier from it.
+//! everything that happened before it on the host, and every batch with work waits for the
+//! timelines at the values the host saw them reach (`command_buffer/submit.rs`), which makes what
+//! completed work wrote visible to it, or, on a driver whose submissions stall on semaphore
+//! operations (`DriverFact::SemaphoreOperationsStallSubmits`), starts with
+//! [`Barrier::after_completed`]; so later work needs no barrier from it.
 //!
 //! **Kept cheap per batch.** The scheduler plans every batch on its thread (a commit's own, where
 //! it submits inline), so the state's upkeep is held to what a batch touches. Each resource's state
@@ -58,6 +71,7 @@
 //! `VkQueue`'s listed in its submission order as their plans were applied, not every resource the
 //! state holds.
 
+use crate::device::functions::Vk;
 use crate::key_hash::KeyMap;
 use ash::vk;
 use std::collections::{HashMap, VecDeque};
@@ -287,6 +301,17 @@ impl<K> Use<K> {
     fn is_nothing(&self) -> bool {
         self.range.is_empty() || (self.read.is_empty() && self.write.is_empty())
     }
+
+    /// Whether the use is a depth/stencil attachment's alone: its reads and writes are the
+    /// attachment's, in the stages of the fragment tests, which load, test and store it.
+    pub(super) fn is_depth_attachment(&self) -> bool {
+        let stages = vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+        let access = vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        let both = self.read.union(self.write);
+        stages.contains(both.stages) && access.contains(both.access)
+    }
 }
 
 /// One global memory barrier: every access of `src` before every access of `dst`. Without access
@@ -298,7 +323,8 @@ pub(super) struct Barrier {
 }
 
 impl Barrier {
-    /// The start of every batch with encoders: what completed batches wrote is visible to every
+    /// The start of every batch with encoders on a driver whose submissions stall on semaphore
+    /// operations (`command_buffer/submit.rs`): what completed batches wrote is visible to every
     /// later command. The tracker forgets a batch once it completed, so its writes are ordered by
     /// completion (its queue's timeline, observed on the host before this submission) and need
     /// only this visibility; the empty source waits for nothing.
@@ -323,6 +349,26 @@ impl Barrier {
             dst: Access::new(
                 vk::PipelineStageFlags2::HOST,
                 vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE,
+            ),
+        }
+    }
+
+    /// The end of every batch where batches are ordered by their ends (`batch_order.rs`):
+    /// [`to_host`](Barrier::to_host)'s, and every earlier command before every access of every
+    /// later command of its `VkQueue`, so later batches there need no barrier from its accesses
+    /// ([`Tracker`]'s module docs).
+    pub(super) fn to_all() -> Barrier {
+        Barrier {
+            src: Access::new(
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_WRITE,
+            ),
+            dst: Access::new(
+                vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::HOST_READ
+                    | vk::AccessFlags2::HOST_WRITE
+                    | vk::AccessFlags2::MEMORY_READ
+                    | vk::AccessFlags2::MEMORY_WRITE,
             ),
         }
     }
@@ -362,19 +408,22 @@ impl Barrier {
     }
 
     /// Record the barrier on `command_buffer`: one global `VkMemoryBarrier` through
-    /// `vkCmdPipelineBarrier`, with [`Barrier::legacy`]'s masks. The runtime records every
-    /// barrier this way, with or without synchronization2: each mask it makes maps to the same or
-    /// a broader legacy mask, so one path is exact.
+    /// `vkCmdPipelineBarrier`, with [`Barrier::legacy`]'s masks, the destination's `MEMORY_READ`
+    /// named as the reads it stands for beside the destination stages
+    /// (`image_barrier::MemoryReads`, the device's queue family for encoders, which records every
+    /// such barrier). The runtime records every barrier
+    /// this way, with or without synchronization2: each mask it makes maps to the same or a
+    /// broader legacy mask, so one path is exact.
     ///
     /// # Safety
     ///
     /// `command_buffer` is a command buffer of `device` in the recording state, and no other
     /// thread records it.
-    pub(super) unsafe fn record(self, device: &ash::Device, command_buffer: vk::CommandBuffer) {
+    pub(super) unsafe fn record(self, device: &Vk, command_buffer: vk::CommandBuffer) {
         let masks = self.legacy();
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(masks.src_access)
-            .dst_access_mask(masks.dst_access);
+            .dst_access_mask(device.reads().named(masks.dst_access, masks.dst_stages));
         // SAFETY: the caller's contract.
         unsafe {
             device.cmd_pipeline_barrier(
@@ -440,7 +489,9 @@ const LEGACY_STAGES: u64 = (1 << 26) - 1;
 /// The access bits `VkAccessFlags` defines, the same in both families (bits 0 to 27).
 const LEGACY_ACCESS: u64 = (1 << 28) - 1;
 
-fn legacy_stages(
+/// `stages` as `VkPipelineStageFlags` name them, each the same or a broader legacy stage, as a
+/// barrier's ([`Barrier::legacy`]); `none` where `stages` is empty.
+pub(super) fn legacy_stages(
     stages: vk::PipelineStageFlags2,
     none: vk::PipelineStageFlags,
 ) -> vk::PipelineStageFlags {
@@ -612,6 +663,30 @@ impl<T> Few<T> {
             self.first = Some(self.rest.remove(0));
         }
     }
+
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    /// Change the values as `change` changes them as one list, in order.
+    fn change_all(&mut self, change: impl FnOnce(&mut Vec<T>)) {
+        if let Some(first) = self.first.take() {
+            self.rest.insert(0, first);
+        }
+        change(&mut self.rest);
+        if !self.rest.is_empty() {
+            self.first = Some(self.rest.remove(0));
+        }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Few<T> {
+    type Item = &'a T;
+    type IntoIter = std::iter::Chain<std::option::Iter<'a, T>, std::slice::Iter<'a, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 impl<T> IntoIterator for Few<T> {
@@ -698,19 +773,23 @@ impl Entry {
         entry
     }
 
-    /// What a use at `at` of this entry's range needs ordered before it.
-    fn depend(&self, read: Access, write: Access, at: Point, needs: &mut Needs) {
+    /// What a use at `at` of this entry's range needs ordered before it, where the accesses of
+    /// its queue's batches below `since` are ordered by their ends (0 where none is).
+    fn depend(&self, read: Access, write: Access, (at, since): (Point, u64), needs: &mut Needs) {
         if !read.is_empty() {
-            self.after_writes(read, at, needs);
+            self.after_writes(read, (at, since), needs);
         }
         if !write.is_empty() {
-            self.after_writes(write, at, needs);
+            self.after_writes(write, (at, since), needs);
             for reads in self.reads.iter() {
                 if reads.at.queue == at.queue {
-                    needs.barrier.add(
-                        Access::new(reads.stages, vk::AccessFlags2::NONE),
-                        Access::new(write.stages, vk::AccessFlags2::NONE),
-                    );
+                    // Reads of a batch ordered by its end need nothing.
+                    if reads.at.value >= since {
+                        needs.barrier.add(
+                            Access::new(reads.stages, vk::AccessFlags2::NONE),
+                            Access::new(write.stages, vk::AccessFlags2::NONE),
+                        );
+                    }
                 } else {
                     add_wait(
                         &mut needs.waits,
@@ -725,11 +804,12 @@ impl Entry {
     }
 
     /// What `access` at `at` needs after the last writes: a barrier from a write of its own
-    /// queue not yet visible to it, and a wait for a write of another queue not yet waited for.
-    fn after_writes(&self, access: Access, at: Point, needs: &mut Needs) {
+    /// queue not yet visible to it (a write of a batch below `since` its batch's end made
+    /// visible), and a wait for a write of another queue not yet waited for.
+    fn after_writes(&self, access: Access, (at, since): (Point, u64), needs: &mut Needs) {
         for writer in self.writers.iter() {
             if writer.at.queue == at.queue {
-                if !writer.visible.covers(access) {
+                if writer.at.value >= since && !writer.visible.covers(access) {
                     needs.barrier.add(self.write, access);
                 }
             } else if !writer.waited_by(at.queue).contains(access.stages) {
@@ -842,13 +922,13 @@ impl<S: Eq + Hash, H: BuildHasher> Entries<S> for HashMap<S, Vec<Entry>, H> {
 }
 
 /// What the uses (sorted by key, one per key and range) at `at` need after the accesses in
-/// `state`.
-fn depend<S>(state: &impl Entries<S>, uses: &[Use<S>], at: Point) -> Needs {
+/// `state`, those of its queue's batches below `since` ordered by their ends.
+fn depend<S>(state: &impl Entries<S>, uses: &[Use<S>], (at, since): (Point, u64)) -> Needs {
     let mut needs = Needs::default();
     for used in uses {
         for entry in state.of(&used.key).into_iter().flatten() {
             if entry.range.overlaps(&used.range) {
-                entry.depend(used.read, used.write, at, &mut needs);
+                entry.depend(used.read, used.write, (at, since), &mut needs);
             }
         }
     }
@@ -909,7 +989,7 @@ fn coalesce(entries: &mut Vec<Entry>) {
 /// The uses one per key and range, sorted by key, without the ones that touch nothing.
 fn merged<S: Copy + Ord + Hash>(uses: impl IntoIterator<Item = Use<S>>) -> Vec<Use<S>> {
     let mut merged: Vec<Use<S>> = Vec::new();
-    let mut index: HashMap<(S, UseRange), usize> = HashMap::new();
+    let mut index: KeyMap<(S, UseRange), usize> = KeyMap::default();
     for used in uses {
         if used.is_nothing() {
             continue;
@@ -945,26 +1025,72 @@ pub(super) struct EncoderUses<K> {
     /// Whether Metal runs the commands in encoded order (blit encoders, serial compute encoders).
     ordered: bool,
     /// The accesses of the current part's commands so far, for that order.
-    inside: HashMap<Class<K>, Vec<Entry>>,
+    inside: KeyMap<Class<K>, Vec<Entry>>,
     /// The parts, in order: the last is the current one. Never empty.
     parts: Vec<Part<K>>,
     /// The fences waited for: before the encoder's first part.
-    waits: Vec<K>,
+    waits: Vec<FenceUse<K>>,
     /// The fences updated: after its last part.
-    updates: Vec<K>,
+    updates: Vec<FenceUse<K>>,
+    /// The images it holds in their attachment layout (`texture/held_depth.rs`).
+    held: Vec<K>,
+    /// A use of a held image but as a depth/stencil attachment was recorded after its hold.
+    broke: bool,
+}
+
+/// A fence an encoder waits for or updates, and the stages of its draws the call names: a render
+/// encoder's `waitForFence:beforeStages:` and `updateFence:afterStages:` name render stages
+/// (`fence.rs`), which `draws` holds as the stages of `render::PASS_DRAW_STAGES` they run in;
+/// `None` covers every stage of the encoder (a compute or blit encoder's call). Either way the
+/// use covers the encoder's stages outside its draws (the runtime's own copies and dispatches
+/// before and after its render pass instances), which only orders more.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FenceUse<K> {
+    fence: K,
+    draws: Option<vk::PipelineStageFlags2>,
+}
+
+impl<K> FenceUse<K> {
+    /// The stages, of an encoder whose commands ran in `stages`, the use covers: those of its
+    /// draws it names and every one outside its draws.
+    fn covered(&self, stages: vk::PipelineStageFlags2) -> vk::PipelineStageFlags2 {
+        match self.draws {
+            None => stages,
+            Some(draws) => {
+                let pass = super::render::PASS_DRAW_STAGES;
+                stages & (draws | vk::PipelineStageFlags2::from_raw(!pass.as_raw()))
+            }
+        }
+    }
+}
+
+/// Add `used` to `fences`, which hold each fence once: a fence named twice covers the stages of
+/// both calls.
+fn add_fence<K: PartialEq>(fences: &mut Vec<FenceUse<K>>, used: FenceUse<K>) {
+    match fences.iter_mut().find(|known| known.fence == used.fence) {
+        Some(known) => {
+            known.draws = match (known.draws, used.draws) {
+                (Some(a), Some(b)) => Some(a | b),
+                _ => None,
+            }
+        }
+        None => fences.push(used),
+    }
 }
 
 /// The uses of one part of an encoder.
 struct Part<K> {
-    /// The tracked uses so far, one per range, at most [`ENTRIES_PER_KEY`] per resource.
-    tracked: HashMap<K, Vec<Use<K>>>,
+    /// The tracked uses so far, one per range, at most [`ENTRIES_PER_KEY`] per resource: most
+    /// resources have one, held inline ([`Few`]), so a command's first use of a resource
+    /// allocates nothing of its own.
+    tracked: KeyMap<K, Few<Use<K>>>,
     stages: vk::PipelineStageFlags2,
 }
 
 impl<K> Part<K> {
     fn new() -> Part<K> {
         Part {
-            tracked: HashMap::new(),
+            tracked: KeyMap::default(),
             stages: vk::PipelineStageFlags2::NONE,
         }
     }
@@ -975,10 +1101,12 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
     pub(super) fn new(ordered: bool) -> EncoderUses<K> {
         EncoderUses {
             ordered,
-            inside: HashMap::new(),
+            inside: KeyMap::default(),
             parts: vec![Part::new()],
             waits: Vec::new(),
             updates: Vec::new(),
+            held: Vec::new(),
+            broke: false,
         }
     }
 
@@ -994,7 +1122,7 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
             return None;
         }
         // One encoder runs on one queue: its commands need barriers, never waits.
-        depend(&self.inside, &inside_uses(uses), Point::default())
+        depend(&self.inside, &inside_uses(uses), (Point::default(), 0))
             .barrier
             .needed()
     }
@@ -1006,6 +1134,12 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         uses: &[Use<K>],
         barrier: Option<Barrier>,
     ) {
+        if !self.held.is_empty() {
+            let held = &self.held;
+            self.broke |= uses.iter().any(|used| {
+                held.contains(&used.key) && !used.is_nothing() && !used.is_depth_attachment()
+            });
+        }
         let part = self.current();
         // Every stage, untracked work's too: a fence wait orders all of the encoder's work.
         part.stages |= uses.iter().fold(stages, |all, used| {
@@ -1034,7 +1168,7 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
                 None => ranges.push(used.clone()),
             }
             if ranges.len() > ENTRIES_PER_KEY {
-                coalesce_uses(ranges);
+                ranges.change_all(coalesce_uses);
             }
         }
     }
@@ -1099,18 +1233,44 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
     /// it. Fences are waited for at the start of the encoder and updated at its end, so a wait
     /// after the encoder updated the fence waits for the update before the encoder, as plain
     /// Metal's compute, blit and render encoders do (an M4 read the earlier encoder's write in
-    /// three runs of each); Metal's API validation asserts.
-    pub(super) fn wait_for_fence(&mut self, fence: K) {
-        if !self.waits.contains(&fence) {
-            self.waits.push(fence);
+    /// three runs of each); Metal's API validation asserts. Before the draw stages `draws` alone
+    /// where `Some` ([`FenceUse`]): the encoder's draws in those stages, and its commands outside
+    /// its draws, run after the update; its draws' other stages may run before it.
+    pub(super) fn wait_for_fence(&mut self, fence: K, draws: Option<vk::PipelineStageFlags2>) {
+        add_fence(&mut self.waits, FenceUse { fence, draws });
+    }
+
+    /// `update_fence`: the fence is updated after the encoder's work; after the draw stages
+    /// `draws` alone where `Some` ([`FenceUse`]): a later wait orders after the encoder's draws in
+    /// those stages and its commands outside its draws, not after its draws' other stages.
+    pub(super) fn update_fence(&mut self, fence: K, draws: Option<vk::PipelineStageFlags2>) {
+        add_fence(&mut self.updates, FenceUse { fence, draws });
+    }
+
+    /// Hold the image known by `key` in its attachment layout through the encoder
+    /// (`texture/held_depth.rs`): a use of it recorded from now on but as a depth/stencil
+    /// attachment breaks the hold ([`broke_hold`](Self::broke_hold)).
+    pub(super) fn hold(&mut self, key: K) {
+        if !self.held.contains(&key) {
+            self.held.push(key);
         }
     }
 
-    /// `update_fence`: the fence is updated after the encoder's work.
-    pub(super) fn update_fence(&mut self, fence: K) {
-        if !self.updates.contains(&fence) {
-            self.updates.push(fence);
-        }
+    /// The images the encoder holds in their attachment layout.
+    pub(super) fn held(&self) -> &[K] {
+        &self.held
+    }
+
+    /// How many parts the encoder's commands were recorded in so far: one more at each
+    /// [`split`](Self::split).
+    pub(super) fn parts(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Whether a use of a held image but as a depth/stencil attachment was recorded after its
+    /// hold: the encoder's commands would find it in another layout than they were recorded for.
+    pub(super) fn broke_hold(&self) -> bool {
+        self.broke
     }
 
     /// The part commands are recorded into now.
@@ -1185,14 +1345,14 @@ impl<K> fmt::Debug for EncoderUses<K> {
 /// commands after them. One entry per range, at most [`ENTRIES_PER_KEY`] per resource, merged
 /// as [`EncoderUses`] merges its own, which claims more and stays exact.
 pub(super) struct UnorderedWrites<K> {
-    writes: HashMap<K, Vec<Use<K>>>,
+    writes: KeyMap<K, Vec<Use<K>>>,
 }
 
 impl<K: Copy + Ord + Hash> UnorderedWrites<K> {
     /// No writes.
     pub(super) fn new() -> UnorderedWrites<K> {
         UnorderedWrites {
-            writes: HashMap::new(),
+            writes: KeyMap::default(),
         }
     }
 
@@ -1228,6 +1388,158 @@ impl<K: Copy + Ord + Hash> UnorderedWrites<K> {
                     .get(&read.key)
                     .is_some_and(|known| known.iter().any(|k| k.range.overlaps(&read.range)))
             })
+    }
+}
+
+/// Uses of earlier commands kept by resource and range, tracked or not alike: one entry per range,
+/// at most [`ENTRIES_PER_KEY`] per resource, merged as [`UnorderedWrites`] merges its own, which
+/// claims more and stays exact.
+#[derive(Clone)]
+struct KeptUses<K> {
+    uses: KeyMap<K, Vec<Use<K>>>,
+}
+
+impl<K: Copy + Ord + Hash> KeptUses<K> {
+    fn new() -> KeptUses<K> {
+        KeptUses {
+            uses: KeyMap::default(),
+        }
+    }
+
+    fn push(&mut self, used: Use<K>) {
+        if used.range.is_empty() {
+            return;
+        }
+        let ranges = self.uses.entry(used.key).or_default();
+        ranges.push(used);
+        if ranges.len() > ENTRIES_PER_KEY {
+            coalesce_uses(ranges);
+        }
+    }
+
+    /// The kept uses of `used`'s resource whose ranges overlap its range.
+    fn meeting<'a>(&'a self, used: &'a Use<K>) -> impl Iterator<Item = &'a Use<K>> + 'a {
+        let known = self.uses.get(&used.key).map(Vec::as_slice).unwrap_or(&[]);
+        known
+            .iter()
+            .filter(move |known| known.range.overlaps(&used.range))
+    }
+}
+
+/// The memory a render pass instance's draws read as their indirect arguments (in
+/// `DRAW_INDIRECT`) since the instance began (`render.rs`), tracked or not alike: Metal reads a
+/// draw's arguments before a later draw of the encoder writes them, behind no barrier (measured),
+/// whatever the resource's hazard tracking, and Vulkan orders the two only by a dependency.
+#[derive(Clone)]
+pub(super) struct IndirectReads<K> {
+    reads: KeptUses<K>,
+}
+
+impl<K: Copy + Ord + Hash> IndirectReads<K> {
+    /// No reads.
+    pub(super) fn new() -> IndirectReads<K> {
+        IndirectReads {
+            reads: KeptUses::new(),
+        }
+    }
+
+    /// Add the indirect argument reads of a draw with `uses`.
+    pub(super) fn add(&mut self, uses: &[Use<K>]) {
+        for used in uses.iter().filter(|used| {
+            used.read
+                .stages
+                .intersects(vk::PipelineStageFlags2::DRAW_INDIRECT)
+        }) {
+            self.reads.push(Use {
+                write: Access::NONE,
+                ..used.clone()
+            });
+        }
+    }
+
+    /// The stages in which a later draw with `uses` writes memory one of the reads read: empty
+    /// where it writes none of it.
+    pub(super) fn written_in(&self, uses: &[Use<K>]) -> vk::PipelineStageFlags2 {
+        uses.iter()
+            .filter(|used| !used.write.is_empty() && self.reads.meeting(used).next().is_some())
+            .fold(vk::PipelineStageFlags2::empty(), |stages, used| {
+                stages | used.write.stages
+            })
+    }
+}
+
+/// The stages a draw runs before its fragments in which a shader writes memory: the vertex,
+/// tessellation, geometry, object and mesh stages.
+pub(super) const PRE_RASTERIZATION_WRITES: vk::PipelineStageFlags2 =
+    vk::PipelineStageFlags2::from_raw(
+        vk::PipelineStageFlags2::VERTEX_SHADER.as_raw()
+            | vk::PipelineStageFlags2::TESSELLATION_CONTROL_SHADER.as_raw()
+            | vk::PipelineStageFlags2::TESSELLATION_EVALUATION_SHADER.as_raw()
+            | vk::PipelineStageFlags2::GEOMETRY_SHADER.as_raw()
+            | vk::PipelineStageFlags2::TASK_SHADER_EXT.as_raw()
+            | vk::PipelineStageFlags2::MESH_SHADER_EXT.as_raw(),
+    );
+
+/// The memory a render pass instance's draws wrote in their stages before their fragments
+/// ([`PRE_RASTERIZATION_WRITES`]) since the instance began (`render.rs`), tracked or not alike:
+/// Metal's tile-based passes run every draw's vertex, object and mesh functions before any draw's
+/// fragments, so a later draw's fragment shader reads and writes such memory after the write,
+/// whatever the resource's hazard tracking, and Vulkan orders the two only by a dependency.
+#[derive(Clone)]
+pub(super) struct GeometryWrites<K> {
+    writes: KeptUses<K>,
+}
+
+impl<K: Copy + Ord + Hash> GeometryWrites<K> {
+    /// No writes.
+    pub(super) fn new() -> GeometryWrites<K> {
+        GeometryWrites {
+            writes: KeptUses::new(),
+        }
+    }
+
+    /// Add the writes before its fragments of a draw with `uses`: a use that writes in one of
+    /// those stages and in the fragment stage too is taken as written before the fragments, which
+    /// claims more and stays exact.
+    pub(super) fn add(&mut self, uses: &[Use<K>]) {
+        for used in uses {
+            let stages = used.write.stages & PRE_RASTERIZATION_WRITES;
+            if stages.is_empty() {
+                continue;
+            }
+            self.writes.push(Use {
+                read: Access::NONE,
+                write: Access::new(stages, used.write.access),
+                ..used.clone()
+            });
+        }
+    }
+
+    /// The memory dependency a later draw with `uses` needs before its fragment shader reads or
+    /// writes memory one of the writes wrote: from the writes' stages and access types to the
+    /// fragment shader and the later draw's access types there. `None` where its fragment
+    /// shader touches none of it.
+    pub(super) fn barrier_before(&self, uses: &[Use<K>]) -> Option<Barrier> {
+        const FRAGMENT: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::FRAGMENT_SHADER;
+        let mut src = Access::NONE;
+        let mut dst = Access::NONE;
+        for used in uses {
+            let mut fragment = Access::NONE;
+            if used.read.stages.intersects(FRAGMENT) {
+                fragment = fragment.union(Access::new(FRAGMENT, used.read.access));
+            }
+            if used.write.stages.intersects(FRAGMENT) {
+                fragment = fragment.union(Access::new(FRAGMENT, used.write.access));
+            }
+            if fragment.is_empty() {
+                continue;
+            }
+            for known in self.writes.meeting(used) {
+                src = src.union(known.write);
+                dst = dst.union(fragment);
+            }
+        }
+        (!src.is_empty()).then_some(Barrier { src, dst })
     }
 }
 
@@ -1294,9 +1606,9 @@ pub(super) struct Summary<K> {
     /// Every stage the encoder's commands ran in.
     stages: vk::PipelineStageFlags2,
     /// The fences waited for before the encoder.
-    waits: Vec<K>,
+    waits: Vec<FenceUse<K>>,
     /// The fences updated after the encoder.
-    updates: Vec<K>,
+    updates: Vec<FenceUse<K>>,
 }
 
 impl<K> fmt::Debug for Summary<K> {
@@ -1327,18 +1639,21 @@ impl<K: Copy + Ord> Summary<K> {
     /// `waits` and updates `updates`, in every stage, so a wait on its queue orders after all of
     /// its batch's work before it, which its sparse binding precedes.
     pub(super) fn of_fences(waits: Vec<K>, updates: Vec<K>) -> Summary<K> {
+        let every = |fence| FenceUse { fence, draws: None };
         Summary {
             uses: Vec::new(),
             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
-            waits,
-            updates,
+            waits: waits.into_iter().map(every).collect(),
+            updates: updates.into_iter().map(every).collect(),
         }
     }
 
     /// The summary of an encoder whose commands do not run (`CommandBuffer::commit_failed`): its
-    /// fences' waits and updates alone, as [`of_fences`](Self::of_fences) makes them.
+    /// fences' waits and updates alone, in every stage, as [`of_fences`](Self::of_fences) makes
+    /// them.
     pub(super) fn fences_only(&self) -> Summary<K> {
-        Summary::of_fences(self.waits.clone(), self.updates.clone())
+        let fences = |uses: &[FenceUse<K>]| uses.iter().map(|used| used.fence).collect();
+        Summary::of_fences(fences(&self.waits), fences(&self.updates))
     }
 
     /// The resources of the tracked uses, in order, each once per range.
@@ -1387,15 +1702,11 @@ impl<K: Copy + Ord> Summary<K> {
             }
         }
         self.uses.sort_by_key(|used| used.key);
-        for fence in other.waits {
-            if !self.waits.contains(&fence) {
-                self.waits.push(fence);
-            }
+        for used in other.waits {
+            add_fence(&mut self.waits, used);
         }
-        for fence in other.updates {
-            if !self.updates.contains(&fence) {
-                self.updates.push(fence);
-            }
+        for used in other.updates {
+            add_fence(&mut self.updates, used);
         }
     }
 }
@@ -1436,8 +1747,12 @@ impl<K: Copy + Ord> Footprint<K> {
         };
         for summary in summaries {
             footprint.uses.extend(summary.uses.iter().cloned());
-            footprint.waits.extend(&summary.waits);
-            footprint.updates.extend(&summary.updates);
+            footprint
+                .waits
+                .extend(summary.waits.iter().map(|used| used.fence));
+            footprint
+                .updates
+                .extend(summary.updates.iter().map(|used| used.fence));
         }
         footprint.uses.sort_by_key(|used| used.key);
         footprint
@@ -1498,7 +1813,8 @@ pub(super) fn ordered<K: Copy + Ord>(
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(PartialEq))]
 struct FenceUpdate {
-    /// The stages it covers: the updating encoder's, and those of the fences it waited for.
+    /// The stages it covers: those of the updating encoder's the call names
+    /// ([`FenceUse::covered`]), and those of the fences it waited for.
     stages: vk::PipelineStageFlags2,
     /// The batch of the updating encoder.
     at: Point,
@@ -1517,6 +1833,9 @@ pub(super) struct Tracker<K> {
     /// Lists a plan applied before gave back, cleared, for the next plans to fill
     /// ([`Spares`]).
     spares: Spares<K>,
+    /// Every batch ends with [`Barrier::to_all`], so the accesses of earlier batches of a
+    /// `VkQueue` need no barrier there ([`Tracker::by_ends`]).
+    by_ends: bool,
 }
 
 /// A resource or a fence an applied plan touched ([`Tracker::touched`]).
@@ -1585,6 +1904,7 @@ impl<K> Default for Tracker<K> {
             completed: Vec::new(),
             touched: Vec::new(),
             spares: Spares::default(),
+            by_ends: false,
         }
     }
 }
@@ -1700,6 +2020,26 @@ impl<K> Plan<K> {
     }
 }
 
+impl<K> Tracker<K> {
+    /// A tracker of a device whose batches each end with [`Barrier::to_all`] (`batch_order.rs`):
+    /// it plans no barrier after an access of an earlier batch of the same `VkQueue`.
+    pub(super) fn by_ends() -> Tracker<K> {
+        Tracker {
+            by_ends: true,
+            ..Tracker::default()
+        }
+    }
+
+    /// The value below which the batches of `at`'s queue are ordered by their ends: `at`'s own
+    /// where every batch ends with [`Barrier::to_all`], else 0.
+    fn since(&self, at: Point) -> u64 {
+        match self.by_ends {
+            true => at.value,
+            false => 0,
+        }
+    }
+}
+
 impl<K: Copy + Ord + Hash> Tracker<K> {
     /// Every batch of `queue` through timeline value `value` completed, and the host saw it: the
     /// state forgets what they did. Only the resources and fences those batches touched are looked
@@ -1758,6 +2098,7 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
     where
         K: 'a,
     {
+        let since = self.since(at);
         let spares = &mut self.spares;
         let PlanLists {
             barriers,
@@ -1780,24 +2121,30 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
             let alone = plan.barriers.is_empty() && encoders.peek().is_none();
             let mut barrier = Barrier::default();
             let mut waited = vk::PipelineStageFlags2::NONE;
-            for fence in &summary.waits {
+            for wait in &summary.waits {
+                let fence = &wait.fence;
                 let update = plan.fences.get(fence).or_else(|| self.fences.get(fence));
                 if let Some(update) = update {
                     waited |= update.stages;
+                    // The stages the call names wait, and the encoder's work outside its draws.
+                    let stages = wait.covered(summary.stages);
                     if update.at.queue == at.queue {
-                        barrier.add(
-                            Access::new(update.stages, vk::AccessFlags2::MEMORY_WRITE),
-                            Access::new(
-                                summary.stages,
-                                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-                            ),
-                        );
+                        // An update of a batch ordered by its end needs nothing.
+                        if update.at.value >= since {
+                            barrier.add(
+                                Access::new(update.stages, vk::AccessFlags2::MEMORY_WRITE),
+                                Access::new(
+                                    stages,
+                                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                                ),
+                            );
+                        }
                     } else {
                         add_wait(
                             &mut plan.waits,
                             Wait {
                                 at: update.at,
-                                stages: summary.stages,
+                                stages,
                             },
                         );
                     }
@@ -1815,8 +2162,8 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
                 }
             }
             let needs = match alone {
-                true => depend(&self.resources, &summary.uses, at),
-                false => depend(&plan.resources, &summary.uses, at),
+                true => depend(&self.resources, &summary.uses, (at, since)),
+                false => depend(&plan.resources, &summary.uses, (at, since)),
             };
             barrier.add(needs.barrier.src, needs.barrier.dst);
             for wait in needs.waits {
@@ -1827,9 +2174,9 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
                 true => plan.uses.extend(summary.uses.iter().cloned()),
                 false => admit(&mut plan.resources, &summary.uses, barrier, &plan.waits, at),
             }
-            for &fence in &summary.updates {
-                let stages = summary.stages | waited;
-                plan.fences.insert(fence, FenceUpdate { stages, at });
+            for update in &summary.updates {
+                let stages = update.covered(summary.stages) | waited;
+                plan.fences.insert(update.fence, FenceUpdate { stages, at });
             }
             plan.barriers.push(barrier);
         }

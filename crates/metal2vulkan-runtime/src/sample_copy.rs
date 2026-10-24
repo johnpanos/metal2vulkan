@@ -32,14 +32,14 @@
 //! them and a colour texture of another format through a view, not its broken temporary buffer.
 //! The plane draws are exact; the bits draws read each sample as the lanes' readbacks do; the
 //! `FragDepth` draw is exact only where the driver stores every depth unchanged
-//! (`depth_copy::copies_exactly`: lavapipe). Where the driver's fragment depth is measured to
-//! change some values (`depth_copy::drawn`: MoltenVK, NVIDIA's), a copy into a
-//! 32-bit float depth runs as a near-equivalent, announced once (`drawn-depth-copy`, its reason
-//! naming the values that change; the orchestrator's ruling of 2026-10-07). Refused as before,
-//! `Unsupported` naming `Feature::Format` and the missing maintenance8 or the defect: a copy
-//! into a 32-bit float depth on any other driver, every copy of a 16-bit depth, whose
-//! conversions the draws would make (unmeasured), a depth or stencil source the draws cannot
-//! sample, and a destination they cannot render to.
+//! (`depth_copy::copies_exactly`: lavapipe's measured releases). Elsewhere a copy into a 32-bit
+//! float depth runs as a near-equivalent, announced once (`drawn-depth-copy`, `depth_copy::drawn`):
+//! its reason names the values the driver's fragment depth is measured to change (MoltenVK,
+//! NVIDIA's; the orchestrator's ruling of 2026-10-07), or, on a driver not measured, the values
+//! Vulkan leaves to it (outside `[0, 1]`, denormals, -0). Refused as before, `Unsupported` naming
+//! `Feature::Format` and the missing maintenance8 or the defect: every copy of a 16-bit depth,
+//! whose conversions the draws would make (unmeasured), a depth or stencil source the draws
+//! cannot sample, and a destination they cannot render to.
 //!
 //! Refused, typed, naming `Feature::Format`: a copy of a combined format's two aspects (not
 //! implemented); on a device whose copies go by draws, what the draws cannot copy (above); and
@@ -60,6 +60,7 @@ use super::texture_descriptor::TextureDescriptor;
 use super::tracker::{Access, Barrier, Use};
 use super::values::ResourceOptions;
 use super::Device;
+use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::device::FormatUsage;
 use metal2vulkan::error::{Capability, Feature, Unsupported};
@@ -293,7 +294,7 @@ fn by_copies(
 /// `extent` and `layers`, through which the draws copy: rendered, sampled and copied both ways,
 /// and mutable, so a copy between it and a colour texture of another format of its texel size
 /// goes through a view on MoltenVK (the module docs). Refused where the device does not make it.
-fn bits_image(
+pub(super) fn bits_image(
     maker: &CommandBuffer,
     (format, pixel_format): (Format, PixelFormat),
     samples: u32,
@@ -400,9 +401,9 @@ fn by_draws(
     } else if to.aspect == stencil {
         Some((Format::R8_UINT, PixelFormat::R8Uint))
     } else if to.aspect == depth && depth_copy::float_depth(to.format) {
-        // Exact where the driver stores every depth unchanged; elsewhere, where what its
-        // fragment depth changes is measured, the announced near-equivalent (the one decision,
-        // `depth_copy::drawn`).
+        // Exact where the driver stores every depth unchanged; elsewhere the announced
+        // near-equivalent, naming what the driver's fragment depth changes or may change (the one
+        // decision, `depth_copy::drawn`).
         if let Drawn::Changes(changes) = depth_copy::drawn(device, to.format).ok_or_else(refuse)? {
             inexact = Some(changes);
         }
@@ -540,7 +541,7 @@ impl SampleCopy {
     /// rest in `GENERAL`; the regions lie in them, each copy's images have one sample count and
     /// formats Vulkan lets it copy between, and each draw's targets are as it was made for
     /// (planned above).
-    pub(super) unsafe fn record(&self, device: &ash::Device, raw: vk::CommandBuffer) {
+    pub(super) unsafe fn record(&self, device: &Vk, raw: vk::CommandBuffer) {
         let general = vk::ImageLayout::GENERAL;
         let phases = self.phases.iter().filter(|phase| !phase.is_empty());
         // SAFETY: the caller's contract above.

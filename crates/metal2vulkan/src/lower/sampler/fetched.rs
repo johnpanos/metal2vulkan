@@ -8,8 +8,8 @@
 //! - NVIDIA's gathers;
 //! - ANV's nearest samples;
 //!
-//! and `OpImageFetch` and `OpImageRead` keep it on RADV, ANV, NVIDIA and lavapipe (EVs
-//! MSFZ-dnp-*, `runtime_lane::depth_compares`). Metal's sample and gather keep it.
+//! and `OpImageFetch` and `OpImageRead` keep it on RADV, ANV, NVIDIA and lavapipe
+//! (`runtime_lane::depth_compares`). Metal's sample and gather keep it.
 //!
 //! **How.** Where Metal's footprint and level are known (`plan`), the shader fetches the texels
 //! through `bicubic::footprint`:
@@ -123,7 +123,7 @@ pub enum FetchLevel {
     /// kernel's bias (`None`: level 0), clamped into the texture's levels (`level::word_level`):
     /// under a nearest mip filter the level Metal's rule reads, clamped into the levels the word's
     /// level clamp leaves; level 0 without a mip filter. Metal reads a comparison's level through
-    /// such a sampler as a sample's (EV TXN-cmplvl2-m4).
+    /// such a sampler as a sample's.
     Word(Option<ValueId>),
     /// A linear mip filter's two levels (`compared::blended`): of the level the constexpr sampler's
     /// snap hands the device for the sample's level or a kernel's bias (`None`: level 0), clamped
@@ -288,7 +288,7 @@ pub(super) fn select(
 /// class is a 16-bit float one: where the NaN switch asks for Metal's NaN
 /// (`NanMinMaxPolicy::Exact`, the profile's `TexelNanRoute::Metal`) on a device without Metal's
 /// own sampler. Metal's gather hands back a 16-bit float texel's own NaN; a device's gather need
-/// not (NVIDIA's hands back every NaN as `0x7fffffff`, EV `NKP-lane1-nv3090`), and its fetch does
+/// not (NVIDIA's hands back every NaN as `0x7fffffff`), and its fetch does
 /// where its read does.
 fn half_gather(cx: &SelectCx<'_>, op: &SampleOp, form: Option<TexelForm>) -> bool {
     use crate::device::profile::TexelNanRoute;
@@ -329,7 +329,7 @@ pub(super) fn plan(
     let constant = |offset: &Option<Offset>| match offset {
         None => Some(None),
         Some(Offset::Const(k)) => Some(Some(k.clone())),
-        Some(Offset::Dynamic(_)) => None,
+        Some(Offset::Dynamic(..)) => None,
     };
     let (offset, level) = match op {
         SampleOp::Gather { offset, .. } => match constant(offset) {
@@ -427,7 +427,7 @@ pub(super) fn plan_word(op: &SampleOp, address: FetchAddress) -> Option<Fetch> {
     let offset = match offset {
         None => None,
         Some(Offset::Const(k)) => Some(k.clone()),
-        Some(Offset::Dynamic(_)) => return None,
+        Some(Offset::Dynamic(..)) => return None,
     };
     Some(Fetch {
         address,

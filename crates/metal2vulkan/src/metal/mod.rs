@@ -374,6 +374,26 @@ impl TextureSwizzleChannels {
             a: channel(3, self.alpha),
         }
     }
+
+    /// This swizzle of the texel `(0, 0, 0, a)` an `A8Unorm` texture buffer reads, as a swizzle
+    /// of the texel `(a, 0, 0, 1)` its bytes' `R8_UNORM` view reads
+    /// (`metal::format::texel_buffer_alpha_in_red`): each channel taken from red, green or blue is
+    /// zero, one taken from alpha the view's red, and `Zero` and `One` stay.
+    pub(crate) fn alpha_in_red(self) -> TextureSwizzleChannels {
+        let held = |s: TextureSwizzle| match s {
+            TextureSwizzle::Red | TextureSwizzle::Green | TextureSwizzle::Blue => {
+                TextureSwizzle::Zero
+            }
+            TextureSwizzle::Alpha => TextureSwizzle::Red,
+            constant => constant,
+        };
+        TextureSwizzleChannels {
+            red: held(self.red),
+            green: held(self.green),
+            blue: held(self.blue),
+            alpha: held(self.alpha),
+        }
+    }
 }
 
 impl Default for TextureSwizzleChannels {
@@ -383,7 +403,7 @@ impl Default for TextureSwizzleChannels {
 }
 
 /// `textureWriteRoundingMode`, Apple's SPI on the pipeline descriptors: how a render pipeline
-/// state's `float` writes to half-float channels round (EV TXN2-twr-m4 on an M4 under macOS 27.0.1,
+/// state's `float` writes to half-float channels round (on an M4 under macOS 27.0.1,
 /// and the consumer's measurement on an M3 Max under macOS 26.7). Metal's raw 0 (the getter's
 /// default) and 1 write as a state made without it: toward zero; 2 rounds a render state's
 /// half-float color attachments, blended or not, and the half-float textures its fragment function
@@ -406,7 +426,7 @@ impl TextureWriteRoundingMode {
     /// The mode of Metal's raw value `raw`, where `supportsTextureWriteRoundingMode:` answers
     /// yes (0 to 2); a larger one is `InvalidDescriptor(UnknownEnumValue)`, where Metal's pipeline
     /// creation stops at its descriptor validation ("device does not support Unknown", with or
-    /// without the debug layer: EV TXN2-twr-m4).
+    /// without the debug layer).
     pub fn from_raw(raw: u64) -> Result<TextureWriteRoundingMode, crate::error::Error> {
         match raw {
             0 | 1 => Ok(TextureWriteRoundingMode::TowardZero),

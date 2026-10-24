@@ -39,7 +39,7 @@ use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
 use crate::pipeline::facts::{RuntimeFact, UniformViewChoice};
 use crate::pipeline::interface::{BufferForm, DescriptorView, PushLoc, SlotInterface, Window};
 use crate::pipeline::sym::{
-    PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, Stage, Symbol,
+    PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage, Symbol,
 };
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, meter, typed_module, AssembleError,
@@ -290,6 +290,46 @@ fn a_bounded_constant_buffer_is_a_uniform_view() {
                 };
                 let out = run(&m, &Config::default(), res).expect("run");
                 assert_eq!(out.buffers[1][..4], [0xC3, 0, 0, 0], "{what} r={r}");
+            }
+        }
+    }
+}
+
+/// A uniform view's slot declares its `RangeAtBindOffset` specialization: where the binder states
+/// the range starts at the bind offset, the read takes the Metal offset alone, whatever the
+/// residual pushed (an alignment-checked binder pushes 0 there); elsewhere the residual plus the
+/// offset, as before. With `uniformBufferStandardLayout` (`u32[]`) and without (`uvec4[]`).
+#[test]
+fn a_uniform_view_read_at_its_bind_offset_drops_the_residual() {
+    let Some(bc) = assemble_file("buffer_end_byte_load_constant") else {
+        return;
+    };
+    let data = [9u8, 8, 7, 6, 5, 0xC3];
+    let key = SpecKey::RangeAtBindOffset(sref(0));
+    for stem in PROFILES {
+        for standard in [true, false] {
+            let what = format!("{stem} standard={standard}");
+            let p = profile_with(stem, true, standard);
+            let a = compile(&bc, "buffer_end_byte_load_constant", &p)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(a.interface.read_keys().contains(&key), "{what}");
+            let (plan, m) = typed_module(&bc, "buffer_end_byte_load_constant", &p).expect("module");
+            // The data at byte 0, a residual of 8 pushed: byte 5 when the range starts at the bind
+            // offset, byte 13 (the padding) when it does not.
+            for (at_bind, want) in [(1u64, 0xC3u8), (0, 0x44)] {
+                let mut ubo = bound(0, 0, &data, 0x44);
+                ubo.bytes.resize(512, 0x44);
+                let res = Resources {
+                    buffers: vec![ubo, bound(1, 0, &[0; 4], 0)],
+                    push: push_bytes(&plan, &[(0, 8)]),
+                    spec: [(key, at_bind)].into(),
+                };
+                let out = run(&m, &Config::default(), res).expect("run");
+                assert_eq!(
+                    out.buffers[1][..4],
+                    [want, 0, 0, 0],
+                    "{what} at_bind={at_bind}"
+                );
             }
         }
     }
@@ -1684,18 +1724,24 @@ fn profile_without(stem: &str, features: &[VkFeature]) -> DeviceProfile {
         .clone()
 }
 
-/// With typed narrow views (`u16[]` on `vk12-floor`, `u8[]` on the 2023 baseline, both on
-/// `moltenvk-m3`), every generated leaf kernel is exact in bounds and contained out of bounds at
-/// bind residuals that are not multiples of 4: a narrow unit's index follows the binder contract
-/// (descriptor base congruent to the Metal address modulo 4), and a sub-word store through a
-/// unit leaves its neighbours unchanged.
+/// With typed narrow views (`u16[]` on `moltenvk-m3` without 8-bit storage access, `u8[]` on the
+/// 2023 baseline, both on `moltenvk-m3`), every generated leaf kernel is exact in bounds and
+/// contained out of bounds at bind residuals that are not multiples of 4: a narrow unit's index
+/// follows the binder contract (descriptor base congruent to the Metal address modulo 4), and a
+/// sub-word store through a unit leaves its neighbours unchanged.
 #[test]
 fn narrow_units_are_exact_at_every_bind_residual() {
     let size = 32u64;
-    for stem in ["moltenvk-m3", "vk12-floor", "lunarg-desktop-baseline-2023"] {
-        let p = profile_with(stem, false, true);
+    const NO8: &[VkFeature] = &[VkFeature::StorageBuffer8BitAccess];
+    let profiles: [(&str, &[VkFeature]); 3] = [
+        ("moltenvk-m3", &[]),
+        ("moltenvk-m3", NO8),
+        ("lunarg-desktop-baseline-2023", &[]),
+    ];
+    for (stem, removed) in profiles {
+        let p = profile_without(stem, removed);
         for k in leaf_kernels() {
-            let what = format!("{stem} {}", k.name);
+            let what = format!("{stem} -{removed:?} {}", k.name);
             let Some(bc) = assemble_text(k.name, &leaf_kernel(&k)) else {
                 return;
             };
@@ -1786,7 +1832,8 @@ fn narrow_views_are_declared_where_the_profile_accesses_the_unit() {
     const ATOMIC_AND: u16 = 240;
     const ATOMIC_OR: u16 = 241;
     const NO16: &[VkFeature] = &[VkFeature::StorageBuffer16BitAccess];
-    let cases: [NarrowCase; 12] = [
+    const NO8: &[VkFeature] = &[VkFeature::StorageBuffer8BitAccess];
+    let cases: [NarrowCase; 14] = [
         ("moltenvk-m3", &[], "store_half", 2, 0, false),
         ("moltenvk-m3", &[], "store_i8", 2, 0, false),
         ("moltenvk-m3", &[], "store_uchar3", 3, 0, false),
@@ -1797,7 +1844,10 @@ fn narrow_views_are_declared_where_the_profile_accesses_the_unit() {
         // An under-aligned leaf joins words: no unit holds it.
         ("moltenvk-m3", &[], "store_i16_bytes", 1, 0, true),
         ("moltenvk-m3", NO16, "store_half", 1, 0, true),
-        ("vk12-floor", &[], "store_half", 2, 0, false),
+        ("moltenvk-m3", NO8, "store_half", 2, 0, false),
+        ("moltenvk-m3", NO8, "store_i8", 1, 0, true),
+        // The floor has no narrow storage access: every sub-word store joins its word.
+        ("vk12-floor", &[], "store_half", 1, 0, true),
         ("vk12-floor", &[], "store_i8", 1, 0, true),
         (
             "lunarg-desktop-baseline-2023",

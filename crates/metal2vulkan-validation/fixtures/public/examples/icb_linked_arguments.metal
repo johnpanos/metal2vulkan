@@ -1,11 +1,10 @@
-// Owned fixture (WP-RRS3, DESIGN D645): vertex, mesh and object functions that use a direct
+// Owned fixture: vertex, mesh and object functions that use a direct
 // texture or sampler argument, by where the value read goes once Metal links the pipeline, and the
 // fragment functions that read their varyings or drop them. Metal refuses a state that supports
 // indirect command buffers whose vertex or mesh function's texel reaches the position or another
 // built-in output, a varying the fragment function reads, a store, or a branch, switch or loop
 // trip count those depend on, and makes one whose texel reaches only a varying no fragment input
-// reads (EVs RRS3-icbtex7, -icbtex9 and -icbtex10, whose probes compile these bodies from source).
-// Written from scratch for the runtime lane;
+// reads (whose probes compile these bodies from source). Written from scratch for the runtime lane;
 // `scripts/regen-air-fixtures/regen-air-fixtures.sh --dir examples icb_linked_arguments` compiles
 // it. No translator sweep reads this directory.
 #include <metal_stdlib>
@@ -271,12 +270,11 @@ fragment float4 point_fragment(PointVaryings in [[stage_in]]) {
     return float4(0.25, 0.5, 0.75, 1.0);
 }
 
-// Fragment functions that use a direct texture (EVs RRS3-icbtex11 and -icbtex12): Metal refuses a
-// state that supports indirect command buffers where the texel reaches a side effect, a depth,
-// stencil or sample mask output, or a color channel its attachment writes, and makes one where it
-// reaches only a color the pipeline has no attachment for, a channel the write mask leaves out, or
-// a dual-source second color without blending.
-// The texel is the color.
+// Fragment functions that use a direct texture: Metal refuses a state that supports indirect
+// command buffers where the texel reaches a side effect, a depth, stencil or sample mask output, or
+// a color channel its attachment writes, and makes one where it reaches only a color the pipeline
+// has no attachment for, a channel the write mask leaves out, or a dual-source second color without
+// blending. The texel is the color.
 fragment float4 texel_fragment(Varyings in [[stage_in]], texture2d<float> tint [[texture(0)]]) {
     return tint.read(uint2(1, 0));
 }
@@ -377,7 +375,7 @@ fragment StencilOutput stencil_fragment(Varyings in [[stage_in]],
 }
 
 // The varying decides a branch whose arms (too costly to speculate) compute the color: with a
-// color attachment its pipeline keeps the read through the branch (DESIGN D645 item 14).
+// color attachment its pipeline keeps the read through the branch.
 fragment float4 branching_fragment(Varyings in [[stage_in]],
                                    device const float4* weights [[buffer(0)]]) {
     if (in.color.x > 0.5) {
@@ -387,7 +385,7 @@ fragment float4 branching_fragment(Varyings in [[stage_in]],
 }
 
 // The varying is the color alone, beside a second color from a constant: with only attachment 1,
-// the read is dropped (DESIGN D645 item 14).
+// the read is dropped.
 fragment TwoColors varying_first_color_fragment(Varyings in [[stage_in]]) {
     TwoColors out;
     out.first = in.color;
@@ -473,8 +471,7 @@ struct Payload {
     }
 }
 
-// Writes its vertices' positions alone: a fragment function's `color` is unwritten (DESIGN D645
-// item 16).
+// Writes its vertices' positions alone: a fragment function's `color` is unwritten.
 struct PositionMeshVertex {
     float4 position [[position]];
 };
@@ -494,7 +491,7 @@ using PositionMesh = metal::mesh<PositionMeshVertex, void, 3, 1, topology::trian
 }
 
 // A post-tessellation vertex function writing its position alone: a fragment function's `color`
-// is unwritten (DESIGN D645 item 16).
+// is unwritten.
 [[patch(triangle, 3)]] vertex float4 post_tess_vertex(float3 bary [[position_in_patch]]) {
     return float4(bary, 1.0);
 }

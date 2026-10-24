@@ -1,10 +1,8 @@
 //! `command_buffer/gate.rs`: a command buffer's waiters return once it finished and every
-//! runtime thread let go of it, and a hold lets go of its value before the gate opens; and what a
-//! scheduler pass spent (`scheduler::Spent`) lets go of its logs before its holds.
+//! runtime thread let go of it, and a hold lets go of its value before the gate opens.
 
 use crate::command_buffer::gate::{Exiting, Gate, Hold};
 use crate::error::{DeadlockCause, Error, TimedOut};
-use crate::scheduler::Spent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -145,25 +143,42 @@ fn a_wait_once_the_process_is_exiting_is_refused_for_that_cause() {
     assert_eq!(gate.wait_unless(|| true), Ok(()));
 }
 
-/// What a scheduler pass spent lets go of its logs before its holds: with the command buffer
-/// finished, its last hold opens the gate, and a log, which holds handles of what the command
-/// buffer's encoders named, going after it would go after the waiters returned (a no-copy
-/// buffer's deallocator then ran on the scheduler's thread, after the program let go of the
-/// buffer: `runtime_lane::rebinds` under load).
+/// A gate is awaited only while a thread is blocked in `wait` or `wait_until`, whichever way the
+/// wait ends: what the finishing thread does before its hold goes delays only such a thread.
 #[test]
-fn a_pass_lets_go_of_its_logs_before_its_holds() {
-    let (log, gate, gone, gone_while_open) = probe();
-    let value = Arc::new(());
-    let mut spent = Spent::<Arc<Probe>, Hold<()>>::default();
-    spent.logs.push(log);
-    spent.buffers.push(Hold::new(&value, &gate));
+fn a_gate_is_awaited_while_a_thread_is_blocked_on_it() {
+    let gate = Arc::new(Gate::default());
+    let value = Arc::new(7_u32);
+    assert!(!gate.awaited());
+    assert_eq!(gate.wait_until(Instant::now()), Err(TimedOut));
+    assert!(!gate.awaited(), "a wait that timed out is not counted");
+    let held = Hold::new(&value, &gate);
+    let waiters: Vec<_> = (0..2)
+        .map(|n| {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || match n {
+                0 => gate.wait().is_ok(),
+                _ => gate
+                    .wait_until(Instant::now() + Duration::from_secs(60))
+                    .is_ok(),
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.awaited() {
+        assert!(Instant::now() < deadline, "no waiter blocked");
+        std::thread::yield_now();
+    }
     gate.finish();
-    assert!(!gate.is_open());
-    drop(spent);
-    assert!(gone.load(Ordering::SeqCst));
     assert!(
-        !gone_while_open.load(Ordering::SeqCst),
-        "a log went after the hold opened the gate"
+        gate.awaited(),
+        "the gate is not open while the hold is alive"
     );
-    assert!(gate.is_open());
+    drop(held);
+    for waiter in waiters {
+        assert!(waiter.join().unwrap());
+    }
+    assert!(!gate.awaited());
+    assert_eq!(gate.wait(), Ok(()));
+    assert!(!gate.awaited(), "a wait of an open gate is not counted");
 }

@@ -2,16 +2,23 @@
 //! render encoder's tessellation factor buffer, offset, instance stride and scale, direct and
 //! indirect patch draws, and Metal's refusals of them.
 //!
-//! The draws, as RT6 Metal probe 11 drew them: the owned fixture `k7_tess_triangle_domain`, with
-//! rasterization disabled in a 1x1 pass without attachments, marks the 65x65 cell of every domain
-//! point of the triangle patches it draws, its per-patch grid 64 by 64 (integer partitioning,
-//! half factors, a maximum factor of 64). Each case sets the factors and draws; the cells it
-//! marked are Metal's. A factor of 1 marks the patch's corners, and 2 and 3 more points, so the
-//! marks say which factors each patch read. The refusals are RT6 Metal probe 10's.
+//! The draws, as a Metal probe on an M4 drew them: the owned fixture `k7_tess_triangle_domain`,
+//! with rasterization disabled in a 1x1 pass without attachments, marks the 65x65 cell of every
+//! domain point of the triangle patches it draws, its per-patch grid 64 by 64 (integer
+//! partitioning, half factors, a maximum factor of 64). Each case sets the factors and draws; the
+//! cells it marked are Metal's. A factor of 1 marks the patch's corners, and 2 and 3 more points,
+//! so the marks say which factors each patch read. The refusals are those of another Metal probe on
+//! an M4.
+//!
+//! Each test runs on the device as the cfg opens it, through its tessellation stages ([`Path`]),
+//! and on the device made without `tessellationShader`, whose patch draws the runtime emulates
+//! (`render/tessellation_scan.rs`): the same marks, and the emulation announced once
+//! ([`EMULATED_TESSELLATION`]).
 
-use super::{buffer_with, read_buffer, validated_device, Messages, ScratchCache, WAIT};
+use super::{buffer_with, read_buffer, validated_device_with, Messages, ScratchCache, WAIT};
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
+use metal2vulkan::device::VkFeature;
 use metal2vulkan::metal::{
     PrimitiveType, TessellationFactorStepFunction, TessellationPartitionMode, VertexFormat,
     VertexStepFunction,
@@ -20,12 +27,98 @@ use metal2vulkan::pipeline::{
     RenderPipelineDescriptor, StageSource, TessellationDescriptor, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor, VertexDescriptor,
 };
+use metal2vulkan::vk::DriverId;
 use metal2vulkan_devtools::{engine_dir, llvm_assemble};
 use metal2vulkan_runtime::{
-    Buffer, CommandBuffer, CommandBufferStatus, CommandQueue, Device, DrawProblem, Error, Function,
-    Invalid, PipelineOptions, Problem, RenderCommandEncoder, RenderPassDescriptor,
-    RenderPipelineState,
+    Buffer, CommandBuffer, CommandBufferStatus, CommandQueue, Degradation, Device, DeviceOptions,
+    DrawProblem, Error, Function, Invalid, PipelineOptions, Problem, RenderCommandEncoder,
+    RenderPassDescriptor, RenderPipelineState,
 };
+
+/// The kind a device without `tessellationShader` takes for its patch draws, which the runtime
+/// emulates (`render/tessellation_scan.rs`).
+pub(super) const EMULATED_TESSELLATION: [Degradation; 1] = [Degradation::EmulatedTessellationDraws];
+
+/// Which tessellation a lane test's device draws patches through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Path {
+    /// The device as the cfg opens it: its tessellation stages where it has `tessellationShader`,
+    /// else its refusal.
+    Native,
+    /// The device made without `tessellationShader` (and `multiviewTessellationShader`): the
+    /// runtime's emulation.
+    Emulated,
+}
+
+/// The device options of `path`: the emulated path's withholds `tessellationShader` and
+/// `multiviewTessellationShader`.
+pub(super) fn options_of(path: Path) -> impl FnOnce(&mut DeviceOptions) {
+    move |options| {
+        if path == Path::Emulated {
+            options.withheld_features.extend([
+                VkFeature::TessellationShader,
+                VkFeature::MultiviewTessellationShader,
+            ]);
+        }
+    }
+}
+
+/// `check` on the lane device of `path` and its name; then the validation layer was silent, on
+/// the emulated path the device announced the emulation once, and the device's triangle order
+/// (`tessellation-triangle-order`) was announced at most once, only on the native path of a
+/// device whose tessellator is not Apple's (MoltenVK on an Apple GPU hands the patches to Metal's):
+/// the emulation draws Metal's order.
+pub(super) fn on_path(path: Path, check: impl FnOnce(Device, &str)) {
+    let cache = ScratchCache::new().unwrap();
+    let messages = Messages::default();
+    let apple_tessellator;
+    {
+        let device =
+            validated_device_with(TEST_DEVICE, &messages, cache.path(), options_of(path)).unwrap();
+        let description = &device.properties().description;
+        apple_tessellator =
+            description.driver_id == Some(DriverId::MOLTENVK) && description.vendor_id == 0x106B;
+        let name = device.name().to_owned();
+        check(device, &name);
+    }
+    let notices = messages.take_notices();
+    let announced = |kind: Degradation| {
+        notices
+            .iter()
+            .filter(|m| {
+                m.degradation
+                    .as_ref()
+                    .is_some_and(|d| d.degradation == kind)
+            })
+            .count()
+    };
+    if path == Path::Emulated {
+        let emulated: usize = EMULATED_TESSELLATION.iter().map(|&k| announced(k)).sum();
+        assert_eq!(emulated, 1, "the emulation's notice");
+    }
+    let order = announced(Degradation::TessellationTriangleOrder);
+    if path == Path::Emulated || apple_tessellator {
+        assert_eq!(order, 0, "the triangle order on {path:?}");
+    } else {
+        assert!(order <= 1, "the triangle order announced {order} times");
+    }
+    let reported = messages.take();
+    assert!(
+        reported.is_empty(),
+        "the validation layer reported: {reported:#?}"
+    );
+}
+
+/// `error`, a refusal of the fixture's pipeline, which only the native path may answer (on a
+/// device that cannot make it); the emulation on a lane device never does.
+fn refusal_allowed(path: Path, name: &str, error: Error) -> Error {
+    assert_eq!(
+        path,
+        Path::Native,
+        "on {name} the emulation refused: {error}"
+    );
+    error
+}
 
 /// The fixture's marks buffer: a word per cell of the 65x65 grid, then three per cell.
 pub(super) const MARK_WORDS: usize = 4225 * 4;
@@ -272,7 +365,7 @@ pub(super) fn cells(marks: &Buffer) -> Vec<u32> {
         .collect()
 }
 
-/// The cells of a patch of factors 1: its three corners (RT6 Metal probe 11).
+/// The cells of a patch of factors 1: its three corners (a Metal probe on an M4).
 pub(super) const CORNERS: &[u32] = &[0, 64, 4160];
 
 /// The cells of a patch of factors 2: the corners, the edges' midpoints and the centre.
@@ -281,13 +374,13 @@ pub(super) const TWOS: &[u32] = &[0, 32, 64, 1386, 2080, 2112, 4160];
 /// The cells of a patch of factors 3.
 const THREES: &[u32] = &[0, 21, 43, 64, 924, 946, 1365, 1408, 2354, 2795, 2816, 4160];
 
-/// The `digest` of a patch of the maximum factor, 64, as Metal marked it (EVs ICBV-scale-m3 and
-/// -m4, and ICBV-scale2-m3 and -m4 for the host's scale: their probe's grid is the fixture's, its
-/// digests of factors 1, 2 and 3 those of `CORNERS`, `TWOS` and `THREES`).
+/// The `digest` of a patch of the maximum factor, 64, as Metal marked it (for the host's scale:
+/// their probe's grid is the fixture's, its digests of factors 1, 2 and 3 those of `CORNERS`,
+/// `TWOS` and `THREES`).
 pub(super) const MAXIMUM: (usize, u32) = (1815, 0xb267_fce1);
 
 /// The count of `cells` (each a cell's index, ascending) and the FNV-1a hash of their indices'
-/// little-endian bytes, as the probe of EVs ICBV-scale-m3 and -m4 printed them.
+/// little-endian bytes, as our probes printed them.
 pub(super) fn digest(cells: &[u32]) -> (usize, u32) {
     let hash = cells
         .iter()
@@ -298,9 +391,9 @@ pub(super) fn digest(cells: &[u32]) -> (usize, u32) {
     (cells.len(), hash)
 }
 
-/// Each case and the cells Metal marked (RT6 Metal probe 11, an M4 with macOS 27.0.1, with and
-/// without Metal's API validation). A pipeline that enables the scale culls every patch until a
-/// scale is set; one that does not ignores the scale.
+/// Each case and the cells Metal marked (a Metal probe on an M4 with macOS 27.0.1, with and without
+/// Metal's API validation). A pipeline that enables the scale culls every patch until a scale is
+/// set; one that does not ignores the scale.
 fn cases() -> Vec<(Case, &'static [u32])> {
     use TessellationFactorStepFunction as S;
     let two_values: &'static [u16] = &[ONE, TWO];
@@ -405,8 +498,8 @@ fn cases() -> Vec<(Case, &'static [u32])> {
             },
             CORNERS,
         ),
-        // The scale rounded to `half` (EVs ICBV-scale2-m3 and -m4): 1.3 and 2.0005 are 2-ish
-        // `half`s, 10^-6 and 2^-24 subnormal ones, and 2^-30 is 0.
+        // The scale rounded to `half`: 1.3 and 2.0005 are 2-ish `half`s, 10^-6 and 2^-24 subnormal
+        // ones, and 2^-30 is 0.
         (
             Case {
                 scale_enabled: true,
@@ -497,10 +590,10 @@ fn cases() -> Vec<(Case, &'static [u32])> {
             },
             CORNERS,
         ),
-        // Factors at the edges of Metal's rules (EVs ICBV-scale2-m3/-m4, ICBV-scale3-m3/-m4): a
-        // subnormal edge factor draws, unscaled or scaled; a product below `half`'s least
-        // subnormal does not cull; an inside factor that is NaN or 0 takes the lower end, which
-        // beside edges of 2 Vulkan's and Metal's tessellators both draw as 2.
+        // Factors at the edges of Metal's rules: a subnormal edge factor draws, unscaled or scaled;
+        // a product below `half`'s least subnormal does not cull; an inside factor that is NaN or 0
+        // takes the lower end, which beside edges of 2 Vulkan's and Metal's tessellators both draw
+        // as 2.
         (
             Case {
                 scale_enabled: true,
@@ -574,7 +667,7 @@ fn cases() -> Vec<(Case, &'static [u32])> {
             TWOS,
         ),
         // Factors 0x47f3 by the `half` 0x3007: 1.000445 in `float`, two segments, where the
-        // product rounded to `half` would be 1.0, one (EVs ICBV-scale3-m3 and -m4): Metal does not
+        // product rounded to `half` would be 1.0, one: Metal does not
         // round it.
         (
             Case {
@@ -619,7 +712,7 @@ fn cases() -> Vec<(Case, &'static [u32])> {
             },
             &[],
         ),
-        // What Metal's validation stops and plain Metal draws (RT6 Metal probe 10, an M4): other
+        // What Metal's validation stops and plain Metal draws (a Metal probe on an M4): other
         // control points than the function's draw with its own, direct and indirect; no instances
         // or patches draw nothing; a scale of 0 or -1 culls where the pipeline enables it and is
         // ignored where it does not.
@@ -685,10 +778,10 @@ fn cases() -> Vec<(Case, &'static [u32])> {
             },
             CORNERS,
         ),
-        // A factor offset of 2, which Metal's validation stops, read from that byte as plain
-        // Metal reads it (RT6 Metal probe 10 `factor_offset_2`: the factors 2 bytes past a 2-byte
-        // pad drew): factors of 2 after a `half` of 0, which a read from the offset rounded down
-        // to 0 would take as an edge, culling.
+        // A factor offset of 2, which Metal's validation stops, read from that byte as plain Metal
+        // reads it (Metal probe case `factor_offset_2` on an M4: the factors 2 bytes past a 2-byte
+        // pad drew): factors of 2 after a `half` of 0, which a read from the offset rounded down to
+        // 0 would take as an edge, culling.
         (
             Case {
                 halves: Some(&[0, TWO, TWO, TWO, TWO]),
@@ -742,12 +835,11 @@ fn cases() -> Vec<(Case, &'static [u32])> {
             },
             &[],
         ),
-        // Odd factor offsets, read from the byte below as plain Metal reads them (EV IRX-pat2-m4,
-        // the encoder's and a command's alike: 1 culled on the `half` of 0 at byte 0, 3 drew from
-        // byte 2), and odd strides, stepped by the multiple of 4 below (EV IRX-pat3-m4: 13 and 15
-        // culled where 12 does, 17 and 19 where 16 does): a read at 3 itself would straddle two
-        // `half`s; one at stride 7 itself, or at 6, would reach the zeros past the `half`s, and
-        // one at 15 or 14 the `half`s past the 0.
+        // Odd factor offsets, read from the byte below as plain Metal reads them (the encoder's and
+        // a command's alike: 1 culled on the `half` of 0 at byte 0, 3 drew from byte 2), and odd
+        // strides, stepped by the multiple of 4 below (13 and 15 culled where 12 does, 17 and 19
+        // where 16 does): a read at 3 itself would straddle two `half`s; one at stride 7 itself, or
+        // at 6, would reach the zeros past the `half`s, and one at 15 or 14 the `half`s past the 0.
         (
             Case {
                 halves: Some(&[0, TWO, TWO, TWO, TWO]),
@@ -790,14 +882,20 @@ fn cases() -> Vec<(Case, &'static [u32])> {
 /// Every case marks the cells Metal marked: the factors each patch read, at the encoder's offset,
 /// by the pipeline's step function from the draw's patch and instance (the base instance
 /// included), scaled where the pipeline enables it, and none for indirect arguments of no
-/// patches. A device without tessellation shaders refuses the pipeline, reported as its refusal.
+/// patches. A device that cannot make the fixture's pipeline refuses it, reported as its refusal.
 #[test]
 fn patch_draws_read_their_factors_as_metal() {
-    let cache = ScratchCache::new().unwrap();
-    let messages = Messages::default();
-    {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let name = device.name().to_owned();
+    read_their_factors_as_metal(Path::Native);
+}
+
+/// [`patch_draws_read_their_factors_as_metal`], emulated: no case refused.
+#[test]
+fn emulated_patch_draws_read_their_factors_as_metal() {
+    read_their_factors_as_metal(Path::Emulated);
+}
+
+fn read_their_factors_as_metal(path: Path) {
+    on_path(path, |device, name| {
         let lane = Lane::new(device);
         let mut answers = Vec::new();
         for (case, metal) in cases() {
@@ -807,32 +905,34 @@ fn patch_draws_read_their_factors_as_metal() {
                     answers.push(format!("{} Metal's", case.name));
                 }
                 Err(Error::Unsupported(u)) => {
+                    let u = refusal_allowed(path, name, Error::Unsupported(u));
                     answers.push(format!("{} refused, {u:?}", case.name));
                 }
                 Err(error) => panic!("{} on {name}: {error}", case.name),
             }
         }
-        eprintln!("patch draws on {name}: {}", answers.join("; "));
-    }
-    let reported = messages.take();
-    assert!(
-        reported.is_empty(),
-        "the validation layer reported: {reported:#?}"
-    );
+        eprintln!("patch draws on {name} ({path:?}): {}", answers.join("; "));
+    });
 }
 
 /// A scale that is infinite as a `half` (70000, as the largest `half`, 65504, and 64 do) takes
-/// the factors to the maximum, 64, as Metal's did (EVs ICBV-scale2-m3 and -m4: the digest
-/// `MAXIMUM`), and so does the `float` `+∞`, which Metal's validation stops at the setter and
-/// plain Metal takes (a probe `ts_inf_enabled`: the maximum factor's vertices). A device without
-/// tessellation shaders refuses the pipeline, reported as its refusal.
+/// the factors to the maximum, 64, as Metal's did (the digest `MAXIMUM`), and so does the `float`
+/// `+∞`, which Metal's validation stops at the setter and plain Metal takes (a probe
+/// `ts_inf_enabled`: the maximum factor's vertices). A device that cannot make the fixture's
+/// pipeline refuses it, reported as its refusal.
 #[test]
 fn a_scale_infinite_as_a_half_draws_the_maximum_factor() {
-    let cache = ScratchCache::new().unwrap();
-    let messages = Messages::default();
-    {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let name = device.name().to_owned();
+    scale_infinite_draws_the_maximum(Path::Native);
+}
+
+/// [`a_scale_infinite_as_a_half_draws_the_maximum_factor`], emulated.
+#[test]
+fn emulated_a_scale_infinite_as_a_half_draws_the_maximum_factor() {
+    scale_infinite_draws_the_maximum(Path::Emulated);
+}
+
+fn scale_infinite_draws_the_maximum(path: Path) {
+    on_path(path, |device, name| {
         let lane = Lane::new(device);
         for scale in [64.0, 65504.0, 70000.0, f32::INFINITY] {
             let case = Case {
@@ -843,30 +943,32 @@ fn a_scale_infinite_as_a_half_draws_the_maximum_factor() {
             match lane.marked(&case) {
                 Ok(cells) => assert_eq!(digest(&cells), MAXIMUM, "scale {scale} on {name}"),
                 Err(Error::Unsupported(u)) => {
+                    let u = refusal_allowed(path, name, Error::Unsupported(u));
                     eprintln!("the maximum scale on {name}: refused, {u:?}");
                     return;
                 }
                 Err(error) => panic!("scale {scale} on {name}: {error}"),
             }
         }
-    }
-    let reported = messages.take();
-    assert!(
-        reported.is_empty(),
-        "the validation layer reported: {reported:#?}"
-    );
+    });
 }
 
-/// An inside factor of `+∞` beside edge factors of 1 takes the maximum, 64, as Metal's did (EVs
-/// ICBV-scale3-m3 and -m4: 1689 cells, their indices' hash 0x540dbf35). A device without
-/// tessellation shaders refuses the pipeline, reported as its refusal.
+/// An inside factor of `+∞` beside edge factors of 1 takes the maximum, 64, as Metal's did (1689
+/// cells, their indices' hash 0x540dbf35). A device that cannot make the fixture's pipeline refuses
+/// it, reported as its refusal.
 #[test]
 fn an_infinite_inside_factor_draws_the_maximum_inside() {
-    let cache = ScratchCache::new().unwrap();
-    let messages = Messages::default();
-    {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let name = device.name().to_owned();
+    infinite_inside_draws_the_maximum(Path::Native);
+}
+
+/// [`an_infinite_inside_factor_draws_the_maximum_inside`], emulated.
+#[test]
+fn emulated_an_infinite_inside_factor_draws_the_maximum_inside() {
+    infinite_inside_draws_the_maximum(Path::Emulated);
+}
+
+fn infinite_inside_draws_the_maximum(path: Path) {
+    on_path(path, |device, name| {
         let lane = Lane::new(device);
         let case = Case {
             scale_enabled: true,
@@ -877,16 +979,12 @@ fn an_infinite_inside_factor_draws_the_maximum_inside() {
         match lane.marked(&case) {
             Ok(cells) => assert_eq!(digest(&cells), (1689, 0x540d_bf35), "on {name}"),
             Err(Error::Unsupported(u)) => {
+                let u = refusal_allowed(path, name, Error::Unsupported(u));
                 eprintln!("the infinite inside on {name}: refused, {u:?}")
             }
             Err(error) => panic!("on {name}: {error}"),
         }
-    }
-    let reported = messages.take();
-    assert!(
-        reported.is_empty(),
-        "the validation layer reported: {reported:#?}"
-    );
+    });
 }
 
 /// `Invalid` as Metal's validation stops the call: `problem` of `call`.
@@ -895,27 +993,34 @@ fn invalid(call: &'static str, problem: DrawProblem) -> Result<(), Error> {
 }
 
 /// What Metal's validation stops and plain Metal runs draws as plain Metal does (the cases' table
-/// pins what each draws); the rest is refused, typed, and a refused call changes nothing (RT6 Metal
-/// probe 10, an M4 with macOS 27.0.1). The setters take any factor offset and instance stride
+/// pins what each draws); the rest is refused, typed, and a refused call changes nothing (a Metal
+/// probe on an M4 with macOS 27.0.1). The setters take any factor offset and instance stride
 /// (`patch_draws_read_their_factors_as_metal` draws them) and every scale, which this pipeline, not
 /// enabling it, ignores; a patch draw is refused without a factor buffer, with a plain pipeline,
-/// with indirect arguments past the buffer, and a direct draw's patch indices past the buffer (RT6
-/// Metal probes 14 and 14b); a draw with other control points than the function's draws with its
+/// with indirect arguments past the buffer, and a direct draw's patch indices past the buffer
+/// (Metal probes on an M4); a draw with other control points than the function's draws with its
 /// own, one of no patches or instances draws nothing, as does a draw of primitives with the
 /// tessellation pipeline, and indirect arguments and a patch index buffer at an offset that is not
 /// a multiple of 4 are read from the offset rounded down. Each pass draws only patch 0 of factors
 /// 2, so it marks what that patch marks.
 #[test]
 fn patch_draws_answer_as_plain_metal_and_refuse_the_rest() {
-    let cache = ScratchCache::new().unwrap();
-    let messages = Messages::default();
-    {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let name = device.name().to_owned();
+    answer_as_plain_metal(Path::Native);
+}
+
+/// [`patch_draws_answer_as_plain_metal_and_refuse_the_rest`], emulated.
+#[test]
+fn emulated_patch_draws_answer_as_plain_metal_and_refuse_the_rest() {
+    answer_as_plain_metal(Path::Emulated);
+}
+
+fn answer_as_plain_metal(path: Path) {
+    on_path(path, |device, name| {
         let lane = Lane::new(device);
         let pipeline = match lane.pipeline(TessellationFactorStepFunction::PerPatch, false) {
             Ok(pipeline) => pipeline,
             Err(Error::Unsupported(u)) => {
+                let u = refusal_allowed(path, name, Error::Unsupported(u));
                 eprintln!("patch draw refusals on {name}: the pipeline is refused, {u:?}");
                 return;
             }
@@ -967,7 +1072,7 @@ fn patch_draws_answer_as_plain_metal_and_refuse_the_rest() {
             );
             assert_eq!(e.draw_primitives(PrimitiveType::Point, 0, 1, 1, 0), Ok(()));
             // A patch index buffer's offset off a multiple of 4 (read from 0, patch 0), and a
-            // direct draw's indices past the buffer (RT6 Metal probes 14 and 14b).
+            // direct draw's indices past the buffer (Metal probes on an M4).
             assert_eq!(e.draw_patches(1, 0, 1, Some(&index), 2, 1, 0), Ok(()));
             assert_eq!(
                 e.draw_patches_indirect(1, Some(&index), 2, &arguments, 0),
@@ -997,10 +1102,5 @@ fn patch_draws_answer_as_plain_metal_and_refuse_the_rest() {
             Ok(())
         })
         .unwrap();
-    }
-    let reported = messages.take();
-    assert!(
-        reported.is_empty(),
-        "the validation layer reported: {reported:#?}"
-    );
+    });
 }

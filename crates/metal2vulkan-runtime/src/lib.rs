@@ -30,9 +30,11 @@ mod amplification;
 mod apple_only;
 mod argument_encoder;
 mod argument_table;
+mod astc;
 mod attachment_stand_in;
 mod attachmentless;
 mod attributes;
+mod batch_order;
 mod binary_archive;
 mod binding;
 mod binding_view;
@@ -48,6 +50,7 @@ mod capabilities;
 mod chroma_pairs;
 mod clear_reach;
 mod clear_value;
+mod color_list;
 mod color_reformat;
 mod color_resolve;
 mod command_buffer;
@@ -78,6 +81,7 @@ mod dynamic_state;
 mod enables;
 mod encoder;
 mod error;
+mod etc;
 mod event;
 mod event_timeline;
 mod exactness;
@@ -95,6 +99,7 @@ mod fetch_reach;
 mod fill_value;
 mod fragment_imageblock;
 mod framebuffer_fetch;
+mod freed_memory;
 mod fresh_unwritten;
 mod function_table;
 #[doc(hidden)]
@@ -106,6 +111,9 @@ mod heap;
 mod heap_sets;
 mod host_aliases;
 mod host_memory;
+#[cfg(unix)]
+mod host_residency;
+mod image_barrier;
 mod image_plan;
 mod index_bounds;
 mod index_rewrite;
@@ -125,8 +133,8 @@ mod loaded;
 mod loader_word;
 mod managed;
 mod memory;
+mod memory_log;
 mod metal_level;
-mod metal_texture;
 mod mipmap;
 mod mipmap_filter;
 mod mipmap_pick;
@@ -135,18 +143,22 @@ mod mipmap_scratch;
 mod misplaced_notices;
 mod nan_clear;
 mod neutral;
+mod noted_apart;
 mod owned_kernel;
 mod pending_dispatch;
 mod pipeline;
 mod pixel_format_info;
 mod predication;
 mod private_properties;
+mod program_objects;
 mod pvrtc;
 mod queue;
 mod range;
 mod rate_map;
 mod rate_mapped_pass;
+mod reader_sizes;
 mod rebind;
+mod recorder;
 mod release;
 mod render;
 mod render_pass;
@@ -160,6 +172,7 @@ mod resource;
 mod resource_ids;
 mod retained;
 mod rotated;
+mod row_copies;
 mod sample_copy;
 mod sample_interleave;
 mod sample_planes;
@@ -169,6 +182,8 @@ mod sampler_listing;
 mod scheduler;
 mod shader_cache;
 mod shadow;
+mod shadow_copy_back;
+mod shadow_copy_in;
 mod shadow_merge;
 mod shadow_stencil;
 mod sharing;
@@ -176,11 +191,13 @@ mod sorted_chunks;
 mod spares;
 mod sparse;
 mod stencil_copy;
+mod storage_placeholder;
 mod tessellation;
 mod texture;
 mod texture_descriptor;
 mod tile_pass;
 mod tracker;
+mod trails;
 mod two_planes;
 mod unique_identifier;
 mod upload;
@@ -234,8 +251,8 @@ pub use error::Unproven;
 pub use error::{
     ArchivedPipeline, BinaryArchiveError, BinaryArchiveMiss, CommandBufferError, DeadlockCause,
     DriverSetting, Error, InstanceApiVersion, Invalid, LoaderNotFound, MemoryKind,
-    MeshRecordsOverflow, Problem, RuntimeGap, SamplerLimit, ShaderCacheError, TimedOut,
-    VkResultCode,
+    MeshRecordsOverflow, Problem, RuntimeGap, SamplerLimit, ShaderCacheError,
+    TessellationRecordsOverflow, TimedOut, VkResultCode,
 };
 pub use error::{FailedPipeline, FailedState, PipelineCreationCause};
 pub use event::{
@@ -281,6 +298,8 @@ pub use queue::CommandQueue;
 pub use rate_map::{RasterizationRateMap, RateMapProblem};
 pub use rate_mapped_pass::RegionRefusal;
 pub use rebind::RebindProblem;
+#[doc(hidden)]
+pub use recorder::CommandsReplayed;
 pub use render::{DrawProblem, RenderCommandEncoder, ResolveTarget};
 pub use render_pass::{
     Attachment, RenderPassColorAttachmentDescriptor, RenderPassDepthAttachmentDescriptor,
@@ -310,7 +329,6 @@ pub use values::{
 };
 pub use view_plan::ViewProblem;
 pub use visibility::{VisibilityProblem, VisibilityResultMode};
-#[doc(hidden)]
-pub use work_counts::WorkCounts;
+pub use work_counts::{CopySite, WorkCounts};
 pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
 pub use ycbcr::{IoSurfaceYCbCr, SurfaceYCbCrMatrix};

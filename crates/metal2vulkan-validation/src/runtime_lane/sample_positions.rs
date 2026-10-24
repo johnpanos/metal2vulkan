@@ -1,14 +1,14 @@
 //! Device tests of sample positions and the store action option that names them (the runtime's
 //! `sample_positions.rs`) on the device the cfg selects, under the validation layer.
 //!
-//! Each pass is one RT6 Metal probes 15, 15d and 15e measured (an M4 with macOS 27.0.1, each case
-//! with and without API validation): a target of one pixel whose triangle covers what lies left of
-//! a vertical edge, resolved. The probes drew white and read the resolved red; the lane draws
-//! through the owned fixture `rt6_restart` (its vertex function places each vertex where buffer 0
-//! holds it, its fragment function writes alpha 1) over a target cleared to zero, so the resolved
-//! alpha is the pixel's coverage. Each is compared as the number of covered samples, as Vulkan
-//! leaves a resolve's rounding to the device. What Metal's validation stops, the runtime refuses
-//! typed, and a pass Metal takes that the runtime has not built is refused `NotImplemented`.
+//! Each pass is one that Metal probes measured (an M4 with macOS 27.0.1, each case with and without
+//! API validation): a target of one pixel whose triangle covers what lies left of a vertical edge,
+//! resolved. The probes drew white and read the resolved red; the lane draws through the owned
+//! fixture `rt6_restart` (its vertex function places each vertex where buffer 0 holds it, its
+//! fragment function writes alpha 1) over a target cleared to zero, so the resolved alpha is the
+//! pixel's coverage. Each is compared as the number of covered samples, as Vulkan leaves a
+//! resolve's rounding to the device. What Metal's validation stops, the runtime refuses typed, and
+//! a pass Metal takes that the runtime has not built is refused `NotImplemented`.
 //!
 //! The passes with a depth or stencil attachment, and those of the store action
 //! `CustomSampleDepthStore`, are the Metal probe's: drawn through the owned fixture
@@ -283,7 +283,7 @@ fn the_samples_land_where_metal_puts_them() {
 }
 
 /// Fewer positions than the pass's samples, which Metal's validation stops, as plain Metal
-/// runs them (EV RRS-probe-4-m4, an M4: 2 positions in a pass of 4 samples put samples 2 and 3
+/// runs them (an M4: 2 positions in a pass of 4 samples put samples 2 and 3
 /// at the pixel's corner, (0, 0)): two positions at (0.75, 0.5) leave two samples covered left
 /// of an edge at 0.1 and at 0.5 (Metal's own positions, none and two), and two at (0.25, 0.5)
 /// all four left of 0.5. Refused where the device takes no custom positions at 2 or at 4.
@@ -1677,7 +1677,7 @@ fn custom_sample_depth_store_stores_as_store() {
     pass.depth_store = custom;
     pass.depth_resolve = Some(resolve);
     // As `Store` with a resolve texture: the texture is left untouched and the depth stored, as
-    // plain Metal does (EV RFX-probe2-m4).
+    // plain Metal does.
     assert_eq!(lane.run(&pass, |_| Ok(())), Ok(()), "csds_depth_resolve");
     let mut pass = DepthPass::new();
     pass.depth = Some(lane.texture(float, 4, true));

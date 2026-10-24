@@ -71,6 +71,54 @@ impl<I> Lines<I> {
         }
     }
 
+    /// Take `queue`'s line for the calling thread, where no thread runs it and `plain` holds for
+    /// each item it holds: those items, in order, which the caller runs before anything it runs
+    /// in the line itself; the line is running until [`Lines::done`]. `None` otherwise, changing
+    /// nothing.
+    pub(crate) fn take_plain(
+        &mut self,
+        queue: u64,
+        plain: impl Fn(&I) -> bool,
+    ) -> Option<VecDeque<I>> {
+        if let Some(line) = self.lines.get(&queue) {
+            if line.running || !line.items.iter().all(plain) {
+                return None;
+            }
+        }
+        let items = self
+            .lines
+            .remove(&queue)
+            .map_or_else(VecDeque::new, |line| line.items);
+        if !items.is_empty() {
+            // A line that holds an item and runs on no thread is ready, once.
+            self.ready.retain(|ready| *ready != queue);
+        }
+        self.lines.insert(
+            queue,
+            Line {
+                items: VecDeque::new(),
+                running: true,
+            },
+        );
+        Some(items)
+    }
+
+    /// Take `queue`'s line for the calling thread where it holds no item and no thread runs it:
+    /// the line is running until [`Lines::done`]. False otherwise, changing nothing.
+    pub(crate) fn take_idle(&mut self, queue: u64) -> bool {
+        if self.lines.contains_key(&queue) {
+            return false;
+        }
+        self.lines.insert(
+            queue,
+            Line {
+                items: VecDeque::new(),
+                running: true,
+            },
+        );
+        true
+    }
+
     /// How many lines are ready.
     pub(crate) fn ready(&self) -> usize {
         self.ready.len()

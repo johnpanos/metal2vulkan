@@ -3,7 +3,7 @@
 //! selects, under the validation layer.
 //!
 //! Metal rounds each channel toward zero, stores a finite value past 65504 as 65504, keeps an
-//! infinity, and stores every NaN as `0x7e00` (EV TXN-hkw-m4, an M4 under macOS 27.0.1: 380,972
+//! infinity, and stores every NaN as `0x7e00` (an M4 under macOS 27.0.1: 380,972
 //! of 380,972 non-NaN channels per format, every NaN of 16 payloads and both signs; Shared and
 //! Private, plain and under the debug layer, alike): [`half_toward_zero`], the fragment write's
 //! rule.
@@ -28,7 +28,7 @@
 use super::color_writes::{
     half, half_toward_zero, specials, unsigned_float, unsigned_float_toward_zero,
 };
-use super::degrade_notices::on_device;
+use super::degrade_notices::{on_device, on_device_with};
 use super::{buffer_with, read_buffer, Messages, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::metal::{PixelFormat, ResourceUsage, TextureUsage};
@@ -241,22 +241,35 @@ fn nan(h: u16) -> bool {
     h & 0x7c00 == 0x7c00 && h & 0x3ff != 0
 }
 
-/// Every form into every format, printed against Metal's conversion and held to it. Each case
-/// runs on a device of its own: a device announces a kind once, so a later case's pipeline on
-/// the same device would record `DeviceNanEncoding` without announcing it again.
+/// Every form into every format, printed against Metal's conversion and held to it. Every case
+/// runs on one device, which announces `DeviceNanEncoding` at each dispatch that binds a variant
+/// taking it (a device announces a kind once unless its options ask for each occurrence), so
+/// each case reads its own notice as on a device of its own; its validation messages fail it by
+/// name.
 #[test]
 fn kernel_writes_store_metals_halves() {
     let values = [half(), specials()].concat();
     let mut differ = Vec::new();
-    for form in Form::ALL {
-        for (pf, channels) in FORMATS {
-            on_device(|device, messages| {
-                if let Some(d) = judge(device, messages, (form, pf, channels), &values) {
-                    differ.push(d);
+    on_device_with(
+        |options| {
+            options.announce_each.insert(Degradation::DeviceNanEncoding);
+        },
+        |device, messages| {
+            for form in Form::ALL {
+                for (pf, channels) in FORMATS {
+                    if let Some(d) = judge(device, messages, (form, pf, channels), &values) {
+                        differ.push(d);
+                    }
+                    assert_eq!(
+                        messages.take(),
+                        Vec::new(),
+                        "{pf:?} by {}: the validation layer reported",
+                        form.kernel()
+                    );
                 }
-            });
-        }
-    }
+            }
+        },
+    );
     assert!(
         differ.is_empty(),
         "kernel half writes not Metal's: {differ:#?}"
@@ -347,7 +360,7 @@ fn small_nan(code: u32, mantissa: u32) -> bool {
 
 /// A kernel's `float` write to an `RG11B10Float` storage texture through every form, against
 /// Metal's conversion: every field rounded toward zero, a negative value 0, a finite value past
-/// the largest the largest, an infinity kept, a NaN `0x7e0` or `0x3f0` (EV FRT-twr1-m4 and the
+/// the largest the largest, an infinity kept, a NaN `0x7e0` or `0x3f0` (our probe and the
 /// M3 Max's m3pkg-twr, alike: the kernel's, a fragment function's and a color attachment's
 /// writes at the default rounding mode, byte for byte). The values are every finite code's and
 /// every tie between neighbouring codes, with one `f32` step either side, of both field widths,

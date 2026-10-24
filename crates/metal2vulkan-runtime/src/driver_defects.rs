@@ -5,10 +5,13 @@
 //! and `deviceID`. A device's defects are in its properties
 //! ([`DeviceProperties::driver_defects`](super::DeviceProperties::driver_defects)), and what a
 //! defect breaks is taken another way where an exact one exists, else refused there, typed
-//! ([`Needs::RuntimeDriverDefect`]), never run wrong.
+//! ([`Needs::RuntimeDriverDefect`]), never run wrong unannounced: only where a refusal would
+//! withhold a feature of the families the device claims (a row of the feature table,
+//! `families/features.rs`) does it run, announced as a degradation.
 //!
 //! Each defect lists the drivers that have it and, for each, the measured identities a probe found
-//! clean: a GPU (`deviceID`) at one release, which the device layer measured
+//! clean: a GPU (`deviceID`, the one it was measured under for a GPU that reports several:
+//! `DeviceDescription::canonical_device_id`) at one release, which the device layer measured
 //! (`DeviceDescription::measured_identity`). Every other release and GPU of the driver has it,
 //! measured broken or not measured at all, so a release or GPU nobody probed takes the exact path,
 //! and one probed clean then needs only its identity in the list, not new code.
@@ -53,7 +56,7 @@ pub(super) struct Affected {
 ///   HEIGHT CT Violation") and loses the device: into the stencil at 4x1, 4x2 and 1x4, out of it
 ///   at 1x4, whether the colour image is a colour attachment, a storage image or both, while 2x2,
 ///   the depth aspect, and an `S8_UINT` image copy. Valid usage: the validation layer reports
-///   nothing. Measured on 615.71.09 with a bare-Vulkan program (the EV `RT6-x13-matrix-3090`):
+///   nothing. Measured on 615.71.09 with a bare-Vulkan program (the probe):
 ///   known broken through 615.71.09. The RTX 5080 Laptop GPU (Blackwell, 0x2c19) on the same
 ///   release copies them (measured clean). Every other NVIDIA GPU and release takes the exact path
 ///   too until a probe finds it clean, where before only the 3090's generation did and Ada and
@@ -80,9 +83,8 @@ pub(super) struct Affected {
 ///   image asks 4112 bytes at 65536; a 1D image bound at byte 4112, written after it in the same
 ///   command buffer, read its old contents back at bytes 4112 to 4159, while one bound at 4160 or
 ///   4352 kept what was written. Measured on 26.2.4 (driverVersion 0x6802004) on Raptor Lake-P's
-///   Iris Xe (`deviceID` 0xa7a0; `runtime_lane::texture_blits`, and a bare-Vulkan program, EVs
-///   SPH-ccsrepro-ms01 and SPH-ccsrepro2-ms01) and Raptor Lake-S's UHD 770 (0xa780,
-///   SPH-ccsrepro-13900, SPH-ccsrepro2-13900); read in main's source of 2026-10-07: known broken
+///   Iris Xe (`deviceID` 0xa7a0; `runtime_lane::texture_blits`, and a bare-Vulkan program) and
+///   Raptor Lake-S's UHD 770 (0xa780); read in main's source of 2026-10-07: known broken
 ///   through 26.2.4. Nothing is refused: the runtime rounds each image's size up to whole
 ///   256-byte chunks there (`texture::ImagePlacement`). Every ANV GPU and release takes the
 ///   rounding, at most 255 bytes an image, until a probe finds it clean. Mesa's source pads the
@@ -122,7 +124,7 @@ pub(super) struct Affected {
 ///   storage, which is what a lazily allocated memory type is, so the view's first command
 ///   buffer dereferences a null heap and the process takes a `SIGSEGV`
 ///   (`runtime_lane::memoryless::a_memoryless_3d_depth_plane_renders` on an M4, 1.4.1,
-///   driverVersion 10401, EV RRP-mless1-mvk4, where the other types' views pass: they view the
+///   driverVersion 10401, where the other types' views pass: they view the
 ///   memoryless texture itself). Read in 1.4.1's source and main's of 2026-10-05 (`fae55a18`,
 ///   unchanged): known broken through 1.4.1. Nothing is refused: such an image takes
 ///   device-local memory (`ImagePlan::memory_class`).
@@ -136,11 +138,13 @@ pub(super) struct Affected {
 ///   `Shared` texture of either format reads back NaNs made quiet and shared exponents
 ///   renormalized, where Metal's `replaceRegion` and `getBytes` keep the bytes. Measured on
 ///   1.4.1 (driverVersion 10401) on an M4 under macOS 27.0.1
-///   (`runtime_lane::compressed_blits`, EV FXR-cbl1-mvk4): known broken through 1.4.1. The
+///   (`runtime_lane::compressed_blits`): known broken through 1.4.1. The
 ///   compression is Metal's, so no MoltenVK release is expected to fix it, but a probe of a
-///   later one decides. Nothing is refused: the image of such a texture a CPU copy reaches is
-///   made of `PixelFormatView` usage (`compressed_blit::copy_exact_usage`), which Metal keeps
-///   uncompressed, and the runtime rewrites what its blits write itself (`compressed_blit.rs`).
+///   later one decides. Nothing is refused: the image of such a texture a CPU copy reaches, and
+///   of a device's own one without `allowGPUOptimizedContents` (whose GPU blits keep the bytes
+///   on Metal), is made of `PixelFormatView` usage (`compressed_blit::copy_exact_usage`), which
+///   Metal keeps uncompressed, and the runtime rewrites what its blits write itself
+///   (`compressed_blit.rs`).
 ///
 /// `MultisampledCopiesConvertFloatNans`:
 /// - Mesa's RADV (`MESA_RADV`): `gfx_or_compute_copy_image` in `radv_meta_copy.c` gives the
@@ -150,15 +154,15 @@ pub(super) struct Affected {
 ///   that format and exports it: a NaN in a 16-bit float channel lands as `0xfe00`, its sign and
 ///   payload lost, while a single-sampled copy kept them. Read in 26.2's source (2026-10-09), and
 ///   measured on 26.2.4 (driverVersion 0x6802004) on the Radeon 780M (`deviceID` 0x15bf;
-///   `runtime_lane::renders::multisampled_nan_clears_store_metal_s_texel`, EVs ZIN-nc7-radv and
-///   ZIN-nc8-radv: every NaN sample of a 4x `R16Float` and `RGBA16Float` NaN clear, copied from
-///   its unsigned-integer scratch, held `0xfe00`; ZIN-x7a-radv: a scratch not mutable to the
-///   attachment's format alike): known broken through 26.2.4. The path is every RADV GPU's, so
-///   every device has it. Nothing is refused: the NaN clear of a multisampled attachment is
-///   written through a view of its image in the unsigned-integer format of its texel size
-///   (`nan_clear.rs`), which the runtime's multisampled color render targets of such formats
-///   take there where it costs the image nothing (`nan_clear::view_candidate`), and is the
-///   device's copy, announced (`device-nan-encoding`), where the image takes no such view.
+///   `runtime_lane::renders::multisampled_nan_clears_store_metal_s_texel`: every NaN sample of a 4x
+///   `R16Float` and `RGBA16Float` NaN clear, copied from its unsigned-integer scratch, held
+///   `0xfe00`: a scratch not mutable to the attachment's format alike): known broken through
+///   26.2.4. The path is every RADV GPU's, so every device has it. Nothing is refused: the NaN
+///   clear of a multisampled attachment is written through a view of its image in the
+///   unsigned-integer format of its texel size (`nan_clear.rs`), which the runtime's multisampled
+///   color render targets of such formats take there where it costs the image nothing
+///   (`nan_clear::view_candidate`), and is the device's copy, announced (`device-nan-encoding`),
+///   where the image takes no such view.
 ///
 /// `ReadsCommandBuffersAfterTheirSignal`:
 /// - MoltenVK (`MOLTENVK`): on a device with `MTLSharedEvent` the GPU signals a timeline
@@ -193,8 +197,8 @@ pub(super) struct Affected {
 ///   Measured clean on 26.2.4 (driverVersion 0x6802004) on both. Nothing is refused: the runtime
 ///   preprocesses every execution of the range apart, before the first runs
 ///   (`generated_execute.rs`). Every RADV GPU and release but the measured identity found clean,
-///   the 780M at 26.2.4, takes it; the RX 7900 XTX is no measured identity, so it takes it at
-///   every release.
+///   the 780M at 26.2.4 (Phoenix's 0x15bf, and Hawk Point's 0x1900, the same GPU), takes it; the
+///   RX 7900 XTX is no measured identity, so it takes it at every release.
 ///
 /// `ExplicitPlaneRowsPastHeight`:
 /// - Mesa's lavapipe (`MESA_LLVMPIPE`): a `DRM_FORMAT_MOD_LINEAR` image made for host allocations
@@ -208,6 +212,79 @@ pub(super) struct Affected {
 ///   bits; gem10): known broken through 26.2.4; 26.0.8 unprobed. Nothing is refused: no such
 ///   image of a height that is no multiple of 4 is made there (`dma_buf.rs`'s
 ///   `explicit_plane_rows`), and the texture takes its shadow.
+///
+/// `OcclusionCountPerColorOutput`:
+/// - Mesa's ANV (`INTEL_OPEN_SOURCE_MESA`): a precise occlusion query counts each passing sample
+///   once per color output the fragment shader writes, where Vulkan's Sample Counting counts it
+///   once; write masks of 0, the query's command buffer and linked pipelines do not change it, and
+///   an imprecise query reads nonzero. Measured on 26.2.4 (driverVersion 0x6802004) on the Iris
+///   Xe (`deviceID` 0xa7a0; `runtime_lane::color_groups`): known broken through 26.2.4. Nothing
+///   is refused, since a refusal would withhold the Mac2 and Metal3 families: the draw runs,
+///   announced (`Degradation::VisibilityCountPerColor`).
+///
+/// `FreedAddressMemoryFailsPendingWork`:
+/// - MoltenVK (`MOLTENVK`): every encoder whose pipeline reads device addresses makes every buffer
+///   of `SHADER_DEVICE_ADDRESS` usage resident (`MVKDevice::encodeGPUAddressableBuffers`), in
+///   Metal command buffers that retain none of it (`retainedReferences` off where the device keeps
+///   its residency set), and `vkFreeMemory` lets go of the memory's Metal objects at once: a
+///   Metal command buffer encoded before and not yet run fails `Invalid Resource` (Metal's code
+///   9), its device then lost. Destroying the buffer alone, its memory kept, fails nothing.
+///   Read in 1.4.1's source, and measured on 1.4.1 (driverVersion 10401) on an M3 Max with macOS
+///   27.0.1: a bare-Vulkan program freeing an unused buffer's memory while a dispatch through a
+///   device address waits behind fills fails at once, and `runtime_lane::freed_memory`: known
+///   broken through 1.4.1. Nothing is refused: the runtime frees such memory once the batches
+///   submitted before it completed (`freed_memory.rs`), the program's own submissions through
+///   `CommandQueue::with_vk_queue` among them (a mark after each use signals a timeline of its
+///   own).
+///
+/// `PushedBufferSizesUnset`:
+/// - MoltenVK (`MOLTENVK`): a shader's runtime array length of a buffer (`OpArrayLength`) reads
+///   the buffer's size from the stage's implicit buffer of sizes, which
+///   `MVKCommandEncoderState::bindDescriptorSets` fills for a set of discrete descriptors (a push
+///   descriptor set layout is one: `pickArgumentBufferMode` takes no argument buffer for it) and
+///   `MVKCommandEncoderState::pushDescriptorSet` never fills: it writes the pushed descriptors
+///   alone. A pushed buffer's length then reads 0, or what an earlier bind left there, and the
+///   accesses bounded by it go nowhere: on an M3 Max with macOS 27.0.1, kernels that push set 0
+///   read the null entry for every resource id (`runtime_lane::resource_ids`), stored no
+///   normalized storage write (`runtime_lane::norm_storage_writes`), and wrote nothing through a
+///   device without robustness's in-shader bounds (`runtime_lane::executions`), where binding set
+///   0 passes each. Read in 1.4.1's source and measured on 1.4.1 (driverVersion 10401): known
+///   broken through 1.4.1. Nothing is refused: the device takes no push command there
+///   (`device/mod.rs`), and every draw and dispatch binds set 0 from its command buffer's pools,
+///   as on a device without the command.
+///
+/// `PushedDescriptorsStaleAfterPipelineBinds`:
+/// - Mesa's ANV (`INTEL_OPEN_SOURCE_MESA`): draws of one layout that push set 0 alike, a
+///   pipeline reading a uniform buffer's constants at fixed offsets (its range starting at the
+///   bind offset, `SpecKey::RangeAtBindOffset`) and then one reading it at the pushed residual
+///   plus the offset through the same descriptor, which the second draw's push leaves out as
+///   unchanged, so that no push follows the bind: the second pipeline reads zeros. Pushing set 0
+///   whole after the bind reads the bytes, and so does pushing one write that did not change
+///   (set 0's first). Measured on 26.2.4 (driverVersion 0x6802004) on the Iris Xe (`deviceID`
+///   0xa7a0; `runtime_lane::unorm_depth_bias`, 3 of 3 runs wrong without the whole push, 3 of 3
+///   right with it) and on the UHD 770 (`deviceID` 0xa780; the same lane, 3 of 3 runs wrong with
+///   no push after the bind, 3 of 3 right with the one write): known broken through 26.2.4.
+///   Nothing is refused: the first draw after each pipeline bind pushes at least one write, those
+///   that changed or else set 0's first (`render/bound.rs`).
+///
+/// `ImmutableSamplersLostAfterCopies`:
+/// - Mesa's lavapipe (`MESA_LLVMPIPE`): a compute dispatch recorded after a copy in the same
+///   `VkCommandBuffer` samples a combined image sampler binding whose pipeline layout bakes an
+///   immutable sampler as Repeat. A kernel's variant for a 4:2:0 texture, whose layout bakes a
+///   clamp-to-edge sampler (`runtime_lane::ycbcr_textures`'s
+///   `a_constexpr_sampler_takes_a_ycbcr_map_through_one_variant`), read the texels clamped at its
+///   first dispatch, recorded in a `VkCommandBuffer` of its own while its pipeline was being made,
+///   and Repeat-addressed at every later one, recorded after the texture's shadow copy: the same
+///   pipeline, layout and pushed descriptors (with the immutable sampler pushed or not), and the
+///   validation layer reported nothing. Measured on 26.0.8 (driverVersion 0x6800008, Ubuntu's
+///   26.0.8-1ubuntu0.3 on LLVM 21.1.8): known broken through 26.0.8. Measured clean on 26.2.4
+///   (0x6802004, LLVM 23.1.1), the same calls recorded alike. Mesa 26.1.0's release notes list
+///   "lavapipe: rework immutable samplers", likely the fix (unverified: its change was not read).
+///   Nothing is refused: an encoder's dispatch of a variant that bakes samplers records in a
+///   `VkCommandBuffer` of its own there (`compute.rs`), as one whose pipeline is still being made
+///   does (`pending_dispatch.rs`); a host step's dispatch (an indirect dispatch's, an indirect
+///   command buffer's execution) records in place. Graphics draws are unmeasured. Every lavapipe
+///   release takes it: 26.2.4, measured clean, has no committed profile to be a measured identity.
 pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::MultisampledDepthStencilColourCopies,
@@ -271,19 +348,45 @@ pub(super) const AFFECTED: &[Affected] = &[
         clean: &[],
     },
     Affected {
+        defect: RuntimeDriverDefect::OcclusionCountPerColorOutput,
+        driver: DriverId::INTEL_OPEN_SOURCE_MESA,
+        clean: &[],
+    },
+    Affected {
         defect: RuntimeDriverDefect::ImplicitPreprocessAfterExecutionSet,
         driver: DriverId::MESA_RADV,
         // The Radeon 780M at 26.2.4, measured clean.
         clean: &[(0x15bf, (26 << 22) | (2 << 12) | 4)],
     },
+    Affected {
+        defect: RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork,
+        driver: DriverId::MOLTENVK,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::PushedBufferSizesUnset,
+        driver: DriverId::MOLTENVK,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds,
+        driver: DriverId::INTEL_OPEN_SOURCE_MESA,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::ImmutableSamplersLostAfterCopies,
+        driver: DriverId::MESA_LLVMPIPE,
+        clean: &[],
+    },
 ];
 
-/// The defects of the driver and device `description` names.
+/// The defects of the driver and device `description` names, its GPU read by the `deviceID` it
+/// was measured under (`DeviceDescription::canonical_device_id`).
 pub(super) fn of(description: &DeviceDescription) -> BTreeSet<RuntimeDriverDefect> {
     among(
         AFFECTED,
         description.driver_id,
-        description.device_id,
+        description.canonical_device_id(),
         description.driver_version,
     )
 }

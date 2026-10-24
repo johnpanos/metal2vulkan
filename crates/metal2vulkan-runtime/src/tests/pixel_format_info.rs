@@ -1,7 +1,7 @@
 //! `pixel_format_info`: `MTLPixelFormatGetInfoForDevice` answers our own measurements at each Metal
-//! level (EVs XRR2-pfi1-m3 and XRR2-pfi1-m4), the level describes a format exactly where the table
-//! has a row, and `MTLGetTextureLevelInfoForDeviceWithOptions` answers the probes' layouts (EVs
-//! API-tli1 to API-tli4 on each).
+//! level (an Apple M3 Max: our probe and the consumer's macOS 27 host lane, whose answers are an
+//! M4's but from 630 to 645), the level describes a format exactly where the table has a row,
+//! and `MTLGetTextureLevelInfoForDeviceWithOptions` answers the probes' layouts (on each).
 
 use crate::{MetalLevel, PixelFormatInfo, TextureLevelQuery};
 use metal2vulkan::metal::PixelFormat as P;
@@ -13,16 +13,15 @@ fn described(level: MetalLevel) -> Vec<u64> {
         .collect()
 }
 
-/// macOS 26.7 on an Apple M3 Max describes 264 values, macOS 27.0.1 on an Apple M4 280: the 264
-/// and the 16 from 630 to 645.
+/// An Apple M3 Max describes the same 264 values under macOS 26.7 and 27.0.1, none from 630 to
+/// 645 (which an Apple M4 describes under 27.0.1).
 #[test]
 fn each_level_answers_its_measured_rows() {
     let old = described(MetalLevel::MacOS26_7);
     let new = described(MetalLevel::MacOS27_0_1);
     assert_eq!(old.len(), 264);
-    assert_eq!(new.len(), 280);
-    let added: Vec<u64> = new.iter().copied().filter(|r| !old.contains(r)).collect();
-    assert_eq!(added, (630..=645).collect::<Vec<u64>>());
+    assert_eq!(new, old);
+    assert!(!new.iter().any(|raw| (630..=645).contains(raw)));
     // Past every named value, and a value no format has, Metal answers Invalid.
     for raw in [0, 2, 9, 2047, 2048, u64::from(u32::MAX) + 10, u64::MAX] {
         for level in MetalLevel::ALL {
@@ -59,7 +58,7 @@ fn a_level_describes_exactly_the_formats_it_answers() {
 }
 
 /// Spot values, as the probes printed them: a format alike at both levels, a cast class numbered
-/// anew, flags that differ, a compressed format's block, and a format only 27.0.1 describes.
+/// anew, flags that differ, a compressed format's block, and a format only an Apple M4 describes.
 #[test]
 fn the_answers_are_the_probes() {
     let at = |level: MetalLevel, pf: P| level.pixel_format_info(u64::from(pf.as_raw()));
@@ -92,12 +91,14 @@ fn the_answers_are_the_probes() {
     let bc1 = at(MetalLevel::MacOS27_0_1, P::BC1RGBA);
     assert_ne!(bc1.flags & 0x400, 0);
     assert_eq!(bc1.words, [8, 4, 4, 1]);
-    // BGRA10Unorm (638): only macOS 27.0.1 describes it.
-    assert_eq!(
-        at(MetalLevel::MacOS26_7, P::BGRA10Unorm),
-        PixelFormatInfo::INVALID
-    );
-    assert_eq!(at(MetalLevel::MacOS27_0_1, P::BGRA10Unorm).cast_class, 43);
+    // BGRA10Unorm (638): only an Apple M4 under macOS 27.0.1 describes it.
+    for level in MetalLevel::ALL {
+        assert_eq!(
+            at(level, P::BGRA10Unorm),
+            PixelFormatInfo::INVALID,
+            "{level}"
+        );
+    }
 }
 
 /// A format of blocks (flags bit 0x400) states its block in the four words: bytes, then a width
@@ -123,8 +124,7 @@ fn block_formats_state_their_block() {
 
 /// One measured answer of `MTLGetTextureLevelInfoForDeviceWithOptions`, as the probes printed it:
 /// format, width, height, depth, array length, level, plane argument, then Metal's 13 words.
-/// Each was answered alike on an Apple M3 Max under macOS 26.7 (EVs API-tli2-m3 to API-tli4-m3)
-/// and an Apple M4 under 27.0.1 (API-tli2-m4 to API-tli4-m4).
+/// Each was answered alike on an Apple M3 Max under macOS 26.7 and an Apple M4 under 27.0.1.
 type Measured = ([u64; 7], [u64; 13]);
 
 /// Answers that state the rule: BGRA8Unorm (80) at levels 0, 1, 64 (the level modulo 64), 1000 and
@@ -228,7 +228,7 @@ const NEAR_TOP: u64 = (1 << 62) + 3;
 /// and BGRA8Unorm (80: one texel, 4 bytes), at all ones, at the first extents whose add wraps and
 /// the last that do not, at `2^62 + 3`, and at level 1, where the shifted extent never wraps. The
 /// words are the rule's, computed apart from the runtime's code; our own probe on an Apple M4 under
-/// macOS 27.0.1 (EV FRT-tlw1-m4) answers the rule at every one of its 495 queries, most of these
+/// macOS 27.0.1 answers the rule at every one of its 495 queries, most of these
 /// among them.
 #[rustfmt::skip]
 const NEAR_TWO_TO_THE_64: &[Measured] = &[
@@ -290,4 +290,46 @@ fn extents_near_two_to_the_64_wrap_the_block_count() {
             );
         }
     }
+}
+
+/// Every ASTC LDR format, and its sRGB form, is described as Metal describes it whatever the
+/// device holds its blocks in (its ASTC format, or a carrier, `astc.rs`): a format of blocks (flags
+/// bit 0x400) of 16 bytes, its footprint, depth 1; and a level's layout counts its blocks, a side
+/// no multiple of the block rounded up, rows of 16-byte blocks, an image of those rows.
+#[test]
+fn astc_formats_answer_metal_s_blocks_and_levels() {
+    use metal2vulkan::bind::AstcDecode;
+    let formats = P::ALL
+        .iter()
+        .filter_map(|&pf| AstcDecode::of(pf).map(|decode| (pf, decode)));
+    let mut seen = 0;
+    for (pf, decode) in formats {
+        seen += 1;
+        let [bw, bh] = decode.block_extent().map(u64::from);
+        for level in MetalLevel::ALL {
+            let raw = u64::from(pf.as_raw());
+            let info = level.pixel_format_info(raw);
+            assert_ne!(info.flags & 0x400, 0, "{level} {pf:?}");
+            assert_eq!(info.words, [16, bw, bh, 1], "{level} {pf:?}");
+            for (width, height, mip) in [(37, 23, 0), (37, 23, 2), (1000, 7, 1), (1, 1, 0)] {
+                let at = |side: u64| (side >> mip).max(1);
+                let (w, h) = (at(width), at(height));
+                let [across, down] = [w.div_ceil(bw), h.div_ceil(bh)];
+                let mut query = TextureLevelQuery::plane_2d(raw, width, height);
+                query.level = mip;
+                let answer = level.texture_level_info(&query);
+                let what = format!("{level} {pf:?} {width}x{height} level {mip}");
+                assert_eq!([answer.width, answer.height], [w, h], "{what}");
+                assert_eq!(
+                    [answer.blocks_across, answer.blocks_down],
+                    [across, down],
+                    "{what}"
+                );
+                assert_eq!(answer.bytes_per_block, 16, "{what}");
+                assert_eq!(answer.bytes_per_row, 16 * across, "{what}");
+                assert_eq!(answer.bytes_per_image, 16 * across * down, "{what}");
+            }
+        }
+    }
+    assert_eq!(seen, 28);
 }

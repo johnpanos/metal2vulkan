@@ -49,9 +49,9 @@ use crate::pipeline::sym::{
 };
 use crate::pipeline::testing::EXACT_SAMPLING;
 use crate::pipeline::testing::{
-    compile, engine_dir, fixtures_dir, link_and_validate, llvm_assemble, profile,
-    profile_with_storage_buffers, status_reach, status_reach_on, storage_buffers, typed_module,
-    AssembleError, StatusReach,
+    compile, compile_given_storage_format, engine_dir, fixtures_dir, link_and_validate,
+    llvm_assemble, profile, profile_with_storage_buffers, status_reach, status_reach_on,
+    storage_buffers, typed_module, AssembleError, StatusReach,
 };
 use crate::pipeline::{
     ComputePipelineDescriptor, FunctionDescriptor, RenderPipelineDescriptor, StageSource,
@@ -606,7 +606,8 @@ entry:
 /// read and write is checked in the shader; on `moltenvk-m3` (`robustBufferAccess` and
 /// `robustImageAccess2`) a texel buffer's are and an image's are not. A size query clamps a level
 /// the thread names on every profile, and a texture atomic is guarded exactly without image
-/// robustness.
+/// robustness. The floor, without formatless storage, compiles a storage slot under its format
+/// (`RGBA32Float`), as the runtime compiles the variant of the bound texture's format.
 #[test]
 fn a_switch_is_named_by_the_check_its_arms_take() {
     use SwitchedOp::*;
@@ -653,7 +654,9 @@ fn a_switch_is_named_by_the_check_its_arms_take() {
             ("vk12-floor", &floor, on_floor),
             ("moltenvk-m3", &m3(), on_m3),
         ] {
-            let a = ok(&bc, "switched", p);
+            let a = compile_given_storage_format(&bc, "switched", p, PixelFormat::RGBA32Float)
+                .unwrap_or_else(|e| panic!("{op:?} on {stem}: compile: {e}"));
+            link_and_validate(&a, p).unwrap_or_else(|e| panic!("{op:?} on {stem}: L3: {e}"));
             assert_eq!(switches(&a), [(want.into(), 1)], "{op:?} on {stem}");
         }
     }
@@ -4612,8 +4615,7 @@ fn argument_buffer_samplers_are_heap_lookups() {
 /// (`RuntimeFact::CubicArgumentSampler`) in a kernel on every profile with the heap, marking the
 /// status by address where the device addresses buffers and through the kernel's binding of it
 /// elsewhere; a fragment function's never does, whose store would cost it the device's
-/// hidden-surface removal (EVs GSM2-crcb-mvk4 and GSM2-crcn-mvk4), so the planner refuses a listed
-/// cubic sampler beside it.
+/// hidden-surface removal, so the planner refuses a listed cubic sampler beside it.
 #[test]
 fn only_non_fragment_stages_test_argument_samplers_for_a_cubic_filter() {
     let Some(bc) = argument_samplers_fixture() else {

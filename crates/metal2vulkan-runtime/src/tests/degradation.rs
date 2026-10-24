@@ -160,6 +160,28 @@ fn the_catalogue_lists_every_kind_and_only_them() {
     assert!(listed.is_empty(), "codes of no kind: {listed:?}");
 }
 
+/// Every code ever issued, in `degradation_codes.txt`, is a kind's or retired, and no other code
+/// is either: a kind removed without retiring its code, or a new kind not added to the list,
+/// fails here. The list only grows, since a code is never reused.
+#[test]
+fn every_code_ever_issued_is_live_or_retired() {
+    let issued: BTreeSet<&str> = include_str!("degradation_codes.txt").lines().collect();
+    let mut known: BTreeSet<&str> = Degradation::ALL.iter().map(|kind| kind.code()).collect();
+    for &(code, _) in Degradation::RETIRED_CODES {
+        assert!(known.insert(code), "{code} is both a kind's and retired");
+    }
+    let unaccounted: Vec<_> = issued.difference(&known).collect();
+    assert!(
+        unaccounted.is_empty(),
+        "issued codes neither a kind's nor retired: {unaccounted:?}"
+    );
+    let unlisted: Vec<_> = known.difference(&issued).collect();
+    assert!(
+        unlisted.is_empty(),
+        "codes missing from degradation_codes.txt: {unlisted:?}"
+    );
+}
+
 /// A kind asked for at every occurrence may be announced on the program's own threads, in a
 /// runtime thread running the program's code, and in a host step on any thread; not on a runtime
 /// thread by itself, nor in a pipeline pool's piece. Any other kind anywhere.
@@ -444,4 +466,27 @@ fn the_kinds_met_per_object_are_counted_and_no_other() {
         .map(|kind| counters.degraded_objects(*kind))
         .collect();
     assert_eq!(counted, [Some(1), Some(2), Some(1), Some(2), Some(3)]);
+}
+
+/// A stage that records `PrecisionNote::FunctionStorageAssumed` names, in numbers, the private
+/// memory a thread of it keeps and what the device holds, the floor of a device not measured.
+#[test]
+fn function_storage_assumed_names_the_bytes_and_the_device_s_evidence() {
+    use crate::degradation::function_storage_reason;
+    use metal2vulkan::device::FunctionStorage;
+    let recorded = "its translation records `PrecisionNote::FunctionStorageAssumed`";
+    assert_eq!(
+        function_storage_reason(recorded, 102_400, FunctionStorage::Assumed(16_384)),
+        format!(
+            "{recorded}: it keeps 102400 bytes of private memory a thread, past the 16384 bytes a \
+             thread the floor of a device whose Function storage is not measured"
+        )
+    );
+    assert_eq!(
+        function_storage_reason(recorded, 40_000, FunctionStorage::Measured(32_768)),
+        format!(
+            "{recorded}: it keeps 40000 bytes of private memory a thread, past the 32768 bytes a \
+             thread measured on this device"
+        )
+    );
 }

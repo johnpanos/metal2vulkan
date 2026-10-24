@@ -1,18 +1,18 @@
 //! Blits through a texture Metal keeps losslessly compressed.
 //!
-//! **Metal's answers** (EVs FXR-fxr3-m4, FXR-fxr4-m4 and FXR-fxr5-m4: an Apple M4 under macOS
-//! 27.0.1, plain; random bytes through every blit direction, every level, slice and texture
-//! type, heap textures and views; and the package share-cblit on an Apple M3 Max under 26.7,
-//! every line of the predicate and the rules identical to the M4's). Metal keeps a texture
-//! losslessly compressed where `texture/heap_tiled.rs`'s rule holds (`metal_compresses`:
-//! `allowGPUOptimizedContents`, the shorter side of level 0 16 texels or more, a colour format of
-//! neither `ShaderWrite` nor `PixelFormatView` usage). A GPU blit that reads or writes such a
-//! texture (a buffer into it, it into a buffer, a texture into another either way) writes the
-//! texels the compression keeps: for `BGRA10_XR` (and its `_sRGB` twin), `RG11B10Float` and
-//! `RGB9E5Float` other bytes than it read, by the rule of `bind::CompressedBlit`, at every level of
-//! the texture; the 70 other formats the census tried keep their bytes. A texture over a buffer or
-//! of an IOSurface is not compressed, and CPU copies (`replace_region`, `get_bytes`) keep the bytes
-//! whatever the texture.
+//! **Metal's answers** (an Apple M4 under macOS 27.0.1, plain; random bytes through every blit
+//! direction, every level, slice and texture type, heap textures and views; the package share-cblit
+//! on an Apple M3 Max under 26.7, every line of the predicate and the rules identical to the M4's;
+//! and the M3 Max under 27.0.1: the rules and the predicate identical to the M4's at every texel of
+//! 11 formats' blits and CPU copies). Metal keeps a texture losslessly compressed where
+//! `texture/heap_tiled.rs`'s rule holds (`metal_compresses`: `allowGPUOptimizedContents`, the
+//! shorter side of level 0 16 texels or more, a colour format of neither `ShaderWrite` nor
+//! `PixelFormatView` usage). A GPU blit that reads or writes such a texture (a buffer into it, it
+//! into a buffer, a texture into another either way) writes the texels the compression keeps: for
+//! `BGRA10_XR` (and its `_sRGB` twin), `RG11B10Float` and `RGB9E5Float` other bytes than it read,
+//! by the rule of `bind::CompressedBlit`, at every level of the texture; the 70 other formats the
+//! census tried keep their bytes. A texture over a buffer or of an IOSurface is not compressed, and
+//! CPU copies (`replace_region`, `get_bytes`) keep the bytes whatever the texture.
 //!
 //! **Held**: the runtime's copies keep the bytes on every device, so after a blit that reads or
 //! writes such a texture the runtime rewrites what the blit wrote, in the same command of the
@@ -24,8 +24,10 @@
 //! MoltenVK, whose copies of a compressed image may already make the rewrite, it changes nothing
 //! more. There a CPU copy, which the runtime makes a Vulkan copy, would make it too
 //! (`RuntimeDriverDefect::CompressedImageCopiesRewriteTexels`: an `RG11B10Float` or
-//! `RGB9E5Float` image, EV FXR-cbl1-mvk4), so the image of a `Shared` or `Managed` texture that
-//! takes a rule is made uncompressed there (`Device::copy_exact_usage`; a heap's texture still
+//! `RGB9E5Float` image), so the image of a `Shared` or `Managed` texture that
+//! takes a rule is made uncompressed there, and so is a device's own texture's without
+//! `allowGPUOptimizedContents`, whose blits Metal makes on an uncompressed texture: its image of
+//! the texture's own usage would be compressed (`Device::copy_exact_usage`; a heap's texture still
 //! takes the compressed image's bytes of the heap).
 //!
 //! **Not measured**: a texture of many samples (the runtime leaves its bytes), and a region
@@ -43,6 +45,7 @@ use super::texture_descriptor::{TextureDescriptor, TextureLayout};
 use super::tracker::{Access, Barrier};
 use super::values::{ResourceOptions, StorageMode};
 use super::{Buffer, Device, MetalLevel};
+use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::bind::{CompressedBlit, CompressedBlitModule};
 use metal2vulkan::error::RuntimeDriverDefect;
@@ -97,7 +100,7 @@ fn rule_for(
 /// Whether a driver of `RuntimeDriverDefect::CompressedImageCopiesRewriteTexels` rewrites texels
 /// in its copies of a compressed image of `format`: the Vulkan formats MoltenVK makes Metal's
 /// `RG11B10Float` and `RGB9E5Float` textures of. `BGRA10_XR`'s images are of a format whose
-/// copies keep their bytes (EV FXR-cbl1-mvk4).
+/// copies keep their bytes.
 fn copies_rewrite(format: Format) -> bool {
     matches!(
         format,
@@ -108,14 +111,17 @@ fn copies_rewrite(format: Format) -> bool {
 impl Device {
     /// `usage`, the usage of the image of `format` of a texture of `descriptor` (checked as
     /// `layout`), with `PixelFormatView` where this device's copies of the image would rewrite
-    /// texels a CPU copy of the texture keeps
-    /// (`RuntimeDriverDefect::CompressedImageCopiesRewriteTexels`): a `Shared` or `Managed`
-    /// texture of a format whose blits take a rule (`rule_for`). Metal keeps an image of that
-    /// usage uncompressed (MoltenVK makes a `PixelFormatView` Metal texture of a
-    /// `MUTABLE_FORMAT` image with no list of formats), so its copies keep the bytes, and the
-    /// runtime rewrites what a blit writes by Metal's rule (`rule_of`, which reads the texture's
-    /// own usage). `None` elsewhere: a `Private` texture's bytes no CPU copy reads or writes keep
-    /// the compression.
+    /// texels Metal keeps (`RuntimeDriverDefect::CompressedImageCopiesRewriteTexels`): an image
+    /// of a format whose copies rewrite, which the device's Metal keeps compressed (an image of
+    /// `usage` with GPU-optimized contents takes a rule, `rule_for`), of a texture whose bytes
+    /// Metal keeps through such a copy: a `Shared` or `Managed` texture, which CPU copies read
+    /// and write, or one without `allowGPUOptimizedContents`, which Metal keeps uncompressed, so
+    /// that its GPU blits keep the bytes too. Metal keeps an image of that usage uncompressed
+    /// (MoltenVK makes a `PixelFormatView` Metal texture of a `MUTABLE_FORMAT` image with no list
+    /// of formats), so its copies keep the bytes, and the runtime rewrites what a blit writes by
+    /// Metal's rule where Metal's texture takes one (`rule_of`, which reads the texture's own
+    /// usage and property). `None` elsewhere: a `Private` texture with GPU-optimized contents,
+    /// whose bytes no CPU copy reads or writes, keeps the compression.
     pub(super) fn copy_exact_usage(
         &self,
         descriptor: &TextureDescriptor,
@@ -130,18 +136,19 @@ impl Device {
             Ok(StorageMode::Shared | StorageMode::Managed)
         );
         let [width, height, _] = layout.extent;
-        let rule = rule_for(
+        let compressed = rule_for(
             layout.pixel_format,
             layout.texture_type,
             [u64::from(width), u64::from(height)],
             u64::from(layout.samples),
-            (descriptor.usage, descriptor.allow_gpu_optimized_contents),
+            (usage, true),
             properties.metal_level,
         );
+        let kept = reachable || !descriptor.allow_gpu_optimized_contents;
         let rewrites = properties.driver_defects.contains(&defect)
-            && reachable
+            && kept
             && copies_rewrite(format)
-            && rule.is_some();
+            && compressed.is_some();
         rewrites.then_some(usage | TextureUsage::PIXEL_FORMAT_VIEW)
     }
 }
@@ -283,7 +290,8 @@ impl BlitCommandEncoder {
         let back = RowsCopy::new(&tight, rows);
         let rewrite = self.rewrite(at, texel, rules)?;
         let (raw_scratch, scratch_base) = rewrite.scratch;
-        let (raw_buffer, base) = buffer.at(0);
+        // Read as a blit's (`host_residency.rs`): the command buffer holds the import.
+        let (raw_buffer, base) = self.core().blit_at(buffer, 0)?;
         let copy = |rows: &[BufferRange], (src, src_base), (dst, dst_base)| {
             let regions: Vec<vk::BufferCopy> = rows
                 .iter()
@@ -403,7 +411,7 @@ impl Rewrite {
     ///
     /// `raw` is recording outside a render pass, and the scratch and the sets live until it
     /// completes.
-    unsafe fn record(&self, device: &ash::Device, raw: vk::CommandBuffer) {
+    unsafe fn record(&self, device: &Vk, raw: vk::CommandBuffer) {
         // SAFETY: the caller's contract.
         unsafe {
             for pass in &self.passes {

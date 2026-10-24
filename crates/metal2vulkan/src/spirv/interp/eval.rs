@@ -146,7 +146,7 @@ pub(super) fn exec(p: &Prog<'_>, l: &mut Lane, sh: &mut Shared, node: &InstNode)
                 })
             })?
         }
-        Inst::Convert { op, a } => convert(p, *op, *a, &*l.get_ref(p, *a)?, res_ty()?)?,
+        Inst::Convert { op, a, .. } => convert(p, *op, *a, &*l.get_ref(p, *a)?, res_ty()?)?,
         Inst::CompositeConstruct { parts } => {
             let ty = res_ty()?;
             if matches!(t.get(ty)?, Type::Vector { .. }) {
@@ -464,6 +464,8 @@ pub(super) fn exec(p: &Prog<'_>, l: &mut Lane, sh: &mut Shared, node: &InstNode)
         }
         Inst::IsHelperInvocation => return unmodelled(crate::spv::Op::IsHelperInvocationEXT),
         Inst::SetMeshOutputs { .. } => return unmodelled(crate::spv::Op::SetMeshOutputsEXT),
+        Inst::EmitVertex => return unmodelled(crate::spv::Op::EmitVertex),
+        Inst::EndPrimitive => return unmodelled(crate::spv::Op::EndPrimitive),
         // The interpreter has no acceleration structures: it cannot trace a ray.
         Inst::RayQuery(op) => return unmodelled(op.to_spirv()),
     };

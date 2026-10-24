@@ -21,43 +21,46 @@
 //!
 //! Plain Metal makes both, and so does the runtime ([`taken_descriptor`]). A `maxAnisotropy` of 1
 //! to 16 samples as that value rounded up to a power of two: 3 as 4, 5 to 7 as 8, 9 to 15 as 16
-//! (EV ANI-p7-m4, an M4 on macOS 27.0.1: every value through runtime and constexpr samplers at
-//! 1, 268 footprints of ratios 1 to 32, each answer bit for bit the power of two's, the powers told
-//! apart at 388 to 1, 191 of them). A `maxAnisotropy` outside 1 to 16 samples as the low five bits
-//! of the value taken through a 32-bit float, saturated to 32 bits, 0 as 1 and 17 to 31 as 32, a
-//! value of 1 to 16 rounded up so ([`metal_anisotropy`]; EVs SPH-samp2-m4 to SPH-samp5-m4, an M4 on
-//! macOS 27.0.1: 0, 17 to 2^64 - 1, each sampling as one of 1, 2, 4, 8, 16 and 32 at gradients that
-//! tell those apart, footprints up to 256 to 1, two runs alike). An anisotropy past the device's
-//! largest (`maxSamplerAnisotropy`, 16 on every venue) filters with that largest, a near-equivalent
-//! announced once (`Degradation::CappedAnisotropy`). A pixel-coordinate sampler Metal makes and
-//! samples its repeat and mirrored-repeat axes as `ClampToEdge`, at level 0 whatever its mip
-//! filter, LOD or gradients, and without anisotropy (EVs SPH-samp1-m4 and SPH-samp2-m4, an M4 on
-//! macOS 27.0.1: nearest and linear filters at 22 points inside, on and past the edges, every
-//! answer the `ClampToEdge` sampler's): so does the runtime ([`taken_descriptor`]). A
-//! `MirrorClampToEdge` `s` or `t` axis it mirrors once about 0 and then clamps, by texel index:
-//! each tap's index `i`, a constant texel offset added first (but dropped where the base level is
-//! 3, 5, 6 or 7 texels wide, as on a repeating axis), reads texel `-1 - i` where it is negative,
-//! then clamped into the level, as a normalized sampler's axis does (EVs RRP-probe1-m4 and
-//! RRP-probe5-m4, an M4 on macOS 27.0.1: nearest and linear samples, gathers and depth comparisons
-//! of textures 1 to 8 texels wide, offsets -7 to 5, two runs alike): so does the runtime, keeping
-//! the mode, whose Vulkan sampler mirrors once and clamps (`MIRROR_CLAMP_TO_EDGE`) at the
-//! coordinate the function divides by the texture's size, the function placing the offset and
-//! filtering linearly as Metal does. Address modes that hold both `ClampToZero` and
-//! `ClampToBorderColor`, which Metal's validation layer stops where the border color is not
-//! transparent black, plain Metal makes, and it reads the border color on every border axis (EVs
-//! TXN-bzmix-m3 and -m4): so does the runtime, as it reads a `ClampToZero` axis's border on any
-//! sampler. Metal takes any LOD clamps, at creation and in a bind (inverted, NaN and infinite ones
-//! included): so does the runtime. Metal raises a sample's level to the lower clamp and then lowers
-//! it to the upper one, so inverted clamps read the upper clamp's level, filtering as clamps of the
-//! upper clamp alone do, a descriptor's and a bind's alike: so does the runtime
-//! ([`metal_lod_clamps`]; EVs SPH-samp5-m4 and SPH-samp7-m4, an M4 on macOS 27.0.1, and
-//! SPH-samp6-m3 and SPH-samp8-m3, the M3 Max on macOS 26.7). A sampler whose clamps where it is
-//! bound are NaN is refused where it is used, by the binding plan, since what Metal samples then is
-//! not measured. Metal takes any raw border color and keeps its low two bits, sampling 3 as
-//! transparent black on every format measured ([`sampler_border_color`], the same EVs). What the
-//! device cannot do with the state on any use (a mirror-clamp address mode or anisotropy it lacks)
-//! is refused here, `Unsupported` ([`check_sampler`]). A minimum or maximum reduction reads the
-//! weighted average, as on an Apple M4 without Metal's validation layer (which refuses one), and
+//! (an M4 on macOS 27.0.1: every value through runtime and constexpr samplers at 1, 268 footprints
+//! of ratios 1 to 32, each answer bit for bit the power of two's, the powers told apart at 388 to
+//! 1, 191 of them). A `maxAnisotropy` outside 1 to 16 samples as the low five bits of the value
+//! taken through a 32-bit float, saturated to 32 bits, 0 as 1 and 17 to 31 as 32, a value of 1 to
+//! 16 rounded up so ([`metal_anisotropy`]; an M4 on macOS 27.0.1: 0, 17 to 2^64 - 1, each sampling
+//! as one of 1, 2, 4, 8, 16 and 32 at gradients that tell those apart, footprints up to 256 to 1,
+//! two runs alike). An anisotropy past the device's largest (`maxSamplerAnisotropy`, 16 on every
+//! venue) filters with that largest, a near-equivalent announced once
+//! (`Degradation::CappedAnisotropy`). A pixel-coordinate sampler Metal makes and samples its repeat
+//! and mirrored-repeat axes as `ClampToEdge`, at level 0 whatever its mip filter, LOD or gradients,
+//! and without anisotropy (an M4 on macOS 27.0.1: nearest and linear filters at 22 points inside,
+//! on and past the edges, every answer the `ClampToEdge` sampler's): so does the runtime
+//! ([`taken_descriptor`]). A `MirrorClampToEdge` `s` or `t` axis it mirrors once about 0 and then
+//! clamps, by texel index: each tap's index `i`, a constant texel offset added first (but dropped
+//! where the base level is 3, 5, 6 or 7 texels wide, as on a repeating axis), reads texel `-1 - i`
+//! where it is negative, then clamped into the level, as a normalized sampler's axis does (an M4 on
+//! macOS 27.0.1: nearest and linear samples, gathers and depth comparisons of textures 1 to 8
+//! texels wide, offsets -7 to 5, two runs alike): so does the runtime, keeping the mode, whose
+//! Vulkan sampler mirrors once and clamps (`MIRROR_CLAMP_TO_EDGE`) at the coordinate the function
+//! divides by the texture's size, the function placing the offset and filtering linearly as Metal
+//! does. Address modes that hold both `ClampToZero` and `ClampToBorderColor`, which Metal's
+//! validation layer stops where the border color is not transparent black, plain Metal makes, and
+//! it reads the border color on every border axis: so does the runtime, as it reads a `ClampToZero`
+//! axis's border on any sampler. Metal takes any LOD clamps, at creation and in a bind (inverted,
+//! NaN and infinite ones included): so does the runtime. Metal raises a sample's level to the lower
+//! clamp and then lowers it to the upper one, so inverted clamps read the upper clamp's level,
+//! filtering as clamps of the upper clamp alone do, a descriptor's and a bind's alike: so does the
+//! runtime ([`metal_lod_clamps`]; an M4 on macOS 27.0.1, and the M3 Max on macOS 26.7). A sampler
+//! whose clamps where it is bound are NaN is refused where it is used, by the binding plan, since
+//! what Metal samples then is not measured. Metal takes any raw border color and keeps its low two
+//! bits, sampling 3 as transparent black on every format measured ([`sampler_border_color`], the
+//! same probes). What the device cannot do with the state on any use (a mirror-clamp address mode
+//! it lacks) is refused here, `Unsupported` ([`check_sampler`]). Anisotropy on a device without
+//! `samplerAnisotropy` is made: its Vulkan samplers are isotropic, and a function samples through
+//! the state with Metal's anisotropic filter emulated where the emulation reaches the sample
+//! (`Degradation::AnisotropicFilter`) and the device's isotropic filter elsewhere
+//! (`Degradation::DeviceAnisotropicFilter`), each announced; an argument buffer that lists it is
+//! refused where it is used, `Unsupported` (`samplerAnisotropy`), since a function reading it
+//! there knows not its anisotropy. A minimum or maximum reduction reads the weighted average, as
+//! on an Apple M4 without Metal's validation layer (which refuses one), and
 //! `DeviceProperties::supports_sampler_reduction_mode` answers no.
 //!
 //! A min or mag filter `Cubic` (`MTLSamplerMinMagFilterCubic`, raw value 2) is made. Without a
@@ -78,6 +81,8 @@ use super::Device;
 use crate::release;
 use ash::vk;
 use metal2vulkan::bind::SamplerDescriptor;
+use metal2vulkan::device::VkFeature;
+use metal2vulkan::error::DriverDeviation;
 use metal2vulkan::metal::sampler::{check_sampler, SamplerUse};
 use metal2vulkan::metal::{
     CompareFunction, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter,
@@ -197,7 +202,7 @@ pub(super) fn forgotten<K, T>(kept: &[(K, Arc<T>)]) -> usize {
 /// Metal's largest `maxAnisotropy`.
 const MAX_ANISOTROPY: u32 = 16;
 
-/// The anisotropy plain Metal samples a `maxAnisotropy` of 17 to 31 with (EV SPH-samp5-m4: at
+/// The anisotropy plain Metal samples a `maxAnisotropy` of 17 to 31 with (at
 /// footprints of 32, 64 and 256 to 1 each reads the level an anisotropy of 32 reads, exactly).
 const PAST_RANGE_ANISOTROPY: u32 = 32;
 
@@ -346,11 +351,15 @@ impl Device {
     ///
     /// A descriptor Metal's validation stops, of a `max_anisotropy` outside 1 to 16 or of pixel
     /// coordinates, is made, and samples as plain Metal samples it (the module's rules); an
-    /// anisotropy past the device's largest filters with that largest, announced once
-    /// (`Degradation::CappedAnisotropy`). Refused:
-    /// what the device cannot do on any use of the state (`Unsupported`, naming the feature: a
-    /// mirror-clamp address mode, a pixel-coordinate one's included, anisotropy). A minimum or
-    /// maximum reduction reads the weighted average.
+    /// anisotropy past the largest of a device with `samplerAnisotropy` filters with that
+    /// largest, announced once (`Degradation::CappedAnisotropy`). An anisotropic state without a
+    /// mip filter whose two filters differ, on a device that samples through Metal's own sampler
+    /// (MoltenVK), filters another footprint than Metal's, announced once
+    /// (`Degradation::NotMipmappedAnisotropicSampler`). Anisotropy on a device without it is made,
+    /// and samples as the module's docs say. Refused: what the device cannot do on
+    /// any use of the state (`Unsupported`, naming the feature: a mirror-clamp address mode, a
+    /// pixel-coordinate one's included). A minimum or maximum reduction reads the weighted
+    /// average.
     pub fn new_sampler_state(&self, descriptor: &SamplerDescriptor) -> Result<SamplerState, Error> {
         self.sampler_state(
             "new_sampler_state",
@@ -396,9 +405,12 @@ impl Device {
         })?;
         self.check_sampler_placement(call, options.placement)?;
         // Metal samples an anisotropy past 16 with 32 (`metal_anisotropy`): a device whose
-        // samplers take less filters with its largest (`bind::sampler_desc` bounds it so).
+        // samplers take less filters with its largest (`bind::sampler_desc` bounds it so). A
+        // device without `samplerAnisotropy` filters with none, Metal's filter emulated where the
+        // function reaches the sample and the isotropic one recorded elsewhere.
         let largest = f32::from_bits(profile.limits().max_sampler_anisotropy_bits);
-        if taken.max_anisotropy as f32 > largest {
+        let anisotropy = (profile.enabled().features).contains(&VkFeature::SamplerAnisotropy);
+        if anisotropy && taken.max_anisotropy as f32 > largest {
             self.degrade(Degradation::CappedAnisotropy, || {
                 (
                     format!(
@@ -410,6 +422,28 @@ impl Device {
                          samplers take at most {largest} (maxSamplerAnisotropy)",
                         taken.max_anisotropy
                     ),
+                )
+            });
+        }
+        // Metal's own sampler handed anisotropy reads no level clamp of a sampler without a mip
+        // filter whose filters differ as Metal's `NotMipmapped` (`metal::sampler::vk_sampler`).
+        // A pixel-coordinate state has no anisotropy (`taken_descriptor`).
+        if anisotropy
+            && taken.max_anisotropy > 1
+            && taken.mip_filter == SamplerMipFilter::NotMipmapped
+            && taken.min_filter != taken.mag_filter
+            && profile.takes_driver_deviation(DriverDeviation::MetalSampler)
+        {
+            self.degrade(Degradation::NotMipmappedAnisotropicSampler, || {
+                (
+                    format!(
+                        "a sampler state of maxAnisotropy {} without a mip filter, minification \
+                         {:?} and magnification {:?}",
+                        descriptor.max_anisotropy, taken.min_filter, taken.mag_filter
+                    ),
+                    "the device samples through Metal's own sampler, whose anisotropic filter \
+                     reads no level clamp as Metal's NotMipmapped where the filters differ"
+                        .to_owned(),
                 )
             });
         }
@@ -467,8 +501,98 @@ impl Device {
     /// The live sampler states, in resource-ID order, each the holder of its ID
     /// (`resource_ids.rs`): what an argument buffer can name (`BindState::argument_samplers`).
     pub(super) fn argument_samplers(&self) -> Vec<SamplerState> {
-        let states = lock(&self.shared().resource_ids).samplers();
-        states.into_iter().map(SamplerState).collect()
+        self.argument_samplers_at().1
+    }
+
+    /// [`argument_samplers`](Self::argument_samplers), with the count of the sampler IDs' slots'
+    /// changes they are live at ([`sampler_slots_changed`](Self::sampler_slots_changed)).
+    fn argument_samplers_at(&self) -> (u64, Vec<SamplerState>) {
+        let (changed, states) = lock(&self.shared().resource_ids).samplers();
+        (changed, states.into_iter().map(SamplerState).collect())
+    }
+
+    /// [`argument_samplers_at`](Self::argument_samplers_at), for a draw's listing: counted
+    /// (`WorkCounts::argument_samplers_taken`).
+    fn argument_samplers_for_draw(&self) -> (u64, Vec<SamplerState>) {
+        self.shared().counts.argument_samplers_taken();
+        self.argument_samplers_at()
+    }
+
+    /// The count of the changes of the sampler IDs' slots so far: while it holds, the live
+    /// sampler states are the ones [`argument_samplers`](Self::argument_samplers) answered at it.
+    pub(super) fn sampler_slots_changed(&self) -> u64 {
+        self.shared()
+            .sampler_ids
+            .slots_changed
+            .load(Ordering::Acquire)
+    }
+}
+
+/// The device's live sampler states a draw lists (`BindState::argument_samplers`), each at the
+/// heap element of its resource ID, taken from the device only where the draw needs them
+/// (`RenderCommandEncoder::settle_draw`): a kept bind state listed at the count of the sampler
+/// IDs' slots' changes that still holds lists them already (`LiveBind::listed_at`), and a draw
+/// that writes no heap element and names no state in a notice takes none.
+pub(super) struct ArgumentSamplers {
+    /// The states and the count of slot changes they were live at, once taken.
+    taken: Option<(u64, Vec<SamplerState>)>,
+    /// Those the draw's variant's set-1 sampler arrays leave out were dropped
+    /// (`heap_sets::fit_samplers`): the states are no longer every live one.
+    trimmed: bool,
+}
+
+impl ArgumentSamplers {
+    /// None taken yet.
+    pub(super) fn untaken() -> ArgumentSamplers {
+        ArgumentSamplers {
+            taken: None,
+            trimmed: false,
+        }
+    }
+
+    /// `device`'s, taken now.
+    pub(super) fn taken(device: &Device) -> ArgumentSamplers {
+        ArgumentSamplers {
+            taken: Some(device.argument_samplers_for_draw()),
+            trimmed: false,
+        }
+    }
+
+    /// The states, taken from `device` now where none were yet.
+    pub(super) fn take(&mut self, device: &Device) -> &mut Vec<SamplerState> {
+        let (_, states) = self
+            .taken
+            .get_or_insert_with(|| device.argument_samplers_for_draw());
+        states
+    }
+
+    /// The states, where they were taken.
+    pub(super) fn states(&self) -> Option<&[SamplerState]> {
+        self.taken.as_ref().map(|(_, states)| &states[..])
+    }
+
+    /// The count of slot changes every live state is listed at: where the states were taken
+    /// and not trimmed.
+    pub(super) fn listed_at(&self) -> Option<u64> {
+        match (&self.taken, self.trimmed) {
+            (Some((changed, _)), false) => Some(*changed),
+            _ => None,
+        }
+    }
+
+    /// Keep those of the taken states that `set`, the variant's set 1, holds
+    /// (`heap_sets::fit_samplers`, `unlisted` saying so): whether every one fits.
+    pub(super) fn fit(
+        &mut self,
+        set: Option<&metal2vulkan::pipeline::DescriptorSetLayout>,
+        unlisted: &mut Option<(u64, u64)>,
+    ) -> bool {
+        let Some((_, states)) = &mut self.taken else {
+            return set.is_none();
+        };
+        let fits = super::heap_sets::fit_samplers(set, states, unlisted);
+        self.trimmed |= !fits;
+        fits
     }
 }
 
@@ -510,7 +634,7 @@ impl SamplerState {
     /// pixel coordinate scaled by the texture's size (`Device::degrade_argument_pixel_samplers`):
     /// its coordinates are pixels, and it filters (a minification or magnification filter other
     /// than nearest) or compares. A nearest pixel state's sample reads Metal's texel, by its
-    /// flagged fetch or Metal's own sampler (EVs SID-pix-mvk4, SID-pix3-lvpx86).
+    /// flagged fetch or Metal's own sampler.
     pub(super) fn scales_in_an_argument_buffer(&self) -> bool {
         let d = &self.0.descriptor;
         !d.normalized_coordinates

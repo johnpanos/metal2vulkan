@@ -19,15 +19,27 @@ const NAN_COPIES: RuntimeDriverDefect = RuntimeDriverDefect::MultisampledCopiesC
 const LATE_READS: RuntimeDriverDefect = RuntimeDriverDefect::ReadsCommandBuffersAfterTheirSignal;
 const PREPROCESS: RuntimeDriverDefect = RuntimeDriverDefect::ImplicitPreprocessAfterExecutionSet;
 const PAST_HEIGHT: RuntimeDriverDefect = RuntimeDriverDefect::ExplicitPlaneRowsPastHeight;
+const COUNTS: RuntimeDriverDefect = RuntimeDriverDefect::OcclusionCountPerColorOutput;
+const FREES: RuntimeDriverDefect = RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork;
+const PUSHES: RuntimeDriverDefect = RuntimeDriverDefect::PushedBufferSizesUnset;
+const STALE_PUSHES: RuntimeDriverDefect =
+    RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds;
+const BAKED_SAMPLERS: RuntimeDriverDefect = RuntimeDriverDefect::ImmutableSamplersLostAfterCopies;
 
 /// Every committed profile's driver has its defects at every release and GPU but those a probe
 /// found clean: MoltenVK the multisampled depth/stencil colour copies, the inexact depths past
 /// `[0, 1]`, the crashing 2D views of a 3D image in lazily allocated memory, the pipeline cache
-/// compiled at load, the copies of compressed images that rewrite texels and the reads of command
-/// buffers after their signal; lavapipe the colour copies, the depth/stencil resolve of the
-/// first layer and level and the explicit plane's rows past its height; RADV the multisampled copies that convert float NaNs, and the implicit
-/// preprocessing after an execution set on every GPU but the 780M at 26.2.4, measured clean; ANV
-/// the compressed image's short size on every GPU (Arrow Lake's, not measured, too); NVIDIA's the
+/// compiled at load, the copies of compressed images that rewrite texels, the reads of command
+/// buffers after their signal, the frees that fail pending work and the pushed sets' unset buffer
+/// sizes; lavapipe the colour copies, the depth/stencil resolve of the
+/// first layer and level, the explicit plane's rows past its height and the baked samplers lost
+/// after a copy;
+/// RADV the multisampled copies that convert float NaNs, and the implicit
+/// preprocessing after an execution set on every GPU but the 780M at 26.2.4 (Phoenix's and Hawk
+/// Point's), measured clean; ANV
+/// the compressed image's short size, the occlusion count per color output and the pushed
+/// descriptors a pipeline bind leaves stale on every GPU (Arrow Lake's, not measured, too);
+/// NVIDIA's the
 /// stencil colour copies on every GPU but the RTX 5080 Laptop GPU at 615.71.09, measured clean (the
 /// GTX 1060 and the RTX 5080 desktop GPU, not measured, take them); SwiftShader none.
 #[test]
@@ -50,16 +62,20 @@ fn the_committed_profiles_drivers_have_their_defects() {
                     CACHE_LOAD,
                     COPY_REWRITES,
                     LATE_READS,
+                    FREES,
+                    PUSHES,
                 ]
             }
-            Some(DriverId::MESA_LLVMPIPE) => vec![COPIES, RESOLVES, PAST_HEIGHT],
+            Some(DriverId::MESA_LLVMPIPE) => vec![COPIES, RESOLVES, PAST_HEIGHT, BAKED_SAMPLERS],
+            // The 780M at 26.2.4, under Phoenix's `deviceID` and Hawk Point's.
             Some(DriverId::MESA_RADV)
-                if (desc.device_id, desc.driver_version) == (0x15bf, MESA_26_2_4) =>
+                if matches!(desc.device_id, 0x15bf | 0x1900)
+                    && desc.driver_version == MESA_26_2_4 =>
             {
                 vec![NAN_COPIES]
             }
             Some(DriverId::MESA_RADV) => vec![NAN_COPIES, PREPROCESS],
-            Some(DriverId::INTEL_OPEN_SOURCE_MESA) => vec![COMPRESSION],
+            Some(DriverId::INTEL_OPEN_SOURCE_MESA) => vec![COMPRESSION, COUNTS, STALE_PUSHES],
             Some(DriverId::NVIDIA_PROPRIETARY)
                 if (desc.device_id, desc.driver_version) == (0x2c19, NVIDIA_615_71_09) =>
             {
@@ -163,6 +179,61 @@ fn radv_s_preprocessing_is_clean_on_the_identity_measured_alone() {
         mesa_26_0_8,
     );
     assert!(!nvidia.contains(&PREPROCESS));
+}
+
+/// lavapipe's baked samplers lost after a copy, measured broken at 26.0.8, are every lavapipe
+/// release's: 26.2.4, measured clean, has no committed profile to be a measured identity. A device
+/// that runs another driver has none.
+#[test]
+fn lavapipe_s_baked_samplers_are_every_release_s() {
+    let lavapipe = Some(DriverId::MESA_LLVMPIPE);
+    let of = |release| among(AFFECTED, lavapipe, 0, release);
+    let mesa_26_0_8 = (26 << 22) | 8;
+    for release in [mesa_26_0_8, MESA_26_2_4 - 1, MESA_26_2_4, MESA_26_2_4 + 1] {
+        assert!(of(release).contains(&BAKED_SAMPLERS), "{release:#x}");
+    }
+    let radv = among(AFFECTED, Some(DriverId::MESA_RADV), 0, mesa_26_0_8);
+    assert!(!radv.contains(&BAKED_SAMPLERS));
+}
+
+/// Hawk Point's Radeon 780M (`deviceID` 0x1900) is Phoenix's GPU (0x15bf): at RADV 26.2.4 it is a
+/// measured identity, so it sends no unmeasured-driver message and takes Phoenix's driver facts
+/// and defects, the implicit preprocessing measured clean among them. At another release, or as a
+/// neighbouring `deviceID` (0x1901), it is unmeasured, works the preprocessing around, and says
+/// so in the message, naming its own `deviceID`.
+#[test]
+fn hawk_points_780m_is_phoenixs_measured_identity() {
+    use crate::driver_facts::{unmeasured_driver, UNMEASURED_DRIVER};
+    let (stem, phoenix) = super::capabilities::committed_descriptions()
+        .into_iter()
+        .find(|(stem, _)| stem == "amd-780m-radv")
+        .expect("amd-780m-radv");
+    let (_, measured) = super::capabilities::created(&stem, &phoenix);
+    let mut hawk_point = phoenix.clone();
+    hawk_point.device_id = 0x1900;
+    let (_, properties) = super::capabilities::created(&stem, &hawk_point);
+    assert_eq!(unmeasured_driver(&properties), None);
+    assert_eq!(properties.driver_facts, measured.driver_facts);
+    assert!(!properties.driver_facts.is_empty());
+    assert_eq!(properties.driver_defects, measured.driver_defects);
+    assert_eq!(
+        of(&hawk_point).into_iter().collect::<Vec<_>>(),
+        [NAN_COPIES]
+    );
+    for (device, release) in [
+        (0x1900, MESA_26_2_4 + 1),
+        (0x1900, MESA_26_2_4 - 1),
+        (0x1901, MESA_26_2_4),
+    ] {
+        let mut other = phoenix.clone();
+        (other.device_id, other.driver_version) = (device, release);
+        let (_, properties) = super::capabilities::created(&stem, &other);
+        let text = unmeasured_driver(&properties).expect("an unmeasured identity");
+        assert!(text.contains(&format!("deviceID {device:#x}")), "{text}");
+        assert!(text.ends_with(&format!("[{UNMEASURED_DRIVER}]")), "{text}");
+        assert!(properties.driver_facts.is_empty(), "{text}");
+        assert!(of(&other).contains(&PREPROCESS), "{device:#x} {release:#x}");
+    }
 }
 
 /// Each clean identity is a measured one: a committed profile of the driver, GPU and release

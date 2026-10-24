@@ -3,14 +3,13 @@
 //! vertex, object and mesh functions before any draw's fragments.
 //!
 //! - **Metal's answer.** a probe drew, in one render pass, a draw whose fragments write a buffer,
-//!   then draws whose vertex function reads the bytes written: on an M3 Max (EV `RRS-probe-6m3`)
-//!   and an M4 (EV `RRS-probe-6`), plain and validated, 20 runs of each of 12 cases (a pixel, a
-//!   tile, a row of tiles, the whole target; one writer or four; draws between), the vertex stage
-//!   read the bytes from before the pass in every run, and a draw of a later pass read the written
-//!   bytes. A memory barrier from the fragment stage to the vertex stage is refused by Metal's
-//!   validation ("afterStages ... can not contain MTLRenderStageTile or MTLRenderStageFragment on
-//!   this device"), and plain Metal ignores it: the vertex stage reads the bytes from before the
-//!   pass there too. probes (EVs `IRX-mfrag-m4`, `IRX-fgeo-m3` and `IRX-fgeo-m4`, plain and
+//!   then draws whose vertex function reads the bytes written: on an M3 Max and an M4, plain and
+//!   validated, 20 runs of each of 12 cases (a pixel, a tile, a row of tiles, the whole target; one
+//!   writer or four; draws between), the vertex stage read the bytes from before the pass in every
+//!   run, and a draw of a later pass read the written bytes. A memory barrier from the fragment
+//!   stage to the vertex stage is refused by Metal's validation ("afterStages ... can not contain
+//!   MTLRenderStageTile or MTLRenderStageFragment on this device"), and plain Metal ignores it: the
+//!   vertex stage reads the bytes from before the pass there too. probes (plain and
 //!   validated) found the same of an object or mesh function's read, and of a command of an
 //!   indirect command buffer behind its barrier (`setBarrier`): its vertex, object and mesh
 //!   functions read the bytes from before the earlier commands' fragments, and the encoder's draws'
@@ -48,13 +47,13 @@ use crate::buffer::Buffer;
 use crate::degradation::Degradation;
 use crate::encoder::EncoderCore;
 use crate::error::Error;
+use crate::key_hash::KeyMap;
 use crate::resource::ResourceKey;
 use crate::tracker::{Barrier, Use, UseRange};
 use crate::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
 use crate::Device;
 use ash::vk;
 use metal2vulkan::pipeline::{PipelineInterface, SlotClass, SlotInterface, Stage};
-use std::collections::HashMap;
 use std::ops::Range;
 
 /// The byte ranges one key holds before they are merged into their hull.
@@ -74,7 +73,7 @@ const MESH_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
 
 /// Byte ranges of buffers, tracked or not, by key.
 #[derive(Clone, Default)]
-struct Written(HashMap<ResourceKey, Vec<Range<u64>>>);
+struct Written(KeyMap<ResourceKey, Vec<Range<u64>>>);
 
 impl Written {
     fn add(&mut self, key: ResourceKey, range: &Range<u64>) {
@@ -130,18 +129,18 @@ pub(super) struct PassStartReads {
 /// copies of bytes the pass's fragment stages wrote, `None` where the stage reads the encoder's.
 #[derive(Default)]
 pub(super) struct PassStartTables {
-    vertex: Option<ArgumentTable>,
-    object: Option<ArgumentTable>,
-    mesh: Option<ArgumentTable>,
+    vertex: Option<Box<ArgumentTable>>,
+    object: Option<Box<ArgumentTable>>,
+    mesh: Option<Box<ArgumentTable>>,
 }
 
 impl PassStartTables {
     /// The table `stage` reads: the one with the copies, else `encoder`'s.
     pub(super) fn or<'a>(&'a self, stage: Stage, encoder: &'a ArgumentTable) -> &'a ArgumentTable {
         let table = match stage {
-            Stage::Vertex => self.vertex.as_ref(),
-            Stage::Object => self.object.as_ref(),
-            Stage::Mesh => self.mesh.as_ref(),
+            Stage::Vertex => self.vertex.as_deref(),
+            Stage::Object => self.object.as_deref(),
+            Stage::Mesh => self.mesh.as_deref(),
             _ => None,
         };
         table.unwrap_or(encoder)
@@ -189,10 +188,12 @@ impl PassStartReads {
         [vertex, object, mesh]: [&ArgumentTable; 3],
         interface: &PipelineInterface,
     ) -> Result<PassStartTables, Error> {
+        // Each table held apart, as a draw that reads none (most) moves them with nothing in them.
+        let table = |table: Option<ArgumentTable>| table.map(Box::new);
         Ok(PassStartTables {
-            vertex: self.table(core, Stage::Vertex, vertex, interface)?,
-            object: self.table(core, Stage::Object, object, interface)?,
-            mesh: self.table(core, Stage::Mesh, mesh, interface)?,
+            vertex: table(self.table(core, Stage::Vertex, vertex, interface)?),
+            object: table(self.table(core, Stage::Object, object, interface)?),
+            mesh: table(self.table(core, Stage::Mesh, mesh, interface)?),
         })
     }
 

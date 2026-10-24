@@ -4,11 +4,23 @@
 //! - **One Vulkan object.** An event is a timeline semaphore. Its counter is a signal index that
 //!   [`EventTimeline`] maps to Metal's values: only the GPU signals the scheduler keeps raise it,
 //!   and a host set is a floor that never touches it.
-//! - **Who observes.** The completion thread sees each batch complete, and with it the event
+//! - **Who observes.** A completion turn sees each batch complete, and with it the event
 //!   signals of the batch; reading the value reads the semaphore's counter too. Either one wakes
 //!   the host's waits and posts the listeners' notifications that came due.
+//! - **A read is observed once a host wait returned for it.** The program may read what the
+//!   signalling work wrote once it sees the value, and Vulkan orders host operations after a
+//!   signal only through a wait ("signal operations happening before host operations that wait
+//!   on them" system-synchronize-with them, the memory model): `vkGetSemaphoreCounterValue`'s
+//!   value "may immediately be out of date" and orders nothing. So a counter the read shows past
+//!   the index last seen is waited for first, a wait of no time ("If the condition is satisfied
+//!   when `vkWaitSemaphores` is called, then `vkWaitSemaphores` returns immediately"), as the
+//!   queues' waiters do (`command_buffer/completion.rs`): one call more, and only where the
+//!   read ran ahead of the completion turns.
 //! - **Host waits** (`wait_until_signaled_value`) wait on the event's condition variable, which
-//!   every rise signals, and read the counter again at least every [`POLL`]. Once the process is
+//!   every rise signals where a host wait sleeps on it (`EventState::parked`, read under the lock
+//!   the rise is made under: a wait that sleeps later looks at the value first), and read the
+//!   counter again at least every [`POLL`]. A rise with no wait asleep spares the notify, a system
+//!   call (`WorkCounts::wakes_event_waiters`, `WorkCounts::wakes_spared`). Once the process is
 //!   exiting they answer from the value last seen ([`exit_guard`]).
 //! - **Shared event handles** are in-process: a handle shares the event, and opening it gives a
 //!   new `SharedEvent` of the same event. Opening it on another device is refused: Vulkan
@@ -95,6 +107,8 @@ struct EventState {
     timeline: EventTimeline<usize>,
     /// The listeners' notifications not yet due, in the order they were asked for.
     notifications: Vec<Notification>,
+    /// The host waits asleep on `changed`: a rise notifies it only where one is.
+    parked: usize,
 }
 
 struct Notification {
@@ -145,6 +159,7 @@ impl EventShared {
             state: Mutex::new(EventState {
                 timeline: EventTimeline::default(),
                 notifications: Vec::new(),
+                parked: 0,
             }),
             changed: Condvar::new(),
             label: Mutex::new(None),
@@ -185,28 +200,51 @@ impl EventShared {
             if !state.timeline.observe(index) {
                 return;
             }
-            self.changed.notify_all();
+            self.rose(&state);
             due(&mut state)
         };
         self.post(due);
     }
 
-    /// The value now, from the semaphore's counter and the host's floor. Once the process is
-    /// exiting, the counter is not read (`exit_guard`): the value is the one last seen.
-    fn value(self: &Arc<Self>) -> u64 {
+    /// The value now, from the semaphore's counter and the host's floor. A counter the read
+    /// shows past the index last seen is waited for, a wait that returns at once, before it is
+    /// observed (the module docs). Once the process is exiting, the counter is not read
+    /// (`exit_guard`): the value is the one last seen.
+    pub(super) fn value(self: &Arc<Self>) -> u64 {
         if let Some(busy) = exit_guard::enter() {
+            let raw = self.device.shared().vk();
             // SAFETY: the semaphore is the device's and live. A failure (a lost device) leaves
             // the value as last seen.
-            let counter = unsafe {
-                self.device
-                    .shared()
-                    .vk()
-                    .get_semaphore_counter_value(self.semaphore)
-            };
+            let counter = unsafe { raw.get_semaphore_counter_value(self.semaphore) };
             exit_guard::called(Call::GetSemaphoreCounterValue);
-            drop(busy);
-            if let Ok(counter) = counter {
-                self.reached(counter);
+            if let Ok(read) = counter {
+                let reaches = |index: u64| {
+                    let semaphores = [self.semaphore];
+                    let values = [index];
+                    let info = vk::SemaphoreWaitInfo::default()
+                        .semaphores(&semaphores)
+                        .values(&values);
+                    // SAFETY: as the read's above. "If timeout is zero, then vkWaitSemaphores
+                    // does not wait"; a failure (a lost device) leaves the value as last seen.
+                    let waited = unsafe { raw.wait_semaphores(&info, 0) };
+                    exit_guard::called(Call::WaitSemaphores);
+                    waited.map(|()| true).or_else(|error| match error {
+                        vk::Result::TIMEOUT => Ok(false),
+                        error => Err(error),
+                    })
+                };
+                let due = {
+                    let mut state = lock(&self.state);
+                    match state.timeline.observe_read(read, reaches) {
+                        Ok(true) => {
+                            self.rose(&state);
+                            due(&mut state)
+                        }
+                        Ok(false) | Err(_) => Vec::new(),
+                    }
+                };
+                drop(busy);
+                self.post(due);
             }
         }
         lock(&self.state).timeline.value()
@@ -219,7 +257,7 @@ impl EventShared {
             if !state.timeline.set(value) {
                 return;
             }
-            self.changed.notify_all();
+            self.rose(&state);
             due(&mut state)
         };
         self.post(due);
@@ -228,7 +266,7 @@ impl EventShared {
     }
 
     /// Wait until the value reaches `value`, at most `timeout`. Once the process is exiting, it
-    /// answers at once from the value last seen: neither the completion thread nor the counter
+    /// answers at once from the value last seen: neither a completion turn nor the counter
     /// raises it any more (`exit_guard`).
     fn wait_until(self: &Arc<Self>, value: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
@@ -236,7 +274,7 @@ impl EventShared {
             if self.value() >= value {
                 return true;
             }
-            let state = lock(&self.state);
+            let mut state = lock(&self.state);
             if state.timeline.value() >= value {
                 return true;
             }
@@ -244,11 +282,13 @@ impl EventShared {
             if left.is_zero() || exit_guard::closed() {
                 return false;
             }
-            drop(
-                self.changed
-                    .wait_timeout(state, left.min(POLL))
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            state.parked += 1;
+            let mut state = self
+                .changed
+                .wait_timeout(state, left.min(POLL))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+            state.parked -= 1;
         }
     }
 
@@ -270,6 +310,16 @@ impl EventShared {
             due(&mut state)
         };
         self.post(due);
+    }
+
+    /// The value rose, under the state's lock (`state`): wake the host waits asleep on it, if any
+    /// (the module docs).
+    fn rose(&self, state: &EventState) {
+        let parked = state.parked > 0;
+        if parked {
+            self.changed.notify_all();
+        }
+        self.device.shared().counts.event_wake(parked);
     }
 
     /// Post `due` notifications to their listeners.

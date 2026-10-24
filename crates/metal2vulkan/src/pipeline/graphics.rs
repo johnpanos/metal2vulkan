@@ -9,10 +9,12 @@ use std::collections::BTreeSet;
 
 use crate::air::container::Hash256;
 use crate::device::requirements::{VkFeature, VkProperty};
+use crate::device::DeviceProfile;
 use crate::error::{
     Attachment, Capability, Error, Feature, InternalError, InternalKind, Unsupported,
 };
 use crate::metal;
+use crate::pipeline::descriptor::TessellationDescriptor;
 use crate::pipeline::interface::{MeshRecords, PatchDomain};
 use crate::pipeline::sym::SampledType;
 use crate::vk;
@@ -54,9 +56,8 @@ pub struct GraphicsState {
     /// `VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT` and the
     /// pipeline's color blend state with
     /// `VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT`, and
-    /// the pipeline's requirements name the feature. `false` with input attachments only under
-    /// `FramebufferFetchPolicy::AcceptUnordered` on a device without the feature, whose fragment
-    /// stage records `PrecisionNote::UnorderedFramebufferFetch`.
+    /// the pipeline's requirements name the feature. A device without the feature takes no input
+    /// attachment: a fetch there is the interlocked storage form or refused.
     pub rasterization_order_attachment_access: bool,
     /// Metal's `maxVertexAmplificationCount` (1 without vertex amplification): a draw with this
     /// pipeline amplifies each vertex by a count in `[1, max_vertex_amplification_count]`, or,
@@ -98,6 +99,10 @@ pub struct GraphicsState {
     /// (`[[viewport_array_index]]`): each primitive selects its viewport and scissor from the
     /// encoder's arrays. A rate-mapped pass drawn region by region sets one viewport per region, so
     /// [`RateMapRegions::admits`](crate::bind::RateMapRegions::admits) refuses such a pipeline.
+    /// Set too on a device without `multiViewport`, where the function stores no `ViewportIndex`
+    /// (every index selects viewport 0 of a draw's one, as Metal's does at or past the count):
+    /// there a draw of the pipeline while the encoder holds more than one viewport cannot select
+    /// one, and the runtime refuses it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub writes_viewport_index: bool,
     /// The color attachments the fragment function reads, and may write, as storage images
@@ -134,6 +139,14 @@ pub struct GraphicsState {
     /// every other pipeline.
     #[cfg_attr(feature = "serde", serde(default))]
     pub mesh_records: Option<MeshRecords>,
+    /// A render pipeline whose vertex function is a post-tessellation vertex function, on a
+    /// device without `tessellationShader`: the function is the pipeline's `VERTEX` module, which
+    /// draws the tessellator's triangles itself as a `TRIANGLE_LIST` from an emulated draw's
+    /// records (the binder's `DrawCommands::tessellation_dispatch` states the consumer contract),
+    /// and the pipeline has no tessellation stages (`tessellation` is `None`). `None` for every
+    /// other pipeline.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub emulated_tessellation: Option<EmulatedTessellation>,
     /// The vertex function writes `[[point_size]]` (as its compiled function's
     /// `writes_point_size` answers; a post-tessellation vertex function's is dropped and
     /// answers `false`). Metal sizes a point
@@ -148,7 +161,8 @@ pub struct GraphicsState {
     /// one vertex of it (Vulkan's provoking vertex): a user varying it declares `[[flat]]` (a
     /// mesh function's per-primitive output read as one included), or the
     /// `[[render_target_array_index]]` or `[[viewport_array_index]]` a vertex function wrote,
-    /// read as a varying or as the `Layer` or `ViewportIndex` builtin. `false` for a pipeline
+    /// read as a varying or as the `Layer` or `ViewportIndex` builtin, or the `[[primitive_id]]`
+    /// its vertex function computes (`IoRole::PrimitiveId`). `false` for a pipeline
     /// without a fragment function, and for one whose fragment function reads only smooth
     /// inputs, perspective-correct or not, or none. A consumer that draws a primitive's vertices
     /// in another order can change what a draw shows only where this is set or the fragment
@@ -172,10 +186,11 @@ pub struct GraphicsState {
     pub writes_depth: bool,
     /// Whether the fragment function reads `[[barycentric_coord]]`, perspective-correct or not
     /// and of any width (`float`, `float2`, `float3`), from the translated fragment stage's
-    /// builtins (`BaryCoordKHR`, `BaryCoordNoPerspKHR`). Metal declares the weights at the pixel
-    /// center only (MSL 5.2.3.4); an AIR barycentric input sampled at the centroid or a sample
-    /// is refused at compile time, so no pipeline has one. `false` for a pipeline without a
-    /// fragment function. A primitive's weights follow the order its vertices are drawn in, so
+    /// builtins (`BaryCoordKHR`, `BaryCoordNoPerspKHR`) or, on a device without
+    /// `fragmentShaderBarycentric`, its varyings, which the pipeline's synthesized geometry stages
+    /// write. Metal reads the weights at the pixel center (MSL 5.2.3.4), under a `centroid` or
+    /// `sample` qualifier too, and so does the stage. `false` for a pipeline without a fragment
+    /// function. A primitive's weights follow the order its vertices are drawn in, so
     /// a consumer that draws them in another order can change what a draw shows only where this
     /// or [`flat_fragment_inputs`](GraphicsState::flat_fragment_inputs) is set.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -248,6 +263,27 @@ pub struct GraphicsState {
     /// which the binder writes to the function's `PushField::ColorWriteRule` of the attachment.
     #[cfg_attr(feature = "serde", serde(default))]
     pub color_write_rules: Vec<(u32, u32)>,
+    /// The fragment function reads textures through snapshots (`VariantKey::snapshot_textures`):
+    /// each draw of the pipeline is drawn twice in its subpass, the texture's attachment in
+    /// `VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT`, first with every color write mask 0,
+    /// then with the pipeline's own (`PushHole::SnapshotPhase`), which it sets for every color
+    /// blend element: `dynamic_states` holds `VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT`. The consumer
+    /// creates the pipeline with `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT`. Its
+    /// requirements name `attachmentFeedbackLoopLayout` and `extendedDynamicState3ColorWriteMask`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub snapshot_reads: bool,
+    /// The group of the pipeline's color attachments this variant draws
+    /// (`VariantKey::color_group`), where the device draws them in groups
+    /// ([`ColorGroup`](crate::pipeline::ColorGroup)): every color-indexed part of the state
+    /// (`color_attachments`, `input_attachments`, `storage_attachments`, `color_write_rules`
+    /// among them) indexes the group's attachments by location, Metal's attachment
+    /// `colors()[l]` at location `l`, and the fragment stage writes those alone. Each draw of the
+    /// pipeline is a draw of every group's variant, in a pass of that group's attachments; the
+    /// vertex stage is the same module in every variant, and the fragment stage's `FragDepth`,
+    /// `SampleMask` and `FragStencilRefEXT` outputs are decorated `Invariant` where there is more
+    /// than one group. `None` where each attachment is at its own index.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub color_group: Option<crate::pipeline::lower_inputs::ColorGroup>,
 }
 
 /// What a consumer and the binder need of a tessellation pipeline.
@@ -294,6 +330,45 @@ pub struct TessellationState {
     pub control_point_index_type: metal::TessellationControlPointIndexType,
 }
 
+/// What a consumer and the binder need of a tessellation pipeline on a device without
+/// `tessellationShader` (`GraphicsState::emulated_tessellation`).
+///
+/// Metal draws `patchCount` patches of `instanceCount` instances from `patchStart` and
+/// `baseInstance`. Each draw of patches runs the tessellation scan
+/// ([`TessellationScanModule`](crate::bind::TessellationScanModule) of [`Self::scan_kernel`]),
+/// which reads each patch's factors from the encoder's factor buffer and writes the draw's
+/// records, one per instance and patch, and its chunks' `VkDrawIndirectCommand`s; each chunk is
+/// a draw of the pipeline, whose vertex function decodes and places the tessellator's point for
+/// the vertex it draws and reads Metal's patch index, instance index and control points' elements
+/// as the native control stage hands them. The pipeline's topology is `TRIANGLE_LIST`, not
+/// dynamic state.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EmulatedTessellation {
+    /// The post-tessellation vertex function's patch type.
+    pub domain: PatchDomain,
+    /// Its `[[patch(_, N)]]` control points per patch (0 when unstated): a patch draw's
+    /// `numberOfPatchControlPoints` must equal a stated count.
+    pub control_points: u32,
+    /// The descriptor's tessellation state, which the vertex function bakes in.
+    pub descriptor: TessellationDescriptor,
+}
+
+impl EmulatedTessellation {
+    /// The tessellation scan the pipeline's draws run.
+    pub fn scan_kernel(&self) -> crate::bind::TessellationScanKernel {
+        crate::bind::TessellationScanKernel {
+            domain: self.domain,
+            partition_mode: self.descriptor.partition_mode,
+            output_winding_order: self.descriptor.output_winding_order,
+            max_tessellation_factor: self.descriptor.max_tessellation_factor,
+            factor_step_function: self.descriptor.factor_step_function,
+            factor_scale_enabled: self.descriptor.factor_scale_enabled,
+        }
+    }
+}
+
 impl GraphicsState {
     /// A state that draws `topology` at `rasterization_samples` and nothing else: no attachment,
     /// dynamic state, tessellation, imageblock, fetch or amplification (one view). A consumer
@@ -325,6 +400,7 @@ impl GraphicsState {
             shadow_stencil: None,
             early_fragment_tests: false,
             mesh_records: None,
+            emulated_tessellation: None,
             writes_point_size: false,
             flat_fragment_inputs: false,
             clip_distances: 0,
@@ -336,6 +412,8 @@ impl GraphicsState {
             sample_mask: None,
             shader_tests: None,
             color_write_rules: Vec::new(),
+            snapshot_reads: false,
+            color_group: None,
         }
     }
 
@@ -527,6 +605,9 @@ fn dynamic_state_feature(state: vk::DynamicState) -> Result<Option<VkFeature>, E
         // `VK_EXT_extended_dynamic_state2`'s first feature (core in Vulkan 1.3 without one), made
         // dynamic only where the profile has it.
         D::PRIMITIVE_RESTART_ENABLE => Some(VkFeature::ExtendedDynamicState2),
+        // `VK_EXT_extended_dynamic_state3`'s color write masks, dynamic only in a pipeline that
+        // reads through snapshots (`GraphicsState::snapshot_reads`).
+        D::COLOR_WRITE_MASK_EXT => Some(VkFeature::ExtendedDynamicState3ColorWriteMask),
         other => {
             return Err(Error::Internal(InternalError::new(
                 InternalKind::Invariant,
@@ -718,35 +799,45 @@ pub struct StorageAttachmentUse {
     pub format: vk::Format,
     /// The fragment function writes the attachment (otherwise it only reads it).
     pub writes: bool,
-    /// The function declares the storage image without a format (`Unknown`), so the format
-    /// supports storage reads (and, when `writes`, writes) without one
-    /// (`VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT` and its write twin); otherwise the
-    /// declaration names `format`'s SPIR-V image format.
+    /// The function declares the storage image without a format (`Unknown`), so the view's
+    /// format ([`view_format`](Self::view_format)) supports storage reads (and, when `writes`,
+    /// writes) without one (`VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT` and its write
+    /// twin); otherwise the declaration names the view's format's SPIR-V image format.
     pub formatless: bool,
     /// The image the consumer binds and how it views it: the attachment's own image, or its
     /// sample planes (see the type's docs). The plan's `WriteSource::TileAttachment` carries the
     /// same value.
     #[cfg_attr(feature = "serde", serde(default))]
     pub view: StorageAttachmentView,
-    /// Where `Some`, the storage view is in this unsigned-integer format of the attachment's
-    /// texel size (`R32_UINT` for a 4-byte texel, `R16_UINT` for 2, `R8_UINT` for 1), not in
-    /// `format`, which stays the attachment's own: an sRGB attachment, whose format has no
-    /// storage access, and whose texels the function unpacks in `format`'s byte order and decodes
-    /// and encodes itself, by Metal's measured conversions. The declaration names the view's
-    /// format (`formatless` is false). The consumer binds such a view of an image made with
-    /// `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`, whose
+    /// Where `Some`, the storage view is in this format, not in `format`, which stays the
+    /// attachment's own ([`view_alias_of`](Self::view_alias_of) decides it from `format` and the
+    /// device):
+    ///
+    /// - an 8-bit sRGB attachment's unsigned-integer format of its texel size (`R32_UINT` for a
+    ///   4-byte texel): its format has no storage access, and the function unpacks the texels in
+    ///   `format`'s byte order and decodes and encodes them itself, by Metal's measured
+    ///   conversions;
+    /// - a BGRA-order attachment's RGBA-order twin (`R8G8B8A8_UNORM` for `B8G8R8A8_UNORM`,
+    ///   `A2B10G10R10_UNORM_PACK32` for `A2R10G10B10_UNORM_PACK32`) on a device that neither
+    ///   reads nor writes `format` without a format (SPIR-V names no image format for it): the
+    ///   function exchanges red and blue on every read and write, and the device converts each
+    ///   channel as it converts `format`'s.
+    ///
+    /// The consumer binds such a view of an image made with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`
+    /// (and `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT` where `format` has no storage access), whose
     /// `VkImageFormatListCreateInfo` lists `format` and this format, with `STORAGE` usage (the
     /// sample planes of [`StorageAttachmentView::SamplePlanes`] in this format); its draws that
-    /// do not fetch render the image through a view in `format`. `None` for any other format: the
-    /// view is in `format`.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub uint_view: Option<vk::Format>,
+    /// do not fetch render the image through a view in `format`. `None` for any other format, and
+    /// on a device that accesses a BGRA-order format without one: the view is in `format`.
+    #[cfg_attr(feature = "serde", serde(default, alias = "uint_view"))]
+    pub view_alias: Option<vk::Format>,
     /// The channels the function's write keeps from the texel it reads first, by the pipeline's
     /// write mask: empty where it does not write the attachment or the mask covers every channel of
     /// the format, all four where it covers none of them (the write stores nothing), else those of
     /// the format the mask leaves out. One module serves every write mask that keeps some of a
-    /// format's channels: the binder writes these into each draw's push bytes, where the function
-    /// reads them. Nothing for the consumer to do.
+    /// format's channels (a blended 8-bit unorm attachment with alpha: each of alpha alone, one
+    /// color channel, and more): the binder writes these into each draw's push bytes, where the
+    /// function reads them. Nothing for the consumer to do.
     #[cfg_attr(feature = "serde", serde(default))]
     pub kept: vk::ColorComponentFlags,
 }
@@ -785,7 +876,7 @@ impl StorageAttachmentUse {
             writes,
             formatless,
             view,
-            uint_view: None,
+            view_alias: None,
             kept: vk::ColorComponentFlags::empty(),
         }
     }
@@ -795,34 +886,34 @@ impl StorageAttachmentUse {
         StorageAttachmentUse { kept, ..self }
     }
 
-    /// The use with its storage view in `uint_view` ([`uint_view`](Self::uint_view)).
-    pub fn with_uint_view(self, uint_view: vk::Format) -> StorageAttachmentUse {
+    /// The use with its storage view in `view_alias` ([`view_alias`](Self::view_alias)).
+    pub fn with_view_alias(self, view_alias: vk::Format) -> StorageAttachmentUse {
         StorageAttachmentUse {
-            uint_view: Some(uint_view),
+            view_alias: Some(view_alias),
             ..self
         }
     }
 
-    /// The format of the storage view: [`uint_view`](Self::uint_view) where it is set, else
+    /// The format of the storage view: [`view_alias`](Self::view_alias) where it is set, else
     /// `format`.
     pub fn view_format(&self) -> vk::Format {
-        self.uint_view.unwrap_or(self.format)
+        self.view_alias.unwrap_or(self.format)
     }
 
-    /// The unsigned-integer format of the texel size an attachment of the sRGB format `format`
-    /// is viewed in, where a fragment function reads it in the storage form
-    /// ([`uint_view`](Self::uint_view)): `R32_UINT` for `B8G8R8A8_SRGB` and `R8G8B8A8_SRGB`,
-    /// `R16_UINT` for `R8G8_SRGB`, `R8_UINT` for `R8_SRGB`; `None` for any other format. A
-    /// consumer that makes an attachment's image before it knows the pipeline (a memoryless
-    /// attachment's backing) makes it mutable to this format. The compile layer sets the view
-    /// only where it builds the form (today the four-byte formats).
-    pub fn uint_view_of(format: vk::Format) -> Option<vk::Format> {
-        match format {
-            vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB => Some(vk::Format::R32_UINT),
-            vk::Format::R8G8_SRGB => Some(vk::Format::R16_UINT),
-            vk::Format::R8_SRGB => Some(vk::Format::R8_UINT),
-            _ => None,
-        }
+    /// The format other than `format` a fetching draw views a color attachment of `format` in,
+    /// where a fragment function reads it in the storage form on `profile`
+    /// ([`view_alias`](Self::view_alias)): `R32_UINT` for `B8G8R8A8_SRGB` and `R8G8B8A8_SRGB`,
+    /// `R16_UINT` for `R8G8_SRGB` and `R8_UINT` for `R8_SRGB`, on every device; `R8G8B8A8_UNORM`
+    /// for `B8G8R8A8_UNORM` and `A2B10G10R10_UNORM_PACK32` for `A2R10G10B10_UNORM_PACK32` where
+    /// the device neither reads nor writes the attachment's format without a format, and stores
+    /// the twin and declares it (without a format, or by its SPIR-V image format,
+    /// `shaderStorageImageExtendedFormats` for an extended one); `None` for any other format and
+    /// device. The compile layer and a consumer that makes an attachment's image before it knows
+    /// the pipeline (a memoryless attachment's backing, a render target's free usage) both take
+    /// it from here, so the image is made mutable to the view the pipeline binds. The compile
+    /// layer sets an sRGB view only where it builds the form (today the four-byte formats).
+    pub fn view_alias_of(format: vk::Format, profile: &DeviceProfile) -> Option<vk::Format> {
+        crate::metal::format::fetch_view_alias(format, profile)
     }
 
     /// The format usages the consumer's image and view need: `StorageImage` of the view's
@@ -831,11 +922,12 @@ impl StorageAttachmentUse {
         &self,
     ) -> Vec<(vk::Format, crate::device::requirements::FormatUsage)> {
         use crate::device::requirements::FormatUsage as U;
-        let mut out = vec![(self.view_format(), U::StorageImage)];
+        let view = self.view_format();
+        let mut out = vec![(view, U::StorageImage)];
         if self.formatless {
-            out.push((self.format, U::StorageImageReadWithoutFormat));
+            out.push((view, U::StorageImageReadWithoutFormat));
             if self.writes {
-                out.push((self.format, U::StorageImageWriteWithoutFormat));
+                out.push((view, U::StorageImageWriteWithoutFormat));
             }
         }
         out

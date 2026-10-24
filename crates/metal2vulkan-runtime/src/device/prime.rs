@@ -15,33 +15,61 @@
 //! alone (`functions.rs`), and each priming checks, in builds with debug assertions, that it made
 //! every entry point of the table but [`UNPRIMED`]: an entry point added to the table and not made
 //! here fails every lane at its first device. The calls: a batch's (a command pool and a command
-//! buffer of it, begun, with the barriers every batch begins and ends with and, where the queue
-//! family writes timestamps, the reset and the two timestamps of a command buffer's GPU times
-//! ([`TIMESTAMP_CALLS`], made only there), ended, submitted after each queue's timeline at 0 and
-//! signalling a timeline of its own and a new fence; the wait for the timeline, a read of every
+//! buffer of it, begun, with the barrier every batch ends with and, where the queue family writes
+//! timestamps, the reset and the two timestamps of a command buffer's GPU times
+//! ([`TIMESTAMP_CALLS`], made only there; their reset on the host before, where the device enables
+//! `hostQueryReset`, [`HOST_QUERY_RESET_CALLS`]), ended, submitted after each queue's timeline at 0
+//! and signalling a timeline of its own and a new fence; the wait for the timeline, a read of every
 //! timeline, the wait for the fence and its reset, a wait for the queue to be idle (its drain after
-//! a failed wait), and the read of the two timestamps, as the completion thread makes them); a
-//! sampler, an occlusion query pool, a buffer in host-visible memory, mapped (and, where the device
-//! has device addresses, [`DEVICE_ADDRESS_CALLS`], its address read), and an image with their
-//! memory and views, a depth image, a render pass and a framebuffer, a descriptor set layout, a
-//! pipeline layout with a push constant range and a descriptor pool with a set written, and a
-//! compute pipeline made with a pipeline cache from a shader module, whose data is read; a command
-//! buffer, recorded and never submitted, with what a host step records: the pipeline and the set
-//! bound, a push constant, a dispatch and one from the buffer's arguments, a copy within the
-//! buffer, a copy from the buffer to the image and back with a barrier between them, a copy between
-//! the image's texels and the image's clear (a render host step's pass steps) and the depth image's
-//! (a batch's first work's), then a render host step's: a graphics pipeline that rasterizes nothing
-//! drawn in a secondary command buffer, directly and from the buffer's arguments, with a vertex
-//! buffer and the states a draw sets, inside a query of the occlusion pool, which the render pass's
-//! subpass executes; where the queues bind sparse memory, an empty `vkQueueBindSparse`
+//! a failed wait), and the read of the two timestamps and, where the device calibrates them, a
+//! calibration reading ([`CALIBRATION_CALLS`]), as a completion turn makes them); a sampler, an
+//! occlusion query pool, a buffer in host-visible memory, mapped (and, where the device has device
+//! addresses, [`DEVICE_ADDRESS_CALLS`], its address read), and an image with their memory and
+//! views, a depth image, a render pass and a framebuffer, a descriptor set layout, a pipeline
+//! layout with a push constant range and a descriptor pool with a set written, and a compute
+//! pipeline made with a pipeline cache from a shader module, its stage specialized as the runtime's
+//! makings are ([`SPECIALIZED`]), whose data is read; a command buffer, recorded and never
+//! submitted, with what a host step records: the pipeline and the set bound (and, where the device
+//! has the push command, the set's write pushed first, [`PUSH_DESCRIPTOR_CALLS`]), a push constant,
+//! a dispatch and one from the buffer's arguments, a copy within the buffer, a copy from the buffer
+//! to the image and back with a barrier between them, a copy between the image's texels and the
+//! image's clear (a render host step's pass steps) and the depth image's (a batch's first work's),
+//! then a render host step's: a graphics pipeline that rasterizes nothing, its stage specialized
+//! too (and named, where the instance reports messages, [`NAMING_CALLS`]), drawn in a secondary
+//! command buffer, directly and from the buffer's arguments, with a
+//! vertex buffer and the states a draw sets, inside a query of the occlusion pool, which the render
+//! pass's subpass executes; where the queues bind sparse memory, an empty `vkQueueBindSparse`
 //! ([`SPARSE_CALLS`]); a wait for the device to be idle; and the release of each object made.
 //! Nothing of it outlives the call.
+//!
+//! **Specialized, with an extended instruction, as the runtime's makings are.** A stage with
+//! specialization constants takes paths of its own: in a driver's compiler, and in the Khronos
+//! validation layer's checks of the stage, which run `spirv-opt`'s passes and the SPIR-V validator
+//! over the module specialized at each pipeline's creation. A module the layer validated before, in
+//! any process, it skips at its creation (its validation cache, kept on disk), and priming's are
+//! the same in every process: so without a specialized stage, priming ran no validator at all, and
+//! the process's first making of a specialized pipeline made the validator's statics. And the
+//! validator makes one of them only at an operand naming an untyped definition made before it,
+//! such as an extended instruction's set: so priming's modules take `GLSL.std.450`'s `UMin` of
+//! their constant, as translated modules take that set's instructions. Measured on the M3 Max
+//! (macOS 27.0.1, MoltenVK 1.4.1, the layer and `spirv-tools` 1.4.357.0 from Homebrew), in a lane
+//! process that exited while a pool's making of a host step's variant was in progress: `SIGSEGV` at
+//! `0x50` inside `spvtools::val::InstructionCanHaveTypeOperand`, its function-local
+//! `std::unordered_set` already destroyed (`CoreChecks::ValidateShaderStage`, from
+//! `vkCreateComputePipelines` on the pool's thread, in its making section). A diagnostic interposer
+//! of the C library's exit handlers showed the validator's two such sets (that one and
+//! `InstructionRequiresTypeOperand`'s) made after the hook's first registration in each of 10 runs,
+//! the second after its last, by a making on the program's thread or the pool's; with priming
+//! specialized and taking the extended instruction, both made in priming, before the hook's first
+//! registration, in each of 10.
 //!
 //! Priming makes each entry point once, in the runtime's shapes; it cannot promise that a layer
 //! makes no new static on a code path a later call takes with other parameters. A section's
 //! first call of each entry point, and every section whose count reaches a power of two,
 //! register the hook again for those (`exit_guard`).
 
+use crate::draw_source::SizedIndexBind;
+use crate::dynamic_state::{ColorWriteMasks, ExtendedDynamicState};
 use crate::error::{vulkan, Error};
 use crate::exit_guard::Call;
 use crate::generated_commands::{
@@ -49,23 +77,32 @@ use crate::generated_commands::{
     LayoutCreateInfo, LayoutToken, EXECUTION_SET_PIPELINES, INDIRECT_BINDABLE, TOKEN_DISPATCH,
     TOKEN_EXECUTION_SET,
 };
+use crate::gpu_time::Calibration;
 use crate::loader_word::LoaderWord;
 use crate::memory;
 use crate::release::{self, Generated, Released};
+use crate::render_state::DepthBiasCommand;
 use crate::sharing::Sharing;
 use crate::tracker::Barrier;
 use ash::vk;
 use std::time::{Duration, Instant};
 
+use super::functions::Vk;
 use super::QueueSlot;
 
 /// The table's entry points priming cannot make before the hook is registered for the device it
-/// primes: the release of a device, an instance and a messenger. The first release of each in
-/// the process registers the hook again as its section ends (`exit_guard::called`).
-pub(crate) const UNPRIMED: [Call; 3] = [
+/// primes: the release of a device, an instance and a messenger, and the commands of a mesh draw
+/// and of an execution of commands the GPU generates, which take pipelines of their own kinds.
+/// The first release of each in the process, and the first replay of each command
+/// (`recorder`), registers the hook again as its section ends (`exit_guard::called`).
+pub(crate) const UNPRIMED: [Call; 7] = [
     Call::DestroyDevice,
     Call::DestroyDebugUtilsMessenger,
     Call::DestroyInstance,
+    Call::CmdDrawMeshTasks,
+    Call::CmdDrawMeshTasksIndirect,
+    Call::CmdExecuteGeneratedCommands,
+    Call::CmdPreprocessGeneratedCommands,
 ];
 
 /// The table's entry points a queue family that writes no timestamps (`timestampValidBits` 0)
@@ -75,6 +112,11 @@ pub(crate) const TIMESTAMP_CALLS: [Call; 3] = [
     Call::CmdWriteTimestamp,
     Call::GetQueryPoolResults,
 ];
+
+/// The table's entry points a device that writes no timestamps, or does not enable
+/// `hostQueryReset` (an adopted one), never calls, nor primes: a timestamp slot's reset on the
+/// host (`gpu_time.rs`).
+pub(crate) const HOST_QUERY_RESET_CALLS: [Call; 1] = [Call::ResetQueryPool];
 
 /// The table's entry points a device without device addresses (`bufferDeviceAddress`) never
 /// calls, nor primes: a buffer's address (`buffer.rs`).
@@ -91,23 +133,81 @@ pub(crate) const GENERATED_COMMANDS_CALLS: [Call; 2] = [
 /// batch's sparse binding (`sparse/bind.rs`).
 pub(crate) const SPARSE_CALLS: [Call; 1] = [Call::QueueBindSparse];
 
+/// The table's entry points a device without the push command (Vulkan 1.4, or
+/// `VK_KHR_push_descriptor`) never calls, nor primes: a host step's set 0 pushed
+/// (`pipeline::objects::pushes_set_zero`).
+pub(crate) const PUSH_DESCRIPTOR_CALLS: [Call; 1] = [Call::CmdPushDescriptorSet];
+
+/// The table's entry points a device that calibrates no timestamps never calls, nor primes: a
+/// completion turn's calibration reading (`gpu_time.rs`).
+pub(crate) const CALIBRATION_CALLS: [Call; 1] = [Call::GetCalibratedTimestamps];
+
+/// The table's entry points a device whose instance reports no messages never calls, nor primes:
+/// a graphics pipeline's debug name (`pipeline/graphics.rs`).
+pub(crate) const NAMING_CALLS: [Call; 1] = [Call::SetDebugUtilsObjectName];
+
+/// The table's entry points a device without extended dynamic state (Vulkan 1.3, or
+/// `VK_EXT_extended_dynamic_state`) never calls, nor primes: a render encoder's dynamic states
+/// (`dynamic_state.rs`).
+pub(crate) const EXTENDED_DYNAMIC_STATE_CALLS: [Call; 9] = [
+    Call::CmdSetCullMode,
+    Call::CmdSetFrontFace,
+    Call::CmdSetPrimitiveTopology,
+    Call::CmdBindVertexBuffers2,
+    Call::CmdSetDepthTestEnable,
+    Call::CmdSetDepthWriteEnable,
+    Call::CmdSetDepthCompareOp,
+    Call::CmdSetStencilTestEnable,
+    Call::CmdSetStencilOp,
+];
+
+/// The table's entry points a device without a dynamic primitive restart (Vulkan 1.3, or
+/// `VK_EXT_extended_dynamic_state2`) never calls, nor primes (`dynamic_state.rs`).
+pub(crate) const PRIMITIVE_RESTART_CALLS: [Call; 1] = [Call::CmdSetPrimitiveRestartEnable];
+
+/// The table's entry points a device without the dynamic color write mask never calls, nor
+/// primes: a snapshot draw's masks (`dynamic_state.rs`, `render/snapshot.rs`).
+pub(crate) const COLOR_WRITE_MASK_CALLS: [Call; 1] = [Call::CmdSetColorWriteMask];
+
+/// The table's entry points a device without `VK_EXT_depth_bias_control` never calls, nor
+/// primes: a depth bias in a unit of its own (`render_state.rs`).
+pub(crate) const DEPTH_BIAS_CALLS: [Call; 1] = [Call::CmdSetDepthBias2];
+
+/// The table's entry points a device without `maintenance5` never calls, nor primes: an index
+/// buffer bound with its size (`draw_source.rs`).
+pub(crate) const SIZED_INDEX_BIND_CALLS: [Call; 1] = [Call::CmdBindIndexBuffer2];
+
+/// The debug name of a render host step's pipeline that priming makes, where the instance reports
+/// messages ([`NAMING_CALLS`]).
+const PRIMING_PIPELINE: &std::ffi::CStr =
+    c"metal2vulkan: a priming pipeline that rasterizes nothing";
+
 /// The longest the priming submission is waited for: it holds two barriers.
 const LIMIT: Duration = Duration::from_secs(10);
 
-/// How long one wait lasts before it is repeated, as the completion thread's.
+/// How long one wait lasts before it is repeated, as a queue waiter's.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
-/// The smallest compute shader: `main`, of one invocation, returns (SPIR-V 1.0). Also the words
-/// of a host step's own module in `tests/teardown_threads.rs`.
-pub(crate) const SHADER: [u32; 35] = [
+/// The smallest compute shader with a specialization constant ([`SPECIALIZED`]) and an extended
+/// instruction: `main`, of one invocation, takes `GLSL.std.450`'s `UMin` of the constant and
+/// returns (SPIR-V 1.0). Also the words of a host step's own module in
+/// `tests/teardown_threads.rs`.
+pub(crate) const SHADER: [u32; 60] = [
     0x0723_0203,
     0x0001_0000,
     0,
-    5,
+    10,
     0,
     // OpCapability Shader
     0x0002_0011,
     1,
+    // %8 = OpExtInstImport "GLSL.std.450"
+    0x0006_000b,
+    8,
+    0x4c53_4c47,
+    0x6474_732e,
+    0x3035_342e,
+    0,
     // OpMemoryModel Logical GLSL450
     0x0003_000e,
     0,
@@ -125,13 +225,28 @@ pub(crate) const SHADER: [u32; 35] = [
     1,
     1,
     1,
+    // OpDecorate %5 SpecId 0
+    0x0004_0047,
+    5,
+    1,
+    0,
     // %2 = OpTypeVoid; %3 = OpTypeFunction %2
     0x0002_0013,
     2,
     0x0003_0021,
     3,
     2,
-    // %1 = OpFunction %2 None %3; %4 = OpLabel; OpReturn; OpFunctionEnd
+    // %6 = OpTypeInt 32 0; %5 = OpSpecConstant %6 0
+    0x0004_0015,
+    6,
+    32,
+    0,
+    0x0004_0032,
+    6,
+    5,
+    0,
+    // %1 = OpFunction %2 None %3; %4 = OpLabel; %9 = OpExtInst %6 %8 UMin %5 %5; OpReturn;
+    // OpFunctionEnd
     0x0005_0036,
     2,
     1,
@@ -139,21 +254,36 @@ pub(crate) const SHADER: [u32; 35] = [
     3,
     0x0002_00f8,
     4,
+    0x0007_000c,
+    6,
+    9,
+    8,
+    38,
+    5,
+    5,
     0x0001_00fd,
     0x0001_0038,
 ];
 
-/// The smallest vertex shader: `main` returns (SPIR-V 1.0), for a pipeline that rasterizes
-/// nothing.
-const VERTEX_SHADER: [u32; 29] = [
+/// The smallest vertex shader with a specialization constant ([`SPECIALIZED`]) and an extended
+/// instruction: `main` takes `GLSL.std.450`'s `UMin` of the constant and returns (SPIR-V 1.0), for
+/// a pipeline that rasterizes nothing.
+const VERTEX_SHADER: [u32; 54] = [
     0x0723_0203,
     0x0001_0000,
     0,
-    5,
+    10,
     0,
     // OpCapability Shader
     0x0002_0011,
     1,
+    // %8 = OpExtInstImport "GLSL.std.450"
+    0x0006_000b,
+    8,
+    0x4c53_4c47,
+    0x6474_732e,
+    0x3035_342e,
+    0,
     // OpMemoryModel Logical GLSL450
     0x0003_000e,
     0,
@@ -164,13 +294,28 @@ const VERTEX_SHADER: [u32; 29] = [
     1,
     0x6e69_616d,
     0,
+    // OpDecorate %5 SpecId 0
+    0x0004_0047,
+    5,
+    1,
+    0,
     // %2 = OpTypeVoid; %3 = OpTypeFunction %2
     0x0002_0013,
     2,
     0x0003_0021,
     3,
     2,
-    // %1 = OpFunction %2 None %3; %4 = OpLabel; OpReturn; OpFunctionEnd
+    // %6 = OpTypeInt 32 0; %5 = OpSpecConstant %6 0
+    0x0004_0015,
+    6,
+    32,
+    0,
+    0x0004_0032,
+    6,
+    5,
+    0,
+    // %1 = OpFunction %2 None %3; %4 = OpLabel; %9 = OpExtInst %6 %8 UMin %5 %5; OpReturn;
+    // OpFunctionEnd
     0x0005_0036,
     2,
     1,
@@ -178,24 +323,89 @@ const VERTEX_SHADER: [u32; 29] = [
     3,
     0x0002_00f8,
     4,
+    0x0007_000c,
+    6,
+    9,
+    8,
+    38,
+    5,
+    5,
     0x0001_00fd,
     0x0001_0038,
 ];
 
-/// What the device primed has: a queue family that writes timestamps, device addresses,
-/// `VK_EXT_device_generated_commands`, and sparse binding on its queues.
+/// The constant [`SHADER`] and the vertex shader declare, specialized as the runtime's makings
+/// specialize their modules' (`pipeline/objects.rs`, `pipeline/graphics.rs`): a specialized stage
+/// takes paths of its own, in a driver's compiler and in a layer's checks of the stage, which a
+/// making then reaches first (the module docs).
+const SPECIALIZED: [vk::SpecializationMapEntry; 1] = [vk::SpecializationMapEntry {
+    constant_id: 0,
+    offset: 0,
+    size: 4,
+}];
+
+/// The value of [`SPECIALIZED`]'s constant.
+const SPECIALIZED_VALUE: [u8; 4] = 1u32.to_le_bytes();
+
+/// The specialization of each priming stage: [`SPECIALIZED`] at [`SPECIALIZED_VALUE`].
+fn specialization() -> vk::SpecializationInfo<'static> {
+    vk::SpecializationInfo::default()
+        .map_entries(&SPECIALIZED)
+        .data(&SPECIALIZED_VALUE)
+}
+
+/// What the device primed has: a queue family that writes timestamps, `hostQueryReset`, device
+/// addresses, `VK_EXT_device_generated_commands`, sparse binding on its queues, the push command,
+/// calibrated timestamps, and the render encoder's commands of [`PrimedDraws`].
 #[derive(Clone, Copy)]
 pub(crate) struct Has {
     pub(crate) timestamps: bool,
+    pub(crate) host_query_reset: bool,
     pub(crate) device_addresses: bool,
     pub(crate) generated_commands: bool,
     pub(crate) sparse_binding: bool,
+    pub(crate) push_descriptor: bool,
+    pub(crate) calibration: bool,
+    pub(crate) object_names: bool,
+    pub(crate) extended_dynamic_state: bool,
+    pub(crate) primitive_restart: bool,
+    pub(crate) color_write_masks: bool,
+    pub(crate) depth_bias: bool,
+    pub(crate) sized_index_bind: bool,
+}
+
+/// The commands a render encoder records that the device has where it has their feature or
+/// extension, which the priming's render host step makes (a deferred command buffer's replay
+/// records them inside a section, `recorder`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PrimedDraws {
+    pub(crate) dynamic: Option<ExtendedDynamicState>,
+    pub(crate) color_write_masks: Option<ColorWriteMasks>,
+    pub(crate) depth_bias: Option<DepthBiasCommand>,
+    pub(crate) sized_index_bind: Option<SizedIndexBind>,
+}
+
+impl PrimedDraws {
+    /// `has`, with what it says of these commands set from them.
+    pub(crate) fn has(&self, has: Has) -> Has {
+        Has {
+            extended_dynamic_state: self.dynamic.is_some(),
+            primitive_restart: self
+                .dynamic
+                .is_some_and(|dynamic| dynamic.primitive_restart_enable.is_some()),
+            color_write_masks: self.color_write_masks.is_some(),
+            depth_bias: self.depth_bias.is_some(),
+            sized_index_bind: self.sized_index_bind.is_some(),
+            ..has
+        }
+    }
 }
 
 /// Prime `device` of `physical`, made from `instance`, whose queues are `queues`, the first of
 /// its primary family `queue_family`, its buffers and images shared as `sharing` says, on this
-/// thread; `has` says what the device has, and `generated` holds the commands of
-/// `VK_EXT_device_generated_commands` where it has them.
+/// thread; `has` says what the device has, `generated` holds the commands of
+/// `VK_EXT_device_generated_commands` where it has them, and `drawn` the render encoder's
+/// commands it has.
 ///
 /// # Safety
 ///
@@ -206,18 +416,24 @@ pub(crate) struct Has {
 pub(super) unsafe fn prime(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
-    device: &ash::Device,
+    device: &Vk,
     loader_word: &LoaderWord,
     queue_family: u32,
     queues: &[QueueSlot],
     sharing: Sharing<'_>,
     has: Has,
     generated: Option<&Commands>,
+    push: Option<vk::PFN_vkCmdPushDescriptorSetKHR>,
+    calibration: Option<Calibration>,
+    drawn: PrimedDraws,
 ) -> Result<(), Error> {
     let mut primer = Primer {
         device,
         loader_word,
         sharing,
+        push,
+        calibration,
+        drawn,
         // SAFETY: the caller's.
         memory: unsafe { instance.get_physical_device_memory_properties(physical) },
         calls: 0,
@@ -226,7 +442,7 @@ pub(super) unsafe fn prime(
     // SAFETY: the caller's.
     let primed = unsafe {
         primer
-            .batch(queue_family, queues, has.timestamps)
+            .batch(queue_family, queues, has.timestamps, has.host_query_reset)
             .and_then(|()| primer.objects(queue_family, has.device_addresses))
             .and_then(|()| match generated {
                 Some(commands) => primer.generated(commands),
@@ -255,9 +471,15 @@ pub(super) unsafe fn prime(
 }
 
 /// The table's entry points, but [`UNPRIMED`], those of [`TIMESTAMP_CALLS`] where the device
-/// has no timestamps, those of [`DEVICE_ADDRESS_CALLS`] where it has no device addresses, those
-/// of [`GENERATED_COMMANDS_CALLS`] where it has no generated commands, and those of
-/// [`SPARSE_CALLS`] where it binds no sparse memory, that `calls` (one bit each) does not hold.
+/// has no timestamps, those of [`HOST_QUERY_RESET_CALLS`] where it has no timestamps or does not
+/// enable `hostQueryReset`, those of [`DEVICE_ADDRESS_CALLS`] where it has no device addresses,
+/// those of [`GENERATED_COMMANDS_CALLS`] where it has no generated commands, those of
+/// [`SPARSE_CALLS`] where it binds no sparse memory, those of [`PUSH_DESCRIPTOR_CALLS`] where it
+/// has no push command, those of [`CALIBRATION_CALLS`] where it calibrates no timestamps, those
+/// of [`NAMING_CALLS`] where its instance reports no messages, and those of
+/// [`EXTENDED_DYNAMIC_STATE_CALLS`], [`PRIMITIVE_RESTART_CALLS`],
+/// [`COLOR_WRITE_MASK_CALLS`], [`DEPTH_BIAS_CALLS`] and [`SIZED_INDEX_BIND_CALLS`] where it has
+/// not their commands, that `calls` (one bit each) does not hold.
 pub(crate) fn missing(calls: u128, has: Has) -> Vec<Call> {
     Call::ALL
         .iter()
@@ -266,9 +488,19 @@ pub(crate) fn missing(calls: u128, has: Has) -> Vec<Call> {
             calls & call.bit() == 0
                 && !UNPRIMED.contains(&call)
                 && (has.timestamps || !TIMESTAMP_CALLS.contains(&call))
+                && ((has.timestamps && has.host_query_reset)
+                    || !HOST_QUERY_RESET_CALLS.contains(&call))
                 && (has.device_addresses || !DEVICE_ADDRESS_CALLS.contains(&call))
                 && (has.generated_commands || !GENERATED_COMMANDS_CALLS.contains(&call))
                 && (has.sparse_binding || !SPARSE_CALLS.contains(&call))
+                && (has.push_descriptor || !PUSH_DESCRIPTOR_CALLS.contains(&call))
+                && (has.calibration || !CALIBRATION_CALLS.contains(&call))
+                && (has.object_names || !NAMING_CALLS.contains(&call))
+                && (has.extended_dynamic_state || !EXTENDED_DYNAMIC_STATE_CALLS.contains(&call))
+                && (has.primitive_restart || !PRIMITIVE_RESTART_CALLS.contains(&call))
+                && (has.color_write_masks || !COLOR_WRITE_MASK_CALLS.contains(&call))
+                && (has.depth_bias || !DEPTH_BIAS_CALLS.contains(&call))
+                && (has.sized_index_bind || !SIZED_INDEX_BIND_CALLS.contains(&call))
         })
         .collect()
 }
@@ -293,11 +525,17 @@ type Release = Box<dyn FnOnce(&ash::Device) -> Call>;
 
 /// A priming in progress.
 struct Primer<'a> {
-    device: &'a ash::Device,
+    device: &'a Vk,
     /// The device's loader word, put back before each call the loader serves.
     loader_word: &'a LoaderWord,
     /// How the device's buffers and images are shared among its queue families.
     sharing: Sharing<'a>,
+    /// The push command, where the device has it (`binding::push_descriptor_command`).
+    push: Option<vk::PFN_vkCmdPushDescriptorSetKHR>,
+    /// The device's calibrated timestamps, where its queue family writes timestamps.
+    calibration: Option<Calibration>,
+    /// The render encoder's commands the device has.
+    drawn: PrimedDraws,
     memory: vk::PhysicalDeviceMemoryProperties,
     /// The table's entry points called, one bit each.
     calls: u128,
@@ -314,7 +552,7 @@ impl Primer<'_> {
     /// The command buffer `vkAllocateCommandBuffers` allocates of `info`, the device's loader
     /// word put back first: the loader serves the call and reads the word, which MoltenVK 1.4.1
     /// overwrites whenever it names the device in a message, as this priming's own submission makes
-    /// it do where its performance tracking logs each activity at once (EV API-dc1-mvk4: a
+    /// it do where its performance tracking logs each activity at once (a
     /// `SIGSEGV` at `0x1cdc0de` in the loader's `vkAllocateCommandBuffers`).
     ///
     /// # Safety
@@ -368,16 +606,18 @@ impl Primer<'_> {
     /// timestamp before and after them, as a command buffer's GPU times are written), submitted
     /// to the first queue after every queue's timeline at 0, signalling a timeline semaphore to 1
     /// and a new fence; the wait for the timeline, a read of every timeline, the wait for the
-    /// fence and its reset, and, with `timestamps`, the read of the two timestamps.
+    /// fence and its reset, and, with `timestamps`, the read of the two timestamps; with
+    /// `host_reset` too, their reset on the host first, as a timestamp slot's (`gpu_time.rs`).
     ///
     /// # Safety
     ///
-    /// As [`prime`]'s.
+    /// As [`prime`]'s; with `host_reset`, the device enables `hostQueryReset`.
     unsafe fn batch(
         &mut self,
         queue_family: u32,
         queues: &[QueueSlot],
         timestamps: bool,
+        host_reset: bool,
     ) -> Result<(), Error> {
         let device = self.device;
         let mut kind = vk::SemaphoreTypeCreateInfo::default()
@@ -409,6 +649,12 @@ impl Primer<'_> {
             // SAFETY: the caller's.
             let queries = unsafe { device.create_query_pool(&info, None) }.map_err(vulkan)?;
             self.hold(queries);
+            if host_reset {
+                // SAFETY: the device enables `hostQueryReset` (the caller's); nothing uses the
+                // new pool's queries.
+                unsafe { device.reset_query_pool(queries, 0, 2) };
+                self.made(Call::ResetQueryPool);
+            }
             Some(queries)
         } else {
             None
@@ -426,7 +672,6 @@ impl Primer<'_> {
                 self.made(Call::CmdResetQueryPool);
                 device.cmd_write_timestamp(buffer, vk::PipelineStageFlags::TOP_OF_PIPE, queries, 0);
             }
-            Barrier::after_completed().record(device, buffer);
             Barrier::to_host().record(device, buffer);
             self.made(Call::CmdPipelineBarrier);
             if let Some(queries) = queries {
@@ -483,6 +728,14 @@ impl Primer<'_> {
             }
         }
         self.made(Call::WaitSemaphores);
+        // A waker's nudge of the scheduler's thread (`scheduler/mod.rs`): the semaphore, at 1,
+        // raised from the host, with no signal of it pending.
+        let raised = vk::SemaphoreSignalInfo::default()
+            .semaphore(signal)
+            .value(2);
+        // SAFETY: the semaphore is live, its one submitted signal landed, and 2 is above it.
+        unsafe { device.signal_semaphore(&raised) }.map_err(vulkan)?;
+        self.made(Call::SignalSemaphore);
         for queue in queues {
             // SAFETY: the timeline is live.
             unsafe { device.get_semaphore_counter_value(queue.timeline) }.map_err(vulkan)?;
@@ -501,7 +754,7 @@ impl Primer<'_> {
         // SAFETY: the fence is signaled and its submission completed.
         unsafe { device.reset_fences(&fences) }.map_err(vulkan)?;
         self.made(Call::ResetFences);
-        // The completion thread's drain of the queues after a failed wait
+        // A completion turn's drain of the queues after a failed wait
         // (`Device::drain_queues`).
         // SAFETY: the queue is used under its lock; its one submission completed.
         queues[0]
@@ -525,6 +778,10 @@ impl Primer<'_> {
                 Err(error) => return Err(vulkan(error)),
             }
             self.made(Call::GetQueryPoolResults);
+        }
+        if let Some(calibration) = self.calibration {
+            let _ = calibration.reading();
+            self.made(Call::GetCalibratedTimestamps);
         }
         Ok(())
     }
@@ -566,10 +823,12 @@ impl Primer<'_> {
             self.hold(layout);
             let mut flags =
                 vk::PipelineCreateFlags2CreateInfoKHR::default().flags(INDIRECT_BINDABLE);
+            let specialization = specialization();
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
-                .name(c"main");
+                .name(c"main")
+                .specialization_info(&specialization);
             let info = vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout)
@@ -853,10 +1112,12 @@ impl Primer<'_> {
                 .map_err(vulkan)?;
             self.made(Call::CreatePipelineCache);
             self.hold(cache);
+            let specialization = specialization();
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
-                .name(c"main");
+                .name(c"main")
+                .specialization_info(&specialization);
             let info = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout)];
@@ -887,6 +1148,31 @@ impl Primer<'_> {
                 .map_err(vulkan)?;
             device.cmd_bind_pipeline(recorded, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.made(Call::CmdBindPipeline);
+            // Where the device has the push command, the set's write pushed with a layout whose
+            // set 0 takes push descriptors, before the set is bound with the pipeline's layout
+            // (which disturbs it). The push ignores the write's `dstSet`.
+            if let Some(push) = self.push {
+                let info = vk::DescriptorSetLayoutCreateInfo::default()
+                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                    .bindings(&bindings);
+                let pushed_set = device
+                    .create_descriptor_set_layout(&info, None)
+                    .map_err(vulkan)?;
+                self.hold(pushed_set);
+                let pushed_sets = [pushed_set];
+                let info = vk::PipelineLayoutCreateInfo::default().set_layouts(&pushed_sets);
+                let pushed = device.create_pipeline_layout(&info, None).map_err(vulkan)?;
+                self.hold(pushed);
+                push(
+                    recorded,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pushed,
+                    0,
+                    writes.len() as u32,
+                    writes.as_ptr(),
+                );
+                self.made(Call::CmdPushDescriptorSet);
+            }
             device.cmd_bind_descriptor_sets(
                 recorded,
                 vk::PipelineBindPoint::COMPUTE,
@@ -984,6 +1270,36 @@ impl Primer<'_> {
             let zero = vk::ClearDepthStencilValue::default();
             device.cmd_clear_depth_stencil_image(recorded, depth, general, &zero, &[depth_whole]);
             self.made(Call::CmdClearDepthStencilImage);
+            // What an encoder records that no host step does, which a deferred command buffer's
+            // replay records (`recorder`): a buffer's fill and its inline update, each at bytes
+            // of its own, a copy of the query's result, and a blit of the image's first texel to
+            // its second after the clear.
+            device.cmd_fill_buffer(recorded, buffer, 192, 4, 0);
+            self.made(Call::CmdFillBuffer);
+            device.cmd_update_buffer(recorded, buffer, 208, &[0; 4]);
+            self.made(Call::CmdUpdateBuffer);
+            let results = vk::QueryResultFlags::empty();
+            device.cmd_copy_query_pool_results(recorded, queries, 0, 1, buffer, 224, 4, results);
+            self.made(Call::CmdCopyQueryPoolResults);
+            Barrier::everything().record(device, recorded);
+            let corner = |x| vk::Offset3D { x, y: 0, z: 0 };
+            let far = |x| vk::Offset3D { x, y: 1, z: 1 };
+            let blit = [vk::ImageBlit {
+                src_subresource: texel,
+                src_offsets: [corner(0), far(1)],
+                dst_subresource: texel,
+                dst_offsets: [corner(1), far(2)],
+            }];
+            device.cmd_blit_image(
+                recorded,
+                image,
+                general,
+                image,
+                general,
+                &blit,
+                vk::Filter::NEAREST,
+            );
+            self.made(Call::CmdBlitImage);
             // The image's read before the pass's layout transition of it.
             Barrier::everything().record(device, recorded);
             self.render_step(RenderStep {
@@ -1027,10 +1343,12 @@ impl Primer<'_> {
             let info = vk::ShaderModuleCreateInfo::default().code(&VERTEX_SHADER);
             let module = device.create_shader_module(&info, None).map_err(vulkan)?;
             self.hold(module);
+            let specialization = specialization();
             let stages = [vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(module)
-                .name(c"main")];
+                .name(c"main")
+                .specialization_info(&specialization)];
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
             // Triangles: a point list's vertex shader must write the point size where the device
             // does not enable `maintenance5`.
@@ -1053,6 +1371,16 @@ impl Primer<'_> {
                 .map_err(|(_, error)| vulkan(error))?[0];
             self.made(Call::CreateGraphicsPipelines);
             self.hold(pipeline);
+            // Its debug name, where the instance reports messages, as a making names its pipeline
+            // (`pipeline/graphics.rs`): the loader serves the call.
+            if let Some(name) = device.object_name() {
+                self.loader_word.restore();
+                let info = vk::DebugUtilsObjectNameInfoEXT::default()
+                    .object_handle(pipeline)
+                    .object_name(PRIMING_PIPELINE);
+                let _ = name(device.handle(), &info);
+                self.made(Call::SetDebugUtilsObjectName);
+            }
 
             let allocate = vk::CommandBufferAllocateInfo::default()
                 .command_pool(commands)
@@ -1103,9 +1431,72 @@ impl Primer<'_> {
             self.made(Call::CmdSetStencilWriteMask);
             device.cmd_set_stencil_reference(draws, faces, 0);
             self.made(Call::CmdSetStencilReference);
+            // The extended dynamic states and the extension states the device has, set before
+            // the bind too (a deferred command buffer's replay records them, `recorder`).
+            let drawn = self.drawn;
+            if let Some(dynamic) = drawn.dynamic {
+                (dynamic.cull_mode)(draws, vk::CullModeFlags::NONE);
+                self.made(Call::CmdSetCullMode);
+                (dynamic.front_face)(draws, vk::FrontFace::COUNTER_CLOCKWISE);
+                self.made(Call::CmdSetFrontFace);
+                (dynamic.primitive_topology)(draws, vk::PrimitiveTopology::TRIANGLE_LIST);
+                self.made(Call::CmdSetPrimitiveTopology);
+                (dynamic.depth_test_enable)(draws, vk::FALSE);
+                self.made(Call::CmdSetDepthTestEnable);
+                (dynamic.depth_write_enable)(draws, vk::FALSE);
+                self.made(Call::CmdSetDepthWriteEnable);
+                (dynamic.depth_compare_op)(draws, vk::CompareOp::ALWAYS);
+                self.made(Call::CmdSetDepthCompareOp);
+                (dynamic.stencil_test_enable)(draws, vk::FALSE);
+                self.made(Call::CmdSetStencilTestEnable);
+                let keep = vk::StencilOp::KEEP;
+                (dynamic.stencil_op)(draws, faces, keep, keep, keep, vk::CompareOp::ALWAYS);
+                self.made(Call::CmdSetStencilOp);
+                if let Some(restart) = dynamic.primitive_restart_enable {
+                    restart(draws, vk::FALSE);
+                    self.made(Call::CmdSetPrimitiveRestartEnable);
+                }
+            }
+            if let Some(ColorWriteMasks(masks)) = drawn.color_write_masks {
+                let all = [vk::ColorComponentFlags::RGBA];
+                masks(draws, 0, all.len() as u32, all.as_ptr());
+                self.made(Call::CmdSetColorWriteMask);
+            }
+            if let Some(bias) = drawn.depth_bias {
+                bias(draws, &vk::DepthBiasInfoEXT::default());
+                self.made(Call::CmdSetDepthBias2);
+            }
+            // A clear of the attachment inside the pass, as a render encoder's clear of a stand-in
+            // records it.
+            let clear = [vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                color_attachment: 0,
+                clear_value: vk::ClearValue::default(),
+            }];
+            let rect = [vk::ClearRect {
+                rect: area,
+                base_array_layer: 0,
+                layer_count: 1,
+            }];
+            device.cmd_clear_attachments(draws, &clear, &rect);
+            self.made(Call::CmdClearAttachments);
             device.cmd_bind_pipeline(draws, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_vertex_buffers(draws, 0, &[buffer], &[0]);
             self.made(Call::CmdBindVertexBuffers);
+            if let Some(dynamic) = drawn.dynamic {
+                let (buffers, offsets) = ([buffer], [0]);
+                let none = std::ptr::null();
+                (dynamic.bind_vertex_buffers2)(
+                    draws,
+                    0,
+                    1,
+                    buffers.as_ptr(),
+                    offsets.as_ptr(),
+                    none,
+                    none,
+                );
+                self.made(Call::CmdBindVertexBuffers2);
+            }
             // An execution under a visibility result mode counts its draws in a query begun and
             // ended in its secondary.
             device.cmd_begin_query(draws, queries, 0, vk::QueryControlFlags::empty());
@@ -1119,6 +1510,10 @@ impl Primer<'_> {
             // and from its arguments.
             device.cmd_bind_index_buffer(draws, buffer, 0, vk::IndexType::UINT32);
             self.made(Call::CmdBindIndexBuffer);
+            if let Some(bind) = drawn.sized_index_bind {
+                bind(draws, buffer, 0, 256, vk::IndexType::UINT32);
+                self.made(Call::CmdBindIndexBuffer2);
+            }
             device.cmd_draw_indexed(draws, 3, 1, 0, 0, 0);
             self.made(Call::CmdDrawIndexed);
             device.cmd_draw_indexed_indirect(draws, buffer, 0, 1, 20);

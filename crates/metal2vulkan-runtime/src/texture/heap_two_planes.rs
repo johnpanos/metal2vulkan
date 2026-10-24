@@ -3,7 +3,7 @@
 //! a texture over a surface's two planes too, at the planes' rows
 //! (`texture/surface_two_planes.rs`).
 //!
-//! **Metal's layout** (EV XRR2-xrh1-m4, an Apple M4 under macOS 27.0.1, plain; a buffer over
+//! **Metal's layout** (an Apple M4 under macOS 27.0.1, plain; a buffer over
 //! the heap's bytes from 0 in a placement heap, and one placed after `makeAliasable` in an
 //! automatic heap; `Shared` and `Private` storage alike, so a `Private` texture's bytes are not
 //! tiled or compressed; 2D textures of 1 x 1, 16 x 12, 37 x 5, 64 x 64, 300 x 70 and 333 x 61 at
@@ -34,10 +34,12 @@
 use super::super::buffer::Buffer;
 use super::super::error::{internal, Error};
 use super::super::owned_kernel::{OwnedKernel, OwnedModule, OwnedSets};
-use super::super::shadow::ShadowStaging;
+use super::super::row_copies::RowCopies;
+use super::super::shadow::{self, ShadowStaging};
 use super::super::tracker::Barrier;
 use super::super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
 use super::super::Device;
+use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::bind::{PlaneLayout, TwoPlaneTexelsModule};
 
@@ -281,19 +283,21 @@ impl HeapPlaneCopies {
     }
 
     /// Record the move of the texture's `image` from `bytes` (the heap's `VkBuffer`) through
-    /// `staging` (`into`), or back.
+    /// `staging` (`into`), or back, its rows back by `back` (`shadow::record_back`).
     ///
     /// # Safety
     ///
     /// `command_buffer` is recording, outside a render pass; the image, the buffers and the
-    /// sets are live until it completes, and the image rests in `GENERAL`.
+    /// sets are live until it completes, and the image rests in `GENERAL`; `back` is the copy's
+    /// `ShadowCopy::staged_back`, over `bytes`.
     pub(crate) unsafe fn record(
         &self,
-        device: &ash::Device,
+        device: &Vk,
         command_buffer: vk::CommandBuffer,
         image: vk::Image,
         (bytes, staging): (vk::Buffer, &ShadowStaging),
         into: bool,
+        back: Option<&RowCopies>,
     ) {
         let (step, set) = match into {
             true => (&self.moves[0], self.sets.sets[0]),
@@ -342,7 +346,7 @@ impl HeapPlaneCopies {
                     &self.regions,
                 );
             } else {
-                device.cmd_copy_buffer(command_buffer, staging.raw(), bytes, &staging.back);
+                shadow::record_back(device, command_buffer, (staging, bytes), back);
             }
         }
     }

@@ -17,9 +17,10 @@
 //!   hook again after the process's first pipeline made in one. Once the process is exiting, a
 //!   piece not started is dropped unrun: it fails its making (`making::Ticket`), as Metal's
 //!   pending work stays pending. While a piece's driver call makes a pipeline
-//!   (`exit_guard::driver_making`), the exit waits for it up to `exit_guard::MAKING_BOUND`, not the
-//!   guard's two seconds: the program need not wait for the command buffer whose making it is
-//!   before it exits, and a making outlasts those.
+//!   (`exit_guard::driver_making`), the exit waits for it, on macOS up to
+//!   `exit_guard::MAKING_BOUND`, not the guard's two seconds: the program need not wait for the
+//!   command buffer whose making it is before it exits, and a making outlasts those. On Linux the
+//!   exit waits as for any section, and then ends the process at once (`exit_guard`).
 //! - **No thread.** Where the host cannot start a thread and none runs, the piece runs on the
 //!   caller's thread, as before the pool.
 //! - **At the user-initiated class** (a concurrency change). On macOS each thread runs at the
@@ -195,9 +196,10 @@ impl PoolQueue {
         lock(&self.state).next_rank(self.budget.age(), ahead_free)
     }
 
-    /// The piece [`next_rank`](Self::next_rank) ranks, taken, and whether nothing waits for it:
-    /// for the budget, which hands it to the thread it gives the turn (`budget.rs`).
-    pub(crate) fn next_piece(&self, ahead_free: bool) -> Option<(Work, bool)> {
+    /// The piece [`next_rank`](Self::next_rank) ranks, taken, with its rank unaged and whether
+    /// nothing waits for it: for the budget, which hands it to the thread it gives the turn
+    /// (`budget.rs`).
+    pub(crate) fn next_piece(&self, ahead_free: bool) -> Option<(Work, Candidate)> {
         lock(&self.state).next_piece(self.budget.age(), ahead_free)
     }
 }
@@ -223,12 +225,13 @@ impl State {
         Some(rank)
     }
 
-    /// The next piece to run, taken, as [`next_rank`](Self::next_rank) ranks it, and whether
-    /// nothing waits for it.
-    fn next_piece(&mut self, age: Duration, ahead_free: bool) -> Option<(Work, bool)> {
+    /// The next piece to run, taken, as [`next_rank`](Self::next_rank) ranks it, with its rank
+    /// unaged (its urgency, its number) and whether nothing waits for it.
+    fn next_piece(&mut self, age: Duration, ahead_free: bool) -> Option<(Work, Candidate)> {
         let ((_, number), ahead) = self.next_rank(age, ahead_free)??;
         let at = self.work.iter().position(|q| q.number == number)?;
-        Some((self.work.remove(at)?.work, ahead))
+        let queued = self.work.remove(at)?;
+        Some((queued.work, ((queued.urgency, number), ahead)))
     }
 }
 
@@ -429,6 +432,22 @@ impl Pool {
         outcomes
     }
 
+    /// The urgency the piece waiting first here ranks at, aged as the budget orders it, where any
+    /// waits (the device tests, `tests/pipeline_wait_order.rs`).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn first_urgency(&self) -> Option<Urgency> {
+        let state = lock(&self.shared.state);
+        let first = state.next_rank(self.shared.budget.age(), true).flatten();
+        first.map(|((urgency, _), _)| urgency)
+    }
+
+    /// The pieces it holds as asked, waiting or running on its threads
+    /// (`WorkCounts::pipeline_pool_busy`).
+    pub(crate) fn busy(&self) -> usize {
+        let state = lock(&self.shared.state);
+        state.work.len() + state.threads.saturating_sub(state.free)
+    }
+
     /// The threads alive and those of them free (the pool's tests).
     #[cfg(test)]
     fn census(&self) -> (usize, usize) {
@@ -542,88 +561,143 @@ fn as_piece<R>(work: impl FnOnce() -> R) -> R {
 
 /// The runtime's tests' hold on the pool: while a [`Hold`](held::Hold) lives, no piece starts,
 /// so every pipeline a draw hands here stays being made (`tests/pipeline_wait_order.rs`, a
-/// device test, compiled under the validation crate's GPU safety cfgs alone).
+/// device test, compiled under the validation crate's GPU safety cfgs alone). The holds are
+/// counted: tests that run at once in one process each keep the pool held until their own is
+/// dropped, whatever the others drop.
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 pub(crate) mod held {
     use crate::device::lock;
     use std::sync::{Condvar, Mutex};
 
-    static HELD: Mutex<bool> = Mutex::new(false);
+    /// The holds that live.
+    static HELD: Mutex<usize> = Mutex::new(0);
     static RELEASED: Condvar = Condvar::new();
 
-    /// The hold, released when dropped.
+    /// One hold, given back when dropped.
     pub(crate) struct Hold(());
 
-    /// Hold every piece the pool starts from now until the hold is dropped.
+    /// Hold every piece the pool starts from now until this hold and every other is dropped.
     pub(crate) fn hold() -> Hold {
-        *lock(&HELD) = true;
+        *lock(&HELD) += 1;
         Hold(())
     }
 
     impl Drop for Hold {
         fn drop(&mut self) {
-            *lock(&HELD) = false;
-            RELEASED.notify_all();
+            let mut held = lock(&HELD);
+            *held -= 1;
+            if *held == 0 {
+                RELEASED.notify_all();
+            }
         }
+    }
+
+    /// Whether a hold lives.
+    pub(crate) fn holding() -> bool {
+        *lock(&HELD) > 0
     }
 
     /// Wait while a hold lives.
     pub(super) fn wait() {
         let mut held = lock(&HELD);
-        while *held {
+        while *held > 0 {
             held = RELEASED
                 .wait(held)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
-    /// Whether a [`MidMaking`] hold lives, and how many makings reached it.
-    static MID: Mutex<(bool, usize)> = Mutex::new((false, 0));
-    static MID_CHANGED: Condvar = Condvar::new();
+    /// A point in a piece that pieces stop at while a hold of it lives, counting those that reached
+    /// it.
+    struct Stop {
+        /// Whether a hold lives, and how many pieces reached the point since it was taken.
+        state: Mutex<(bool, usize)>,
+        changed: Condvar,
+    }
 
-    /// A hold on every draw's making that took what its state kept for it (`render.rs`):
-    /// released when dropped.
-    pub(crate) struct MidMaking(());
+    impl Stop {
+        const fn new() -> Stop {
+            Stop {
+                state: Mutex::new((false, 0)),
+                changed: Condvar::new(),
+            }
+        }
+
+        /// Hold every piece that reaches the point from now until the hold is dropped.
+        fn hold(&'static self) -> Holding {
+            *lock(&self.state) = (true, 0);
+            Holding(self)
+        }
+
+        /// A piece reached the point: wait while a hold lives.
+        fn reach(&self) {
+            let mut state = lock(&self.state);
+            if !state.0 {
+                return;
+            }
+            state.1 += 1;
+            self.changed.notify_all();
+            while state.0 {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+
+    /// A hold on a [`Stop`]: released when dropped.
+    pub(crate) struct Holding(&'static Stop);
+
+    impl Holding {
+        /// Wait until `pieces` pieces reached the hold, at most `wait`: whether they did.
+        pub(crate) fn reached(&self, pieces: usize, wait: std::time::Duration) -> bool {
+            let state = lock(&self.0.state);
+            let (state, _) = self
+                .0
+                .changed
+                .wait_timeout_while(state, wait, |state| state.1 < pieces)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.1 >= pieces
+        }
+    }
+
+    impl Drop for Holding {
+        fn drop(&mut self) {
+            lock(&self.0.state).0 = false;
+            self.0.changed.notify_all();
+        }
+    }
+
+    /// A draw's making that took what its state kept for it (`render.rs`).
+    static MID_MAKING: Stop = Stop::new();
+
+    /// A dispatch's making that its piece settled, before the piece gives back what it took
+    /// (`dispatch_making.rs`): inside the piece's trail (`trails.rs`).
+    static SETTLED: Stop = Stop::new();
 
     /// Hold every draw's making from now, once it took what its state kept for it, until the
     /// hold is dropped: a making running, which its state's release cannot stop.
-    pub(crate) fn mid_making_hold() -> MidMaking {
-        *lock(&MID) = (true, 0);
-        MidMaking(())
+    pub(crate) fn mid_making_hold() -> Holding {
+        MID_MAKING.hold()
     }
 
-    impl MidMaking {
-        /// Wait until `makings` makings reached the hold, at most `wait`: whether they did.
-        pub(crate) fn reached(&self, makings: usize, wait: std::time::Duration) -> bool {
-            let mid = lock(&MID);
-            let (mid, _) = MID_CHANGED
-                .wait_timeout_while(mid, wait, |mid| mid.1 < makings)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            mid.1 >= makings
-        }
-    }
-
-    impl Drop for MidMaking {
-        fn drop(&mut self) {
-            lock(&MID).0 = false;
-            MID_CHANGED.notify_all();
-        }
-    }
-
-    /// A draw's making that took what its state kept for it: wait while a [`MidMaking`] hold
-    /// lives.
+    /// A draw's making that took what its state kept for it: wait while a
+    /// [`mid_making_hold`] lives.
     pub(crate) fn mid_making() {
-        let mut mid = lock(&MID);
-        if !mid.0 {
-            return;
-        }
-        mid.1 += 1;
-        MID_CHANGED.notify_all();
-        while mid.0 {
-            mid = MID_CHANGED
-                .wait(mid)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        MID_MAKING.reach();
+    }
+
+    /// Hold every dispatch's piece from now, once it settled its making and before it gives back
+    /// what it took, until the hold is dropped: the batches that waited for the making may run
+    /// and complete meanwhile.
+    pub(crate) fn settled_hold() -> Holding {
+        SETTLED.hold()
+    }
+
+    /// A dispatch's piece that settled its making: wait while a [`settled_hold`] lives.
+    pub(crate) fn settled() {
+        SETTLED.reach();
     }
 }
 

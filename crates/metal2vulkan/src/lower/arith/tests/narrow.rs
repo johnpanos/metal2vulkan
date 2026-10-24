@@ -152,7 +152,7 @@ fn a_half_round_trip_through_its_bits_is_compact() {
 /// Under native half rounding a `half` may reach its store unrounded (the device folds the
 /// conversion pair), and the store's bits then saturate: a finite magnitude from `65536` up is
 /// infinity, never a NaN's code or a code past 16 bits (whose bit 17 a pair's store carried into
-/// the next lane, EV `NKP-lane1-nv3090`); every other value is truncated toward zero onto the half
+/// the next lane); every other value is truncated toward zero onto the half
 /// grid, an infinity and a NaN as before, and a half value is its own bits. A module whose rounding
 /// is Metal's takes no cap.
 #[test]
@@ -970,11 +970,13 @@ fn half_rounding_keeps_denormals() {
     );
 }
 
-/// In `QuantizeForm::Converted` a `half` rounding is the conversion to 16 bits and its widening
-/// alone, which the interpreter rounds to nearest even with half denormals kept, as the devices
-/// that take `DriverDeviation::MetalHalfConversion` are measured to on every `f32`: over
+/// In `QuantizeForm::Converted` and `Controlled` a `half` rounding is the conversion to 16 bits
+/// and its widening alone, which the interpreter rounds to nearest even with half denormals kept,
+/// as the devices that take `DriverDeviation::MetalHalfConversion` are measured to on every `f32`
+/// and as the Vulkan spec makes it under the controlled form's float controls: over
 /// [`half_rounding_operands`], `round` and `round_exact_below_normal` give the exactly rounded
-/// half on scalars and vectors, with no `OpQuantizeToF16` and no `RoundEven` in the module.
+/// half on scalars and vectors, with no `OpQuantizeToF16` and no `RoundEven` in the module. In
+/// `Controlled` each conversion is decorated `NoContraction`, and none in `Converted`.
 #[test]
 fn converted_half_rounding_is_the_exactly_rounded_half() {
     let xs = half_rounding_operands();
@@ -1004,17 +1006,42 @@ fn converted_half_rounding_is_the_exactly_rounded_half() {
             crate::lower::arith::narrow::round_exact_below_normal,
         ),
     ];
-    for (name, round) in rounds {
+    use crate::spirv::builder::QuantizeForm;
+    use crate::spirv::ir::Contraction;
+    for ((name, round), q) in rounds
+        .into_iter()
+        .flat_map(|r| [(r, QuantizeForm::Converted), (r, QuantizeForm::Controlled)])
+    {
         // `round_exact_below_normal` is exact only on an `x` that is a value of the format
         // below the smallest normal half; the converted form is exact on every `x`.
         for (form, input, cs) in [(h, f32f, &cases), (v, vec(f32f, 3), &vc)] {
             let body = |fb: &mut FunctionBuilder<'_>, x: &[Value]| {
-                fb.module()
-                    .set_quantize_form(crate::spirv::builder::QuantizeForm::Converted);
+                fb.module().set_quantize_form(q);
                 round(fb, form, x[0])
             };
             let m = kernel_with(&[input], form, &body, true, false)
-                .unwrap_or_else(|e| panic!("{name}: build: {e:?}"));
+                .unwrap_or_else(|e| panic!("{name} {q:?}: build: {e:?}"));
+            let conversions: Vec<Contraction> = m
+                .blocks()
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|n| match n.inst {
+                    Inst::Convert {
+                        op: crate::spirv::ir::ConvOp::FConvert,
+                        contract,
+                        ..
+                    } => Some(contract),
+                    _ => None,
+                })
+                .collect();
+            let held = match q {
+                QuantizeForm::Controlled => Contraction::Forbidden,
+                _ => Contraction::Allowed,
+            };
+            assert!(
+                conversions.len() >= 2 && conversions.iter().all(|c| *c == held),
+                "{name} {q:?}: {conversions:?}"
+            );
             let quantizes = crate::lower::arith::narrow::quantizes(&m);
             let rounds_even = m.blocks().iter().flat_map(|b| &b.insts).any(|n| {
                 matches!(
@@ -1030,7 +1057,7 @@ fn converted_half_rounding_is_the_exactly_rounded_half() {
                 "{name}: a quantize or RoundEven"
             );
             check_module(
-                &format!("converted {name} on {form:?}"),
+                &format!("{q:?} {name} on {form:?}"),
                 m,
                 &[input],
                 form,
@@ -1042,9 +1069,9 @@ fn converted_half_rounding_is_the_exactly_rounded_half() {
     }
 }
 
-/// Metal's conversion of the `f32` of bits `b` to `half` (EVs NAN-hcv3-m3 and NAN-hcv3-m4 on
-/// every `f32`, and the M3 Max's probe of every NaN): to nearest even on the half grid, half
-/// denormals and the sign of a zero kept, infinity from 65520 up, and `0x7E00` for every NaN.
+/// Metal's conversion of the `f32` of bits `b` to `half` (on every `f32`, and the M3 Max's probe of
+/// every NaN): to nearest even on the half grid, half denormals and the sign of a zero kept,
+/// infinity from 65520 up, and `0x7E00` for every NaN.
 fn metal_half(b: u64) -> u64 {
     let x = f32v(b);
     if x.is_nan() {
@@ -2651,43 +2678,59 @@ fn srgb_conversions_are_named_apart_and_charge_their_table_once() {
     assert_eq!(routine_words(&ArithPlan::default()).count(), 0);
 }
 
-/// A `half` `fadd`, `fsub` or `fmul` takes the device's 16-bit arithmetic exactly where the profile
-/// takes `DriverDeviation::MetalHalfArithmetic` and has `shaderFloat16` (the MoltenVK captures
-/// alone), on one to four lanes; `fdiv`, `frem`, other formats, and a chunk wider than four lanes
+/// A `half` `fadd`, `fsub` or `fmul` takes the device's 16-bit arithmetic, on one to four lanes,
+/// exactly where the profile has `shaderFloat16` and takes `DriverDeviation::MetalHalfArithmetic`
+/// (the MoltenVK captures alone, measured) or rounds to `half` under the 16-bit float controls (by
+/// the Vulkan spec, with no fact); `fdiv`, `frem`, other formats, and a chunk wider than four lanes
 /// never do.
 #[test]
 fn half_arithmetic_on_the_device_follows_the_profile() {
+    use super::super::F16Basis;
     use crate::error::DriverDeviation;
+    use crate::spirv::builder::QuantizeForm;
     use crate::spirv::testing::is_moltenvk_capture;
-    let mut taken = 0;
+    let (mut measured, mut controlled) = (0, 0);
     for (stem, p) in committed_profiles().expect("profiles") {
-        let device = p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic)
-            && p.fields().leaf.float16;
-        assert_eq!(device, is_moltenvk_capture(&stem), "{stem}");
+        let float16 = p.fields().leaf.float16;
+        let fact = p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic) && float16;
+        assert_eq!(fact, is_moltenvk_capture(&stem), "{stem}");
+        let controls = super::super::narrow::quantize_form(&p) == QuantizeForm::Controlled;
+        let basis = match (fact, controls) {
+            (true, _) => Some(F16Basis::Measured),
+            (false, true) => Some(F16Basis::Controlled),
+            (false, false) => None,
+        };
         for op in [AirBin::FAdd, AirBin::FSub, AirBin::FMul] {
             for lanes in 1..=4 {
                 assert_eq!(
                     super::super::f16_arithmetic(&p, op, vec(half(), lanes)),
-                    device,
+                    basis,
                     "{stem}: {op:?} on {lanes} lanes"
                 );
             }
             for f in [vec(half(), 8), float(32), bfloat(), float(64)] {
-                assert!(
-                    !super::super::f16_arithmetic(&p, op, f),
+                assert_eq!(
+                    super::super::f16_arithmetic(&p, op, f),
+                    None,
                     "{stem}: {op:?} on {f:?}"
                 );
             }
         }
         for op in [AirBin::FDiv, AirBin::FRem] {
-            assert!(
-                !super::super::f16_arithmetic(&p, op, half()),
+            assert_eq!(
+                super::super::f16_arithmetic(&p, op, half()),
+                None,
                 "{stem}: {op:?}"
             );
         }
-        taken += usize::from(device);
+        measured += usize::from(basis == Some(F16Basis::Measured));
+        controlled += usize::from(basis == Some(F16Basis::Controlled));
     }
-    assert!(taken >= 2, "the MoltenVK captures take it");
+    assert!(measured >= 2, "the MoltenVK captures take it, measured");
+    assert!(
+        controlled >= 2,
+        "the float-controls profiles take it, by the spec"
+    );
 }
 
 /// The device's `half` `+ - *` ([`ops::f16_binary`]) is the exact result rounded once to `half`, on
@@ -2850,6 +2893,65 @@ fn half_arithmetic_on_the_device_is_one_16_bit_instruction() {
                 "{what}: the 16-bit instructions"
             );
             assert!(decorated.contains(&computed[2].2), "{what}: NoContraction");
+        }
+    }
+}
+
+/// Under the float controls (`QuantizeForm::Controlled`), where the profile leaves a NaN's bits to
+/// the device (`ModuleBuilder::native_half_nans`, `NanMinMaxPolicy::Native`), `from_bits` is the
+/// device's widening of the bits as a 16-bit float, with no integer decode: every half bit
+/// pattern, with junk above its 16 bits, reads as its exact `f32` value but a NaN, which reads as
+/// a NaN, one lane at a time and four at once, and `narrow::widens_bits` finds the widening.
+/// Without the flag (the NaN switch's `NanMinMaxPolicy::Exact`) the integer decode stands: every
+/// pattern exact, NaN payloads included, and `widens_bits` finds none.
+#[test]
+fn a_half_decode_under_the_float_controls_is_the_devices_widening() {
+    use super::super::narrow::{f32_of_half_bits, from_bits, widens_bits};
+    use crate::spirv::builder::QuantizeForm;
+    let junk = |h: u32| u64::from(h | NARROW_JUNK);
+    let one: Vec<Case> = (0..=0xFFFFu32).map(|h| vec![vec![junk(h)]]).collect();
+    let four: Vec<Case> = (0..0x1_0000u32)
+        .step_by(4)
+        .map(|h| vec![(h..h + 4).map(junk).collect()])
+        .collect();
+    let want = |c: &Case| {
+        Some(
+            c[0].iter()
+                .map(|b| u64::from(f32_of_half_bits(*b as u32 & 0xFFFF)))
+                .collect(),
+        )
+    };
+    for native in [false, true] {
+        for (lanes, cases) in [(1u8, &one), (4, &four)] {
+            let what = format!("{lanes} lanes, NaN bits the device's {native}");
+            let body = move |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
+                fb.module().set_quantize_form(QuantizeForm::Controlled);
+                fb.module().set_native_half_nans(native);
+                from_bits(fb, vec(half(), lanes), x[0])
+            };
+            let (ins, out) = ([vec(int(32), lanes)], vec(float(32), lanes));
+            let m = kernel_with(&ins, out, &body, true, false)
+                .unwrap_or_else(|e| panic!("{what}: build: {e:?}"));
+            let budget = crate::budget::Budget::default();
+            let mut meter = crate::budget::Meter::new(&budget);
+            let widens = widens_bits(&m, &mut meter).expect("widens_bits");
+            assert_eq!(widens, native, "{what}: widens_bits");
+            let decodes = m.blocks().iter().flat_map(|b| &b.insts).any(|n| {
+                matches!(
+                    n.inst,
+                    Inst::Convert {
+                        op: ConvOp::ConvertUToF,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(decodes, !native, "{what}: the integer decode");
+            check_accept(&what, &ins, out, &body, cases, &want, &|g, w| {
+                g == w
+                    || (native
+                        && f32::from_bits(g as u32).is_nan()
+                        && f32::from_bits(w as u32).is_nan())
+            });
         }
     }
 }

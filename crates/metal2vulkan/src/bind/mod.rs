@@ -69,18 +69,30 @@
 //! [`flat_dispatch_module`], which reads its arguments on the device ([`FlatIndirect`]). Where one
 //! command writes a buffer's bytes through a texture copied in and out of them and also another
 //! way, [`shadow_merge_module`] merges the bytes the texture changed into the buffer's in place of
-//! the copy back. A blit between a buffer and a two-plane extended-range texture moves its color
-//! words through [`plane_words_module`], and a blit between two such textures moves both planes as
-//! Metal's blit does through [`plane_copy_module`]. A rotated texture's texels move between its
+//! the copy back ([`shadow_merge_image_module`] reading the shadow's texels through its
+//! unsigned-integer view, where it has one, and [`shadow_merge_kept_image_module`] reading the
+//! kept texels from an image copy of the shadow too), and where a device copies a shadow back faster by a
+//! dispatch, [`shadow_copy_back_module`] stores its texels' words at their rows, and
+//! [`shadow_copy_in_module`] copies a merged texture's texels in and keeps them with one dispatch.
+//! A copy of many
+//! equal rows between two buffers is one dispatch of [`rows_copy_module`] where a copy's region
+//! per row costs more. A render pass that loads a
+//! 32-bit float depth holding a value Vulkan's depth test compares otherwise than Metal's (a
+//! negative value or a NaN, whose magnitude Metal compares) renders over its stand-in, written
+//! before the pass and merged back after it by [`depth_magnitude_module`]. A blit between a buffer
+//! and a two-plane extended-range texture moves its color words through [`plane_words_module`],
+//! and a blit between two such textures moves both planes as Metal's blit does through
+//! [`plane_copy_module`]. A rotated texture's texels move between its
 //! pass's frame and its store through [`rotate_texels_module`], and a heap's two-plane
 //! extended-range texture's texels between its image and its two planes in the heap's bytes through
 //! [`two_plane_texels_module`]; a blit into such a texture of a heap writes the heap's bytes at
 //! Metal's rows through [`plane_bytes_copy_module`]. A heap texture over host pages keeps its
 //! elements in the heap's bytes in Metal's tiled layout, moved between its image and those bytes
-//! through [`tiled_texels_module`]. A render pass that loads an extended-range or padded 10-bit
-//! color attachment and draws first rewrites the bits its codes leave unused through
-//! [`unused_bits_module`] of its form, in the 32 x 32 tiles a mask names, as Metal's tile store
-//! does. The tiles a pass's draws reach, which Metal's tile store writes back, are the mask one
+//! through [`tiled_texels_module`]. A render pass that loads an extended-range, padded 10-bit or
+//! bfloat color attachment and draws first rewrites the bits its codes leave unused through
+//! [`unused_bits_module`] of its format, in the 32 x 32 tiles a mask names, as Metal's tile store
+//! does; under the exact tile store it also raises a signed normalized attachment's minimum codes
+//! and normalizes an `RGB9E5Float` attachment's words there. The tiles a pass's draws reach, which Metal's tile store writes back, are the mask one
 //! dispatch of [`tile_reach_module`] bins its captured primitives into: [`capture_assembly_module`]
 //! assembles them from a pass's capture draws' records, and [`capture_settle_module`] widens the
 //! mask to every tile where the binning counted a primitive it cannot answer. A GPU blit that reads
@@ -88,7 +100,14 @@
 //! leaves of the formats whose bytes it changes ([`CompressedBlit`]), which
 //! [`compressed_blit_module`] of the rule rewrites after the copy. A BC1 to BC5 texture a device
 //! decodes otherwise than Metal is read through a twin of its texels as Metal decodes them
-//! ([`BlockDecode`]), which [`block_decode_module`] writes from the blocks each write left.
+//! ([`BlockDecode`]), which [`block_decode_module`] writes from the blocks each write left; an
+//! ASTC LDR texture on a device without its block through a twin of Metal's decode of its blocks
+//! ([`AstcDecode`], in the texels [`AstcTexels`] names), which [`astc_decode_module`] writes; a
+//! PVRTC texture on a device without its format through a twin of its texels' codes
+//! ([`PvrtcDecode`]), which [`pvrtc_decode_module`] writes; an ETC2 or EAC texture on a device
+//! without the formats through a twin of its codes or an 11-bit format's values ([`EtcDecode`], in
+//! the texels [`EtcTexels`] names), which [`etc_decode_module`] writes; a 4:2:2 texture through a
+//! twin of its texels' codes ([`ChromaDecode`]), which [`chroma_decode_module`] writes.
 //! [`sampler_desc`] gives the Vulkan sampler a plan's sampler write needs, [`heap_classes`] the
 //! classes of the handle heap's arrays on a profile, [`FunctionTableWords`] the words of a
 //! visible-function table's buffer, and [`FunctionTableSnapshot`] the one buffer of a command's
@@ -109,13 +128,17 @@
 
 pub(crate) mod acceleration;
 pub(crate) mod argument_buffer;
+pub(crate) mod astc_decode;
 pub(crate) mod block_decode;
 pub(crate) mod capture_assembly;
+pub(crate) mod chroma_decode;
 pub(crate) mod color_resolve;
 pub(crate) mod compressed_blit;
+pub(crate) mod depth_magnitude;
 pub(crate) mod depth_stencil_copy;
 pub(crate) mod depth_stencil_resolve;
 pub(crate) mod dispatch;
+pub(crate) mod etc_decode;
 pub(crate) mod extended_shadow;
 pub(crate) mod graphics;
 pub(crate) mod heap;
@@ -131,16 +154,22 @@ pub(crate) mod plan;
 pub(crate) mod plane_bytes_copy;
 pub(crate) mod plane_copy;
 pub(crate) mod plane_words;
+pub(crate) mod pvrtc_decode;
 pub(crate) mod rate_map;
 pub(crate) mod replay;
 pub(crate) mod resident;
 pub(crate) mod rotate_texels;
+pub(crate) mod rows_copy;
 pub(crate) mod sample_interleave;
 pub(crate) mod sample_planes;
+pub(crate) mod shadow_copy_back;
+pub(crate) mod shadow_copy_in;
 pub(crate) mod shadow_merge;
+pub(crate) mod shadow_merge_image;
 pub(crate) mod state;
 pub(crate) mod status;
 pub(crate) mod table;
+pub(crate) mod tessellation_scan;
 pub(crate) mod tile_map;
 pub(crate) mod tile_reach;
 pub(crate) mod tiled_texels;
@@ -159,17 +188,21 @@ pub use argument_buffer::{
     ArgumentBufferLayout, ArgumentDescriptor, ArgumentLayoutError, ArgumentMember, ArgumentPlace,
     ArgumentType, ARGUMENT_HANDLE_BYTES,
 };
+pub use astc_decode::{astc_decode_module, AstcDecode, AstcTexels};
 pub use block_decode::{block_decode_module, BlockDecode, BlockDecodeModule};
 pub use capture_assembly::{
     capture_assembly_module, capture_settle_module, CaptureAssemblyModule, CaptureSettleModule,
 };
+pub use chroma_decode::{chroma_decode_module, ChromaDecode};
 pub use color_resolve::{
     color_resolve_modules, ColorResolveFormat, ColorResolveModules, ResolveChannel, ResolveRule,
     ResolveSource, SRGB_RESOLVE_LINEAR, SRGB_RESOLVE_THRESHOLDS,
 };
 pub use compressed_blit::{compressed_blit_module, CompressedBlit, CompressedBlitModule};
+pub use etc_decode::{etc_decode_module, EtcDecode, EtcTexels};
 // The bytes of `WriteSource::ColorWriteTable`'s buffer.
 pub use crate::lower::arith::srgb::color_write_table;
+pub use depth_magnitude::{depth_magnitude_module, DepthMagnitudeModule};
 pub use depth_stencil_copy::{
     depth_split_module, depth_stencil_copy_modules, stencil_split_module, CopySource,
     DepthSplitModule, DepthStandInForm, DepthStencilCopy, DepthStencilCopyModules, StencilBit,
@@ -183,6 +216,7 @@ pub use dispatch::{Dispatch, DispatchCommands, DispatchRegion, IndirectArgs};
 pub use extended_shadow::{extended_shadow_module, ExtendedShadowModule};
 pub use graphics::{
     DrawCall, DrawCommands, IndexOverrun, MeshDispatch, MeshGroups, MeshRecordsRegion,
+    TessellationDispatch, TessellationRecords,
 };
 pub use heap::{
     handle_entry, handle_entry_flags, heap_classes, heap_element, heap_raw_form,
@@ -205,7 +239,7 @@ pub use instantiate::{
 pub use mesh_scan::{mesh_scan_module, MeshScanModule};
 pub use mipmap_filter::{
     mipmap_filter_module, MipmapFilterChain, MipmapFilterKernel, MipmapFilterLevel,
-    MipmapFilterModule,
+    MipmapFilterModule, MipmapRule,
 };
 pub use neutral::NeutralResource;
 pub use plan::resources::sampler_desc;
@@ -245,7 +279,9 @@ pub use plane_bytes_copy::{
 };
 pub use plane_copy::{plane_copy_module, PlaneCopyModule, PlaneRows};
 pub use plane_words::{plane_words_module, PlaneWordsModule};
+pub use pvrtc_decode::{pvrtc_decode_module, PvrtcDecode};
 pub use rotate_texels::{rotate_texels_module, RotateTexelsModule};
+pub use rows_copy::{rows_copy_module, RowsCopyModule};
 pub use sample_interleave::{
     interleave_merge_modules, interleave_split_module, InterleaveMergeModules,
     InterleaveSplitModule,
@@ -253,11 +289,20 @@ pub use sample_interleave::{
 pub use sample_planes::{
     planes_merge_modules, planes_split_module, PlanesCopy, PlanesMergeModules, PlanesSplitModule,
 };
+pub use shadow_copy_back::{shadow_copy_back_module, ShadowCopyBackModule, ShadowTexelView};
+pub use shadow_copy_in::{shadow_copy_in_module, ShadowCopyInModule};
 pub use shadow_merge::{shadow_merge_module, ShadowMergeModule};
+pub use shadow_merge_image::{
+    shadow_merge_image_module, shadow_merge_kept_image_module, ShadowMergeImageModule,
+};
 pub use status::{
     ExecutionStatus, MeshRecordsFault, ReplayFaults, StatusBits, StatusReport, StatusWord,
+    TessellationRecordsFault,
 };
 pub use table::{FunctionTableSnapshot, FunctionTableWords};
+pub use tessellation_scan::{
+    tessellation_scan_module, TessellationScanKernel, TessellationScanModule,
+};
 pub use tile_map::{SparseTileMap, TileMapError, TileMapping};
 pub use tile_reach::{tile_reach_module, TileReachModule};
 pub use tiled_texels::{tiled_texels_module, TiledLevelMove, TiledTexelsModule};

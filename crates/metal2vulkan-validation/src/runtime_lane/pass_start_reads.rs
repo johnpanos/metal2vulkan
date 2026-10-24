@@ -2,27 +2,28 @@
 //! (`runtime/render/pass_start_reads.rs`) on the device the cfg selects, under the validation
 //! layer.
 //!
-//! a probe (EVs `RRS-probe-6m3`, an M3 Max, and `RRS-probe-6`, an M4; plain and validated, 20 runs
-//! a case) drew, in one render pass, a draw whose fragments write a buffer and then draws whose
-//! vertex function reads the written bytes: the vertex stage read the bytes from before the pass in
-//! every run, and plain Metal ignored a memory barrier from the fragment stage to the vertex stage
+//! a probe (an M3 Max, and an M4; plain and validated, 20 runs a case) drew, in one render pass, a
+//! draw whose fragments write a buffer and then draws whose vertex function reads the written
+//! bytes: the vertex stage read the bytes from before the pass in every run, and plain Metal
+//! ignored a memory barrier from the fragment stage to the vertex stage
 //! (Metal's validation stops it). Here the owned fixture `rt6_attachmentless`'s `rt6_mark_sample`
 //! ORs bit 0 into word 0 of a buffer over the probe pass of `render_state`, whose `rt6_full` then
 //! draws at the depth word 0 holds: 0.5 (`0x3f00_0000`) from before the pass, where the written
 //! word is `0x3f00_0001`.
 //!
-//! a probe (EVs `IRX-fgeo-m3`, the M3 Max, and `IRX-fgeo-m4`, an M4) found the same of an indirect
-//! command buffer's commands, behind their barrier or not, and the other order too: an earlier
-//! draw's fragments read what a later draw's vertex function wrote, and their write outlasts the
-//! later one's. A command's vertex stage reads the copy taken before the pass here; a vertex
-//! stage's write of bytes a fragment stage of its pass read or wrote is announced
-//! (`fragments-before-geometry`).
+//! a probe (the M3 Max, and an M4) found the same of an indirect command buffer's commands, behind
+//! their barrier or not, and the other order too: an earlier draw's fragments read what a later
+//! draw's vertex function wrote, and their write outlasts the later one's. A command's vertex stage
+//! reads the copy taken before the pass here; a vertex stage's write of bytes a fragment stage of
+//! its pass read or wrote is announced (`fragments-before-geometry`).
 
 use super::buffer_with;
 use super::degrade_notices::{
     assert_made_once, forced, made_render_kinds, shared_in_system_memory,
 };
-use super::render_state::{quiet, validated, Pipe, Probe, PASS, WHITE};
+use super::render_state::{
+    quiet, validated, validated_checking_synchronization, Pipe, Probe, PASS, WHITE,
+};
 use super::{read_buffer, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::metal::{
@@ -249,6 +250,60 @@ fn a_vertex_stage_reads_the_bytes_from_before_its_pass_s_fragment_writes() {
     quiet(probe, &messages);
 }
 
+/// A later draw's fragments read and write what an earlier draw's vertex stage wrote in the same
+/// render pass instance after the write, as Metal's run every draw's vertex functions before any
+/// draw's fragments: the writer (the fixture `icb_render_replay_template`, rasterizing nothing)
+/// stores `WORD` in word 0, then the marker ORs bit 0 into it, which leaves `WORD | 1`; the
+/// validation layer, checking synchronization, reports no hazard between the write and the
+/// fragments' access, which records after a memory dependency from the write. Twice: in the
+/// second pass both pipelines are made, so the marker's draw records into the writer's render
+/// pass instance (in the first, a draw whose pipeline is being made may record into an instance
+/// of its own, `render/inline_first.rs`).
+#[test]
+fn a_fragment_stage_touches_what_an_earlier_vertex_stage_of_its_pass_wrote_after_the_write() {
+    const WORD: u32 = 0x100;
+    let (messages, _cache, probe) = validated_checking_synchronization();
+    let marker = pipeline(
+        &probe,
+        "rt6_attachmentless",
+        "rt6_cover",
+        Some("rt6_mark_sample"),
+        false,
+    );
+    let writer = pipeline(
+        &probe,
+        "icb_render_replay_template",
+        "icb_render_replay_template",
+        None,
+        false,
+    );
+    // The writer's word: `params[0] * (vid + 1) + params[1]`.
+    let params = buffer_with(
+        &probe.device,
+        &[0u32, WORD]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    for pass in 0..2 {
+        let words = buffer_with(&probe.device, &[0u8; 64]).unwrap();
+        probe.run(PASS.depth(PixelFormat::Depth32Float, 1.0), |_, e, _| {
+            e.set_render_pipeline_state(&writer).unwrap();
+            e.set_vertex_buffer(Some(&params), 0, 0).unwrap();
+            e.set_vertex_buffer(Some(&words), 0, 1).unwrap();
+            e.draw_primitives(PrimitiveType::Point, 0, 1, 1, 0).unwrap();
+            mark(e, &marker, &words);
+        });
+        assert_eq!(
+            read_buffer(&words, 0, 4).unwrap(),
+            (WORD | 1).to_le_bytes(),
+            "pass {pass}"
+        );
+    }
+    quiet(probe, &messages);
+}
+
 /// A buffer a vertex stage of the pass wrote too (the fixture `icb_render_replay_template`,
 /// rasterizing nothing, writes words 0 and 1) is read in place, announced once
 /// (`in-place-vertex-reads`); the depth is the device's.
@@ -294,11 +349,10 @@ fn a_vertex_stage_reads_in_place_what_another_stage_of_its_pass_wrote() {
 }
 
 /// A command of an indirect command buffer reads, from its vertex stage, the bytes from before
-/// its pass's fragment writes, as Metal's commands read them behind their barrier or not (EVs
-/// IRX-fgeo-m3, the M3 Max, and IRX-fgeo-m4, an M4): after the encoder's marker before the call,
-/// and after a command's, without and with the reader's barrier, which splits the pass. The
-/// copy, taken before the pass into the recording that replays the commands, is announced once
-/// (`unordered-draw-bytes`).
+/// its pass's fragment writes, as Metal's commands read them behind their barrier or not (the M3
+/// Max, and an M4): after the encoder's marker before the call, and after a command's, without and
+/// with the reader's barrier, which splits the pass. The copy, taken before the pass into the
+/// recording that replays the commands, is announced once (`unordered-draw-bytes`).
 #[test]
 fn a_command_s_vertex_stage_reads_the_bytes_from_before_its_pass_s_fragment_writes() {
     let (messages, _cache, probe) = validated();
@@ -374,9 +428,9 @@ fn a_command_s_vertex_stage_reads_the_bytes_from_before_its_pass_s_fragment_writ
 /// A vertex stage's write of bytes a fragment stage of its pass read and wrote before it (the
 /// marker's, then the fixture `icb_render_replay_template`'s write of words 0 and 1, rasterizing
 /// nothing) is announced once (`fragments-before-geometry`). Metal runs the vertex function
-/// before the pass's fragments (EVs IRX-fgeo-m3 and IRX-fgeo-m4: an earlier fragment read a later
-/// vertex function's write, and its own write outlasted it), so the marker ORs bit 0 into the
-/// writer's 0.5; the device's order is printed.
+/// before the pass's fragments (an earlier fragment read a later vertex function's write, and its
+/// own write outlasted it), so the marker ORs bit 0 into the writer's 0.5; the device's order is
+/// printed.
 #[test]
 fn a_vertex_stage_s_write_after_a_fragment_s_access_is_announced() {
     let (messages, _cache, probe) = validated();

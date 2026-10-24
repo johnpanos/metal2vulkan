@@ -137,15 +137,16 @@ const OP_CONSTANT: u16 = 43;
 const OP_CONSTANT_COMPOSITE: u16 = 44;
 const OP_BITWISE_AND: u16 = 199;
 
-/// `a`'s module rounds a `half` exactly, by one of the three forms `lower::arith::narrow::round`
-/// takes, at least once: on a profile that takes neither measured fact below, the integer rounding,
+/// `a`'s module rounds a `half` exactly, by one of the forms `lower::arith::narrow::round` takes,
+/// at least once: on a profile that takes neither measured fact below, the integer rounding,
 /// which clears the 13 bits below the half's last with an `OpBitwiseAnd` of `0xFFFFE000`; where the
 /// device's quantize is measured Metal's (`DriverDeviation::MetalHalfQuantize`), each
 /// `OpQuantizeToF16` feeds an `OpFOrdEqual`, the test of the rounding that keeps half subnormals
 /// where the quantize gives a zero, so none rounds a `half` alone, which flushes them; or, on a
 /// profile that takes `DriverDeviation::MetalHalfConversion` (moltenvk-m3), an `OpFConvert` of an
 /// `f32` to 16 bits widened back by another, the device's conversion that is measured to be
-/// Metal's.
+/// Metal's, or the same pair on a profile whose float controls make it Metal's
+/// (`narrow::controlled_modes`).
 fn assert_exact_half_rounding(a: &FunctionArtifact) {
     let w = &a.module.words;
     let mut quantized = Vec::new();
@@ -590,7 +591,7 @@ declare {{ float, i8 }} @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr a
 }
 
 /// A constexpr pixel sampler with a compare function has no Metal answer. Apple's compiler rejects
-/// one ("invalid values combination in sampler initialization", RT13-px-probe-m4), so no AIR from
+/// one ("invalid values combination in sampler initialization"), so no AIR from
 /// Metal's toolchain carries it, and the compile layer refuses it
 /// `NotRepresentable(PixelSamplerCompare)` on every committed profile, whatever the device has. The
 /// same comparison through a normalized sampler compiles on `moltenvk-m3` and is not refused for
@@ -623,10 +624,10 @@ fn a_constexpr_pixel_sampler_with_a_compare_function_is_refused() {
 
 /// Plain Metal reads a constexpr sampler's minimum or maximum reduction as the weighted average on
 /// Apple's GPU (an Apple M4 on macOS 27.0.1, whose `supportsSamplerReductionMode` answers no;
-/// RT13-px3-probe-m4 and RT13-px5-probe-m4 for linear, nearest and bicubic samplers), so the
-/// translation lowers one as the weighted-average sampler: the same module, interface (its
-/// immutable sampler's words; the sampler a pipeline state numbers stays the module's), facts,
-/// notes and requirements on every committed profile, with no `samplerFilterMinmax`.
+/// for linear, nearest and bicubic samplers), so the translation lowers one as the weighted-average
+/// sampler: the same module, interface (its immutable sampler's words; the sampler a pipeline state
+/// numbers stays the module's), facts, notes and requirements on every committed profile, with no
+/// `samplerFilterMinmax`.
 #[test]
 fn a_constexpr_reduction_compiles_as_the_weighted_average() {
     let linear = EDGE_WORDS | 1 << 9 | 1 << 11;
@@ -1144,12 +1145,16 @@ fn sign_extracts(a: &FunctionArtifact) -> usize {
 }
 
 const MASK_LOD: u32 = 0x2;
+const MASK_CONST_OFFSET: u32 = 0x8;
 const MASK_OFFSET: u32 = 0x10;
+const OP_SWITCH: u16 = 251;
 
 /// A dynamic offset on a gather, and on a fragment's implicit-LOD sample, is the `Offset` operand
 /// of the value Metal applies, its low four bits sign-extended by one `OpBitFieldSExtract`; only
-/// the sample needs `maintenance8`. Without `shaderImageGatherExtended` a dynamic gather offset is
-/// refused naming it. A runtime sampler's gather reads the offset a second time for its snap behind
+/// the sample needs `maintenance8`. Without `shaderImageGatherExtended` (the floor) a dynamic gather
+/// offset is taken as `ConstOffset` arms: one switch on its dynamic lane's low four bits, 16 gathers
+/// each with a `ConstOffset` and none with `Offset`, and the module needs neither feature. A
+/// runtime sampler's gather reads the offset a second time for its snap behind
 /// the word, which moves the centre back where Metal drops it, on a device without Metal's own
 /// sampler (lavapipe). On one with it (MoltenVK) only a pixel word's gather snaps, and Metal's own
 /// sampler drops the offset of the normalized centre it is handed where Metal drops the pixel
@@ -1174,17 +1179,17 @@ fn dynamic_offsets_are_offset_operands_of_their_low_four_bits() {
         .contains(&VkFeature::ShaderImageGatherExtended));
     assert!(!a.requirements.features.contains(&VkFeature::Maintenance8));
     let floor = profile("vk12-floor", EXACT_SAMPLING).expect("profile");
-    match compile(&bc, "k", &floor) {
-        Err(Error::Unsupported(u)) => assert_eq!(
-            (u.feature, u.needs),
-            (
-                Feature::GatherExtended,
-                Needs::AnyOf(vec![vec![Capability::Feature(
-                    VkFeature::ShaderImageGatherExtended
-                )]])
-            )
-        ),
-        other => panic!("{:?}", other.map(|_| ())),
+    let a = ok(&bc, "k", &floor);
+    assert_eq!(count(&a, OP_SWITCH), 1);
+    assert_eq!(
+        operand_masks(&a, OP_IMAGE_GATHER, 6),
+        [MASK_CONST_OFFSET; 16]
+    );
+    for f in [
+        VkFeature::Maintenance8,
+        VkFeature::ShaderImageGatherExtended,
+    ] {
+        assert!(!a.requirements.features.contains(&f), "{f:?}");
     }
     let Some(bc) = assemble("fragment_dynamic_offset", DYNAMIC_OFFSET_FRAGMENT) else {
         return;

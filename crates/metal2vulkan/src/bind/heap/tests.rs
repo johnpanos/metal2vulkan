@@ -132,11 +132,11 @@ fn fit_is_shape_samples_numeric_type_usage_and_aspect() {
     // A format the table holds no representation of fits no class: the heap does not know which
     // of its textures the function reads, so a resident one it cannot view is the neutral, and
     // nothing is refused.
-    let pvrtc = PixelFormat::PVRTCRGB4BPP;
-    assert_eq!(fit(&shape(T::Type2D, pvrtc, 1, READ), &f2d), Fit::No);
+    let unheld = PixelFormat::ASTC4x2HDR;
+    assert_eq!(fit(&shape(T::Type2D, unheld, 1, READ), &f2d), Fit::No);
     assert_eq!(
         fit(
-            &shape(T::Type2D, pvrtc, 1, READ),
+            &shape(T::Type2D, unheld, 1, READ),
             &class(ImageDim::D2, false, false, Uint, Sampled)
         ),
         Fit::No
@@ -171,7 +171,7 @@ fn fit_is_shape_samples_numeric_type_usage_and_aspect() {
     assert_eq!(fit(&shape(T::Type2D, rgba, 1, WRITE), &s2d), Fit::Holds);
     assert_eq!(fit(&shape(T::Type2D, rgba, 1, READ), &s2d), Fit::No);
     // Apple's private `BlockWritesOnly` is a usage Metal's validation takes a write through, as
-    // `ShaderWrite` (EV XRR2-usw1; CoreAnimation's blur textures are `0x10005`).
+    // `ShaderWrite` (CoreAnimation's blur textures are `0x10005`).
     let blocked = TextureUsage::BLOCK_WRITES_ONLY;
     for usage in [blocked, READ | TextureUsage::RENDER_TARGET | blocked] {
         assert_eq!(fit(&shape(T::Type2D, rgba, 1, usage), &s2d), Fit::Holds);
@@ -598,7 +598,11 @@ fn resource_id_placement_puts_a_sampler_at_its_element() {
 /// without an alias, the view the class's formatless declaration serves, or a half-float format's
 /// rounding, which a heap write takes from its handle's class; one needing a conversion view (bgra8
 /// or sRGB where the profile cannot store them directly) is a typed refusal. Both occur on the
-/// committed profiles, and every profile views a half-float member directly.
+/// committed profiles, and every profile views a half-float member directly. An `A8Unorm` member
+/// held in red (`StorageImageClass::AlphaInRed`) is viewed through its `R8_UNORM` image, whose
+/// texels a heap access converts where the handle carries `A8Unorm`'s class: unswizzled, or
+/// swizzled to read as unswizzled; a swizzle that moves its alpha carries another class and is
+/// refused.
 #[test]
 fn a_storage_member_needing_a_conversion_view_is_refused() {
     let s2d = class(
@@ -608,7 +612,7 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
         SampledType::Float,
         ImageAccess::Storage,
     );
-    let (mut direct, mut refused) = (0, 0);
+    let (mut direct, mut refused, mut in_red) = (0, 0, 0);
     for (stem, p) in committed_profiles().expect("profiles") {
         let planner = HeapPlanner {
             profile: &p,
@@ -640,6 +644,7 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
             PixelFormat::RGBA8UnormSRGB,
             PixelFormat::R16Float,
             PixelFormat::RGBA16Float,
+            PixelFormat::A8Unorm,
         ] {
             let m = shape(TextureType::Type2D, pf, 1, WRITE);
             let got = planner.view(&m, &s2d, vk::ImageLayout::GENERAL);
@@ -654,6 +659,38 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
                     assert_eq!(Some(v.format), crate::metal::format::direct_format(pf));
                     assert_eq!(v.layout, vk::ImageLayout::GENERAL);
                     direct += 1;
+                }
+                Ok(c) if c.class == StorageImageClass::AlphaInRed => {
+                    let v = got.unwrap_or_else(|e| panic!("{stem} {pf:?}: {e}"));
+                    assert_eq!(v.format, vk::Format::R8_UNORM, "{stem}");
+                    use crate::metal::TextureSwizzle as S;
+                    for (swizzle, kept) in [
+                        ((S::Zero, S::Zero, S::Zero, S::Alpha), true),
+                        ((S::Alpha, S::Zero, S::Zero, S::One), false),
+                    ] {
+                        let mut swizzled = m;
+                        if let TextureShape::Texture { swizzle: s, .. } = &mut swizzled {
+                            *s = crate::metal::TextureSwizzleChannels::new(
+                                swizzle.0, swizzle.1, swizzle.2, swizzle.3,
+                            );
+                        }
+                        let got = planner.view(&swizzled, &s2d, vk::ImageLayout::GENERAL);
+                        match kept {
+                            true => assert_eq!(
+                                got.map(|v| v.format),
+                                Ok(vk::Format::R8_UNORM),
+                                "{stem} {swizzle:?}"
+                            ),
+                            false => assert_eq!(
+                                got,
+                                Err(BindError::Unsupported(Unsupported::not_implemented(
+                                    Feature::ArgumentBufferTextures
+                                ))),
+                                "{stem} {swizzle:?}"
+                            ),
+                        }
+                    }
+                    in_red += 1;
                 }
                 Ok(_) => {
                     assert_eq!(
@@ -670,8 +707,8 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
         }
     }
     assert!(
-        direct > 0 && refused > 0,
-        "direct {direct}, refused {refused}"
+        direct > 0 && refused > 0 && in_red > 0,
+        "direct {direct}, refused {refused}, in red {in_red}"
     );
 }
 
@@ -1029,12 +1066,16 @@ fn a_late_cubic_sampler_is_listed_with_its_cubic_bit_beside_tested_stages() {
 
 /// A sampler state of a shape the plan was not made for is held as a command buffer commits where
 /// the plan's checks of a listed shape pass: `check_sampler` for every use of its sampler arrays
-/// (invalid LOD clamps refuse; an anisotropic state refuses beside a cube's explicit gradients),
+/// (invalid LOD clamps refuse; an anisotropic state passes beside a cube's explicit gradients,
+/// whose use's sampler is isotropic, and, on a device without `samplerAnisotropy`, there alone),
 /// and an opaque-black border only where the members were checked against one. A plan whose arrays
 /// sample nothing (a function that only names the states) holds any shape.
 #[test]
 fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
     let profile = m3();
+    let floor =
+        crate::pipeline::testing::profile("vk12-floor", crate::device::DevicePolicy::default())
+            .expect("profile");
     let placement = HeapPlacement::ResourceId;
     let planned = PlannedHandleTable {
         set: 0,
@@ -1058,18 +1099,22 @@ fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
         integer: false,
         cube_gradient,
     };
+    let held_on =
+        |profile: &DeviceProfile, template: &ResourceTemplate, late: SamplerDescriptor| -> bool {
+            let mut samplers = encoded.to_vec();
+            samplers.push(crate::bind::ArgumentSampler::new(late, 2).at_element(2));
+            assert!(!template
+                .argument_samplers
+                .as_ref()
+                .expect("shape")
+                .shapes
+                .contains(&late.shape()));
+            relisted_sampler_tables(template, profile, &samplers, placement)
+                .expect("relisted")
+                .is_some()
+        };
     let held = |template: &ResourceTemplate, late: SamplerDescriptor| -> bool {
-        let mut samplers = encoded.to_vec();
-        samplers.push(crate::bind::ArgumentSampler::new(late, 2).at_element(2));
-        assert!(!template
-            .argument_samplers
-            .as_ref()
-            .expect("shape")
-            .shapes
-            .contains(&late.shape()));
-        relisted_sampler_tables(template, &profile, &samplers, placement)
-            .expect("relisted")
-            .is_some()
+        held_on(&profile, template, late)
     };
     let lod = {
         let mut d = SamplerDescriptor::new();
@@ -1101,7 +1146,30 @@ fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
     );
     assert!(!held(&sampled, black), "members unchecked for the border");
     let gradients = template(vec![class(false), class(true)], false);
-    assert!(!held(&gradients, anisotropic), "beside a cube's gradients");
+    assert!(held(&gradients, anisotropic), "beside a cube's gradients");
+    // Without `samplerAnisotropy` the plan's check refuses an anisotropic state for a use without
+    // a cube's gradients and passes it for one with them, whose sampler it makes isotropic.
+    assert!(
+        !floor
+            .fields()
+            .enabled
+            .features
+            .contains(&crate::device::requirements::VkFeature::SamplerAnisotropy),
+        "vk12-floor states samplerAnisotropy"
+    );
+    assert!(
+        !held_on(&floor, &sampled, anisotropic),
+        "anisotropic without samplerAnisotropy"
+    );
+    assert!(
+        !held_on(&floor, &gradients, anisotropic),
+        "anisotropic beside a use without the gradients, without samplerAnisotropy"
+    );
+    let cube_only = template(vec![class(true)], false);
+    assert!(
+        held_on(&floor, &cube_only, anisotropic),
+        "a cube's gradients alone, without samplerAnisotropy"
+    );
     let checked = template(vec![class(false)], true);
     assert!(held(&checked, black), "members checked for the border");
     let naming = template(Vec::new(), false);

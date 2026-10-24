@@ -31,19 +31,32 @@ pub use metal2vulkan_devtools::{
     engine_dir, fixtures_dir, llvm_assemble, metal_assemble, AssembleError,
 };
 
-/// A scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// A scratch directory of the caller's own, `<temp dir>/<stem>-<process id>-<n>` with `n` from a
+/// process-wide counter: tests on threads of one process (`cargo test`) and tests in processes of
+/// their own (nextest) never share one. Removed, with what it holds, on drop.
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> std::io::Result<Scratch> {
+    /// A fresh scratch directory named after `stem`; panics when it cannot be made.
+    pub(crate) fn new(stem: &str) -> Scratch {
+        Scratch::try_new(stem).unwrap_or_else(|e| panic!("scratch directory {stem}: {e}"))
+    }
+
+    /// [`Scratch::new`], with the error returned.
+    pub(crate) fn try_new(stem: &str) -> std::io::Result<Scratch> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "m2v-pipeline-testing-{}-{}",
+            "{stem}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir)?;
         Ok(Scratch(dir))
+    }
+
+    /// The directory.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -64,15 +77,45 @@ pub const EXACT_SAMPLING: DevicePolicy = DevicePolicy {
     ..DevicePolicy::UNTRUSTED.exact_answers()
 };
 
-/// Committed profile `stem` (`validation/profiles/<stem>.json`) derived under `policy`.
-pub fn profile(stem: &str, policy: DevicePolicy) -> Result<DeviceProfile, String> {
+/// The description of committed profile `stem` (`validation/profiles/<stem>.json`).
+pub fn description(stem: &str) -> Result<DeviceDescription, String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let desc =
-        DeviceDescription::from_khronos_json(&text, None).map_err(|e| format!("{stem}: {e}"))?;
-    let dev = Device::new(desc, policy).map_err(|e| format!("{stem}: {e}"))?;
+    DeviceDescription::from_khronos_json(&text, None).map_err(|e| format!("{stem}: {e}"))
+}
+
+/// The description of committed profile `stem` as a context at Vulkan 1.2, the runtime's instance
+/// version, reads the device (`DeviceDescription::query`'s rule), with
+/// `VK_KHR_format_feature_flags2` left out of what it enabled unless `flags2`: the version is the
+/// lower of the two, a feature that version does not expose with the remaining extensions is not
+/// read, and only the formats the product asks about are. The format tables keep the per-format
+/// bits the device reported (`DeviceDescription::khr_format_feature_flags2` stays).
+pub fn description_at_1_2(stem: &str, flags2: bool) -> Result<DeviceDescription, String> {
+    use crate::device::requirements::{ApiVersion, VkExtension};
+    let mut desc = description(stem)?;
+    let api = desc.api_version.min(ApiVersion::V1_2);
+    desc.api_version = api;
+    if !flags2 {
+        desc.extensions.remove(&VkExtension::KhrFormatFeatureFlags2);
+    }
+    let extensions = desc.extensions.clone();
+    desc.features
+        .retain(|&feature| feature.exposure().exposed(api, &extensions));
+    let queried: std::collections::BTreeSet<_> =
+        crate::device::FormatSupport::queries_for(api, &extensions)
+            .into_iter()
+            .collect();
+    desc.formats
+        .formats
+        .retain(|format, _| queried.contains(format));
+    Ok(desc)
+}
+
+/// Committed profile `stem` (`validation/profiles/<stem>.json`) derived under `policy`.
+pub fn profile(stem: &str, policy: DevicePolicy) -> Result<DeviceProfile, String> {
+    let dev = Device::new(description(stem)?, policy).map_err(|e| format!("{stem}: {e}"))?;
     Ok(dev.profile().clone())
 }
 
@@ -83,14 +126,27 @@ pub fn profile_with_storage_buffers(
     policy: DevicePolicy,
     storage: u32,
 ) -> Result<DeviceProfile, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut desc =
-        DeviceDescription::from_khronos_json(&text, None).map_err(|e| format!("{stem}: {e}"))?;
+    let mut desc = description(stem)?;
     desc.limits.max_per_stage_descriptor_storage_buffers = storage;
     let dev = Device::new(desc, policy).map_err(|e| format!("{stem}: {e}"))?;
+    Ok(dev.profile().clone())
+}
+
+/// The name [`formatless_floor`]'s profile goes by in a test's messages.
+pub const FORMATLESS_FLOOR: &str = "vk12-floor+formatless";
+
+/// `vk12-floor` derived under `policy` with the two optional features that let a shader access a
+/// storage image without its format (`shaderStorageImageReadWithoutFormat` and
+/// `shaderStorageImageWriteWithoutFormat`): the floor, which states neither, beside a device that
+/// leaves a storage texture's format to the bound view.
+pub fn formatless_floor(policy: DevicePolicy) -> Result<DeviceProfile, String> {
+    use crate::device::requirements::VkFeature;
+    let mut desc = description("vk12-floor")?;
+    desc.features.extend([
+        VkFeature::ShaderStorageImageReadWithoutFormat,
+        VkFeature::ShaderStorageImageWriteWithoutFormat,
+    ]);
+    let dev = Device::new(desc, policy).map_err(|e| format!("{FORMATLESS_FLOOR}: {e}"))?;
     Ok(dev.profile().clone())
 }
 
@@ -143,6 +199,33 @@ pub fn compile(
     compile_with(bitcode, entry, p, &LowerInputs::new())
 }
 
+/// [`compile`], given each storage texture's format where `p` asks for it: a profile that reads or
+/// writes storage images only with a declared format (the floor, which states neither
+/// `shaderStorageImageReadWithoutFormat` nor `shaderStorageImageWriteWithoutFormat`) needs every
+/// storage slot's format (`NeedsInput(StorageTextureFormat)`), and the runtime compiles the variant
+/// of the format bound there. Each slot named takes `pf`'s read-and-write choice
+/// ([`storage_image_choice`](crate::metal::format::storage_image_choice)); a profile that asks for
+/// none compiles as [`compile`] does.
+pub fn compile_given_storage_format(
+    bitcode: &[u8],
+    entry: &str,
+    p: &DeviceProfile,
+    pf: crate::metal::PixelFormat,
+) -> Result<Arc<FunctionArtifact>, Error> {
+    let mut inputs = LowerInputs::new();
+    loop {
+        match compile_with(bitcode, entry, p, &inputs) {
+            Err(Error::NeedsInput(crate::error::RuntimeInput::StorageTextureFormat { slot }))
+                if !inputs.storage_images.contains_key(&slot) =>
+            {
+                let choice = crate::metal::format::storage_image_choice(pf, p)?;
+                inputs.storage_images.insert(slot, choice);
+            }
+            r => return r,
+        }
+    }
+}
+
 /// The lowering inputs a fragment function compiles under for the color attachments of `r` on
 /// `p`: how they take its float outputs (`LoweringInputs::color_writes`) and which hold
 /// extended-range texels (`LoweringInputs::extended_range_colors`), as
@@ -162,7 +245,11 @@ pub fn fragment_inputs(
         &r.color_attachments,
         r.texture_write_rounding_mode,
     );
-    inputs.rotated_colors = crate::pipeline::color_writes::rotated_colors(&r.color_attachments);
+    inputs.word_colors =
+        crate::pipeline::color_writes::word_colors(&r.color_attachments, r.alpha_to_coverage, p);
+    inputs.rotated_colors = crate::pipeline::color_writes::rotated_colors(&r.color_attachments, p);
+    inputs.alpha_in_red_colors =
+        crate::pipeline::color_writes::alpha_in_red_colors(&r.color_attachments, p);
     inputs.half_output_lanes =
         crate::pipeline::color_writes::half_output_lanes(&r.color_attachments);
     inputs.rotated_factors =
@@ -364,6 +451,39 @@ pub fn zero_relocations(a: &FunctionArtifact, words: &[u32]) -> Vec<u32> {
         }
     }
     out
+}
+
+/// The result ids of each product check's scaling multiply in module `words`
+/// (`denormal::tiny_product` under `TinyCheck::Fused`, `|a| · 2^48`): an `OpFMul` of a 32-bit
+/// `float` constant `2^48`, or of a vector of them. So a test counts the check's own instructions
+/// apart from the caller's.
+pub fn tiny_check_scales(words: &[u32]) -> Vec<u32> {
+    use crate::spv::Op;
+    const SCALE: u32 = 0x5780_0000;
+    let (mut floats, mut scales, mut results) = (Vec::new(), Vec::new(), Vec::new());
+    let mut i = 5;
+    while i < words.len() {
+        let (len, op) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+        assert!(len > 0 && i + len <= words.len(), "malformed module");
+        let at = &words[i..i + len];
+        if op == Op::TypeFloat as u32 && at[2] == 32 {
+            floats.push(at[1]);
+        }
+        if op == Op::Constant as u32 && len == 4 && floats.contains(&at[1]) && at[3] == SCALE {
+            scales.push(at[2]);
+        }
+        if op == Op::ConstantComposite as u32
+            && len > 3
+            && at[3..].iter().all(|c| scales.contains(c))
+        {
+            scales.push(at[2]);
+        }
+        if op == Op::FMul as u32 && (scales.contains(&at[3]) || scales.contains(&at[4])) {
+            results.push(at[2]);
+        }
+        i += len;
+    }
+    results
 }
 
 /// The module `words` without the math library's routines: the functions of exactly one
@@ -950,8 +1070,8 @@ fn convert_to_msl(
     args: &MoltenVkMslArgs,
     scratch: &Scratch,
 ) -> Result<PathBuf, AssembleError> {
-    let spv = scratch.0.join("module.spv");
-    let msl = scratch.0.join("module.metal");
+    let spv = scratch.path().join("module.spv");
+    let msl = scratch.path().join("module.metal");
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     std::fs::write(&spv, bytes).map_err(|e| AssembleError::Missing(format!("scratch: {e}")))?;
     let mut convert = vec![spv.as_os_str()];
@@ -966,7 +1086,8 @@ fn convert_to_msl(
 /// installed; `Rejected` when it refuses the module.
 pub fn moltenvk_msl(words: &[u32]) -> Result<String, AssembleError> {
     let args = moltenvk_msl_args(words).map_err(AssembleError::Rejected)?;
-    let scratch = Scratch::new().map_err(|e| AssembleError::Missing(format!("scratch: {e}")))?;
+    let scratch = Scratch::try_new("m2v-pipeline-testing")
+        .map_err(|e| AssembleError::Missing(format!("scratch: {e}")))?;
     let msl = convert_to_msl(words, &args, &scratch)?;
     std::fs::read_to_string(&msl).map_err(|e| AssembleError::Rejected(format!("msl: {e}")))
 }
@@ -983,8 +1104,9 @@ pub fn moltenvk_msl_compile(words: &[u32]) -> Result<(), AssembleError> {
         ));
     }
     let args = moltenvk_msl_args(words).map_err(AssembleError::Rejected)?;
-    let scratch = Scratch::new().map_err(|e| AssembleError::Missing(format!("scratch: {e}")))?;
-    let air = scratch.0.join("module.air");
+    let scratch = Scratch::try_new("m2v-pipeline-testing")
+        .map_err(|e| AssembleError::Missing(format!("scratch: {e}")))?;
+    let air = scratch.path().join("module.air");
     // The Metal toolchain is a separate download: probe for it before blaming the module.
     msl_tool(
         "xcrun",

@@ -3,23 +3,24 @@
 //! destroyed with the device. Every encoder of a pass without attachments records its draws against
 //! its sample count's kept pass, makes its pipelines against it, and begins it.
 //!
-//! Such a pass rasterizes at its `defaultRasterSampleCount` (RT6 Metal probe 8), the sample count
-//! the encoder checks each pipeline's `rasterSampleCount` against (`render.rs`). A Vulkan subpass
-//! without attachments rasterizes at its pipelines' `rasterizationSamples`, but MoltenVK takes
-//! the count from its subpass's default sample count, which only creating a pipeline against that
-//! very `VkRenderPass` sets (`MVKGraphicsPipeline` in MoltenVK 1.4.1's `MVKPipeline.mm`; a
+//! Such a pass rasterizes at its `defaultRasterSampleCount` (a Metal probe on an M4), the sample
+//! count the encoder checks each pipeline's `rasterSampleCount` against (`render.rs`). A Vulkan
+//! subpass without attachments rasterizes at its pipelines' `rasterizationSamples`, but MoltenVK
+//! takes the count from its subpass's default sample count, which only creating a pipeline against
+//! that very `VkRenderPass` sets (`MVKGraphicsPipeline` in MoltenVK 1.4.1's `MVKPipeline.mm`; a
 //! `MVKRenderSubpass` begins with 1). A pass made per encoder, after the pipelines it draws were
 //! made against another, compatible one, rasterized one sample: at 2x each pixel held sample 0
-//! alone (EV `RT6-atl-gpu-mvk`). The kept pass is the one its pipelines were made against, on
-//! every device, so it is the one its subpass's default was set on; the others rasterize the
-//! pipelines' count either way. A pass of no attachments has no load or store operation, so the
-//! one pass serves both as the compatible pass and as the pass begun.
+//! alone. The kept pass is the one its pipelines were made against, on every
+//! device, so it is the one its subpass's default was set on; the others rasterize the pipelines'
+//! count either way. A pass of no attachments has no load or store operation, so the one pass
+//! serves both as the compatible pass and as the pass begun.
 //!
 //! A pass whose subpass leaves out attachments the pass still describes (the sample planes', with
 //! their anchor, `render_target.rs`) is no pass without attachments here: only a shape with no
 //! attachment at all is kept, so the kept passes number at most the sample counts times the
 //! view masks drawn.
 
+use super::color_list::ColorList;
 use super::device::lock;
 use super::error::Error;
 use super::render_target::{self, PassShape, RenderPassObject};
@@ -54,16 +55,16 @@ pub(super) fn keeps(shape: &PassShape) -> bool {
 /// `view_mask`.
 pub(super) fn shape(samples: u32, view_mask: u32) -> PassShape {
     PassShape {
-        colors: Vec::new(),
+        colors: ColorList::new(),
         depth_stencil: None,
         samples,
-        color_resolves: Vec::new(),
+        color_resolves: ColorList::new(),
         depth_stencil_resolve: None,
         fetch_inputs: false,
-        no_inputs: Vec::new(),
-        storage: Vec::new(),
+        no_inputs: ColorList::new(),
+        storage: ColorList::new(),
         view_mask,
-        locations: Vec::new(),
+        locations: ColorList::new(),
     }
 }
 

@@ -17,6 +17,43 @@
 //!   `VkPipelineLayout` (the same layout is compatible for every set and for the push constants);
 //!   a bind or push with another layout forgets what the earlier one held. A draw's push
 //!   constants are left out only where they are the same writes, in order, as the last ones.
+//! - **A pushed set 0** (`pipeline::objects::pushes_set_zero`). Kept while pushed with the same
+//!   layout: a push of the same bindings and elements, in order, carries only the writes that
+//!   differ from those set 0 holds (none: left out), as the descriptors it does not write keep
+//!   theirs; a bind of set 0 or a push or bind with another layout forgets it. The Vulkan
+//!   specification, `vkCmdPushDescriptorSet`: "Push descriptors can be updated incrementally and
+//!   cause shaders to use the updated descriptors for subsequent bound pipeline commands with the
+//!   pipeline type set by pipelineBindPoint until the descriptor is overwritten, or else until
+//!   the set is disturbed as described in Pipeline Layout Compatibility. When the set is
+//!   disturbed or push descriptors with a different descriptor set layout are set, all push
+//!   descriptors are undefined." One layout's set 0 is one set layout. Set 1 bound with the same
+//!   layout disturbs no set 0, and a pipeline bound between draws disturbs none (Pipeline Layout
+//!   Compatibility): "When binding a descriptor set (see Descriptor Set Binding) to set number N,
+//!   a previously bound descriptor set bound with lower index M than N is disturbed if the
+//!   pipeline layouts for set M and N are not compatible for set M. Otherwise, the bound
+//!   descriptor set in M is not disturbed.", and "When binding a pipeline, the pipeline can
+//!   correctly access any previously bound descriptor set N if it was bound with a compatible
+//!   pipeline layout for set N, and it was not disturbed." A pipeline of another layout is drawn
+//!   with that layout, whose push or bind forgets what set 0 held. Variants whose layouts are
+//!   identically defined share one (`pipeline/shared_layouts.rs`), so a pipeline bind between
+//!   their draws keeps set 0 and the push constants too. Where the driver's pushed descriptors go
+//!   stale across a pipeline bind
+//!   (`RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds`), the push after every
+//!   pipeline bind carries at least one write: the writes that changed, or else set 0's first, as
+//!   it holds it. Any push there makes the driver take the bound pipeline's descriptors again;
+//!   what the push leaves out stays as set 0 holds it.
+//! - **Equal shapes, measured.** Two layouts that are not one are not compatible here, even
+//!   where their set 0 and push-constant ranges have the same shape
+//!   (`VariantObjects::set_zero_shape`) and Vulkan would hold them compatible for set 0 (Pipeline
+//!   Layout Compatibility: "compatible for set N" if created "with identically defined descriptor
+//!   set layouts for sets zero through N", the same
+//!   `VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT` and "identical push constant ranges"):
+//!   a push "with a different descriptor set layout" leaves every pushed descriptor undefined,
+//!   and the specification does not say whether an identically defined layout is a different
+//!   one. So a draw of another layout of the same shape (one that differs in a later set, or
+//!   bakes a host step's own samplers) pushes set 0 whole. [`Bound::pushed_set`] counts such
+//!   pushes and the writes they would carry if those layouts were one
+//!   (`WorkCounts::set_zero_equal_shape_switches` and kin): what a push carries is unchanged.
 //! - **Vertex and index buffers.** Each binding is kept until bound again; binding a pipeline
 //!   disturbs none.
 //! - **Dynamic states.** Each is kept, at the value it was set to, until a pipeline that makes it
@@ -30,9 +67,53 @@
 use ash::vk;
 
 use super::{DrawState, IndexBind};
-use crate::binding::PushWrite;
+use crate::binding::{PushWrite, SetWrite};
 use crate::pipeline::FixedState;
-use crate::render_state::DepthBiasSetting;
+use crate::render_state::{DepthBiasSetting, ViewportList};
+
+/// What draws' recordings recorded (`render::Recording::record`): their state commands, the
+/// writes their set 0's pushes carried, and their pushes across equal shapes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Recorded {
+    pub(super) states: u64,
+    pub(super) writes_pushed: u64,
+    pub(super) equal_shapes: EqualShapes,
+}
+
+/// Draws' pushes that carried set 0 whole although set 0 held the pushed descriptors of another
+/// layout of the same shape ([`Bound::equal_shape_writes`]): how many, the writes they carried,
+/// and the writes they would carry if the layouts were one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct EqualShapes {
+    pub(super) switches: u64,
+    pub(super) carried: u64,
+    pub(super) if_shared: u64,
+}
+
+impl std::ops::AddAssign for Recorded {
+    fn add_assign(&mut self, other: Recorded) {
+        self.states += other.states;
+        self.writes_pushed += other.writes_pushed;
+        self.equal_shapes.switches += other.equal_shapes.switches;
+        self.equal_shapes.carried += other.equal_shapes.carried;
+        self.equal_shapes.if_shared += other.equal_shapes.if_shared;
+    }
+}
+
+impl Recorded {
+    /// Add them to `counts` (`WorkCounts::draw_states_recorded`, `set_zero_writes_pushed`,
+    /// `set_zero_equal_shape_switches` and kin).
+    pub(super) fn count(self, counts: &crate::work_counts::Counters) {
+        counts.draw_states_recorded(self.states);
+        counts.set_zero_writes_pushed(self.writes_pushed);
+        let EqualShapes {
+            switches,
+            carried,
+            if_shared,
+        } = self.equal_shapes;
+        counts.set_zero_equal_shape_switches(switches, carried, if_shared);
+    }
+}
 
 /// The state commands recorded into one secondary command buffer that still hold (the module
 /// docs).
@@ -45,6 +126,16 @@ pub(super) struct Bound {
     /// The layout the descriptor sets below were bound with, and each set number's set.
     sets_layout: vk::PipelineLayout,
     sets: Vec<Option<vk::DescriptorSet>>,
+    /// The descriptors pushed as set 0 with `sets_layout`, where set 0 holds pushed ones.
+    pushed: Vec<SetWrite>,
+    /// The shape of `sets_layout`'s set 0 and push-constant ranges, as the last push gave it
+    /// (`VariantObjects::set_zero_shape`).
+    pushed_shape: u64,
+    /// A pipeline bind since the last push, where the driver's pushed descriptors go stale across
+    /// one (a driver's defect: the module docs): the next push carries at least one write.
+    forgotten: bool,
+    /// The writes the last push that set 0 held the bindings of carried ([`Bound::pushed_set`]).
+    changed: Vec<SetWrite>,
     /// The layout the last push constants were pushed with, and their writes: each write's
     /// stages, offset and length, its bytes one after another in `push_bytes`.
     push_layout: vk::PipelineLayout,
@@ -56,15 +147,59 @@ pub(super) struct Bound {
     /// The index buffer: its buffer, offset, index type and, bound with a size, the size.
     index: Option<(vk::Buffer, u64, vk::IndexType, Option<u64>)>,
     /// The dynamic states set that still hold, and their values.
-    set: Vec<vk::DynamicState>,
+    set: States,
     values: Option<Values>,
+}
+
+/// Dynamic states whose values [`Values`] holds, a bit each: a draw tests and notes each of its
+/// pipeline's at every draw, which a bit does without a search, and a record holds them with no
+/// storage of its own.
+#[derive(Clone, Copy, Default)]
+struct States(u16);
+
+impl States {
+    /// The bit of `state`, where [`Values`] holds its value.
+    #[inline]
+    fn bit(state: vk::DynamicState) -> Option<u16> {
+        let at = match state {
+            vk::DynamicState::VIEWPORT => 0,
+            vk::DynamicState::SCISSOR => 1,
+            vk::DynamicState::DEPTH_BIAS => 2,
+            vk::DynamicState::BLEND_CONSTANTS => 3,
+            vk::DynamicState::STENCIL_COMPARE_MASK => 4,
+            vk::DynamicState::STENCIL_WRITE_MASK => 5,
+            vk::DynamicState::STENCIL_REFERENCE => 6,
+            vk::DynamicState::CULL_MODE => 7,
+            vk::DynamicState::FRONT_FACE => 8,
+            vk::DynamicState::PRIMITIVE_TOPOLOGY => 9,
+            vk::DynamicState::PRIMITIVE_RESTART_ENABLE => 10,
+            vk::DynamicState::DEPTH_TEST_ENABLE => 11,
+            vk::DynamicState::DEPTH_WRITE_ENABLE => 12,
+            vk::DynamicState::DEPTH_COMPARE_OP => 13,
+            vk::DynamicState::STENCIL_TEST_ENABLE => 14,
+            vk::DynamicState::STENCIL_OP => 15,
+            _ => return None,
+        };
+        Some(1 << at)
+    }
+
+    /// Those of `states` [`Values`] holds.
+    #[inline]
+    fn of(states: &[vk::DynamicState]) -> States {
+        States(
+            states
+                .iter()
+                .filter_map(|&s| States::bit(s))
+                .fold(0, |all, bit| all | bit),
+        )
+    }
 }
 
 /// The values a draw sets its dynamic states to: the encoder's state at the draw and its input
 /// assembly.
 pub(super) struct Values {
-    viewports: Vec<vk::Viewport>,
-    scissors: Vec<vk::Rect2D>,
+    viewports: ViewportList<vk::Viewport>,
+    scissors: ViewportList<vk::Rect2D>,
     fixed: FixedState,
     stencil_reference: [u32; 2],
     depth_bias: DepthBiasSetting,
@@ -81,8 +216,11 @@ pub(super) struct Now<'a> {
     pub(super) primitive_restart: bool,
 }
 
+// The checks a draw makes here, at every draw, are inline: they join `Recording::record` in
+// whichever codegen unit it lands in, as the state they test is matched there too.
 impl Bound {
     /// Follow `command_buffer`: where the record is another's, it begins again, empty.
+    #[inline]
     pub(super) fn follow(&mut self, command_buffer: vk::CommandBuffer) {
         if self.command_buffer != command_buffer {
             *self = Bound {
@@ -93,17 +231,23 @@ impl Bound {
     }
 
     /// Whether binding `pipeline`, which holds the dynamic states `dynamic` (the module docs),
-    /// sets anything: noted as bound where it does.
+    /// sets anything: noted as bound where it does, the next push of set 0 then carrying at least
+    /// one write where `forgets_pushed` (a driver's defect: the module docs).
+    #[inline]
     pub(super) fn pipeline(
         &mut self,
         pipeline: vk::Pipeline,
         dynamic: &[vk::DynamicState],
+        forgets_pushed: bool,
     ) -> bool {
         if self.pipeline == pipeline {
             return false;
         }
         self.pipeline = pipeline;
-        self.set.retain(|state| dynamic.contains(state));
+        if forgets_pushed {
+            self.forgotten = true;
+        }
+        self.set.0 &= States::of(dynamic).0;
         if !dynamic.contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE) {
             self.vertex.retain(|&(.., stride)| stride.is_none());
         }
@@ -112,6 +256,7 @@ impl Bound {
 
     /// Whether binding `sets` from set number `first` with `layout` sets anything: noted as
     /// bound where it does.
+    #[inline]
     pub(super) fn sets(
         &mut self,
         layout: vk::PipelineLayout,
@@ -131,6 +276,10 @@ impl Bound {
         if self.sets_layout != layout {
             self.sets_layout = layout;
             self.sets.clear();
+            self.pushed.clear();
+        }
+        if first == 0 {
+            self.pushed.clear();
         }
         if self.sets.len() < first + sets.len() {
             self.sets.resize(first + sets.len(), None);
@@ -141,7 +290,90 @@ impl Bound {
         true
     }
 
+    /// The writes of `writes`, set 0 with `layout`, whose set 0 and push-constant ranges have
+    /// `shape`, that a push carries, noted as pushed: where set 0 holds pushed descriptors of the
+    /// same bindings and elements, in order, with `layout`, those that differ from them (none
+    /// where all are the same, but the first where a pipeline bind since the last push leaves
+    /// the driver's pushed descriptors stale: the module docs); else all of them. A push leaves
+    /// the later sets bound with the same layout as they were. With them, where the push carries
+    /// all of them across a switch between equal shapes, the writes it would carry if those
+    /// layouts were one ([`equal_shape_writes`](Self::equal_shape_writes)), worked out only then:
+    /// a push that holds set 0 counts nothing.
+    pub(super) fn pushed_set<'a>(
+        &'a mut self,
+        layout: vk::PipelineLayout,
+        shape: u64,
+        writes: &'a [SetWrite],
+    ) -> (&'a [SetWrite], Option<u64>) {
+        let held = self.sets_layout == layout
+            && !self.pushed.is_empty()
+            && self.pushed.len() == writes.len()
+            && (self.pushed.iter().zip(writes))
+                .all(|(a, b)| (a.binding, a.element, a.ty) == (b.binding, b.element, b.ty));
+        if held {
+            self.changed.clear();
+            for (old, new) in self.pushed.iter_mut().zip(writes) {
+                if !old.same(new) {
+                    *old = *new;
+                    self.changed.push(*new);
+                }
+            }
+            if self.forgotten {
+                // The driver takes the bound pipeline's descriptors again at any push: set 0's
+                // first, as it holds it, where none changed.
+                if let (true, Some(&first)) = (self.changed.is_empty(), writes.first()) {
+                    self.changed.push(first);
+                }
+                self.forgotten = false;
+            }
+            return (&self.changed, None);
+        }
+        let if_shared = self.equal_shape_writes(layout, shape, writes);
+        if self.sets_layout != layout {
+            self.sets_layout = layout;
+            self.sets.clear();
+        }
+        match self.sets.first_mut() {
+            Some(first) => *first = None,
+            None => self.sets.push(None),
+        }
+        self.pushed.clear();
+        self.pushed.extend_from_slice(writes);
+        self.pushed_shape = shape;
+        self.forgotten = false;
+        (writes, if_shared)
+    }
+
+    /// Where a push of `writes` with `layout`, whose set 0 and push-constant ranges have `shape`,
+    /// carries set 0 whole although set 0 holds the pushed descriptors of another layout of the
+    /// same shape: the writes it would carry if the layouts were one. Those that differ from what
+    /// set 0 holds (all of them where its bindings and elements differ), and at least one after a
+    /// pipeline bind where the driver's pushed descriptors go stale across one, as the push of a
+    /// held set 0 carries there (`WorkCounts::set_zero_writes_if_shapes_shared`). `None` for any
+    /// other push. Measured only: [`Bound::pushed_set`] carries what it carried.
+    fn equal_shape_writes(
+        &self,
+        layout: vk::PipelineLayout,
+        shape: u64,
+        writes: &[SetWrite],
+    ) -> Option<u64> {
+        if self.sets_layout == layout || self.pushed.is_empty() || shape != self.pushed_shape {
+            return None;
+        }
+        let same_bindings = self.pushed.len() == writes.len()
+            && (self.pushed.iter().zip(writes))
+                .all(|(a, b)| (a.binding, a.element, a.ty) == (b.binding, b.element, b.ty));
+        if !same_bindings {
+            return Some(writes.len() as u64);
+        }
+        let changed = (self.pushed.iter().zip(writes))
+            .filter(|(old, new)| !old.same(new))
+            .count() as u64;
+        Some(changed.max(u64::from(self.forgotten)))
+    }
+
     /// Whether pushing `writes` with `layout` sets anything: noted as pushed where it does.
+    #[inline]
     pub(super) fn pushes(&mut self, layout: vk::PipelineLayout, writes: &[PushWrite]) -> bool {
         let same = self.push_layout == layout
             && self.pushes.len() == writes.len()
@@ -171,6 +403,7 @@ impl Bound {
 
     /// Whether binding `buffer` at `offset` to vertex buffer `binding` (with `stride`, where the
     /// strides are dynamic) sets anything: noted as bound where it does.
+    #[inline]
     pub(super) fn vertex_buffer(
         &mut self,
         binding: u32,
@@ -193,6 +426,7 @@ impl Bound {
     }
 
     /// Whether binding `index` sets anything: noted as bound where it does.
+    #[inline]
     pub(super) fn index_buffer(&mut self, index: &IndexBind) -> bool {
         let bound = (
             index.buffer,
@@ -209,14 +443,18 @@ impl Bound {
 
     /// Whether setting dynamic `state` to its value `now` sets anything: noted as set where it
     /// does. A state no value here holds is always set.
+    #[inline]
     pub(super) fn dynamic(&mut self, state: vk::DynamicState, now: Now<'_>) -> bool {
+        let Some(bit) = States::bit(state) else {
+            return true;
+        };
         let values = self.values.get_or_insert_with(|| Values::of(now));
-        let held = self.set.contains(&state);
+        let held = self.set.0 & bit != 0;
         if held && values.holds(state, now) == Some(true) {
             return false;
         }
-        if values.take(state, now) && !held {
-            self.set.push(state);
+        if values.take(state, now) {
+            self.set.0 |= bit;
         }
         true
     }
@@ -238,6 +476,7 @@ impl Values {
     }
 
     /// Whether `state` holds the value `now` sets it to; `None` for a state no value here holds.
+    #[inline]
     fn holds(&self, state: vk::DynamicState, now: Now<'_>) -> Option<bool> {
         let s = now.state;
         let (ds, now_ds) = (&self.fixed.depth_stencil, &s.fixed.depth_stencil);
@@ -250,7 +489,7 @@ impl Values {
                     && self
                         .viewports
                         .iter()
-                        .zip(&s.viewports)
+                        .zip(s.viewports.iter())
                         .all(|(a, b)| viewport_bits(a) == viewport_bits(b))
             }
             vk::DynamicState::SCISSOR => {
@@ -258,7 +497,7 @@ impl Values {
                     && self
                         .scissors
                         .iter()
-                        .zip(&s.scissors)
+                        .zip(s.scissors.iter())
                         .all(|(a, b)| rect(a) == rect(b))
             }
             vk::DynamicState::DEPTH_BIAS => self.depth_bias == s.depth_bias.setting(),
@@ -298,18 +537,13 @@ impl Values {
     }
 
     /// Take `state`'s value from `now`; `false` for a state no value here holds.
+    #[inline]
     fn take(&mut self, state: vk::DynamicState, now: Now<'_>) -> bool {
         let s = now.state;
         let (ds, now_ds) = (&mut self.fixed.depth_stencil, &s.fixed.depth_stencil);
         match state {
-            vk::DynamicState::VIEWPORT => {
-                self.viewports.clear();
-                self.viewports.extend_from_slice(&s.viewports);
-            }
-            vk::DynamicState::SCISSOR => {
-                self.scissors.clear();
-                self.scissors.extend_from_slice(&s.scissors);
-            }
+            vk::DynamicState::VIEWPORT => self.viewports.clone_from(&s.viewports),
+            vk::DynamicState::SCISSOR => self.scissors.clone_from(&s.scissors),
             vk::DynamicState::DEPTH_BIAS => self.depth_bias = s.depth_bias.setting(),
             vk::DynamicState::BLEND_CONSTANTS => self.blend_color = s.blend_color,
             vk::DynamicState::STENCIL_COMPARE_MASK => {
@@ -352,6 +586,7 @@ impl Values {
 }
 
 /// A viewport's fields as the command carries them, bit for bit.
+#[inline]
 fn viewport_bits(viewport: &vk::Viewport) -> [u32; 6] {
     [
         viewport.x,
@@ -365,6 +600,7 @@ fn viewport_bits(viewport: &vk::Viewport) -> [u32; 6] {
 }
 
 /// A scissor's fields.
+#[inline]
 fn rect(rect: &vk::Rect2D) -> [i64; 4] {
     [
         i64::from(rect.offset.x),
@@ -372,4 +608,106 @@ fn rect(rect: &vk::Rect2D) -> [i64; 4] {
         i64::from(rect.extent.width),
         i64::from(rect.extent.height),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Bound;
+    use crate::binding::{Info, SetWrite};
+    use ash::vk::{self, Handle};
+
+    /// A uniform buffer write at binding `binding` of the buffer whose handle is `buffer`.
+    fn uniform(binding: u32, buffer: u64) -> SetWrite {
+        SetWrite {
+            binding,
+            element: 0,
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            info: Info::Buffer(vk::DescriptorBufferInfo {
+                buffer: vk::Buffer::from_raw(buffer),
+                offset: 0,
+                range: 64,
+            }),
+        }
+    }
+
+    /// A push after a pipeline bind of the same layout carries only the writes that changed, the
+    /// bind disturbing no set 0; where the driver's pushed descriptors go stale across the bind (a
+    /// driver's defect), it carries at least one: set 0's first, as held, where none changed.
+    #[test]
+    fn a_push_after_a_pipeline_bind_carries_what_changed_and_one_where_asked() {
+        let layout = vk::PipelineLayout::from_raw(1);
+        let writes = [uniform(0, 7), uniform(1, 8)];
+        let changed = [uniform(0, 7), uniform(1, 9)];
+        for forgets in [false, true] {
+            let mut bound = Bound::default();
+            bound.follow(vk::CommandBuffer::from_raw(2));
+            assert!(bound.pipeline(vk::Pipeline::from_raw(3), &[], forgets));
+            assert_eq!(bound.pushed_set(layout, 5, &writes).0.len(), 2);
+            assert!(bound.pipeline(vk::Pipeline::from_raw(4), &[], forgets));
+            let carried = bound.pushed_set(layout, 5, &changed).0;
+            let only = |write: &SetWrite| carried.len() == 1 && carried[0].same(write);
+            assert!(only(&changed[1]), "forgets {forgets}");
+            // Another pipeline, the same writes.
+            assert!(bound.pipeline(vk::Pipeline::from_raw(3), &[], forgets));
+            let carried = bound.pushed_set(layout, 5, &changed).0;
+            match forgets {
+                true => assert!(carried.len() == 1 && carried[0].same(&changed[0])),
+                false => assert!(carried.is_empty()),
+            }
+            // The same pipeline again binds nothing, and the push carries nothing.
+            assert!(!bound.pipeline(vk::Pipeline::from_raw(3), &[], forgets));
+            assert_eq!(bound.pushed_set(layout, 5, &changed).0.len(), 0);
+        }
+    }
+
+    /// A push of another layout of the same shape carries set 0 whole, and counts the writes
+    /// it would carry if the two were one layout: those that changed, at least one where the
+    /// driver's pushed descriptors go stale across a pipeline bind; one of another shape, or of
+    /// the same layout, counts nothing; what each push carries is unchanged.
+    #[test]
+    fn a_push_across_equal_shapes_counts_what_one_layout_would_carry() {
+        let (a, b) = (
+            vk::PipelineLayout::from_raw(1),
+            vk::PipelineLayout::from_raw(2),
+        );
+        let writes = [uniform(0, 7), uniform(1, 8)];
+        let changed = [uniform(0, 7), uniform(1, 9)];
+        for forgets in [false, true] {
+            let mut bound = Bound::default();
+            bound.follow(vk::CommandBuffer::from_raw(3));
+            bound.pipeline(vk::Pipeline::from_raw(4), &[], forgets);
+            let (carried, counted) = bound.pushed_set(a, 5, &writes);
+            assert_eq!((carried.len(), counted), (2, None), "nothing pushed yet");
+            // Another layout of the same shape, the same writes.
+            bound.pipeline(vk::Pipeline::from_raw(5), &[], forgets);
+            let none_changed = u64::from(forgets);
+            let (carried, counted) = bound.pushed_set(b, 5, &writes);
+            assert_eq!(
+                (carried.len(), counted),
+                (2, Some(none_changed)),
+                "carried whole"
+            );
+            // Back to the first layout, one write changed.
+            bound.pipeline(vk::Pipeline::from_raw(4), &[], forgets);
+            let (carried, counted) = bound.pushed_set(a, 5, &changed);
+            assert_eq!((carried.len(), counted), (2, Some(1)));
+            // A layout of another shape.
+            bound.pipeline(vk::Pipeline::from_raw(6), &[], forgets);
+            let (carried, counted) = bound.pushed_set(b, 6, &changed);
+            assert_eq!((carried.len(), counted), (2, None));
+            // The same pipeline and layout again: held, nothing counted.
+            let (carried, counted) = bound.pushed_set(b, 6, &changed);
+            assert_eq!((carried.len(), counted), (0, None));
+            // The same layout through another pipeline: held, nothing counted, one write carried
+            // where the bind leaves the driver's pushed descriptors stale.
+            bound.pipeline(vk::Pipeline::from_raw(7), &[], forgets);
+            let (carried, counted) = bound.pushed_set(b, 6, &changed);
+            let carried = carried.len();
+            assert_eq!(
+                (carried, counted),
+                (usize::from(forgets), None),
+                "forgets {forgets}"
+            );
+        }
+    }
 }

@@ -25,10 +25,16 @@
 //!   fails `CommandBufferError::EncodedUseRebound` there, as all did before. Commands encoded after
 //!   the rebind use the new pages. A rebind while a command buffer that is not yet committed has
 //!   encoded a use of the buffer or heap (one of its resources included), or has an encoder open
-//!   that used one, is refused (`Invalid`, [`RebindProblem::EncodedUses`]): its commands took the
-//!   old pages, and committing them after the rebind would be neither order. A command buffer
-//!   committed with commands the runtime records only once earlier work completed (executions of an
-//!   indirect command buffer the GPU writes) counts as uncommitted until it completed.
+//!   that used one (a render encoder uses its attachments' bytes from its open), is refused
+//!   (`Invalid`, [`RebindProblem::EncodedUses`]): its commands took the old pages, and committing
+//!   them after the rebind would be neither order. A command buffer committed with commands the
+//!   runtime records only once earlier work completed (executions of an indirect command buffer
+//!   the GPU writes) counts as uncommitted until it completed.
+//! - **The new pages' import.** New memory that is the bytes a live no-copy buffer was made over,
+//!   of its memory class, lies in that buffer's import, as a buffer made over them does
+//!   (`host_aliases.rs`): the rebind imports nothing, pins no page and asks the kernel about no
+//!   mapping (`WorkCounts::host_mappings_queried`). A heap's, and a buffer's with a texture's
+//!   aliasing image over its bytes, import their new memory themselves.
 //! - **The deallocators.** The old range's runs once every command buffer first submitted
 //!   before the rebind that used it completed (at the rebind where none holds it: a command
 //!   buffer not yet submitted holds its pages weakly); the new range's at the next rebind's turn,
@@ -51,17 +57,21 @@
 //!   dma-bufs, each such image is made again over a dma-buf of its own new pages before the rebind
 //!   settles (`Device::dma_buf_images_again`, `dma_buf.rs`), and refused likewise where it is not.
 
+#[cfg(unix)]
+use super::buffer::Imported;
 use super::buffer::{Buffer, Detached, HostCell, HostPages, Lying, WeakBuffer};
 use super::command_buffer::CommandBufferShared;
 use super::device::lock;
 use super::error::{invalid, Error, Problem};
 use super::heap::Heap;
 use super::host_memory::{Deallocator, HostMemory, HostRelease, KeepAlive};
+use super::key_hash::KeyMap;
+use super::program_objects;
 use super::resource::{ObjectId, ResourceKey};
 use super::Device;
 use metal2vulkan::bind::ResidentRange;
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
@@ -74,8 +84,9 @@ pub enum RebindProblem {
     /// not over the caller's host memory.
     NotHostMemory,
     /// A command buffer that is not yet committed has encoded a use of the buffer or heap, or of
-    /// a resource placed in it, or has an encoder open that used one (or one committed whose
-    /// commands the runtime records only once earlier work completed): commit or drop it first.
+    /// a resource placed in it, or has an encoder open that used one (a render encoder uses its
+    /// attachments' bytes from its open), or one committed whose commands the runtime records
+    /// only once earlier work completed: commit or drop it first.
     EncodedUses,
 }
 
@@ -84,7 +95,7 @@ pub enum RebindProblem {
 #[derive(Default)]
 pub(super) struct Rebinds {
     live: AtomicUsize,
-    buffers: Mutex<HashMap<ResourceKey, Entry>>,
+    buffers: Mutex<KeyMap<ResourceKey, Entry>>,
     /// How many of them are detached (`detach.rs`): else no command names a detached one.
     detached: AtomicUsize,
     /// Signaled as a submitted command buffer that took one of them completes
@@ -388,7 +399,7 @@ const LOST_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// pages held from now on under the one lock, so a detach either came before (and fails the
 /// submission) or waits for the command buffer.
 pub(super) struct Submitting<'a> {
-    buffers: MutexGuard<'a, HashMap<ResourceKey, Entry>>,
+    buffers: MutexGuard<'a, KeyMap<ResourceKey, Entry>>,
 }
 
 /// What a submission found of what an encoder's commands, or a segment's, took.
@@ -491,6 +502,15 @@ impl Submitting<'_> {
                 retained.push(Box::new(pages));
             }
         }
+        // A blit's objects of a releasable import, held until it completes. Gone only with their
+        // import, as a rebind or a detach replaced its buffer's pages, which a pin above found
+        // moved: the recording that named them runs nothing.
+        for hold in taken.imports.drain(..) {
+            match hold.retained() {
+                Some(held) => retained.push(held),
+                None => found.moved = true,
+            }
+        }
         // `cell` and `now` drop here, under the lock: never the last hold of anything (above).
         found
     }
@@ -591,6 +611,8 @@ pub(super) enum Pinned {
 #[derive(Default)]
 pub(super) struct Taken {
     pins: Vec<(ResourceKey, Pinned)>,
+    /// The objects of releasable imports its blits took ([`ImportHold`]).
+    imports: Vec<ImportHold>,
     named: BTreeSet<ResourceKey>,
     resolved: Vec<ResidentRange>,
     /// A command named a detached buffer, and the encoder recorded nothing from it on
@@ -598,7 +620,50 @@ pub(super) struct Taken {
     dead: bool,
 }
 
+/// The objects of a releasable import a blit's command took (`Buffer::blit_at`,
+/// `host_residency.rs`): held while its encoder records, weakly from the commit until the command
+/// buffer's first submission, as its pages are, then until it completes. Held weakly, they keep
+/// the device's residency from releasing them (the committed recording names their `VkBuffer`),
+/// but not the import from going with its buffer's pages (a rebind, a detach), as Metal holds
+/// nothing of a command buffer not yet submitted: their free, and the deallocator after it, run
+/// in that call, and the recording that named them never runs (its pin of the pages moved).
+pub(super) enum ImportHold {
+    #[cfg(unix)]
+    Held(Arc<Imported>),
+    #[cfg(unix)]
+    Waiting(Weak<Imported>),
+}
+
+impl ImportHold {
+    /// Held weakly from now on.
+    fn wait(&mut self) {
+        match self {
+            #[cfg(unix)]
+            ImportHold::Held(held) => *self = ImportHold::Waiting(Arc::downgrade(held)),
+            #[cfg(unix)]
+            ImportHold::Waiting(_) => {}
+        }
+    }
+
+    /// The objects, held until the command buffer completes: `None` where they went.
+    fn retained(self) -> Option<Box<dyn Any + Send + Sync>> {
+        match self {
+            #[cfg(unix)]
+            ImportHold::Held(held) => Some(Box::new(held)),
+            #[cfg(unix)]
+            ImportHold::Waiting(held) => held
+                .upgrade()
+                .map(|held| Box::new(held) as Box<dyn Any + Send + Sync>),
+        }
+    }
+}
+
 impl Taken {
+    /// Note `hold`, the objects of a releasable import a blit took.
+    pub(super) fn hold_import(&mut self, hold: ImportHold) {
+        self.imports.push(hold);
+    }
+
     /// Note `pinned`, what a command took of the buffer of `key`.
     pub(super) fn pin(&mut self, key: ResourceKey, pinned: Pinned) {
         self.pins.push((key, pinned));
@@ -607,6 +672,12 @@ impl Taken {
     /// Note that a command named `key`.
     pub(super) fn name(&mut self, key: ResourceKey) {
         self.named.insert(key);
+    }
+
+    /// Whether a command named a buffer over host pages ([`named_pins`](Self::named_pins) holds
+    /// one).
+    pub(super) fn names_a_pin(&self) -> bool {
+        self.pins.iter().any(|(key, _)| self.named.contains(key))
     }
 
     /// The keys of the buffers over host pages a command named, sorted, each once.
@@ -651,11 +722,19 @@ impl Taken {
     }
 
     /// Hold every pin weakly: its command buffer committed and waits for its first submission.
-    pub(super) fn wait(&mut self) {
+    /// The pages it held go to `held`, which its deferred command buffers' replays hold until
+    /// they are replayed (`recorder`).
+    pub(super) fn wait(&mut self, held: &mut Vec<Arc<HostPages>>) {
         for (_, pinned) in &mut self.pins {
             if let Pinned::Held(pages) = pinned {
-                *pinned = Pinned::Waiting(Arc::downgrade(pages));
+                let waiting = Pinned::Waiting(Arc::downgrade(pages));
+                if let Pinned::Held(pages) = std::mem::replace(pinned, waiting) {
+                    held.push(pages);
+                }
             }
+        }
+        for hold in &mut self.imports {
+            hold.wait();
         }
     }
 
@@ -676,6 +755,7 @@ impl Taken {
             Pinned::Detached => None,
         });
         retained.extend(live.map(|pages| Box::new(pages) as Box<dyn Any + Send + Sync>));
+        retained.extend(self.imports.drain(..).filter_map(ImportHold::retained));
         self.named.clear();
         self.resolved.clear();
     }
@@ -716,12 +796,13 @@ impl Buffer {
     ///
     /// Refused: a buffer that is not a no-copy buffer of its own (`Invalid`,
     /// [`RebindProblem::NotHostMemory`]); a command buffer not yet committed whose commands used
-    /// the buffer, or an open encoder that did (`Invalid`, [`RebindProblem::EncodedUses`]); new
-    /// memory at another offset in its page than the old where a texture over the buffer lives
-    /// (`NotImplemented(RebindTextures)`: the texture's copies, views and aliasing image are
-    /// planned at that offset), or where the device cannot make a texture's aliasing image again
-    /// over the new memory (`NotImplemented(RebindTextures)`, which says when); memory the device
-    /// cannot import exactly, as `new_buffer_with_bytes_no_copy` refuses it; a lost device.
+    /// the buffer, or an open encoder that did (a render encoder with an attachment over it, from
+    /// its open) (`Invalid`, [`RebindProblem::EncodedUses`]); new memory at another offset in its
+    /// page than the old where a texture over the buffer lives (`NotImplemented(RebindTextures)`:
+    /// the texture's copies, views and aliasing image are planned at that offset), or where the
+    /// device cannot make a texture's aliasing image again over the new memory
+    /// (`NotImplemented(RebindTextures)`, which says when); memory the device cannot import
+    /// exactly, as `new_buffer_with_bytes_no_copy` refuses it; a lost device.
     ///
     /// # Safety
     ///
@@ -742,19 +823,19 @@ impl Buffer {
             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
         };
         // SAFETY: the caller's contract.
-        unsafe {
+        let rebound = unsafe {
             self.device().rebind_host_pages(
                 CALL,
                 self,
                 cell,
                 memory,
-                HostRelease {
-                    deallocator,
-                    keep_alive,
-                },
+                HostRelease::new(deallocator, keep_alive),
                 None,
             )
-        }
+        };
+        // The buffer a pending command buffer may hold has the program's objects now.
+        program_objects::settle();
+        rebound
     }
 }
 
@@ -773,9 +854,9 @@ impl Heap {
     ///
     /// Refused: a heap not over the caller's host memory (`Invalid`,
     /// [`RebindProblem::NotHostMemory`]); a command buffer not yet committed whose commands used
-    /// the heap or a resource placed in it, or an open encoder that did (`Invalid`,
-    /// [`RebindProblem::EncodedUses`]); memory whose first byte is off the import's unit
-    /// (`Invalid`, `HeapProblem::HostMemoryAlignment`); memory the device cannot import exactly;
+    /// the heap or a resource placed in it, or an open encoder that did (a render encoder with an
+    /// attachment in it, from its open) (`Invalid`, [`RebindProblem::EncodedUses`]); memory whose
+    /// first byte is off the import's unit (`Invalid`, `HeapProblem::HostMemoryAlignment`); memory the device cannot import exactly;
     /// an image the device cannot make again there (as `new_texture_at_offset` refuses it); a
     /// lost device.
     ///
@@ -797,19 +878,19 @@ impl Heap {
             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
         };
         // SAFETY: the caller's contract.
-        unsafe {
+        let rebound = unsafe {
             self.device().rebind_host_pages(
                 CALL,
                 own,
                 cell,
                 memory,
-                HostRelease {
-                    deallocator,
-                    keep_alive,
-                },
+                HostRelease::new(deallocator, keep_alive),
                 Some(self),
             )
-        }
+        };
+        // The heap a pending command buffer may hold has the program's objects now.
+        program_objects::settle();
+        rebound
     }
 }
 

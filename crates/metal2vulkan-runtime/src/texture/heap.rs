@@ -11,7 +11,7 @@
 //!   resource lies in the chunk (`texture::ImagePlacement`). Metal's answer is its GPU's own (an M4
 //!   on macOS 27.0.1 and an M3 Max on macOS 26.7 answer alike: 128-byte alignment and the sizes of
 //!   Apple's layouts, 16384 bytes for a 64x64 `RGBA8Unorm` texture a shader writes and 16512 for
-//!   one it only reads, which Metal compresses; SPR-heaptex1, SPR-heaptex2), and a program places
+//!   one it only reads, which Metal compresses), and a program places
 //!   by the query's answer, so the runtime answers its own device's. It depends on the device and
 //!   the descriptor alone, never on what was allocated. Where Metal's layout is measured
 //!   (`heap_tiled.rs`: plain and block-compressed formats; multisample textures), it answers the
@@ -43,7 +43,7 @@
 //! - **Where Metal's answer is not its image's** (the consumer's report): Metal answers a 4:2:2
 //!   texture its rows of 2-byte texels at a multiple of 16 bytes, the last unpadded, at an
 //!   alignment of 16, and an `X32_Stencil8` texture as a `Stencil8` one
-//!   (`Device::metal_heap_answer`; an M4, EV `APX-fmt1-m4`), which the runtime answers too.
+//!   (`Device::metal_heap_answer`; an M4), which the runtime answers too.
 //!   Where the device's image needs more bytes or a coarser alignment than that answer, and for
 //!   every 4:2:2 texture, the texture is a shadow of the heap's bytes in memory of its own
 //!   (`AliasRoute::MemoryShadow`): its planes fit the answer (an `X32_Stencil8` texture's stencil
@@ -95,7 +95,7 @@
 //!   `make_aliasable` gives its range to the next resource; a placement heap takes any offset that
 //!   is a multiple of the alignment with the texture's bytes inside the heap, overlapping other
 //!   resources or not (Metal: an offset not a multiple of the alignment is stopped by validation
-//!   and answers nil without it, and so does one past the heap's end; SPR-heaptex1, TTG-nil1-m4:
+//!   and answers nil without it, and so does one past the heap's end:
 //!   the runtime answers `Nil`). The texture's storage and CPU cache modes are the heap's (another
 //!   is `Invalid`, as Metal ends the process), and its hazard tracking is the heap's buffer's, so
 //!   Metal's tracking at the granularity of the heap orders a buffer's write before an
@@ -104,11 +104,11 @@
 //! - **Depth twins**. A `Depth32Float` texture the device holds with a depth twin takes both images
 //!   of the heap: the image at the texture's offset and the twin past it, at the next multiple of
 //!   the twin's alignment ([`heap_extent`]), so the answered size covers both and the texture's
-//!   bytes are its range alone, as Metal's placement and aliasing rules need (CRF heap probe 1: two
-//!   `Depth32Float` textures side by side keep their texels, and a buffer filled over the first
-//!   changes every texel of it and none of the second's). Each image takes the heap's memory or its
-//!   linear tiling as above. Both are the heap buffer's resource to hazard tracking, and
-//!   `depth-twin` is announced as for `new_texture`.
+//!   bytes are its range alone, as Metal's placement and aliasing rules need (a Metal heap probe on
+//!   the M3 Max and an M4: two `Depth32Float` textures side by side keep their texels, and a buffer
+//!   filled over the first changes every texel of it and none of the second's). Each image takes
+//!   the heap's memory or its linear tiling as above. Both are the heap buffer's resource to hazard
+//!   tracking, and `depth-twin` is announced as for `new_texture`.
 //! - **Depth and stencil images apart**. On a driver that lays depth and stencil images apart from
 //!   the memory they are bound to ([`DriverFact::DepthStencilImagesLieApart`]: MoltenVK, measured),
 //!   a heap's texture with such an image (its own or its twin) aliases none of the heap's other
@@ -116,38 +116,46 @@
 //! - **Compressed images**. On a driver whose compressed images may keep their texels apart from
 //!   the memory they are bound to ([`DriverFact::CompressedImagesHideAliasedWrites`]: ANV on
 //!   Intel's GPUs, measured), a heap's colour texture whose optimal image takes the heap's memory
-//!   takes, in order: that image with host-transfer usage, which the driver keeps uncompressed in
-//!   its memory ([`DriverFact::HostTransferImagesKeepTheirBytes`]), where the device enabled
-//!   `hostImageCopy` (the runtime on a device it creates, `device/create.rs`; the consumer on one
-//!   it adopts that says so, `device/adopt.rs`) and the format and shape take the usage; else a
-//!   linear image, where one serves as above; else the optimal image. The device announces the
-//!   first two once each as costs (`heap-texture-host-transfer`, `heap-texture-linear`) and the
-//!   last once as a near-equivalent (`heap-texture-hides-aliased-writes`). The first two keep
-//!   Metal's visibility contract, not a byte layout: a write through a buffer or texture over the
-//!   texture's bytes changes every texel it covers, and the texture's writes show in those
-//!   bytes, in the device's layout for the image, as Metal's are in its GPU's. Depth and stencil
-//!   images and depth twins keep their optimal images: a buffer's write over ANV's changed every
-//!   texel (the heap depth lane).
+//!   and that Metal keeps losslessly compressed too (`heap_tiled::metal_compresses_layout`) takes
+//!   that image, the driver's compression and fast clears kept, under the device's
+//!   `HeapCompressionPolicy::Compressed` (the default), announced once as a near-equivalent
+//!   (`heap-texture-compressed`): Metal's texture shows no aliased write as written either (an M3
+//!   Max read opaque magenta in every texel of drawn content a buffer's fill over the texture's
+//!   bytes covered). Any other such texture, and every one under
+//!   `HeapCompressionPolicy::Uncompressed`, takes, in order: that image with host-transfer usage,
+//!   which the driver keeps uncompressed in its memory
+//!   ([`DriverFact::HostTransferImagesKeepTheirBytes`]), where the device enabled `hostImageCopy`
+//!   (the runtime on a device it creates, `device/create.rs`; the consumer on one it adopts that
+//!   says so, `device/adopt.rs`) and the format and shape take the usage; else a linear image,
+//!   where one serves as above; else the optimal image. The device announces the first two once
+//!   each as costs (`heap-texture-host-transfer`, `heap-texture-linear`) and the last once as a
+//!   near-equivalent (`heap-texture-hides-aliased-writes`). The first two keep Metal's visibility
+//!   contract, not a byte layout: a write through a buffer or texture over the texture's bytes
+//!   changes every texel it covers, and the texture's writes show in those bytes, in the device's
+//!   layout for the image, as Metal's are in its GPU's. Depth and stencil images and depth twins
+//!   keep their optimal images: a buffer's write over ANV's changed every texel (the heap depth
+//!   lane).
 //! - **Texture buffers**. A heap's texture buffer is a buffer of the heap's at the texture's
 //!   offset, its row of texels long, with the texture buffer over its bytes as
-//!   `Buffer::new_texture` makes one: Metal's answers, measured (CRF heap probe 1, an M3 Max and
-//!   an M4 alike, plain and validated): the size is the row exactly and the alignment 16 bytes,
-//!   for every format and storage mode; the texels are the heap's bytes from the offset, in
-//!   order, so a buffer over them and the texture alias byte for byte; an automatic heap answers
-//!   `heapOffset` 0 and counts the row in `usedSize`, and `makeAliasable` gives the range back.
-//!   The texture answers `heap`, `heap_offset`, `make_aliasable` and `is_aliasable` through the
-//!   buffer, which is no resource of the program's (Metal's texture answers `buffer` nil).
+//!   `Buffer::new_texture` makes one: Metal's answers, measured (a Metal heap probe, an M3 Max and
+//!   an M4 alike, plain and validated): the size is the row exactly and the alignment 16 bytes, for
+//!   every format and storage mode; the texels are the heap's bytes from the offset, in order, so a
+//!   buffer over them and the texture alias byte for byte; an automatic heap answers `heapOffset` 0
+//!   and counts the row in `usedSize`, and `makeAliasable` gives the range back. The texture
+//!   answers `heap`, `heap_offset`, `make_aliasable` and `is_aliasable` through the buffer, which
+//!   is no resource of the program's (Metal's texture answers `buffer` nil).
 
 use super::first_move::FirstMove;
 use super::heap_tiled::{
-    metal_heap_layout, modelled_size, HeapLayout, HeapTiledCopies, TiledLayout, Untiled,
-    UNMEASURED_FORMAT,
+    metal_compresses_layout, metal_heap_layout, modelled_size, HeapLayout, HeapTiledCopies,
+    TiledLayout, Untiled, UNMEASURED_FORMAT,
 };
 use super::heap_two_planes::{HeapPlaneCopies, TwoPlaneHeapLayout};
 use super::stand_in::StandIn;
 use super::{
-    copy_units, image_aspects, image_error, DetachedImage, IdUse, Image, ImageObjects,
-    ImagePlacement, ImageSwap, Owner, Raw, Remade, Storage, Texture, TextureDescriptor, ViewRecord,
+    copy_units, image_aspects, image_error, pages_hold, DetachedImage, IdUse, Image, ImageObjects,
+    ImagePlacement, ImageSwap, KeptResolves, Owner, Raw, Remade, Storage, Texture,
+    TextureDescriptor, ViewRecord,
 };
 use crate::address::ObjectsToken;
 use crate::buffer::{
@@ -161,25 +169,27 @@ use crate::device::lock;
 use crate::error::{internal, invalid, nil, vulkan, Error, MemoryKind, Nil, Problem, RuntimeGap};
 use crate::heap::{Heap, HeapProblem, HeapType, SizeAndAlign, WeakHeap};
 use crate::image_plan::{check_image_limits, plan_texture_images, ImagePlan};
+use crate::key_hash::KeyMap;
 use crate::linear_plan::{check_linear_limits, linear_lack, LinearLack, LINEAR_ALIGNMENT};
 use crate::memory::{Memory, MemoryClass, Placement};
+use crate::metal_level::MetalLevel;
 use crate::release;
 use crate::resource::{Identity, ResourceKey};
-use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
+use crate::shadow::{Backing, ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
+use crate::shadow_merge::ScratchSpares;
 use crate::texture_descriptor::{effective_usage, Creator, TextureLayout, TextureProblem};
 use crate::tracker::UseRange;
 use crate::two_planes;
 use crate::values::{ResourceOptions, StorageMode};
 use crate::Device;
 use ash::vk;
-use metal2vulkan::device::DriverFact;
+use metal2vulkan::device::{DriverFact, HeapCompressionPolicy};
 use metal2vulkan::error::{Feature, LinearNeed, Unsupported};
 use metal2vulkan::metal::format::ycbcr_format;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan::vk::{
     Format, FormatFeatureFlags2, ImageAspectFlags, ImageUsageFlags, SampleCountFlags,
 };
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -195,7 +205,7 @@ pub(crate) const HEAP_BASE_ALIGNMENT: u64 = 256 << 10;
 /// Where a heap texture's image lies: its heap, and its offset and size there. The range has
 /// this one owner from its allocation on, the texture's image once it is made. The last texture
 /// object over the image gives an automatic heap's range back (`give_back`), as Metal's texture
-/// does at its release (EV XRB-hep1-m4), unless `makeAliasable` gave it back already; the place's
+/// does at its release, unless `makeAliasable` gave it back already; the place's
 /// drop gives it back where no texture object was made over it.
 pub(crate) struct HeapPlace {
     /// Its heap, held weakly: the texture objects hold it (`TextureShared::heap`), as Metal's
@@ -406,6 +416,9 @@ enum AliasRoute {
     /// An optimal colour image the driver may compress, a near-equivalent
     /// (`heap-texture-hides-aliased-writes`).
     Hidden,
+    /// An optimal colour image the driver may compress, of a texture Metal keeps losslessly
+    /// compressed too, under `HeapCompressionPolicy::Compressed` (`heap-texture-compressed`).
+    Compressed,
     /// A depth or stencil image the driver lays apart from its memory, in memory of its own,
     /// whose texels the encoders copy from the heap's bytes and back: a shadow of them
     /// (`shadowed-texture`).
@@ -450,8 +463,9 @@ enum AliasRoute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mine {
     /// The texture's own; a shadow of the heap's bytes may serve it where the texture is held
-    /// with no depth twin.
-    Texture { shadows: bool },
+    /// with no depth twin (`shadows`), and Metal keeps it losslessly compressed where
+    /// `compressed` (`heap_tiled::metal_compresses_layout`).
+    Texture { shadows: bool, compressed: bool },
     /// The texture's depth twin.
     Twin,
 }
@@ -487,6 +501,9 @@ struct HeapBinding {
     /// The memory is host memory the heap imported (`Device::new_heap_with_bytes_no_copy`): an
     /// image bound to it is made for host allocations.
     host: bool,
+    /// The host pages the heap's bytes lie in now, where `host`: a submission that takes the move
+    /// of an image bound to them holds them (`texture/first_move.rs`).
+    pages: Option<Arc<HostPages>>,
 }
 
 /// What a texture of a descriptor takes of a heap.
@@ -633,7 +650,7 @@ impl HeapPlane {
 /// blocks tightly packed, each plane at a multiple of 4 bytes and of its block's bytes, the buffer
 /// offsets Vulkan copies the aspect at. A texture made in `X32_Stencil8` has its stencil's planes
 /// alone: its image's depth holds no texel of it; a 4:2:2 texture's rows lie at a multiple of 16
-/// bytes, the last unpadded, as Metal lays out a heap's (an M4, EV `APX-fmt1-m4`: a buffer over one
+/// bytes, the last unpadded, as Metal lays out a heap's (an M4: a buffer over one
 /// read each row there, the bytes between untouched). The planes, and the bytes they span.
 pub(crate) fn heap_plane_layout(
     format: Format,
@@ -748,6 +765,17 @@ pub(crate) fn heap_planes(
     (regions, end)
 }
 
+/// Whether `regions` copy every aspect of an image of `format`: every aspect but an
+/// `X32_Stencil8` texture's depth, whose planes are its stencil's alone ([`heap_plane_layout`]).
+fn copies_every_aspect(regions: &[vk::BufferImageCopy], format: Format) -> bool {
+    let copied = regions
+        .iter()
+        .fold(vk::ImageAspectFlags::empty(), |aspects, region| {
+            aspects | region.image_subresource.aspect_mask
+        });
+    copied == image_aspects(format).into()
+}
+
 /// The initial layout of a heap texture's image of `tiling`: `PREINITIALIZED` for a linear one,
 /// whose move to `GENERAL` then keeps the bytes it holds, the heap's.
 fn initial_layout(tiling: vk::ImageTiling) -> vk::ImageLayout {
@@ -764,7 +792,7 @@ fn linear_tiling(tiling: vk::ImageTiling) -> bool {
     tiling == vk::ImageTiling::LINEAR || tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
 }
 
-/// Metal's answer for a texture buffer of `layout` in a heap (CRF heap probe 1, an M3 Max and an
+/// Metal's answer for a texture buffer of `layout` in a heap (a Metal heap probe, an M3 Max and an
 /// M4 alike): its row of texels exactly, at a multiple of 16 bytes
 /// (`minimumTextureBufferAlignmentForPixelFormat:`, `LINEAR_ALIGNMENT`) for every format and
 /// storage mode. The texels are a buffer of the heap's (`Device::new_heap_texture_buffer`), which
@@ -784,7 +812,7 @@ const FOUR_TWO_TWO_ALIGNMENT: u64 = 16;
 
 /// Metal's answer for a heap's 4:2:2 texture of `layout` (2D, one level): its rows of 2-byte
 /// texels at a multiple of 16 bytes, the last unpadded, at an alignment of 16 (an M4 under macOS
-/// 27.0.1, EV `APX-fmt1-m4`: 44 bytes for 6 x 3, 148 for 10 x 5, 6000 for 1000 x 3, in every
+/// 27.0.1: 44 bytes for 6 x 3, 148 for 10 x 5, 6000 for 1000 x 3, in every
 /// storage mode and usage; the M3 Max's alike where the consumer measured). It is the span of
 /// the texture's planes as the runtime lays them out in the heap (`heap_plane_layout`).
 fn four_two_two_heap_answer(layout: &TextureLayout) -> SizeAndAlign {
@@ -805,19 +833,16 @@ fn four_two_two_heap_answer(layout: &TextureLayout) -> SizeAndAlign {
 /// `pf` and type `ty` of which plain Metal makes none (a descriptor's [`Error::Nil`]):
 ///
 /// - a two-plane YCbCr format's ([`TextureProblem::NoTextureOfFormat`]): 16, and 128 for a 2D
-///   array, for every type it takes (an Apple M4 under macOS 27.0.1, EV XRR2-ycf3p1b-m4, each of
-///   the 69 formats; with the 1D array, cube array and texture buffer, EVs TTG-nil1-m4 and an M3
-///   Max under 26.7 alike, TTG-nil2-m3);
+///   array, for every type it takes (an Apple M4 under macOS 27.0.1, each of the 69 formats; with
+///   the 1D array, cube array and texture buffer, our probe and an M3 Max under 26.7 alike);
 /// - a two-plane extended-range cube or cube array's ([`TextureProblem::TypeForFormat`]): 16
-///   (an M4, EV `APX2-xr1-m4`, plain and validated);
+///   (an M4, plain and validated);
 /// - `Unspecialized`'s, `RGBA16Float_XR`'s, `AnyDepth`'s and `AnyStencil`'s: 128 for a 1D, 2D
-///   and 2D multisample texture, 16 for a texture buffer, 16 KiB for the arrays, cubes and 3D
-///   textures, as for a texture of a format (an M3 Max under macOS 26.7, EVs `APX2-un2-m3` and
-///   TTG-nil2-m3, the consumer's report alike; plain and validated, every usage and storage
-///   mode). An M4 under macOS 27.0.1 answers 128 for all but the texture buffer (EVs
-///   `APX2-un1-m4`, TTG-nil1-m4, TTG-nil4-m4); the runtime answers the M3 Max's, its
-///   consumer's.
-pub(crate) fn no_texture_alignment(pf: PixelFormat, ty: TextureType) -> u64 {
+///   and 2D multisample texture, 16 for a texture buffer, and for the arrays, cubes and 3D
+///   textures the level's answer (`MetalLevel::no_texture_stack_alignment`): 16 KiB, as for a
+///   texture of a format, on an M3 Max under macOS 26.7 (the consumer's report alike; plain and
+///   validated, every usage and storage mode), and 128 under macOS 27.0.1 (and an M4 alike).
+pub(crate) fn no_texture_alignment(pf: PixelFormat, ty: TextureType, level: MetalLevel) -> u64 {
     use TextureType as T;
     if ycbcr_format(pf).is_some() {
         return if ty == T::Type2DArray { 128 } else { 16 };
@@ -833,7 +858,7 @@ pub(crate) fn no_texture_alignment(pf: PixelFormat, ty: TextureType) -> u64 {
         | T::Cube
         | T::CubeArray
         | T::Type3D
-        | T::Type2DMultisampleArray => 16 << 10,
+        | T::Type2DMultisampleArray => level.no_texture_stack_alignment(),
     }
 }
 
@@ -850,15 +875,14 @@ const TWO_PLANE_ALIGNMENT: u64 = 16;
 const TWO_PLANE_SLICE_ALIGNMENT: u64 = 128;
 
 /// Metal's answer for a heap's two-plane extended-range texture of `layout` (an M4 under macOS
-/// 27.0.1, EVs `APX2-xr1-m4`, `APX2-xr2-m4`, and the M3 Max under 26.7 alike, EVs TXN-xrheap-m3
-/// and `APX2-xr3-m3`, plain and validated; every usage and storage mode): plane 0's slice is its
-/// rows of 4-byte words at a multiple of 16 bytes, plane 1's its rows of alpha bytes at a multiple
-/// of 16, the last unpadded. Plane 0's slices, rounded up to [`TWO_PLANE_PAGE`], then plane 1's. A
-/// 2D or 1D array's slices each lie at a multiple of 128 in each plane, the last one's padded;
-/// a mipmapped texture answers its first level alone and a 3D one its first slice (Metal lays
-/// the rest out past the answer). The alignment is 16, 128 for a 2D array. 64 x 64 answers
-/// 20480 at 16; 1 x 1 16385; 1920 x 1080 10380288; a 2D array of three 64 x 64 slices 61440 at
-/// 128.
+/// 27.0.1, and the M3 Max under 26.7 alike, plain and validated; every usage and storage mode):
+/// plane 0's slice is its rows of 4-byte words at a multiple of 16 bytes, plane 1's its rows of
+/// alpha bytes at a multiple of 16, the last unpadded. Plane 0's slices, rounded up to
+/// [`TWO_PLANE_PAGE`], then plane 1's. A 2D or 1D array's slices each lie at a multiple of 128 in
+/// each plane, the last one's padded; a mipmapped texture answers its first level alone and a 3D
+/// one its first slice (Metal lays the rest out past the answer). The alignment is 16, 128 for a 2D
+/// array. 64 x 64 answers 20480 at 16; 1 x 1 16385; 1920 x 1080 10380288; a 2D array of three 64 x
+/// 64 slices 61440 at 128.
 fn two_plane_heap_answer(layout: &TextureLayout) -> SizeAndAlign {
     let [width, height, _] = layout.extent.map(u64::from);
     let words = height * (4 * width).next_multiple_of(TWO_PLANE_ALIGNMENT);
@@ -898,9 +922,9 @@ fn planes_answer(layout: &TextureLayout) -> Option<SizeAndAlign> {
 
 /// The descriptor Metal sizes a heap texture of `descriptor` as, where that is another's
 /// (`Device::metal_heap_answer`): an `X32_Stencil8` texture as a `Stencil8` one, a stencil
-/// texture (an M4, EV `APX-fmt1-m4`); one of Apple's private `BlockWritesOnly` usage as one
-/// without it (the consumer's report at 4ce09ab30), of `ShaderRead` usage where it has no other,
-/// which Metal compresses alike (EV API-hsa1-m4: equal answers at every shape), not as `Unknown`.
+/// texture (an M4); one of Apple's private `BlockWritesOnly` usage as one without it (the
+/// consumer's report at 4ce09ab30), of `ShaderRead` usage where it has no other, which Metal
+/// compresses alike (equal answers at every shape), not as `Unknown`.
 /// `None` for any other.
 fn sized_as(descriptor: &TextureDescriptor) -> Option<TextureDescriptor> {
     if descriptor.pixel_format == PixelFormat::X32Stencil8 {
@@ -1003,7 +1027,7 @@ impl Device {
     /// `Unsupported` for a format, size or sample count the device lacks, and `NotImplemented` for
     /// an alignment past the heap's base (`HeapTextureAlignment`).
     ///
-    /// Metal's answer by usage (EV API-hsa1-m4, an Apple M4 under macOS 27.0.1, 63210 answers, the
+    /// Metal's answer by usage (an Apple M4 under macOS 27.0.1, 63210 answers, the
     /// consumer's M3 Max rows under 26.7 alike): each shape has two answers, its compressed and its
     /// plain size, and the usage picks one as `heap_tiled::metal_keeps_uncompressed` says; the
     /// storage mode never changes it. The private usages `NoConcurrentAccess` (0x4000), `Video`
@@ -1029,7 +1053,7 @@ impl Device {
                 let (pf, ty) = (descriptor.pixel_format, descriptor.texture_type);
                 return Ok(SizeAndAlign {
                     size: 0,
-                    align: no_texture_alignment(pf, ty),
+                    align: no_texture_alignment(pf, ty, self.properties().metal_level),
                 });
             }
             layout => layout?,
@@ -1070,7 +1094,7 @@ impl Device {
                 let (pf, ty) = (descriptor.pixel_format, descriptor.texture_type);
                 return Ok(Some(SizeAndAlign {
                     size: 0,
-                    align: no_texture_alignment(pf, ty),
+                    align: no_texture_alignment(pf, ty, self.properties().metal_level),
                 }));
             }
             layout => layout?,
@@ -1146,6 +1170,11 @@ impl Device {
         let usage = descriptor.image_usage();
         let (plan, twin) = plan_texture_images(&layout, usage, false, &facts)
             .map_err(|refusal| image_error(call, refusal))?;
+        // A heap texture's samples read what its bytes hold, which an ASTC carrier's decoded twin
+        // would decode as it is placed (`astc.rs`): refused, its size query too.
+        if crate::astc::decode_of(&plan).is_some() {
+            return Err(Error::NotImplemented(RuntimeGap::DecodedHeapTexture));
+        }
         // An image whose copies would rewrite texels a CPU copy keeps is made uncompressed; the
         // texture still takes the compressed image's bytes of the heap, as Metal's does.
         let (plan, twin, compressed) =
@@ -1163,6 +1192,11 @@ impl Device {
         // A shadowed image is no depth twin's texture: one held with a twin is not.
         let mine = Mine::Texture {
             shadows: twin.is_none(),
+            compressed: metal_compresses_layout(
+                &layout,
+                effective_usage(descriptor.usage),
+                descriptor.allow_gpu_optimized_contents,
+            ),
         };
         // A two-plane texture's image is larger than Metal's answer: it lies in memory of its
         // own, a shadow of its planes in the heap's bytes where Metal's layout of them is
@@ -1353,7 +1387,7 @@ impl Device {
     /// Metal's answer to `heapTextureSizeAndAlignWithDescriptor:` for `descriptor` (checked as
     /// `layout`) where it is not the size of its own GPU's image of the texture, which the runtime answers
     /// for every other descriptor (the module docs); `None` for those. Measured on an M3 Max
-    /// under macOS 26.7 (the consumer's report) and an M4 under 27.0.1 (EV `APX-fmt1-m4`):
+    /// under macOS 26.7 (the consumer's report) and an M4 under 27.0.1:
     ///
     /// - A 4:2:2 texture (`GBGR422`, `BGRG422`) takes its rows of 2-byte texels at a multiple
     ///   of 16 bytes, the last unpadded, at an alignment of 16 (`four_two_two_heap_answer`).
@@ -1404,11 +1438,13 @@ impl Device {
     /// The texture's own colour image (`own`, not a depth twin) on a driver whose compressed
     /// images hide writes through an alias
     /// ([`DriverFact::CompressedImagesHideAliasedWrites`]), where its optimal image takes the
-    /// heap's memory, takes in order: `optimal` with host-transfer usage, where the device enabled
-    /// `hostImageCopy` (the driver keeps such an image's bytes,
-    /// [`DriverFact::HostTransferImagesKeepTheirBytes`]), the format takes the usage, and the
-    /// device makes such an image of the plan in that memory; else `linear`, where it serves as
-    /// above; else `optimal`, a near-equivalent ([`AliasRoute`]).
+    /// heap's memory, takes `optimal`, which the driver may compress, where Metal keeps the
+    /// texture losslessly compressed and the device's policy keeps the driver's compression
+    /// (`HeapCompressionPolicy::Compressed`, the default; [`AliasRoute::Compressed`]); else in
+    /// order: `optimal` with host-transfer usage, where the device enabled `hostImageCopy` (the
+    /// driver keeps such an image's bytes, [`DriverFact::HostTransferImagesKeepTheirBytes`]), the
+    /// format takes the usage, and the device makes such an image of the plan in that memory; else
+    /// `linear`, where it serves as above; else `optimal`, a near-equivalent ([`AliasRoute`]).
     fn heap_image(
         &self,
         optimal: ImagePlan,
@@ -1430,7 +1466,7 @@ impl Device {
             return match self.linear_heap_image(linear, texture_type, &takes, AliasRoute::Direct) {
                 Err(error)
                     if linear_refusal(&error)
-                        && mine == (Mine::Texture { shadows: true })
+                        && matches!(mine, Mine::Texture { shadows: true, .. })
                         && shadowable(&optimal, requirements.size) =>
                 {
                     Ok(HeapImage {
@@ -1474,6 +1510,22 @@ impl Device {
                 tiling: vk::ImageTiling::OPTIMAL,
                 requirements,
                 route: AliasRoute::Direct,
+            });
+        }
+        let compressed = matches!(
+            mine,
+            Mine::Texture {
+                compressed: true,
+                ..
+            }
+        );
+        let policy = self.compile_device().policy().heap_compression;
+        if compressed && policy == HeapCompressionPolicy::Compressed {
+            return Ok(HeapImage {
+                plan: optimal,
+                tiling: vk::ImageTiling::OPTIMAL,
+                requirements,
+                route: AliasRoute::Compressed,
             });
         }
         if let Some(image) = self.host_transfer_image(&optimal, texture_type, &takes)? {
@@ -1611,11 +1663,10 @@ impl Device {
         let _making = bytes.making_texture();
         // The descriptor first: what plain Metal answers nil for (a format of which it makes no
         // texture alone, `Unspecialized`) comes before the heap's storage mode and
-        // `framebufferOnly`, which Metal stops for another format (EVs TTG-nil1-m4, TTG-nil2-m3,
-        // TTG-nil4-m4).
+        // `framebufferOnly`, which Metal stops for another format.
         let layout = match self.heap_layout(call, descriptor, Creator::Device) {
             // A placement heap makes a two-plane extended-range cube or cube array, which the
-            // device and an automatic heap answer nil for (EV TTG-nil4-m4): the runtime's gap.
+            // device and an automatic heap answer nil for: the runtime's gap.
             Err(Error::Nil(Nil {
                 problem: Problem::Texture(TextureProblem::TypeForFormat),
                 ..
@@ -1629,7 +1680,7 @@ impl Device {
         };
         let options = heap.placed_options(call, descriptor.resource_options)?;
         // A heap makes no framebuffer-only texture (plain Metal asserts on the rotation, the
-        // consumer's report and EV ZCI2-rotprobe3-m4's `heap`).
+        // consumer's report and our probe).
         if descriptor.framebuffer_only {
             return Err(invalid(
                 call,
@@ -1682,8 +1733,7 @@ impl Device {
             }
         }
         let offset = heap_offset(heap, call, p.size_and_align, offset)?;
-        // A placement heap's texture answers aliasable from the start, as Metal's does (EVs
-        // SPH-alias1-m3, -m4).
+        // A placement heap's texture answers aliasable from the start, as Metal's does.
         let aliasable = heap.heap_type() == HeapType::Placement;
         let place = HeapPlace::new(heap, offset, p.size_and_align.size, aliasable);
         self.heap_texture_at(heap, &bytes, p, place, options, descriptor)
@@ -1874,7 +1924,7 @@ impl Device {
         let made = match pages.as_deref().and_then(HostPages::dma_buf) {
             None => Err("the heap's bytes lie in no dma-buf pages".to_owned()),
             Some((imports, start, type_index)) => {
-                let pages = (&**imports, type_index, start + offset);
+                let pages = (&*imports, type_index, start + offset);
                 let size = p.size_and_align.size;
                 self.dma_buf_heap_image(&p.image.plan, &facts, pages, size)?
             }
@@ -1915,9 +1965,8 @@ impl Device {
             at,
             row_pitch: natural.row_pitch,
             slice_pitch: natural.slice_pitch,
-            alone: None,
         };
-        Ok((self.dma_buf_image(&[plan], facts, &texels)?).map(|(_, made)| made))
+        self.dma_buf_image(plan, facts, &texels)
     }
 
     /// No pages are imported as dma-bufs on this system: never reached.
@@ -2089,11 +2138,15 @@ impl Device {
             options: binding.options,
             allow_gpu_optimized_contents: binding.allow_gpu_optimized_contents,
             identity: binding.identity,
-            views: Mutex::new(HashMap::new()),
+            views: Mutex::new(KeyMap::default()),
+            own_views: Mutex::new(KeyMap::default()),
+            resolves: KeptResolves::new(),
             twin: None,
             decoded: None,
+            second: std::sync::OnceLock::new(),
             form: Default::default(),
             kept_outside: AtomicBool::new(false),
+            signed_depth: AtomicBool::new(false),
             detached: Mutex::new(None),
             first_move: Mutex::new(None),
             host_copies: false,
@@ -2101,7 +2154,8 @@ impl Device {
             staging_copies: false,
             objects: ObjectsToken::default(),
         };
-        let first = FirstMove::new(raw, made.plan().format, initial, binding.host);
+        let pages = binding.pages.as_ref().filter(|_| binding.host);
+        let first = FirstMove::new(raw, made.plan().format, initial, pages.and_then(pages_hold));
         *lock(&made.first_move) = Some(first);
         Ok(made)
     }
@@ -2125,11 +2179,15 @@ impl Device {
             options: binding.options,
             allow_gpu_optimized_contents: binding.allow_gpu_optimized_contents,
             identity: binding.identity,
-            views: Mutex::new(HashMap::new()),
+            views: Mutex::new(KeyMap::default()),
+            own_views: Mutex::new(KeyMap::default()),
+            resolves: KeptResolves::new(),
             twin: None,
             decoded: None,
+            second: std::sync::OnceLock::new(),
             form: Default::default(),
             kept_outside: AtomicBool::new(false),
+            signed_depth: AtomicBool::new(false),
             detached: Mutex::new(Some(DetachedImage {
                 stand_in,
                 own: None,
@@ -2211,7 +2269,7 @@ impl Device {
     pub(crate) fn rebound_heap_images(
         &self,
         heap: &Heap,
-        pages: &HostPages,
+        pages: &Arc<HostPages>,
         remade: &mut Remade,
     ) -> Result<Vec<ImageSwap>, Error> {
         let (memory, base) = pages.memory();
@@ -2258,13 +2316,10 @@ impl Device {
             let Some((raw, initial)) = made else {
                 return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
             };
+            let first = FirstMove::new(raw, image.plan().format, initial, pages_hold(pages));
             // Dropped on a later failure, the images made so far go.
-            swaps.push(ImageSwap::new(
-                Arc::clone(image),
-                ImageObjects::new(self, raw),
-                initial,
-                pages,
-            ));
+            let objects = ImageObjects::new(self, raw);
+            swaps.push(ImageSwap::new(Arc::clone(image), objects, first, pages));
         }
         Ok(swaps)
     }
@@ -2338,6 +2393,7 @@ impl Device {
             allow_gpu_optimized_contents: descriptor.allow_gpu_optimized_contents,
             identity: bytes.identity(),
             host: bytes.caller_memory() == Some(CallerMemory::HostPages),
+            pages: bytes.host_pages(),
         };
         // Over dma-buf pages the image of the driver's `DRM_FORMAT_MOD_LINEAR` layout is made
         // here, its pages' source called once; where none is, the texture is a shadow of the
@@ -2400,13 +2456,19 @@ impl Device {
                     self.detached_heap_image(&binding, p.image, owner, Arc::clone(stand_in))
                 }
                 #[cfg(unix)]
-                (None, Some(made)) => self.dma_buf_texture_image(
-                    made,
-                    p.image.plan,
-                    owner,
-                    (binding.options, binding.allow_gpu_optimized_contents),
-                    binding.identity,
-                ),
+                (None, Some(made)) => {
+                    let pages = binding.pages.as_ref().ok_or_else(|| {
+                        internal("a heap texture over dma-buf pages the heap does not lie in")
+                    })?;
+                    self.dma_buf_texture_image(
+                        made,
+                        p.image.plan,
+                        owner,
+                        (binding.options, binding.allow_gpu_optimized_contents),
+                        binding.identity,
+                        pages,
+                    )
+                }
                 _ => self.bind_heap_image(&binding, p.image, at, image_size, owner)?,
             };
             if let Some((twin, offset)) = twin {
@@ -2480,10 +2542,33 @@ impl Device {
 }
 
 impl Device {
+    /// The image of a heap's shadow of `plan` (`heap_shadow_image`, `heap_tiled_image`), of
+    /// `identity`, its owner made by `owner`. Where its copies in write every aspect (`every`,
+    /// [`copies_every_aspect`]) it starts as its memory lies: each copy in writes every texel of
+    /// every aspect before any command reads it (`shadow.rs`), so zeros there would never be read.
+    /// Else it starts as a new texture of its storage mode does
+    /// ([`new_image_owned`](Self::new_image_owned)), as no copy writes the aspect they leave out (an
+    /// `X32_Stencil8` texture's depth).
+    fn new_heap_shadow(
+        &self,
+        plan: ImagePlan,
+        layout: &TextureLayout,
+        descriptor: &TextureDescriptor,
+        identity: Identity,
+        every: bool,
+        owner: impl FnOnce(Placement, vk::Image) -> Owner,
+    ) -> Result<Image, Error> {
+        match every {
+            true => self.new_image_as_it_lies(plan, layout, descriptor, identity, owner),
+            false => self.new_image_owned(plan, layout, descriptor, identity, owner),
+        }
+    }
+
     /// The image of a heap texture on [`AliasRoute::Shadow`]: `image`'s plan in memory of its own,
     /// whose texels the encoders copy from the heap's bytes (`bytes`) at `place` and back
     /// (`shadow.rs`), laid out as [`heap_planes`] says; of an identity of its own, of the heap's
-    /// hazard tracking, and the heap's `options`. Its drop gives the range back.
+    /// hazard tracking, and the heap's `options`, started by [`new_heap_shadow`](Self::new_heap_shadow).
+    /// Its drop gives the range back.
     fn heap_shadow_image(
         &self,
         bytes: &Buffer,
@@ -2513,6 +2598,7 @@ impl Device {
                 ..region
             })
             .collect();
+        let every = copies_every_aspect(&regions, plan.format);
         let shadow_range = UseRange::Image {
             aspects: image_aspects(plan.format).into(),
             levels: 0..plan.levels,
@@ -2524,7 +2610,7 @@ impl Device {
         };
         let mut own = *descriptor;
         own.resource_options = options;
-        self.new_image_owned(plan, layout, &own, identity, |placement, image| {
+        self.new_heap_shadow(plan, layout, &own, identity, every, |placement, image| {
             let copies = ShadowCopies {
                 source: ShadowSource::Bytes {
                     buffer,
@@ -2535,6 +2621,7 @@ impl Device {
                         regions,
                         staging: None,
                         texel: None,
+                        words: None,
                     },
                     // A heap's bytes join no other memory (`host_aliases.rs`).
                     alias: None,
@@ -2543,6 +2630,8 @@ impl Device {
                 shadow_range,
                 tracked: identity.tracked,
                 drops_writes: false,
+                backing: Backing::of(bytes, false),
+                merge_scratch: ScratchSpares::default(),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -2576,8 +2665,9 @@ impl Device {
     /// The image of a heap's two-plane texture on [`AliasRoute::Planes`]: `image`'s plan in
     /// memory of its own, whose texels the encoders move from its two planes in the heap's bytes
     /// (`bytes`) at `place` and back (`shadow.rs`, `heap_two_planes.rs`); of an identity of its
-    /// own, of the heap's hazard tracking, and the heap's `options`. Its drop gives the range
-    /// back.
+    /// own, of the heap's hazard tracking, and the heap's `options`. It starts as its memory lies,
+    /// as each move in writes every texel (its color word and its alpha byte) before any command
+    /// reads it. Its drop gives the range back.
     fn heap_planes_image(
         &self,
         bytes: &Buffer,
@@ -2610,7 +2700,7 @@ impl Device {
         let pixel_format = layout.pixel_format;
         let mut own = *descriptor;
         own.resource_options = options;
-        self.new_image_owned(plan, layout, &own, identity, |placement, image| {
+        self.new_image_as_it_lies(plan, layout, &own, identity, |placement, image| {
             let copies = ShadowCopies {
                 source: ShadowSource::Bytes {
                     buffer,
@@ -2629,6 +2719,8 @@ impl Device {
                 shadow_range,
                 tracked: identity.tracked,
                 drops_writes: false,
+                backing: Backing::of(bytes, false),
+                merge_scratch: ScratchSpares::default(),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -2641,8 +2733,8 @@ impl Device {
     /// The image of a heap texture on `AliasRoute::Tiled`: `image`'s plan in memory of its own,
     /// whose elements the encoders move from Metal's tiles, laid out as `tiled`, in the heap's
     /// bytes (`bytes`) at `place` and back (`shadow.rs`, `heap_tiled.rs`); of an identity of its
-    /// own, of the heap's hazard tracking, and the heap's `options`. Its drop gives the range
-    /// back.
+    /// own, of the heap's hazard tracking, and the heap's `options`, started by
+    /// [`new_heap_shadow`](Self::new_heap_shadow). Its drop gives the range back.
     fn heap_tiled_image(
         &self,
         bytes: &Buffer,
@@ -2666,6 +2758,7 @@ impl Device {
             plan.levels,
             plan.layers,
         );
+        let every = copies_every_aspect(&regions, plan.format);
         if tiled.size > place.size {
             return Err(internal("a tiled heap texture's elements past its range"));
         }
@@ -2688,7 +2781,7 @@ impl Device {
         };
         let mut own = *descriptor;
         own.resource_options = options;
-        self.new_image_owned(plan, layout, &own, identity, |placement, image| {
+        self.new_heap_shadow(plan, layout, &own, identity, every, |placement, image| {
             let copies = ShadowCopies {
                 source: ShadowSource::Bytes {
                     buffer,
@@ -2706,6 +2799,8 @@ impl Device {
                 shadow_range,
                 tracked: identity.tracked,
                 drops_writes: false,
+                backing: Backing::of(bytes, false),
+                merge_scratch: ScratchSpares::default(),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -2823,6 +2918,11 @@ impl Device {
                 Degradation::HeapTextureHidesAliasedWrites,
                 "and the texture's image takes neither host-transfer usage nor linear tiling on \
                  this device",
+            ),
+            AliasRoute::Compressed => (
+                Degradation::HeapTextureCompressed,
+                "and Metal keeps the texture losslessly compressed too, whose image the device's \
+                 policy keeps compressed (HeapCompressionPolicy::Compressed)",
             ),
         };
         self.degrade(kind, || {

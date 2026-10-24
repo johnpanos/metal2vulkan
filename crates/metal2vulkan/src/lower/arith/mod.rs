@@ -23,9 +23,10 @@
 //! and `double` are native (`f64` needs `shaderFloat64`), and `half` and `bfloat` are held widened
 //! in an `f32` that is always a value of the narrow format ([`narrow`]): each operation rounds its
 //! `f32` result back to the format, so no profile needs `shaderFloat16`; where the device's 16-bit
-//! `+ - *` is measured to be Metal's `half` arithmetic and the profile has `shaderFloat16`, a
-//! `half` `+ - *` is that instruction, kept apart, between exact conversions instead
-//! ([`ArithStrategy::F16`]).
+//! `+ - *` is Metal's `half` arithmetic and the profile has `shaderFloat16`, a `half` `+ - *` is
+//! that instruction, kept apart, between exact conversions instead ([`ArithStrategy::F16`]): where
+//! it is measured to be, and where the 16-bit float controls the module then declares make it so
+//! by the Vulkan spec ([`narrow::controlled_modes`]).
 //!
 //! Precision: a `half` rounding keeps half denormals, as Metal does; a `float` or `half` fused
 //! multiply-add (`air.fma`, `llvm.fma`, and `llvm.fmuladd`, which Metal fuses) rounds once on every
@@ -43,10 +44,16 @@
 //! compiler may take another than the device's. Every other lowering is exact for every non-poison
 //! input within the device's floating-point environment: signed zeros, infinities, and NaNs are
 //! preserved by `SignedZeroInfNanPreserve` where an operation without `nnan`/`ninf`/`nsz` requires
-//! it and the profile supports it (else `PrecisionNote::DeviceSignedZeroInfNan`), while denormal
-//! flushing and the rounding mode are the device default (no `DenormPreserve`/`RoundingModeRTE`
-//! yet; the rounding mode decides the inexact `FConvert` narrowings and integer-to-float
-//! conversions, which Vulkan leaves to the device without `shaderRoundingModeRTE`). `sign`,
+//! it, or a check or a fused multiply-add routine answers Metal's zero of its sign
+//! ([`ArithPlan::keep_zero_signs`]), and the profile supports it (else
+//! `PrecisionNote::DeviceSignedZeroInfNan`), while denormal flushing and the rounding mode are the
+//! device default (the rounding mode decides the inexact `FConvert` narrowings and integer-to-float
+//! conversions, which Vulkan leaves to the device without `RoundingModeRTE`), but in an entry that
+//! rounds to `half` under the float controls ([`narrow::controlled_modes`]), which declares
+//! `RoundingModeRTE`, `DenormPreserve` and `SignedZeroInfNanPreserve` for 16 bits and the modes the
+//! device's independence ties to them: `RoundingModeRTE` for 32 bits on a device whose rounding
+//! modes are not independent, Metal's own rounding of `float` arithmetic, and for 64 bits the
+//! rounding and denormals IEEE 754 gives `double`. `sign`,
 //! `fract`, `saturate`, `median3`, and `pow` answer as Metal does at zeros, NaNs, infinities, and
 //! `f32` denormals whatever the device's modes, and the normalized and sRGB `air.unpack`/`air.pack`
 //! conversions are exact integer sequences and Metal's tables.
@@ -193,9 +200,9 @@ pub enum ArithStrategy {
         contract: Contraction,
     },
     /// A `half` `fadd`, `fsub` or `fmul` on lanes of `form` by the device's 16-bit arithmetic,
-    /// Metal's own in the forms that keep it apart (`DriverDeviation::MetalHalfArithmetic`,
-    /// [`ops::f16_binary`]): the operands narrowed to 16 bits, exactly, the instruction kept
-    /// apart, and its result widened, exactly.
+    /// Metal's own in the forms that keep it apart (measured, `DriverDeviation::MetalHalfArithmetic`,
+    /// or by the Vulkan spec under the 16-bit float controls, [`ops::f16_binary`]): the operands
+    /// narrowed to 16 bits, exactly, the instruction kept apart, and its result widened, exactly.
     F16 {
         op: AirBin,
         form: Form,
@@ -285,15 +292,22 @@ pub enum ArithStrategy {
         reciprocal: divide::Reciprocal,
     },
     /// `air.mix` on `float` or `half`, with or without fast-math flags: Metal's
-    /// `fma(t, y, fma(-t, x, x))` (`math::metal_mix`), both fused multiply-adds the given one.
-    Mix(fma::Fma),
+    /// `fma(t, y, fma(-t, x, x))` (`math::metal_mix`), both fused multiply-adds `fma`; where
+    /// `flush`, the inner one's `float` result read as Metal reads a denormal.
+    Mix {
+        fma: fma::Fma,
+        flush: bool,
+    },
     /// `air.dot` on `float` or `half` vectors of form `form`: Metal's fused chain of the
     /// products (`math::metal_dot`), each fused multiply-add `fma`, on one lane; where `flush`, the
-    /// chain's `float` values before the last read as Metal reads a denormal.
+    /// chain's `float` values before the last read as Metal reads a denormal; where `tiny`, the
+    /// first product Metal's where the device's rounding reaches `±2^-126`, by that check
+    /// ([`denormal::tiny_product`]).
     Dot {
         fma: fma::Fma,
         form: Form,
         flush: bool,
+        tiny: Option<denormal::TinyCheck>,
     },
     /// An `fdiv` carrying `arcp` on `float` lanes: Metal's fast division, `x` times its fast
     /// reciprocal of `y` with that reciprocal's two flushes, answered as Metal answers at
@@ -420,6 +434,20 @@ pub enum ArithStrategy {
         elem: Form,
         contract: Contraction,
     },
+    /// `air.dot` of chunked vectors of `lanes` lanes of `elem` (`float` or `half`) as Metal's fused
+    /// chain over every lane ([`chunk::dot_chain`]), each fused multiply-add `fma`; where `flush`,
+    /// the chain's `float` values before the last read as Metal reads a denormal, and the lanes of
+    /// the operands `reads` names and the result, where it says so; where `tiny`, the first product
+    /// Metal's where the device's rounding reaches `±2^-126`, by that check
+    /// ([`denormal::tiny_product`]).
+    ChunkedChain {
+        lanes: u16,
+        elem: Form,
+        fma: fma::Fma,
+        flush: bool,
+        reads: denormal::Flush,
+        tiny: Option<denormal::TinyCheck>,
+    },
     /// A float result with Metal's NaN selected where it is a NaN ([`nan`]): the value of `of`, a
     /// result of `form`, then [`nan::select`] of `answer`. Named as `of`.
     Nan {
@@ -437,6 +465,15 @@ pub enum ArithStrategy {
         form: Form,
         out: Form,
         flush: denormal::Flush,
+    },
+    /// A `float` multiply `of` (lanes of form `form`) whose device product may round up to
+    /// `±2^-126` where Metal flushes the exact product, below it, to the zero of its sign
+    /// ([`denormal::tiny_product`]): `of`'s product, then that zero where `check` finds the exact
+    /// product below `2^-126`.
+    TinyProduct {
+        of: Box<ArithStrategy>,
+        form: Form,
+        check: denormal::TinyCheck,
     },
     /// An operation with a wide integer operand or result on a profile without `shaderInt64`,
     /// on the two words of each value ([`wide`]).
@@ -523,7 +560,7 @@ impl FamilyStrategy for ArithStrategy {
             },
             S::Fma(f) | S::Fused { fma: f, .. } => f.name(),
             S::FastFmod { .. } => FAST_FMOD,
-            S::Mix(_) => MIX,
+            S::Mix { .. } => MIX,
             S::Dot { .. } => DOT,
             S::Folded => FOLDED,
             S::Convert {
@@ -553,6 +590,7 @@ impl FamilyStrategy for ArithStrategy {
             S::IndexWord(_) => "arith.index_word",
             S::SinCos { .. } => "arith.sincos",
             S::ChunkedDot { .. } => "arith.chunked.dot",
+            S::ChunkedChain { .. } => CHUNKED_DOT,
             S::Chunked { .. } => "arith.chunked",
             S::LaneExtract { .. } | S::LaneInsert { .. } => "arith.element.chunked",
             S::LaneShuffle { fragment: true, .. } => "arith.shuffle.fragment",
@@ -567,6 +605,7 @@ impl FamilyStrategy for ArithStrategy {
             // Named as its operation: unwrapped above.
             S::Nan { .. } => "arith.nan",
             S::Denormals { .. } => "arith.denormals",
+            S::TinyProduct { .. } => "arith.float.tiny",
         })
     }
 
@@ -644,8 +683,20 @@ impl FamilyStrategy for ArithStrategy {
             // fused multiply-add.
             S::FastFmod { fma, .. } => 64 + fma.words() + math::FAST_DIVISION_CALL_WORDS,
             // The negation of `t` on its bits and the two fused multiply-adds.
-            S::Mix(f) => 32 + 2 * f.words(),
-            S::Dot { fma, form, flush } => math::metal_dot_words(*form, fma.words(), *flush),
+            S::Mix { fma, flush } => {
+                32 + 2 * fma.words()
+                    + if *flush {
+                        denormal::flush_words(fma.form)
+                    } else {
+                        0
+                    }
+            }
+            S::Dot {
+                fma,
+                form,
+                flush,
+                tiny,
+            } => math::metal_dot_words(*form, fma.words(), (*flush, *tiny)),
             S::Convert {
                 kind: ConvertKind::FromFp8(_),
                 ..
@@ -682,6 +733,14 @@ impl FamilyStrategy for ArithStrategy {
                 nan,
             } => chunk::sin_cos_words(*shape, *fast, *nan).saturating_add(store.words()),
             S::ChunkedDot { lanes, elem, .. } => chunk::dot_words(*lanes, *elem),
+            S::ChunkedChain {
+                lanes,
+                elem,
+                fma,
+                flush,
+                reads,
+                tiny,
+            } => chunk::dot_chain_words(*lanes, *elem, fma.words(), (*flush, *tiny), *reads),
             S::Chunked {
                 lanes, parts, wide, ..
             } => {
@@ -712,6 +771,9 @@ impl FamilyStrategy for ArithStrategy {
             S::WordBitcast { from, to } => chunk::bitcast_words(*from, *to),
             S::Wide(w) => w.words(),
             S::Nan { of, answer, form } => of.words().saturating_add(answer.words(*form)),
+            S::TinyProduct { of, form, check } => of
+                .words()
+                .saturating_add(denormal::tiny_product_words(*form, *check)),
             S::Denormals {
                 of,
                 form,
@@ -786,8 +848,10 @@ fn leaves(d: &DemoteTy) -> u32 {
 /// floating-point environment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArithPlan {
-    /// The float container widths whose operations LLVM requires to keep signed zeros,
-    /// infinities, and NaNs (an operation without all of `nnan`, `ninf`, and `nsz`).
+    /// The float container widths whose operations must keep signed zeros, infinities, and NaNs:
+    /// those LLVM requires it of (an operation without all of `nnan`, `ninf`, and `nsz`), and
+    /// those of a check or a fused multiply-add routine that answers Metal's zero of its sign
+    /// ([`ArithPlan::keep_zero_signs`]).
     pub preserve: BTreeSet<u8>,
     /// The widths whose `SignedZeroInfNanPreserve` execution mode the entry declares: those of
     /// `preserve` the profile supports.
@@ -907,6 +971,13 @@ pub struct ArithPlan {
     /// (`narrow::round_texel`): where the profile's NaN is the translation's to answer as Metal's
     /// (`NanEncoding::Device`, the policy's `NanMinMaxPolicy::Exact`), decided by [`finish`].
     pub texel_nans: bool,
+    /// Whether a `half`'s NaN bits are left to the device's conversion where the module rounds
+    /// through the conversion under the float controls ([`QuantizeForm::Controlled`]): a `half`
+    /// read from its bits is the device's widening of them (`narrow::from_bits`), and a `half`
+    /// texel takes the rounding's NaN (`narrow::round_texel`). Where the profile's NaN is the
+    /// device's own (`NanEncoding::Native`, the policy's `NanMinMaxPolicy::Native`, the default),
+    /// decided by [`finish`].
+    pub native_half_nans: bool,
     /// Whether Metal's `fmin`, `fmax`, `min3`, `max3`, `clamp` or `saturate` on `float` or `half`
     /// takes the device's `NMin`, `NMax` or `NClamp`, measured to be Metal's
     /// (`DriverDeviation::MetalMinMax`), recorded at selection: the module then requires
@@ -938,14 +1009,44 @@ impl ArithPlan {
         }
     }
 
-    /// Record fused multiply-add `fma`, selected: its routine, which [`declare`] defines once,
-    /// or the device's 16-bit `Fma` ([`ArithPlan::f16_fma`]).
+    /// Record fused multiply-add `fma`, selected: its routine, which [`declare`] defines once
+    /// (and whose widths [`finish`] keeps zero signs of), or the device's 16-bit `Fma`
+    /// ([`ArithPlan::f16_fma`]).
     pub fn take_fma(&mut self, fma: fma::Fma) {
         if let Some(r) = fma.routine() {
             self.fmas.insert(r);
         }
         self.f16_fma |= fma.route == fma::Route::F16;
         self.native_fma |= fma.route == fma::Route::Native;
+    }
+
+    /// Record a check of a `float` product at `±2^-126` on lanes of form `f`
+    /// ([`denormal::tiny_product`]), selected where `check` is one: it answers Metal's zero of
+    /// the product's sign, so its width keeps zero signs ([`ArithPlan::keep_zero_signs`]).
+    pub fn take_tiny_check(
+        &mut self,
+        check: Option<denormal::TinyCheck>,
+        f: Form,
+    ) -> Option<denormal::TinyCheck> {
+        if check.is_some() {
+            self.keep_zero_signs(f.container());
+        }
+        check
+    }
+
+    /// Record that a check or routine computed by the translation answers Metal's zero of its
+    /// sign on floats of container width `width`: a fused multiply-add routine where the profile's
+    /// functions answer as Metal's ([`fma::Routine::widths`]: in `double`, in integers, a `half`
+    /// one, or a checked `OpFmaKHR`'s small results), a product flushed at `±2^-126`
+    /// ([`denormal::tiny_product`]). Vulkan lets a device take a zero of either sign from any
+    /// float operation of an entry without `SignedZeroInfNanPreserve` at its width (it assumes
+    /// `NSZ` there: the Vulkan specification's "Precision and Operation of SPIR-V Instructions"),
+    /// whatever the AIR's flags: NVIDIA's 615.71.09 on the RTX 3090 answered `-0` for a checked
+    /// `fma(+0, 100, +0)` whose answer is `+0`, in a fast-math entry. So the width joins
+    /// [`ArithPlan::preserve`], which [`finish`] declares where the profile supports it, else
+    /// notes `PrecisionNote::DeviceSignedZeroInfNan`.
+    pub fn keep_zero_signs(&mut self, width: u8) {
+        self.preserve.insert(width);
     }
 
     /// Whether an `arcp` division's quotient is the device's `OpFDiv(x, y)`: where the profile's
@@ -1027,6 +1128,9 @@ pub const MIX: &str = "arith.mix.fused";
 /// The census name of `air.dot` on `float` and `half` as Metal's fused chain
 /// ([`ArithStrategy::Dot`]).
 pub const DOT: &str = "arith.dot.fused";
+/// The census name of `air.dot` on chunked `float` and `half` vectors as Metal's fused chain
+/// ([`ArithStrategy::ChunkedChain`]).
+pub const CHUNKED_DOT: &str = "arith.chunked.dot.fused";
 /// See [`SRGB_PACK`].
 pub const SRGB_UNPACK: &str = "arith.unpack.srgb";
 /// The census name of the color table a fragment function's sRGB color writes read
@@ -1039,7 +1143,8 @@ pub const FAST_DIVIDE: &str = "arith.fdiv.fast";
 pub const FOLDED: &str = "arith.float.folded";
 
 /// Complete the arith family's plan once every instruction and parameter is selected: declare
-/// `SignedZeroInfNanPreserve` for each required width the profile supports, and note
+/// `SignedZeroInfNanPreserve` for each required width the profile supports (with those its fused
+/// multiply-add routines compute in where its functions answer as Metal's), and note
 /// `DeviceSignedZeroInfNan` for one it does not (the device's behavior is accepted and
 /// reported); then, with the entry's execution modes known, keep the math-library routines whose
 /// function the device's instruction does not answer: on a profile whose `float` functions are
@@ -1059,6 +1164,10 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         narrow::native_rounding(cx.profile, cx.families.arith.quantize).is_some();
     // Where the NaN switch asks for Metal's NaN, a texel's NaN is its own through that rounding.
     cx.families.arith.texel_nans = nan::encoding(cx.profile) == NanEncoding::Device;
+    // Under the float controls a `half`'s NaN is the device's conversion's where the profile
+    // leaves NaN bits to the device.
+    cx.families.arith.native_half_nans = cx.families.arith.quantize == QuantizeForm::Controlled
+        && nan::encoding(cx.profile) == NanEncoding::Native;
     cx.families.arith.mask = if cx
         .profile
         .fields()
@@ -1069,6 +1178,21 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     } else {
         MaskForm::And
     };
+    // Where the profile's functions answer as Metal's (`FloatMathsPolicy::Exact`), a fused
+    // multiply-add routine answers Metal's zero of its sign: every width it computes in keeps
+    // zero signs. Every family selected its fused multiply-adds by now.
+    if cx.profile.fields().float_functions == FloatFunctions::Device {
+        let arith = &mut cx.families.arith;
+        let kept: BTreeSet<u8> = arith
+            .fmas
+            .iter()
+            .flat_map(|r| r.widths())
+            .copied()
+            .collect();
+        for w in kept {
+            arith.keep_zero_signs(w);
+        }
+    }
     let fc = cx.profile.fields().float_controls;
     let widths: Vec<u8> = cx.families.arith.preserve.iter().copied().collect();
     for w in widths {
@@ -1698,6 +1822,31 @@ fn with_denormals(
     }
 }
 
+/// `s`, a `float` operation `op` on lanes of form `f`, with Metal's flush of a product whose exact
+/// value lies below `2^-126` where the device's rounding may reach `±2^-126`
+/// ([`ArithStrategy::TinyProduct`]): an `f32` multiply whose result can be that small (`result`,
+/// [`denormal_result`]) on a profile that computes Metal's products
+/// ([`denormal::checks_tiny_products`]). A sum or difference that small is exact, so a rounding
+/// never reaches `2^-126` from below it.
+fn tiny_product(
+    cx: &mut SelectCx<'_>,
+    s: ArithStrategy,
+    op: AirBin,
+    f: Form,
+    result: bool,
+) -> ArithStrategy {
+    let check = denormal::tiny_check(cx.profile)
+        .filter(|_| op == AirBin::FMul && result && f.float_fmt() == Some(FloatFmt::F32));
+    let Some(check) = cx.families.arith.take_tiny_check(check, f) else {
+        return s;
+    };
+    ArithStrategy::TinyProduct {
+        of: Box::new(s),
+        form: f,
+        check,
+    }
+}
+
 /// The flushes of a fused addition by `OpFmaKHR` on `float` lanes of form `f` of `operands`
 /// (`a`, `b` and `c`, or a chain link's `a` and `b`, [`ArithStrategy::Fused`]): none where the
 /// device reads its denormals as Metal does ([`denormal::device_flushes`]; the module then
@@ -2108,10 +2257,12 @@ fn select_in(
                         } else {
                             s
                         }
-                    } else if f16_arithmetic(cx.profile, *op, f) {
-                        // The device's own `half` arithmetic, measured to be Metal's in the forms
-                        // that keep it apart, which the AIR's flags allow whatever they are.
-                        cx.families.arith.f16_arith = true;
+                    } else if let Some(basis) = f16_arithmetic(cx.profile, *op, f) {
+                        // The device's own `half` arithmetic, Metal's in the forms that keep it
+                        // apart, which the AIR's flags allow whatever they are. Only the measured
+                        // basis is a property the module requires; the float controls are modes
+                        // its entry declares.
+                        cx.families.arith.f16_arith |= basis == F16Basis::Measured;
                         let s = S::F16 { op: *op, form: f };
                         with_nan(cx, at, s, nan::binary_answer(*op, fmt), f)
                     } else {
@@ -2121,10 +2272,12 @@ fn select_in(
                             contract,
                         };
                         // Metal reads an `f32` denormal operand of `+ - *` as a zero and flushes
-                        // a denormal result; its remainder is not measured.
+                        // a denormal result, a product's before rounding; its remainder is not
+                        // measured.
                         let s = match op {
                             AirBin::FAdd | AirBin::FSub | AirBin::FMul => {
                                 let result = denormal_result(cx, *op, *a, *b);
+                                let s = tiny_product(cx, s, *op, f, result);
                                 with_denormals(
                                     cx,
                                     s,
@@ -2475,9 +2628,9 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {
 ///
 /// `air.fast_fmod` on `float` is selected beside this, as [`ArithStrategy::FastFmod`].
 ///
-/// `llvm.minnum` and `llvm.maxnum` on `float` with every flag, Metal's fast-math form of
-/// `a < b ? a : b` and `a > b ? a : b`, are Metal's `fmin` and `fmax` ([`FloatFn::Min`],
-/// [`FloatFn::Max`]); without every flag they stay LLVM's (`FloatFn::MinNum`).
+/// `llvm.minnum` and `llvm.maxnum` on `float`, Metal's fast-math form of `a < b ? a : b` and
+/// `a > b ? a : b` (with every flag), are Metal's `fmin` and `fmax` ([`FloatFn::Min`],
+/// [`FloatFn::Max`]), with any flags; on the other formats they stay LLVM's (`FloatFn::MinNum`).
 ///
 /// `air.fract` on `half` with every flag, Metal's fast-math compile of a `half` `fract` (it has
 /// no `fast_` `half` function), answers the largest `half` below one for a NaN and an infinity
@@ -2489,7 +2642,7 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {
 /// `fast_atan2`'s quotient beyond a divisor of `2^126`, which a call without every flag takes
 /// from a flushed reciprocal (probe cases 6802ab13 and c11eb8cb), and `fast_fract` and `fast_asinh`
 /// at infinities, which only a call with every flag answers as a NaN (A1 case aed3faaa without
-/// flags, EV HRD-nan-fn-metal with them), and `half` `fract`'s NaN and infinities. The other flag
+/// flags, our probe with them), and `half` `fract`'s NaN and infinities. The other flag
 /// combinations are not measured; they take the answer of a call without flags.
 fn refine_float(
     op: FloatFn,
@@ -2506,10 +2659,12 @@ fn refine_float(
     }
     // `a < b ? a : b` and `a > b ? a : b` under fast math are `llvm.minnum` and `llvm.maxnum`
     // with every flag, which Metal answers as `fmin` and `fmax` (`nan_minmax_fast`, every lane);
-    // another flag state is not measured and keeps LLVM's function.
+    // without a flag Metal answers them the same, word for word (those two calls of
+    // `nan_minmax_fast` with their flags removed, every pair of 20 patterns, NaNs and denormals
+    // among them), and so with some flags (`nnan` on `llvm.minnum`, `nsz arcp` on `llvm.maxnum`).
     match op {
-        FloatFn::MinNum if every_flag(fmf) => return FloatFn::Min,
-        FloatFn::MaxNum if every_flag(fmf) => return FloatFn::Max,
+        FloatFn::MinNum => return FloatFn::Min,
+        FloatFn::MaxNum => return FloatFn::Max,
         _ => {}
     }
     if !fast {
@@ -2641,11 +2796,6 @@ fn select_float_fn(
     let lowered = float_call(op, fast, fmf, f, facts).ok_or_else(not_lowered)?;
     record(cx, lowered.notes);
     fp_env(cx, fmf, f);
-    // A `mix` that reads its denormals as Metal's own leaves them to the device's
-    // `OpFmaKHR`, measured to read them as Metal does.
-    if let FloatLowering::Mix(fma) = lowered.how {
-        cx.families.arith.device_denormals |= facts.metal_mix(fma, f);
-    }
     if let FloatLowering::Fn(op) = lowered.how {
         let uses = libm::uses(op, f);
         let arith = &mut cx.families.arith;
@@ -2672,17 +2822,32 @@ fn select_float_fn(
     let s = match lowered.how {
         FloatLowering::Fma(fma) => ArithStrategy::Fma(fma),
         FloatLowering::FastFmod { fma, reciprocal } => ArithStrategy::FastFmod { fma, reciprocal },
-        FloatLowering::Mix(fma) => ArithStrategy::Mix(fma),
-        // The chain's values are flushed where `OpFmaKHR` and the multiply may keep a
-        // denormal ([`with_denormals`] flushes the operands and the result); the
-        // routines read and answer them as Metal does.
-        FloatLowering::Dot(fma) => ArithStrategy::Dot {
+        // As `dot`'s chain: the inner fused multiply-add's result is flushed where `OpFmaKHR` may
+        // keep a denormal ([`with_denormals`] flushes the operands and the result); the routines,
+        // and `OpFmaKHR` checked ([`fma::Fma::checked`]), read and answer them as Metal does.
+        FloatLowering::Mix(fma) => ArithStrategy::Mix {
             fma,
-            form: f,
             flush: fma.route.device_float()
+                && !fma.checked()
                 && f.float_fmt() == Some(FloatFmt::F32)
                 && !denormal::device_flushes(cx.profile),
         },
+        // The chain's values are flushed where `OpFmaKHR` and the multiply may keep a
+        // denormal ([`with_denormals`] flushes the operands and the result); the
+        // routines read and answer them as Metal does.
+        FloatLowering::Dot(fma) => {
+            // The first product is a multiply: Metal's flush before its rounding.
+            let tiny =
+                denormal::tiny_check(cx.profile).filter(|_| f.float_fmt() == Some(FloatFmt::F32));
+            ArithStrategy::Dot {
+                fma,
+                form: f,
+                flush: fma.route.device_float()
+                    && f.float_fmt() == Some(FloatFmt::F32)
+                    && !denormal::device_flushes(cx.profile),
+                tiny: cx.families.arith.take_tiny_check(tiny, f),
+            }
+        }
         FloatLowering::Fn(op) => ArithStrategy::FloatFn {
             f: op,
             form: f,
@@ -2691,10 +2856,52 @@ fn select_float_fn(
     };
     // The device's instruction reads `f32` denormals as Metal does only where the table
     // says so; `OpFmaKHR` is the device's, the routines are Metal's.
+    // Native device maths answers `fast::atan2` by the device's instructions, its denormals the
+    // device's (`PrecisionNote::DeviceDenormals`, [`function_notes`]); nothing is flushed there.
+    let native_atan2 = |op: FloatFn| {
+        matches!(op, FloatFn::FastAtan2 { .. })
+            && facts.native
+            && libm::uses(op, f).iter().any(|r| r.native())
+    };
+    // Where the profile's functions are Metal's, Metal's fast `sinpi`, `cospi` and `tanpi` are the
+    // device's form ([`FloatFn::FastSinPi`], `math::pi_scaled`), whose first multiply and
+    // difference read the operand: as Metal does on the deviation, else flushed. For a normal
+    // operand no step of it is a denormal, and it answers none.
+    let device_pi = |op: FloatFn| {
+        facts.metal_functions
+            && matches!(
+                op,
+                FloatFn::FastSinPi | FloatFn::FastCosPi | FloatFn::FastTanPi
+            )
+    };
+    // `OpFmaKHR` checked ([`fma::Fma::checked`]) answers no denormal: only its operands are read.
+    let checked = |fma: fma::Fma| {
+        denormal::coverage(FloatFn::Fma).map(|r| denormal::Reading {
+            result: r.result && !fma.checked(),
+            ..r
+        })
+    };
     let reading = match lowered.how {
-        FloatLowering::Fma(fma) if fma.route.device_float() => denormal::coverage(FloatFn::Fma),
+        FloatLowering::Fma(fma) if fma.route.device_float() => checked(fma),
+        FloatLowering::Fn(op) if native_atan2(op) => None,
+        FloatLowering::Fn(op) if device_pi(op) => Some(denormal::Reading {
+            covered: denormal::Covered::Deviation,
+            operands: 0b1,
+            result: false,
+        }),
         FloatLowering::Fn(op) => denormal::coverage(op),
         FloatLowering::Dot(_) => denormal::coverage(FloatFn::Dot),
+        // `mix` by `OpFmaKHR` reads its operands and result as its fused multiply-adds do.
+        FloatLowering::Mix(fma) if fma.route.device_float() => checked(fma),
+        // `fast::fmod` by `OpFmaKHR` reads its two operands and its result as `fma` does, but under
+        // native device maths, which leaves them to the device; its quotient's division reads them
+        // as Metal's.
+        FloatLowering::FastFmod { fma, .. } if fma.route.device_float() && !facts.native => {
+            checked(fma).map(|r| denormal::Reading {
+                operands: 0b11,
+                ..r
+            })
+        }
         _ => None,
     };
     let s = match reading {
@@ -2741,19 +2948,42 @@ fn native_min_max(p: &DeviceProfile, op: FloatFn, f: Form) -> bool {
         && p.fields().min_max == MinMaxRoute::Native
 }
 
+/// Why the device's 16-bit `+ - *` answers as Metal's `half` arithmetic ([`f16_arithmetic`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum F16Basis {
+    /// Measured (`DriverDeviation::MetalHalfArithmetic`): the module requires
+    /// `VkProperty::MetalHalfArithmetic`.
+    Measured,
+    /// The 16-bit float controls the module's `half` roundings take ([`QuantizeForm::Controlled`],
+    /// [`narrow::controlled_modes`]), which its entry then declares ([`narrow::computes_in_16_bits`]):
+    /// no fact.
+    Controlled,
+}
+
 /// Whether the float binary operator `op` on lanes of form `f` takes the device's 16-bit
-/// arithmetic ([`ArithStrategy::F16`]): a `half` `fadd`, `fsub` or `fmul`, on one to four lanes (a
-/// chunk's own form), where profile `p` takes `DriverDeviation::MetalHalfArithmetic` and has
-/// `shaderFloat16`. A `half` `fdiv` keeps the shared precise routine: Metal's fast and relaxed
-/// compiles answer the device's 16-bit quotient of widened operands as a `float` one (EV
-/// `CRT2-ha2-m4`), and it has no form that keeps it apart. A `half` `frem` is not measured.
-fn f16_arithmetic(p: &DeviceProfile, op: AirBin, f: Form) -> bool {
+/// arithmetic ([`ArithStrategy::F16`]), and on what basis: a `half` `fadd`, `fsub` or `fmul`, on
+/// one to four lanes (a chunk's own form), where profile `p` has `shaderFloat16` and takes
+/// `DriverDeviation::MetalHalfArithmetic` ([`F16Basis::Measured`]) or rounds to `half` under the
+/// 16-bit float controls ([`F16Basis::Controlled`]). Under those controls the instruction is Metal's
+/// by the Vulkan spec ([`ops::f16_binary`]). A `half` `fdiv` keeps the shared precise routine:
+/// Metal's fast and relaxed compiles answer the device's 16-bit quotient of widened operands as a
+/// `float` one, it has no form that keeps it apart, and Vulkan's precision table
+/// does not make a 16-bit quotient correctly rounded. A `half` `frem` is not measured.
+fn f16_arithmetic(p: &DeviceProfile, op: AirBin, f: Form) -> Option<F16Basis> {
     use crate::error::DriverDeviation;
-    matches!(op, AirBin::FAdd | AirBin::FSub | AirBin::FMul)
+    let applies = matches!(op, AirBin::FAdd | AirBin::FSub | AirBin::FMul)
         && f.float_fmt() == Some(FloatFmt::Half)
         && (1..=4).contains(&f.lanes)
-        && p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic)
-        && p.fields().leaf.float16
+        && p.fields().leaf.float16;
+    if !applies {
+        None
+    } else if p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic) {
+        Some(F16Basis::Measured)
+    } else if narrow::quantize_form(p) == QuantizeForm::Controlled {
+        Some(F16Basis::Controlled)
+    } else {
+        None
+    }
 }
 
 /// The fast division routine a float function call of form `f` lowered as `how` calls:
@@ -2815,8 +3045,6 @@ struct FloatFacts {
     reciprocal: divide::Reciprocal,
     /// Whether the profile's `float` functions are Metal's (`FloatFunctions::Metal`).
     metal_functions: bool,
-    /// Whether the device reads `f32` denormals as Metal does ([`denormal::device_flushes`]).
-    metal_denormals: bool,
     /// Whether the profile takes native device maths (`FloatFunctions::Native`).
     native: bool,
     /// Whether the profile leaves Metal's NaN to the device ([`NanEncoding::Native`]).
@@ -2836,26 +3064,11 @@ impl FloatFacts {
             routes: fma::routes(p),
             reciprocal: divide::Reciprocal::on(p),
             metal_functions: p.fields().float_functions == FloatFunctions::Metal,
-            metal_denormals: denormal::device_flushes(p),
             native: p.fields().float_functions == FloatFunctions::Native,
             nan_native: nan::encoding(p) == NanEncoding::Native,
             native_min_max: p.fields().min_max == MinMaxRoute::Native,
             native_order: p.fields().rounding_order == RoundingOrderRoute::Native,
         }
-    }
-
-    /// Whether `mix` by fused multiply-add `fma` on form `f` reads its `f32` denormals as Metal's
-    /// own `mix`: where the profile's `float` functions are Metal's
-    /// (`DriverDeviation::MetalFloatFunctions`), its `OpFmaKHR` is Metal's own `fma`, so the two
-    /// steps are Metal's `mix` as Metal compiles it, and where the device reads `f32` denormals as
-    /// Metal does (`DriverDeviation::MetalFloatDenormals`, which measures `OpFmaKHR` among them) so
-    /// do the steps: MoltenVK's. Elsewhere how Metal's `mix` reads an `f32` denormal is not
-    /// measured (class J), and the call notes `DeviceDenormals`.
-    fn metal_mix(self, fma: fma::Fma, f: Form) -> bool {
-        f.float_fmt() == Some(FloatFmt::F32)
-            && self.metal_functions
-            && self.metal_denormals
-            && fma.route == fma::Route::Khr
     }
 }
 
@@ -3055,9 +3268,9 @@ fn float_call_of(
     // Metal's `mix(x, y, t)` on `float` and `half` is `fma(t, y, fma(-t, x, x))`, with and without
     // fast-math flags, so both fused multiply-adds take the profile's route. The routines answer
     // Metal's `float` NaN; `OpFmaKHR` answers the device's, which is selected, and a `half`
-    // result's as the `half` `fma`'s. How Metal's `mix` reads an `f32` denormal is measured only
-    // through Metal's own `fma` ([`FloatFacts::metal_mix`]); elsewhere the note stays on every
-    // route.
+    // result's as the `half` `fma`'s. Each reads an `f32` denormal as Metal's `fma` does: the
+    // routines themselves, `OpFmaKHR` on the deviation or flushed ([`ArithStrategy::Mix`]'s
+    // `flush`, [`with_denormals`]).
     if op == FloatFn::Mix {
         if let Some(fma) = fma::Fma::by(routes, f) {
             // The device's order takes its `FMix` where Metal's fused form would be emulated:
@@ -3080,7 +3293,6 @@ fn float_call_of(
                 });
             }
             let khr = fma.route.device_float();
-            let denormals = !facts.metal_mix(fma, f);
             let nan = match f.float_fmt() {
                 Some(FloatFmt::Half) => {
                     nan::function_answer(op, fast, every_flag(fmf), FloatFmt::Half)
@@ -3089,8 +3301,7 @@ fn float_call_of(
             };
             return Some(FloatCall {
                 how: FloatLowering::Mix(fma),
-                notes: OpNotes::everywhere(device_float_notes(f, denormals, false).collect())
-                    .with(native_fma(fma)),
+                notes: native_fma(fma),
                 nan,
             });
         }
@@ -3133,12 +3344,15 @@ fn float_call_of(
     // table is single precision, so a narrow call keeps `fmod`. Where the profile's `float`
     // functions are Metal's, its `fma` is Metal's own and its quotient's reciprocal Metal's fast
     // one in a fast-math entry ([`divide::Reciprocal::Device`]), so its notes hold only outside
-    // one.
+    // one. Metal reads a denormal operand as the zero of its sign and answers no denormal, in both
+    // modes: the routines read them so, and the device's fused multiply-add on the
+    // deviation or flushed ([`with_denormals`]) where the profile asks Metal's functions; native
+    // device maths leaves them to the device's (`DeviceDenormals`), unflushed.
     if fast && op == FloatFn::Fmod && f.float_fmt() == Some(FloatFmt::F32) {
         if let Some(fma) = fma::Fma::by(routes, f) {
             let khr = fma.route.device_float();
             let mut notes = BTreeSet::from([PrecisionNote::DeviceArithmetic]);
-            if khr {
+            if khr && facts.native {
                 notes.extend(device_float_notes(f, true, false));
             }
             return Some(FloatCall {
@@ -3158,14 +3372,21 @@ fn float_call_of(
     let nan = answer.filter(|_| !metal_nans);
     // A function whose denormals Metal's table reads ([`denormal::coverage`]) reads them as
     // Metal does: the device's, where the profile states it does, else flushed
-    // ([`with_denormals`]).
+    // ([`with_denormals`]). So do Metal's fast `sinpi`, `cospi` and `tanpi` (a
+    // denormal operand read as a zero, no denormal answer): the routines read the operand by
+    // `denormal::operand`, and the device's form where the profile's functions are Metal's reads
+    // it as `select_float_fn` says. Native device maths records the note ([`function_notes`]).
+    let fast_pi = matches!(
+        op,
+        FloatFn::FastSinPi | FloatFn::FastCosPi | FloatFn::FastTanPi
+    );
     let mut notes = function_notes(
         op,
         fast,
         f,
         (metal_functions, facts.native, facts.native_order),
         (
-            !op.metal_denormals() && denormal::coverage(op).is_none(),
+            !op.metal_denormals() && denormal::coverage(op).is_none() && !fast_pi,
             !metal_nans && answer.is_none(),
         ),
     );
@@ -3610,6 +3831,7 @@ fn arity(s: &ArithStrategy) -> Option<usize> {
         S::InsertConst(_)
         | S::LaneInsert { at: Some(_), .. }
         | S::ChunkedDot { .. }
+        | S::ChunkedChain { .. }
         | S::Dot { .. } => Some(2),
         // An index word reads its operands itself (an index extension has no value).
         S::Zero(_)
@@ -3625,7 +3847,7 @@ fn arity(s: &ArithStrategy) -> Option<usize> {
         | S::Member { .. } => Some(0),
         S::Chunked { parts, .. } => parts.first().and_then(|(_, p)| arity(p)),
         S::Wide(w) => w.arity(),
-        S::Nan { of, .. } | S::Denormals { of, .. } => arity(of),
+        S::Nan { of, .. } | S::Denormals { of, .. } | S::TinyProduct { of, .. } => arity(of),
         _ => None,
     }
 }
@@ -3680,11 +3902,39 @@ fn value(
                 r
             }
         }
+        S::TinyProduct { of, form, check } => {
+            let r = value(cx, fb, of, xs)?;
+            let ab = match xs {
+                [a, b, ..] => [*a, *b],
+                _ => return Err(cx.fail("a product without its operands")),
+            };
+            denormal::tiny_product(fb, *form, ab, r, *check)?
+        }
         S::ChunkedDot {
             lanes,
             elem,
             contract,
         } => chunk::dot(fb, *lanes, *elem, *contract, a(cx, 0)?, a(cx, 1)?)?,
+        S::ChunkedChain {
+            lanes,
+            elem,
+            fma: f,
+            flush,
+            reads,
+            tiny,
+        } => {
+            let routine = match f.routine() {
+                Some(r) => match cx.decl.families.arith.fmas.get(&r) {
+                    Some(id) => Some(*id),
+                    None => return Err(cx.fail("a dot whose fused multiply-add is not declared")),
+                },
+                None => None,
+            };
+            let fma =
+                |fb: &mut FunctionBuilder<'_>, args: &[SValue]| fma::emit(fb, *f, args, routine);
+            let xy = [a(cx, 0)?, a(cx, 1)?];
+            chunk::dot_chain(fb, *lanes, *elem, xy, &fma, (*flush, *tiny), *reads)?
+        }
         S::LaneExtract { src, at, index } => chunk::extract(fb, *src, *at, *index, xs)?,
         S::LaneInsert { dst, at, index } => chunk::insert(fb, *dst, *at, *index, xs)?,
         S::LaneShuffle {
@@ -3996,7 +4246,7 @@ fn value(
             };
             math::fast_fmod(fb, x, y, &divide, &fma)?
         }
-        S::Mix(f) => {
+        S::Mix { fma: f, flush } => {
             let routine = match f.routine() {
                 Some(r) => match cx.decl.families.arith.fmas.get(&r) {
                     Some(id) => Some(*id),
@@ -4010,12 +4260,13 @@ fn value(
             };
             let fma =
                 |fb: &mut FunctionBuilder<'_>, args: &[SValue]| fma::emit(fb, *f, args, routine);
-            math::metal_mix(fb, f.form, xyt, &fma)?
+            math::metal_mix(fb, f.form, xyt, &fma, *flush)?
         }
         S::Dot {
             fma: f,
             form,
             flush,
+            tiny,
         } => {
             let routine = match f.routine() {
                 Some(r) => match cx.decl.families.arith.fmas.get(&r) {
@@ -4030,7 +4281,7 @@ fn value(
             };
             let fma =
                 |fb: &mut FunctionBuilder<'_>, args: &[SValue]| fma::emit(fb, *f, args, routine);
-            math::metal_dot(fb, *form, xy, &fma, *flush)?
+            math::metal_dot(fb, *form, xy, &fma, (*flush, *tiny))?
         }
         S::Convert { kind, from, to } => {
             let p = a(cx, 0)?;

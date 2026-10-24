@@ -15,7 +15,7 @@ use crate::device::function_storage;
 use crate::device::metal::MetalDeviceProperties;
 use crate::device::policy::{
     ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-    RoundingOrderPolicy, SamplingPolicy, Unorm8LinearFilterPolicy,
+    RoundingOrderPolicy, SamplingPolicy, Unorm8LinearFilterPolicy, YCbCrFilterPolicy,
 };
 use crate::device::profile::{
     BufferAccess, Containment, CubeGradientRoute, CubeGradients, DescriptorCaps, DeviceProfile,
@@ -54,6 +54,10 @@ struct DeviceInner {
     /// The description's allocation sizes, which the Metal-facing `maxBufferLength` and the
     /// runtime's heap sizes read; not a profile field, as above.
     allocation: AllocationLimits,
+    /// The description the device was made from, kept so a compile over a device's compiler word
+    /// bound can rebuild the device under a reduced policy (`Device::fit_render_variant` and the
+    /// other kinds' fits); not a profile field, as above.
+    description: DeviceDescription,
 }
 
 impl Device {
@@ -126,6 +130,7 @@ impl Device {
             robust_buffer_access_update_after_bind: desc.robust_buffer_access_update_after_bind,
             generated_commands: desc.generated_commands,
             allocation: desc.allocation,
+            description: desc,
         })))
     }
 
@@ -149,6 +154,13 @@ impl Device {
     /// The policy the device was created with.
     pub fn policy(&self) -> &DevicePolicy {
         &self.0.policy
+    }
+
+    /// The description the device was made from, for a compile that rebuilds the device under a
+    /// reduced policy to fit a compiler word bound (`Device::fit_render_variant` and the other
+    /// kinds' fits).
+    pub(crate) fn description(&self) -> &DeviceDescription {
+        &self.0.description
     }
 
     /// The description's `robustBufferAccessUpdateAfterBind`.
@@ -244,6 +256,7 @@ fn derive_fields(
         fragment_stores_and_atomics: has(VkFeature::FragmentStoresAndAtomics),
         zero_initialize_workgroup_memory: has(VkFeature::ShaderZeroInitializeWorkgroupMemory),
         fma32: has(VkFeature::ShaderFmaFloat32),
+        fma16: has(VkFeature::ShaderFmaFloat16),
     };
     let images = ImageCaps {
         storage_read_without_format: has(VkFeature::ShaderStorageImageReadWithoutFormat),
@@ -328,7 +341,6 @@ fn derive_fields(
         handle_domain: policy.handle_domain,
         containment,
         isolation: policy.isolation,
-        framebuffer_fetch: policy.framebuffer_fetch,
         texel_conversion: policy.texel_conversion,
         half_blend: policy.half_blend,
         // Metal's where a form is measured to be Metal's or the policy asks for Metal's rounding;
@@ -384,6 +396,20 @@ fn derive_fields(
         } else {
             TexelNanRoute::Device
         },
+        // Metal's filter of a two-plane YCbCr texture through the slot's variant where the policy
+        // asks for it: on a device that samples through Metal's own sampler, under the YCbCr
+        // filter's switch or Metal's sampling; on one that samples natively, under the switch. A
+        // device that emulates Metal's sampler answers it in every module.
+        ycbcr_variant: match deviates(DriverDeviation::MetalSampler) {
+            true => {
+                policy.ycbcr_filter == YCbCrFilterPolicy::Exact
+                    || policy.sampling == SamplingPolicy::Exact
+            }
+            false => {
+                policy.sampling == SamplingPolicy::NativeDevice
+                    && policy.ycbcr_filter == YCbCrFilterPolicy::Exact
+            }
+        },
         // Metal's picks where the device's minimum and maximum are measured to be Metal's or its
         // functions are Metal's own; elsewhere the device's where the policy takes them.
         min_max: if deviates(DriverDeviation::MetalMinMax)
@@ -405,21 +431,30 @@ fn derive_fields(
         },
         // The device's measured value, keyed on its identity as the workarounds are, or the floor.
         function_storage: function_storage::of(desc),
-        // The measured deviations, one per pipeline kind. Unmeasured, a MoltenVK driver's route is
-        // unknown, since it hands the gradients to Metal by some route; another driver's is
-        // Vulkan's rule.
+        // The measured deviations, one per pipeline kind (the graphics one per macOS release's
+        // reading of SPIRV-Cross's fixup). Unmeasured, a MoltenVK driver's route is unknown, since
+        // it hands the gradients to Metal by some route; another driver's is Vulkan's rule.
         cube_gradients: {
-            let route = |deviation, measured| match (deviates(deviation), desc.driver_id) {
-                (true, _) => measured,
-                (false, Some(vk::DriverId::MOLTENVK)) => CubeGradientRoute::Unmeasured,
-                (false, _) => CubeGradientRoute::Vulkan,
+            let route = |measured: &[(DriverDeviation, CubeGradientRoute)]| match (
+                measured.iter().find(|(deviation, _)| deviates(*deviation)),
+                desc.driver_id,
+            ) {
+                (Some(&(_, route)), _) => route,
+                (None, Some(vk::DriverId::MOLTENVK)) => CubeGradientRoute::Unmeasured,
+                (None, _) => CubeGradientRoute::Vulkan,
             };
             CubeGradients {
-                graphics: route(
-                    DriverDeviation::GraphicsCubeGradientRoute,
-                    CubeGradientRoute::AppleSwizzled,
-                ),
-                compute: route(DriverDeviation::CubeGradientRoute, CubeGradientRoute::Metal),
+                graphics: route(&[
+                    (
+                        DriverDeviation::GraphicsCubeGradientRoute,
+                        CubeGradientRoute::AppleSwizzled,
+                    ),
+                    (
+                        DriverDeviation::GraphicsCubeGradientTangents,
+                        CubeGradientRoute::AppleProjected,
+                    ),
+                ]),
+                compute: route(&[(DriverDeviation::CubeGradientRoute, CubeGradientRoute::Metal)]),
             }
         },
         // The deviations taken past their last measured release, which a module records
@@ -440,9 +475,11 @@ fn derive_fields(
 fn workarounds(desc: &DeviceDescription) -> Vec<DriverWorkaround> {
     let mut found = by_identity(desc);
     // Every rasterizer but Apple's hands a clipped primitive's fragments their coverage by the
-    // whole primitive (or, lavapipe, by its own pieces), never by Apple's pieces.
+    // whole primitive (or, lavapipe, by its own pieces), never by Apple's pieces; and every
+    // tessellator but Apple's orders a patch's triangles its own way.
     if !(desc.driver_id == Some(vk::DriverId::MOLTENVK) && desc.vendor_id == APPLE_VENDOR_ID) {
         found.push(DriverWorkaround::ClippedCoverageNotMetals);
+        found.push(DriverWorkaround::TessellatorNotMetals);
     }
     found.extend(super::driver_facts::defects(desc));
     found.sort();
@@ -466,15 +503,21 @@ fn by_identity(desc: &DeviceDescription) -> Vec<DriverWorkaround> {
         Some(vk::DriverId::MESA_LLVMPIPE) => {
             vec![DriverWorkaround::ClippedTrianglesSplitPixelFragments]
         }
-        Some(vk::DriverId::NVIDIA_PROPRIETARY)
-            if super::NVIDIA_AMPERE_GA10X.contains(&desc.device_id) =>
-        {
-            vec![DriverWorkaround::NarrowMaskAfterSignedClamp]
+        // A `half` round trip folded on every GPU it drives, and on the 3090's generation a
+        // narrow integer's mask dropped.
+        Some(vk::DriverId::NVIDIA_PROPRIETARY) => {
+            let mut found = vec![DriverWorkaround::HalfConversionPairFolded];
+            if super::NVIDIA_AMPERE_GA10X.contains(&desc.device_id) {
+                found.push(DriverWorkaround::NarrowMaskAfterSignedClamp);
+            }
+            found
         }
-        // A uniform buffer's reads at different addresses, on every GPU it drives.
-        Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA) => {
-            vec![DriverWorkaround::UniformReadsOutpaceStorageReads]
-        }
+        // A uniform buffer's reads at different addresses, and a register allocator that faults
+        // compiling a module past a word bound, on every GPU it drives.
+        Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA) => vec![
+            DriverWorkaround::UniformReadsOutpaceStorageReads,
+            DriverWorkaround::RegisterAllocatorOverflowsLargeModules,
+        ],
         _ => Vec::new(),
     }
 }
@@ -482,14 +525,13 @@ fn by_identity(desc: &DeviceDescription) -> Vec<DriverWorkaround> {
 /// The operation classes measured exact in a vertex function on a driver that takes
 /// `DriverDeviation::MetalVertexSimdgroups`: with the vertex stage forced into the profile,
 /// MoltenVK 1.4.1 ran `rvc_simd_vertex`'s `simd_sum`, `simd_shuffle`, `simd_shuffle_xor` and
-/// `simd_ballot` as Metal does (EVs RVC-probe2-m4 and RVC-m3all, 200 of 200 words on the M4 and the
-/// M3 Max), and with the votes added, `gsm2_vertex_votes_shifts`' `simd_all` and `simd_any` over
-/// full and partial simdgroups (EVs GSM2-vv-m4 and GSM2-vv-m3, the four cases matching in both legs
-/// on both chips).
+/// `simd_ballot` as Metal does (200 of 200 words on the M4 and the M3 Max), and with the votes
+/// added, `gsm2_vertex_votes_shifts`' `simd_all` and `simd_any` over full and partial simdgroups
+/// (the four cases matching in both legs on both chips).
 ///
 /// The clustered class stays out: with it added, MoltenVK 1.4.1 refused `gsm2_quad_ops`' vertex
 /// functions, whose quad reductions then lowered to it ("Subgroup builtins are not available in
-/// this type of function", SPIRV-Cross's MSL conversion; EV GSM2-qd3-m4). They now take the ballot
+/// this type of function", SPIRV-Cross's MSL conversion). They now take the ballot
 /// and shuffles, so no quad or simdgroup operation of a vertex function on the `Direct` tier needs
 /// it.
 const MEASURED_VERTEX_OPS: OpBits = OpBits(
@@ -869,6 +911,18 @@ fn enabled_caps(
     }
     if deviations.contains_key(&DriverDeviation::Unorm8LinearFilter) {
         properties.insert(VkProperty::Unorm8LinearFilter);
+    }
+    if deviations.contains_key(&DriverDeviation::MetalDepth16Stores) {
+        properties.insert(VkProperty::MetalDepth16Stores);
+    }
+    if deviations.contains_key(&DriverDeviation::MetalDepth16BiasedStores) {
+        properties.insert(VkProperty::MetalDepth16BiasedStores);
+    }
+    if deviations.contains_key(&DriverDeviation::MetalInterpolation) {
+        properties.insert(VkProperty::MetalInterpolation);
+    }
+    if deviations.contains_key(&DriverDeviation::MetalFirstVertexIndices) {
+        properties.insert(VkProperty::MetalFirstVertexIndices);
     }
     let l = &desc.limits;
     let sample_counts: [(vk::SampleCountFlags, fn(u32) -> VkProperty); 6] = [

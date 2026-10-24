@@ -3,7 +3,7 @@
 //! `runtime::sample_copy`, carries into and out of the texture's aspect), on the device the cfg
 //! selects, under the validation layer, against Metal's answer.
 //!
-//! **Metal's answer** (EV FRT4-dm1-m4, our own probe, an Apple M4 under macOS 27.0.1, every case
+//! **Metal's answer** (our own probe, an Apple M4 under macOS 27.0.1, every case
 //! below): each copy unit of the buffer lands in its sample by the layout measured for colour,
 //! texel `(x, y)` sample `s` at `offset + y * bytesPerRow + (x * n + s) * bpp`, the samples outside
 //! a region keep the clear, and the copy back out returns the buffer bit for bit, every edge value
@@ -22,21 +22,24 @@
 //!   the clear.
 //! - **The copy back**: the buffer, bit for bit, but for an edge value the device is known to
 //!   change, each change announced or a recorded driver fact: by the `FragDepth` draw where the
-//!   driver's fragment depth changes values (`drawn-depth-copy`, its driver's measured changes:
-//!   NVIDIA's denormals as a zero of their sign and NaN as -inf; MoltenVK's positive NaN writing
-//!   nothing, a value with the sign bit set as +0, one past 1 as 1), by a depth image without
+//!   driver's fragment depth is not measured to keep every value (`drawn-depth-copy`, its driver's
+//!   measured changes: NVIDIA's denormals as a zero of their sign and NaN as -inf; MoltenVK's
+//!   positive NaN writing nothing, a value with the sign bit set as +0, one past 1 as 1; on a
+//!   driver not measured, what Vulkan leaves to it: any value outside `[0, 1]`, a denormal as a
+//!   zero, -0 as +0), by a depth image without
 //!   `VK_EXT_depth_range_unrestricted` whose driver may clamp (`restricted-depth-upload`; ANV's
 //!   stores a value past 1 as 1, and NaN and a value with the sign bit set as +0), and by a depth
 //!   image whose driver is not measured to keep a denormal (no
 //!   `DriverFact::DepthImageKeepsDenormals`: RADV's and ANV's hold one as a zero).
 //! - **Refused** only where the move refuses: a 16-bit depth on a device whose maintenance8
 //!   copies are missing or wrong (`RuntimeDriverDefect::MultisampledDepthStencilColourCopies`),
-//!   whose draws would convert it (unmeasured), as `NotImplemented(MultisampledBufferCopy)`.
+//!   whose draws would convert it (unmeasured), as `NotImplemented(MultisampledBufferCopy)`. A
+//!   32-bit float depth is copied in on every such device, by the draw, announced where inexact.
 //!
 //! Each case prints a `DEPTH-BUFFER` line, and each edge value a `DEPTH-EDGE` line (what the
 //! kernel read and what came back), so a lane's log shows every device's answer.
 
-use super::degrade_notices::{assert_made_once, forced, loses_depth_denormals};
+use super::degrade_notices::{assert_made_once, forced, loses_depth_denormals, signs_depth_tests};
 use super::degrade_notices::{made_compute_kinds, shared_in_system_memory};
 use super::{buffer_with, read_buffer, validated_device, Messages, ScratchCache, WAIT};
 use crate::candidate::runtime_samples::{encode, read_function};
@@ -211,7 +214,7 @@ impl Changes {
         if back == word {
             return true;
         }
-        // A depth image that may clamp (ANV's, EV ZIN2-dm3-anv): a value past 1 lands as 1, and
+        // A depth image that may clamp (ANV's): a value past 1 lands as 1, and
         // a NaN or a value with the sign bit set (-0 and negative denormals included) as +0.
         if self.clamped {
             let clamped = match is_nan(word) || sign != 0 {
@@ -235,7 +238,7 @@ impl Changes {
             Some(DriverId::NVIDIA_PROPRIETARY) => {
                 (is_denormal(word) && back == sign) || (is_nan(word) && back == 0xff80_0000)
             }
-            // MoltenVK's (EV ZIN2-dm3-mvk4): a positive NaN writes nothing, the sample keeping
+            // MoltenVK's: a positive NaN writes nothing, the sample keeping
             // what it held; a value with the sign bit set (-0, -inf, a negative NaN) lands as +0;
             // a value past 1 and +inf as 1.
             Some(DriverId::MOLTENVK) => match (is_nan(word), sign != 0) {
@@ -243,7 +246,15 @@ impl Changes {
                 (_, true) => back == 0,
                 (false, false) => value > 1.0 && back == one,
             },
-            _ => false,
+            // A driver whose fragment depth is not measured (`depth_copy::UNMEASURED_FLOAT_DEPTH`):
+            // Vulkan leaves a value outside `[0, 1]` undefined, and the driver may flush a
+            // denormal to zero or store -0 as +0.
+            _ => {
+                let outside = is_nan(word) || !(0.0..=1.0).contains(&value);
+                outside
+                    || (is_denormal(word) && back & 0x7fff_ffff == 0)
+                    || (word == sign && back == 0)
+            }
         }
     }
 }
@@ -506,6 +517,10 @@ fn a_buffer_copies_every_sample_of_a_multisampled_depth_or_stencil_both_ways() {
             (
                 Degradation::DepthDenormals,
                 float_depth && loses_depth_denormals(&device, false),
+            ),
+            (
+                Degradation::SignedDepthTest,
+                float_depth && signs_depth_tests(&device),
             ),
             (
                 Degradation::SharedInSystemMemory,

@@ -8,14 +8,13 @@
 //!
 //! A layout off Metal's rules (an offset or `bytesPerRow` off the copy unit, rows of more than
 //! one that overlap, or a `bytesPerImage` of more than one image off the copy unit or below the
-//! region's rows) is copied where plain Metal copies it (an M4 under macOS 27.0.1, EVs
-//! SPCrp-probe1-m4, SPCrp-probe3-m4 and SPH-bpi1-m4; its validation stops it): each row at
-//! `offset + z * bytesPerImage + y * bytesPerRow` rounded down to the copy unit or to 4 bytes,
-//! whichever is smaller, and a copy into a texture of one image of more than one row, from offset
-//! 0, with `bytesPerRow` rounded down to the copy unit a multiple of 16, at that rounded pitch
-//! (Metal's aligned path). Out of a texture, images that overlap are written in turn, a later
-//! image's bytes over an earlier one's. A region of one image ignores `bytesPerImage`.
-//! [`placed_rows`] states what stays refused.
+//! region's rows) is copied where plain Metal copies it (an M4 under macOS 27.0.1; its validation
+//! stops it): each row at `offset + z * bytesPerImage + y * bytesPerRow` rounded down to the copy
+//! unit or to 4 bytes, whichever is smaller, and a copy into a texture of one image of more than
+//! one row, from offset 0, with `bytesPerRow` rounded down to the copy unit a multiple of 16, at
+//! that rounded pitch (Metal's aligned path). Out of a texture, images that overlap are written in
+//! turn, a later image's bytes over an earlier one's. A region of one image ignores
+//! `bytesPerImage`. [`placed_rows`] states what stays refused.
 
 use super::chroma_pairs::is_four_two_two;
 use super::copy_plan::{
@@ -24,6 +23,7 @@ use super::copy_plan::{
 };
 use super::image_plan::ImagePlan;
 use super::linear_plan::BufferLayout as TexelsLayout;
+use super::pvrtc::is_pvrtc;
 use super::two_planes;
 use super::view_plan::ViewRecord;
 use metal2vulkan::error::{Feature, Unsupported};
@@ -130,12 +130,12 @@ fn off_rules(layout: &BufferLayout, s: &Shape, unit: &CopyUnit) -> bool {
 
 /// The buffer offset of each row of a region of shape `s` (image by image, row by row) where
 /// plain Metal's blit reads it (`into_texture`) or writes it, for a layout off Metal's rules
-/// (EV SPCrp-probe3-m4: every offset from 0 to 7 and 4 to 12, every `bytesPerRow` from 0 to 38,
+/// (every offset from 0 to 7 and 4 to 12, every `bytesPerRow` from 0 to 38,
 /// units of 1 to 16 bytes, `BC1_RGBA`, `Depth32Float`, and images of a 3D texture).
 ///
 /// Each row is at `offset + z * bytesPerImage + y * bytesPerRow` rounded down to the copy unit or
-/// to 4 bytes, whichever is smaller, images of a 3D texture at any `bytesPerImage` too (EV
-/// SPH-bpi1-m4: 0, 4, 12 and 18 under a 16-byte image). A copy into a texture of one image of
+/// to 4 bytes, whichever is smaller, images of a 3D texture at any `bytesPerImage` too (0, 4, 12
+/// and 18 under a 16-byte image). A copy into a texture of one image of
 /// more than one row whose `bytesPerRow` rounded down to the copy unit is a multiple of 16 takes
 /// Metal's aligned path from offset 0: its rows at that rounded pitch.
 ///
@@ -310,7 +310,7 @@ pub(super) fn plan_buffer_copy(
 /// A copy of a layout off Metal's rules (shape `s`, of the checked `image`) through a tightly
 /// packed staging layout, each row where plain Metal places it ([`placed_rows`]); the rows stay
 /// in the buffer. Out of the texture, rows that overlap (images closer than the region's rows)
-/// are written in turn, as plain Metal writes them (EV SPH-bpi1-m4: in order in every run of
+/// are written in turn, as plain Metal writes them (in order in every run of
 /// 3D textures up to 256x64x4): each row's bytes that a later row writes are left out of it
 /// ([`later_rows_win`]), so the copies' regions are disjoint.
 fn plan_placed_copy(
@@ -445,10 +445,17 @@ fn texture_unit(pf: PixelFormat) -> Option<(u32, [u32; 2])> {
 
 /// Whether Metal copies between textures of `a` and `b` (macOS 26.7's rule): the same format, or
 /// two formats of one copy unit, whose bytes it copies, a depth or stencil format's among them
-/// (probes); formats of different units are refused.
+/// (probes), or a compressed format and an uncompressed one whose texel is the bytes of its block
+/// (each block into one texel and back, [`source_region`]); formats of units of different bytes
+/// are refused.
+///
+/// The runtime's gaps: a PVRTC format with an uncompressed one, whose blocks plain Metal moves in
+/// an order of its own (our probe on an Apple M3 Max under macOS 27.0.1: neither the rows nor the
+/// CPU's Z order), and two compressed formats of one block's bytes and different extents (ASTC
+/// 6x5 and BC7), not measured.
 fn check_formats(a: PixelFormat, b: PixelFormat) -> Result<(), CopyRefusal> {
-    // Between two `YCBCR8_420_2P` textures Metal copies both of the surfaces' planes (EV
-    // XRR2-ycc2-m4), where the runtime's copy moves the luma bytes its texels are: the runtime's
+    // Between two `YCBCR8_420_2P` textures Metal copies both of the surfaces' planes, where the
+    // runtime's copy moves the luma bytes its texels are: the runtime's
     // gap, as is a copy between one and another format, which is not measured.
     if ycbcr(a) || ycbcr(b) {
         return Err(CopyRefusal::Unsupported(
@@ -458,12 +465,20 @@ fn check_formats(a: PixelFormat, b: PixelFormat) -> Result<(), CopyRefusal> {
     if a == b {
         return Ok(());
     }
+    let not_implemented =
+        || CopyRefusal::Unsupported(Unsupported::not_implemented(Feature::Format).naming_format(a));
     match (texture_unit(a), texture_unit(b)) {
         (Some(x), Some(y)) if x == y => {}
+        (Some((x, from)), Some((y, to))) if x == y => {
+            let texel = |extent: [u32; 2]| extent == [1, 1];
+            if texel(from) == texel(to) || is_pvrtc(a) || is_pvrtc(b) {
+                return Err(not_implemented());
+            }
+        }
         _ => return Err(CopyProblem::Format.into()),
     }
     // Into a 4:2:2 texture from another format of its unit plain Metal writes `0xff` over part
-    // of each row (EV RRP-probe11-m4, `RG8Unorm` into `GBGR422`), no copy of the bytes: the
+    // of each row (`RG8Unorm` into `GBGR422`), no copy of the bytes: the
     // runtime's gap. Out of one, and between the two orders, it copies them.
     if is_four_two_two(b) && !is_four_two_two(a) {
         return Err(CopyRefusal::Unsupported(Unsupported::not_implemented(
@@ -540,7 +555,8 @@ fn pair_unit(record: &ViewRecord, image: Option<&ImagePlan>) -> Result<CopyUnit,
 /// edge inside a block and not at the other's, the sides differ in size and cover the same blocks,
 /// which plain Metal copies whole (an Apple M3 Max under macOS 26.7, a probe: a whole block of a
 /// 4 x 2 level into one of an 8 x 8 level and back, which its validation takes, and 4 x 2 of
-/// either, which it stops).
+/// either, which it stops). Between a compressed and an uncompressed format the region is in the
+/// destination's texels ([`source_region`]).
 pub(super) fn plan_region_copy(
     pair: &CopyPair<'_>,
     region: &TextureRegion,
@@ -549,7 +565,8 @@ pub(super) fn plan_region_copy(
     dst_origin: [u32; 3],
 ) -> Result<Vec<ImageCopyRegion>, CopyRefusal> {
     let (src_unit, dst_unit) = pair.check()?;
-    let src = check_region(pair.src, region, &src_unit)?;
+    let source = source_region(region, &src_unit, &dst_unit)?;
+    let src = check_region(pair.src, &source, &src_unit)?;
     let dst_region = TextureRegion {
         level: dst_level,
         slice: dst_slice,
@@ -563,9 +580,44 @@ pub(super) fn plan_region_copy(
     Ok(vec![ImageCopyRegion { src, dst }])
 }
 
+/// The source's region of a region copy of `region` between textures of units `src` and `dst`:
+/// `region` itself between units of one extent. Between a compressed format and an uncompressed
+/// one (`check_formats`) every coordinate of the copy is in the destination's texels, the source
+/// addressed as if it held the destination's format (our probe on an Apple M3 Max under macOS
+/// 27.0.1: BC1 with `RG32Uint` and `RGBA16Uint`, BC7, `EAC_RGBA8` and ASTC 6x5 with
+/// `RGBA32Uint`, `ETC2_RGB8` with `RG32Uint`, both ways): out of a compressed texture the origin
+/// and size count its blocks (an origin of 4 is the fifth block), into one they count the
+/// source's texels as the destination's, the origin rounded down to a block's texel and the size
+/// up to whole blocks, each on its own (an origin of 1 and a size of 4 copy texel 0 alone).
+/// Refused (`Region`) where the source's texels overflow.
+fn source_region(
+    region: &TextureRegion,
+    src: &CopyUnit,
+    dst: &CopyUnit,
+) -> Result<TextureRegion, CopyProblem> {
+    let mut out = *region;
+    for axis in 0..2 {
+        let (from, to) = (src.extent[axis], dst.extent[axis]);
+        if from == to {
+            continue;
+        }
+        let (origin, size) = (region.origin[axis], region.size[axis]);
+        (out.origin[axis], out.size[axis]) = match to {
+            1 => (
+                origin.checked_mul(from).ok_or(CopyProblem::Region)?,
+                size.checked_mul(from).ok_or(CopyProblem::Region)?,
+            ),
+            _ => (origin / to, size.div_ceil(to)),
+        };
+    }
+    Ok(out)
+}
+
 /// `copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:
 /// sliceCount:levelCount:`, and `copyFromTexture:toTexture:` (`whole`: every level and slice of
-/// two textures of one shape).
+/// two textures of one shape). Between a compressed and an uncompressed format (`check_formats`)
+/// the runtime's gap (`NotImplemented(Format)`): which level's blocks Metal copies into which
+/// level's texels is not measured.
 pub(super) fn plan_levels_copy(
     pair: &CopyPair<'_>,
     src_slice: u32,
@@ -576,6 +628,11 @@ pub(super) fn plan_levels_copy(
     levels: u32,
 ) -> Result<Vec<ImageCopyRegion>, CopyRefusal> {
     let (src_unit, dst_unit) = pair.check()?;
+    if src_unit.extent != dst_unit.extent {
+        return Err(CopyRefusal::Unsupported(
+            Unsupported::not_implemented(Feature::Format).naming_format(pair.src.pixel_format),
+        ));
+    }
     let (src, dst) = (pair.src, pair.dst);
     let in_range = |start: u32, count: u32, limit: u32| {
         start.checked_add(count).is_some_and(|end| end <= limit)
@@ -622,9 +679,9 @@ pub(super) fn plan_levels_copy(
 
 /// `copyFromTexture:toTexture:`: the levels the two textures share, paired by size
 /// ([`aligned_levels`]), and the slices they share, as plain Metal copies them (an M4 under macOS
-/// 27.0.1, EV SPCrp-probe3-m4 `sz_whole_*`): an 8x8 texture of 4 levels into a 4x4 one of 3 copies
-/// its levels 1 to 3, a 2D texture into a 2D array its one slice. Two textures with no levels of
-/// one size are refused (`Size`): plain Metal aborts.
+/// 27.0.1): an 8x8 texture of 4 levels into a 4x4 one of 3 copies its levels 1 to 3, a 2D texture
+/// into a 2D array its one slice. Two textures with no levels of one size are refused (`Size`):
+/// plain Metal aborts.
 pub(super) fn plan_whole_copy(pair: &CopyPair<'_>) -> Result<Vec<ImageCopyRegion>, CopyRefusal> {
     let (src, dst) = (pair.src, pair.dst);
     let (src_level, dst_level) = aligned_levels(src, dst).ok_or(CopyProblem::Size)?;
@@ -673,7 +730,7 @@ pub(super) struct RowsCopy {
 impl RowsCopy {
     /// Each row of `src` into the same row of `dst` (as many rows, each as long). Where
     /// destination rows overlap (a rotated texture's, `texture/rotation.rs`), the later row keeps
-    /// the bytes they share, as plain Metal writes them (EV ZCI2-rotprobe5-m4): an earlier row
+    /// the bytes they share, as plain Metal writes them: an earlier row
     /// copies only the bytes no later row writes ([`later_rows_win`]).
     pub(super) fn new(src: &[Range<u64>], dst: &[Range<u64>]) -> RowsCopy {
         debug_assert_eq!(src.len(), dst.len());
@@ -722,8 +779,8 @@ impl RowsCopy {
     }
 
     /// Whether a source row and a destination row share a byte, for a copy within one buffer:
-    /// Vulkan's copy forbids it, where Metal moves the bytes as a copy through a temporary does
-    /// (TOB probe 1).
+    /// Vulkan's copy forbids it, where Metal moves the bytes as a copy through a temporary does (a
+    /// Metal probe on the M3 Max and an M4).
     pub(super) fn meets(&self) -> bool {
         let mut src: Vec<Range<u64>> = self.rows.iter().map(|r| r.src..r.src + r.size).collect();
         let mut dst: Vec<Range<u64>> = self.rows.iter().map(|r| r.dst..r.dst + r.size).collect();
@@ -817,7 +874,7 @@ pub(super) fn plan_rows_copy(
 }
 
 /// The position, in blocks from the layout's offset, at which plain Metal lays block (`x`, `y`)
-/// of a region `blocks` wide and high out at a `bytesPerRow` of 0 (EV RRP-probe8-m4, an M4 under
+/// of a region `blocks` wide and high out at a `bytesPerRow` of 0 (an M4 under
 /// macOS 27.0.1; the reims-vgpu consumer's report of a whole 16 x 16 level on an M3 Max under
 /// macOS 26.7): the region's own Morton order, counted from its corner, the x bit lowest. Each axis
 /// takes as many bits as its block count needs, and the larger axis's extra bits go on top, so a
@@ -851,7 +908,7 @@ pub(super) fn block_order_position(x: u64, y: u64, blocks: [u64; 2]) -> u64 {
 ///
 /// A region off its blocks lays out the blocks [`check_region`] rounds it to (its origin rounded
 /// down to its block and its size up to whole blocks, each on its own), in their own Morton
-/// order, as plain Metal's copy does (EV CFR-probe6-m4; its validation stops it).
+/// order, as plain Metal's copy does (its validation stops it).
 ///
 /// Refused as Metal's validation refuses it: a region past the level and an offset off the block
 /// (`CopyProblem`), and a layout past the buffer (`BufferRange`). A PVRTC texture has no 3D type

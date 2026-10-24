@@ -1,4 +1,5 @@
 use crate::device::properties::registry_id;
+use crate::device::submit::binding_seen;
 
 #[test]
 fn the_registry_id_folds_the_uuid_and_is_never_zero() {
@@ -419,7 +420,7 @@ fn equivalent_queue_families_are_all_taken_in_turn() {
         queue_plan(&[family(all, 2), transfer]),
         staged(0, &[(0, 0), (0, 1)], &[], Some((1, 0)))
     );
-    // NVIDIA's shape (an RTX 3090 with 615.71.09, EV XSH-sqp1-3090): a graphics family of 16, a
+    // NVIDIA's shape (an RTX 3090 with 615.71.09): a graphics family of 16, a
     // copy engine of 2, a compute family of 8, then video and optical flow families that also
     // transfer.
     let compute = family(all & !vk::QueueFlags::GRAPHICS, 8);
@@ -440,11 +441,10 @@ fn equivalent_queue_families_are_all_taken_in_turn() {
         plan(0, &[(0, 0), (0, 1), (0, 2), (0, 3)], &[(0, 4), (0, 5)]),
         "no family of transfers alone: no staging queue"
     );
-    // RADV's shape (a Radeon 780M with Mesa 26.2.4, EV XSH-spq2-radv): a graphics family of
-    // one, a compute family of four, video decode and encode families, and a family of sparse
-    // binding alone. Its compute queues stall behind a kernel on every compute unit (a readback
-    // there took up to 1054 ms, EV XSH-spq5-radv), so none stages: its textures copy on the host
-    // from its host-cached memory.
+    // RADV's shape (a Radeon 780M with Mesa 26.2.4): a graphics family of one, a compute family of
+    // four, video decode and encode families, and a family of sparse binding alone. Its compute
+    // queues stall behind a kernel on every compute unit (a readback there took up to 1054 ms), so
+    // none stages: its textures copy on the host from its host-cached memory.
     let video = |flags| family(flags, 1);
     assert_eq!(
         queue_plan(&[
@@ -507,7 +507,7 @@ fn host_image_copy_is_enabled_wherever_the_device_has_it() {
 
 /// The runtime enables `VK_NV_linear_color_attachment` exactly where the device lists it with
 /// what it requires, Vulkan 1.3 (where `VK_KHR_format_feature_flags2` is core) or that extension
-/// (the runtime's default Vulkan 1.2 instance, the consumer's ZIN2-mc1), and has
+/// (the runtime's default Vulkan 1.2 instance, the consumer's probe), and has
 /// `linearColorAttachment`, asked only then.
 #[test]
 fn linear_color_attachment_is_enabled_where_the_device_has_it_at_vulkan_1_3() {
@@ -657,4 +657,67 @@ fn a_device_extension_whose_instance_extension_the_instance_lacks_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(message.contains("VK_KHR_surface"), "{message}");
+}
+
+/// A no-copy buffer's binding stops being waited for only once a host wait returned for its
+/// value (`device/submit.rs`): a timeline's read alone orders no host operation after the
+/// signal. A read below the value asks for no wait, and a failed wait leaves it waited for.
+#[test]
+fn a_binding_is_seen_complete_only_once_a_host_wait_returned_for_it() {
+    let mut asked = Vec::new();
+    let mut seen = |read: u64, returned: Result<bool, ()>| {
+        binding_seen(read, 5, |value| {
+            asked.push(value);
+            returned
+        })
+    };
+    assert!(
+        !seen(5, Ok(false)),
+        "the read shows it; the wait did not return"
+    );
+    assert!(seen(6, Ok(true)));
+    assert!(!seen(4, Ok(true)), "the read shows it pending");
+    assert!(!seen(5, Err(())), "a lost device");
+    assert_eq!(asked, [5, 5, 5]);
+}
+
+/// `float-tininess-after-rounding`'s condition (`device/float_tininess.rs`): under native device
+/// maths (`FloatMathsPolicy::Native`, the default) every committed profile's device but MoltenVK's,
+/// whose float functions are Metal's own, takes the device's `float` multiply and fused
+/// multiply-add, which round a tiny result before they flush it; under `FloatMathsPolicy::Exact`
+/// none does.
+#[test]
+fn native_device_maths_rounds_a_tiny_product_before_its_flush_off_moltenvk() {
+    use crate::device::float_tininess::rounds_before_flushing;
+    use metal2vulkan::device::FloatMathsPolicy;
+    let (mut rounding, mut metals) = (0, 0);
+    for (path, description) in descriptions() {
+        let moltenvk = path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().starts_with("moltenvk"));
+        for float_maths in [FloatMathsPolicy::Native, FloatMathsPolicy::Exact] {
+            let mut options = DeviceOptions::default();
+            options.policy.float_maths = float_maths;
+            let set = enable_set(&description, &options);
+            let enabled = description
+                .clone()
+                .with_enabled(&set)
+                .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
+            let compile = metal2vulkan::device::Device::new(enabled, options.policy)
+                .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
+            let rounds = rounds_before_flushing(&compile);
+            let native = float_maths == FloatMathsPolicy::Native;
+            assert_eq!(
+                rounds,
+                native && !moltenvk,
+                "{path:?} under {float_maths:?}"
+            );
+            rounding += usize::from(rounds);
+            metals += usize::from(native && moltenvk);
+        }
+    }
+    assert!(
+        rounding > 0 && metals > 0,
+        "{rounding} rounding, {metals} Metal's own"
+    );
 }

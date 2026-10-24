@@ -3,21 +3,21 @@
 //!
 //! - On the CPU interpreter, 192 linear 2D samples Metal took, 16 per format and result type, are
 //!   Metal's bytes, through a constexpr sampler and through a runtime one: 128 of the one-plane
-//!   formats (EV TXN-xrprobe4-m3, an Apple M3 Max on macOS 26.7, byte-identical to the Apple
-//!   M4's TXN-xrprobe4-m4), whose device lane `runtime_lane::extended_range_samples` compares the
-//!   same samples on each venue, and 64 of the two-plane formats (EV XRR-tx1-m4, an Apple M4 on
-//!   macOS 27.0.1: footprints inside the texture of its linear clamp-to-edge samples), whose
-//!   device lane `runtime_lane::two_plane_samples` replays every sample of that probe.
+//!   formats (an Apple M3 Max on macOS 26.7, byte-identical to the Apple M4's probe),
+//!   whose device lane `runtime_lane::extended_range_samples` compares the same samples on each
+//!   venue, and 64 of the two-plane formats (an Apple M4 on macOS 27.0.1: footprints inside the
+//!   texture of its linear clamp-to-edge samples), whose device lane
+//!   `runtime_lane::two_plane_samples` replays every sample of that probe.
 //! - Under every address mode, each border color, a constant offset, and pixel coordinates,
 //!   through constexpr and runtime samplers (a runtime sampler's `MirrorClampToEdge` too, each
 //!   tap mirrored once and clamped), nearest samples are the decoded texel at Metal's position and
 //!   linear samples the model's (the footprint of `lower::sampler::linear`, the format's exact sum:
 //!   the module docs of `lower::sampler::extended`).
 //! - What is not built is refused, `NotImplemented(Format)`: by the lowering (here a two-plane
-//!   form's gather, a `half` gather, a mip filter, and mixed constexpr filters), and by the
-//!   binder (a runtime sampler whose word states a mip filter or mixed filters).
+//!   form's gather, a linear mip filter of a two-plane form, and mixed constexpr filters), and by
+//!   the binder (a runtime sampler whose word states mixed filters).
 //! - A swizzled texture's samples and gathers are the unswizzled texture's, swizzled, as plain
-//!   Metal answers (EV FPV-sw1-m4).
+//!   Metal answers.
 //! - The binder joins a sampled slot bound in such a format to the variant, whose plan views the
 //!   slot's own image in the raw format and binds no sampler.
 
@@ -27,13 +27,12 @@ use crate::error::Unsupported;
 use crate::metal::sampler::SamplerWord;
 use crate::metal::{SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter};
 
-/// Metal's linear samples, the files `xr_samples.tsv` (EV TXN-xrprobe4-m3) and
-/// `xr_plane_samples.tsv` (EV XRR-tx1-m4) beside the owned fixture `xr_samples.metal`, one per
-/// line: the raw format (550 `RGB10A8_2P_XR10`, 551 its `_sRGB` twin, 552 `BGRA10_XR`, 553 its
-/// twin, 554 `BGR10_XR`, 555 its twin), the result (`f` `float`, `h` `half`), the fractions `kx`
-/// and `ky` in 1/256 steps, the codes (red, green, blue, alpha; a two-plane texel's alpha its
-/// byte) of the taps `(i, j)`, `(i + 1, j)`, `(i, j + 1)`, and `(i + 1, j + 1)`, and the result's
-/// lanes as bits.
+/// Metal's linear samples, the files `xr_samples.tsv` and `xr_plane_samples.tsv` beside the owned
+/// fixture `xr_samples.metal`, one per line: the raw format (550 `RGB10A8_2P_XR10`, 551 its `_sRGB`
+/// twin, 552 `BGRA10_XR`, 553 its twin, 554 `BGR10_XR`, 555 its twin), the result (`f` `float`, `h`
+/// `half`), the fractions `kx` and `ky` in 1/256 steps, the codes (red, green, blue, alpha; a
+/// two-plane texel's alpha its byte) of the taps `(i, j)`, `(i + 1, j)`, `(i, j + 1)`, and `(i + 1,
+/// j + 1)`, and the result's lanes as bits.
 fn metal_linear() -> String {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/fixtures/public/engine");
@@ -412,7 +411,7 @@ fn address(mode: Mode, j: i64, n: i64) -> Option<i64> {
             let m = if j < 0 { -1 - j } else { j } % (2 * n);
             Some(if m >= n { 2 * n - 1 - m } else { m })
         }
-        // Mirrored once about the level's start, then clamped (RRP-probe5-m4).
+        // Mirrored once about the level's start, then clamped.
         Mode::MirrorClamp => Some(if j < 0 { -1 - j } else { j }.min(n - 1)),
         Mode::Border => (0..n).contains(&j).then_some(j),
     }
@@ -765,15 +764,17 @@ fn models(runtime: bool) {
 }
 
 /// The lowering refuses what it does not build under the variant, `NotImplemented(Format)`: a
-/// two-plane form's gather (another form's `float` gather is built), a `half` gather, a constexpr
-/// sampler with a mip filter, and one whose minification and magnification filters differ. Each
-/// kernel compiles without the variant.
+/// two-plane form's gather (another form's gather is built, `float` or `half`), a constexpr
+/// sampler with a linear mip filter of a two-plane form (a nearest one is built for every form),
+/// and one whose minification and magnification filters differ. Each kernel compiles without the
+/// variant.
 #[test]
 fn unbuilt_samples_are_refused() {
     let edge = words(false, 1, false, 0);
     let planes = |f: ExtendedRange| matches!(f, ExtendedRange::Planes { .. });
     let every = |_: ExtendedRange| true;
-    let kernels: [(&str, String, &dyn Fn(ExtendedRange) -> bool); 4] = [
+    let none = |_: ExtendedRange| false;
+    let kernels: [(&str, String, &dyn Fn(ExtendedRange) -> bool); 5] = [
         (
             "gather",
             sample_kernel(Through::Constexpr(edge), false, (0, 0), true),
@@ -782,12 +783,17 @@ fn unbuilt_samples_are_refused() {
         (
             "half gather",
             sample_kernel(Through::Constexpr(edge), true, (0, 0), true),
-            &every,
+            &planes,
         ),
         (
-            "mip",
+            "nearest mip",
             sample_kernel(Through::Constexpr(edge | 1 << 13), false, (0, 0), false),
-            &every,
+            &none,
+        ),
+        (
+            "linear mip",
+            sample_kernel(Through::Constexpr(edge | 2 << 13), false, (0, 0), false),
+            &planes,
         ),
         (
             "mixed",
@@ -827,7 +833,7 @@ fn unbuilt_samples_are_refused() {
 /// `half` that rounded toward zero, saturating at 65504; a gather reads the red of the linear
 /// footprint's four taps in Vulkan's order `(x0, y1)`, `(x1, y1)`, `(x1, y0)`, `(x0, y0)`, its
 /// `half` rounded to nearest even; a tap outside a border axis reads the border color through
-/// the format's channels (EVs FPV-pf5-m4 and FPV-pf8-m4).
+/// the format's channels.
 #[test]
 fn bfloat_samples_read_the_nearest_texel() {
     use SamplerAddressMode as A;
@@ -951,7 +957,7 @@ fn bfloat_samples_read_the_nearest_texel() {
             },
         }
     };
-    // A gather's `half` rounds to nearest even, a sample's toward zero (EV FPV-pf8-m4).
+    // A gather's `half` rounds to nearest even, a sample's toward zero.
     let bits = |v: u32, half: bool, gather: bool| {
         let x = f32::from_bits(v);
         match (half, gather || x.is_nan()) {
@@ -1030,7 +1036,7 @@ fn bfloat_samples_read_the_nearest_texel() {
 }
 
 /// A swizzled texture's samples and gathers are the unswizzled texture's, swizzled, as plain
-/// Metal answers (EV FPV-sw1-m4): nearest and linear samples (`float` and `half`, through a
+/// Metal answers: nearest and linear samples (`float` and `half`, through a
 /// constexpr sampler and a runtime one) and `float` gathers of each component, of a 4 x 4
 /// texture of each one-plane extended-range, padded and bfloat form (a two-plane form's samples
 /// alone), clamped to an opaque-white border, at 32 positions around and past the edges, on one
@@ -1210,7 +1216,7 @@ fn padded_words(ch: usize) -> Vec<u16> {
         .collect()
 }
 
-/// Each of Metal's samples in `padded_samples.tsv` (EVs XRR2-x6e and XRR2-x6h, an Apple M4 under
+/// Each of Metal's samples in `padded_samples.tsv` (an Apple M4 under
 /// macOS 27.0.1, byte-identical on an Apple M3 Max under macOS 26.7) is Metal's bytes, through a
 /// runtime sampler of the row's state and, where a constexpr sampler can state it, through one:
 /// `R10Unorm_X6` and `RG10Unorm_X12` under every address mode and border color, nearest and
@@ -1221,8 +1227,8 @@ fn padded_samples_are_metals_bytes() {
     replay_padded_samples("padded_samples.tsv");
 }
 
-/// Each of Metal's samples in `padded_srgb_samples.tsv` (EVs XRR2-x6es and XRR2-x6hs, an Apple M4
-/// under macOS 27.0.1, byte-identical on an Apple M3 Max under macOS 26.7) is Metal's bytes, as
+/// Each of Metal's samples in `padded_srgb_samples.tsv` (an Apple M4 under macOS 27.0.1,
+/// byte-identical on an Apple M3 Max under macOS 26.7) is Metal's bytes, as
 /// [`padded_samples_are_metals_bytes`] replays them: `R10Unorm_X6_sRGB` (its taps its decode
 /// steps, its linear filter a YCbCr field's on the grid `8192`) and `RG10Unorm_X12_sRGB` (its
 /// reads and filter `RG10Unorm_X12`'s) under every address mode and border color, nearest and
@@ -1327,11 +1333,20 @@ fn replay_padded_samples(name: &str) {
 /// A kernel's state: texture slot 0 bound in `pf`, buffers 0 and 1, and sampler slot 0 bound to
 /// `desc`.
 pub(super) fn sampled_state(pf: PixelFormat, desc: SamplerDescriptor) -> BindState {
+    sampled_state_of(TextureType::Type2D, pf, desc)
+}
+
+/// [`sampled_state`] with a texture of type `ty`.
+pub(super) fn sampled_state_of(
+    ty: TextureType,
+    pf: PixelFormat,
+    desc: SamplerDescriptor,
+) -> BindState {
     let mut t = StageTable::default();
     t.textures.insert(
         0,
         BoundTexture::Texture {
-            facts: TextureFacts::new(TextureType::Type2D, pf),
+            facts: TextureFacts::new(ty, pf),
             resource_id: None,
         },
     );
@@ -1356,8 +1371,9 @@ pub(super) fn sampled_state(pf: PixelFormat, desc: SamplerDescriptor) -> BindSta
 /// A sampled slot bound in an extended-range format joins the plan's variant through a
 /// constexpr and a runtime sampler: the variant's pipeline plans the same key, views the slot's
 /// image in the raw format, and binds no sampler. The binder refuses a runtime sampler whose
-/// word states a mip filter or mixed filters, `NotImplemented(Format)`, and plans one stating
-/// `MirrorClampToEdge`, whose taps the fetches address. On every committed profile.
+/// word states mixed filters, `NotImplemented(Format)`, and plans one stating a nearest mip
+/// filter, whose level the function reads (`levels`), or `MirrorClampToEdge`, whose taps the
+/// fetches address. On every committed profile.
 #[test]
 fn a_sampled_slot_joins_the_variant() {
     use SamplerMinMagFilter as F;
@@ -1449,14 +1465,16 @@ fn a_sampled_slot_joins_the_variant() {
                     mixed.mag_filter = F::Nearest;
                     let mut clamp = linear;
                     clamp.t_address_mode = SamplerAddressMode::MirrorClampToEdge;
-                    let clamped = sampled_state(pf, clamp).shape();
-                    for p in [&plain, &variant] {
-                        let named = p
-                            .plan(&dev, &clamped)
-                            .unwrap_or_else(|e| panic!("{what} mirror clamp: {e}"));
-                        assert_eq!(named.variant, plan.variant, "{what} mirror clamp");
+                    for (name, desc) in [("mirror clamp", clamp), ("mip", mip)] {
+                        let shape = sampled_state(pf, desc).shape();
+                        for p in [&plain, &variant] {
+                            let named = p
+                                .plan(&dev, &shape)
+                                .unwrap_or_else(|e| panic!("{what} {name}: {e}"));
+                            assert_eq!(named.variant, plan.variant, "{what} {name}");
+                        }
                     }
-                    for (name, desc) in [("mip", mip), ("mixed", mixed)] {
+                    for (name, desc) in [("mixed", mixed)] {
                         match plain.plan(&dev, &sampled_state(pf, desc).shape()) {
                             Err(crate::error::BindError::Unsupported(u)) => assert_eq!(
                                 u,
@@ -1471,4 +1489,217 @@ fn a_sampled_slot_joins_the_variant() {
         }
     }
     assert!(planned > 0);
+}
+
+/// [`sample_kernel`]'s `float` sample through `through` taken `n` times, the `i`-th at the
+/// coordinate plus `i / 8` on each axis, and where `offsets` at its own constant texel offset
+/// (`(i + 1, -i)`), the sum stored.
+fn samples_kernel(through: Through, n: usize, offsets: bool) -> String {
+    let k = sample_kernel(through, false, (0, 0), false);
+    let call = k
+        .lines()
+        .find(|l| l.starts_with("  %r = call"))
+        .expect("the sample's call")
+        .to_string();
+    let extract = "  %v = extractvalue { <4 x float>, i8 } %r, 0";
+    assert!(k.contains(extract), "the sample's texel");
+    let mut body = String::new();
+    for i in 0..n {
+        let d = i as f32 / 8.0;
+        body.push_str(&format!(
+            "  %uv{i} = fadd <2 x float> %uv, <float {d:?}, float {d:?}>\n"
+        ));
+        let offset = match offsets {
+            true => format!("<2 x i32> <i32 {}, i32 {}>", i + 1, -(i as i32)),
+            false => "<2 x i32> <i32 0, i32 0>".to_string(),
+        };
+        body.push_str(
+            &call
+                .replacen("%r =", &format!("%r{i} ="), 1)
+                .replacen("<2 x float> %uv,", &format!("<2 x float> %uv{i},"), 1)
+                .replacen("<2 x i32> <i32 0, i32 0>", &offset, 1),
+        );
+        body.push_str(&format!(
+            "\n  %v{i} = extractvalue {{ <4 x float>, i8 }} %r{i}, 0\n"
+        ));
+    }
+    let mut sum = "%v0".to_string();
+    for i in 1..n {
+        body.push_str(&format!("  %s{i} = fadd <4 x float> {sum}, %v{i}\n"));
+        sum = format!("%s{i}");
+    }
+    body.push_str(&format!("  %v = fadd <4 x float> {sum}, zeroinitializer"));
+    k.replacen(&format!("{call}\n{extract}"), &body, 1)
+}
+
+/// The words a sample of an extended-range slot past the first may add beside its routine: the
+/// call with its arguments, the status word and the sum's addition.
+const SITE_WORDS: usize = 160;
+
+/// The samples of one extended-range slot call one routine (`routine::Extended`) on a profile
+/// whose driver keeps a `DontInline` call a call (`DriverWorkaround::DontInlineKeepsCalls`): a
+/// kernel of 1, 2 and 4 samples through the runtime sampler, or through a constexpr linear
+/// clamp-to-edge sampler each at its own constant texel offset (the call's value), holds one
+/// routine, which its entry calls once per sample and which holds every fetch, and each sample
+/// past the first adds no more than a call's words. On any other profile the entry holds every
+/// fetch, its code written at each site (`extended::Sample::routine`).
+#[test]
+fn the_samples_of_one_slot_call_one_routine() {
+    const OP_FUNCTION: u32 = 54;
+    const OP_FUNCTION_END: u32 = 56;
+    const OP_FUNCTION_CALL: u32 = 57;
+    const OP_IMAGE_FETCH: u32 = 95;
+    let clamped = Through::Constexpr(words(true, 1, false, 0));
+    let cases = [(Through::Runtime, false), (clamped, true)];
+    for ((stem, p), (through, offsets)) in profiles()
+        .into_iter()
+        .flat_map(|sp| cases.map(|c| (sp.clone(), c)))
+    {
+        let keeps = p
+            .fields()
+            .workarounds
+            .contains(&crate::device::profile::DriverWorkaround::DontInlineKeepsCalls);
+        let mut words = Vec::new();
+        for n in [1usize, 2, 4] {
+            let what = format!("{stem}, {n} samples, offsets {offsets}");
+            let Some(bc) = assemble(&what, &samples_kernel(through, n, offsets)) else {
+                return;
+            };
+            let mut inputs = LowerInputs::new();
+            inputs
+                .extended_range
+                .insert(SOURCE, ExtendedRange::Planes { srgb: false });
+            let a = validate_entry(&bc, "k", &inputs, &p, &what);
+            // Each function's calls and fetches, by its result id.
+            let w = &a.module.words;
+            let (mut calls, mut fetches) = (BTreeMap::new(), BTreeMap::new());
+            let mut current = None;
+            let mut i = 5;
+            while i < w.len() {
+                let (len, op) = ((w[i] >> 16) as usize, w[i] & 0xffff);
+                assert!(len > 0 && i + len <= w.len(), "{what}: malformed module");
+                match op {
+                    OP_FUNCTION => current = Some(w[i + 2]),
+                    OP_FUNCTION_END => current = None,
+                    OP_FUNCTION_CALL => {
+                        let f = current.expect("a call outside a function");
+                        *calls
+                            .entry(f)
+                            .or_insert_with(BTreeMap::new)
+                            .entry(w[i + 3])
+                            .or_insert(0usize) += 1;
+                    }
+                    OP_IMAGE_FETCH => *fetches.entry(current.expect("a fetch")).or_insert(0) += 1,
+                    _ => {}
+                }
+                i += len;
+            }
+            let called: std::collections::BTreeSet<u32> =
+                calls.values().flat_map(|c| c.keys().copied()).collect();
+            if !keeps {
+                let holders: Vec<u32> = fetches.keys().copied().collect();
+                assert!(
+                    matches!(holders[..], [f] if !called.contains(&f)),
+                    "{what}: the entry holds every fetch, {holders:?}"
+                );
+                continue;
+            }
+            // The entry is the calling function no other calls.
+            let entries: Vec<u32> = calls
+                .keys()
+                .copied()
+                .filter(|f| !called.contains(f))
+                .collect();
+            let [entry] = entries[..] else {
+                panic!("{what}: one entry, {entries:?}");
+            };
+            assert_eq!(
+                fetches.get(&entry),
+                None,
+                "{what}: the entry fetches nothing"
+            );
+            let routines: Vec<u32> = calls
+                .get(&entry)
+                .into_iter()
+                .flatten()
+                .filter(|(f, k)| **k == n && fetches.contains_key(f))
+                .map(|(f, _)| *f)
+                .collect();
+            assert_eq!(
+                routines.len(),
+                1,
+                "{what}: the routine the entry calls per sample"
+            );
+            words.push((n, w.len()));
+        }
+        if !keeps {
+            continue;
+        }
+        let (n0, words0) = words[0];
+        for &(n, w) in &words[1..] {
+            assert!(
+                w - words0 <= (n - n0) * SITE_WORDS,
+                "{stem}, offsets {offsets}: {n} samples grew {} words from {n0}",
+                w - words0
+            );
+        }
+    }
+}
+
+/// A linear sample of an extended-range form with grid steps hands its exact sum each tap's steps
+/// from the codes (`extended_range::steps`), not the decoded value the sum recovers them from,
+/// and the sum takes its value on the grid by a multiplication by `1/255` and an exact correction
+/// (`texel_round::ratio_by_255_to_f32`): the module divides nowhere (a decode's exact quotient, or
+/// the general one), on the routine's profile and the site code's.
+#[test]
+fn a_linear_sample_s_taps_reach_its_sum_undecoded() {
+    const OP_FUNCTION: u32 = 54;
+    const OP_FUNCTION_END: u32 = 56;
+    const OP_IMAGE_FETCH: u32 = 95;
+    const OP_UDIV: u32 = 134;
+    let clamped = Through::Constexpr(words(true, 1, false, 0));
+    let forms = [
+        ExtendedRange::Planes { srgb: false },
+        ExtendedRange::Planes { srgb: true },
+        ExtendedRange::Bgra10 { srgb: false },
+        ExtendedRange::Bgr10 { srgb: true },
+    ];
+    for (stem, p) in profiles() {
+        for form in forms {
+            let what = format!("{stem}, {form:?}");
+            let Some(bc) = assemble(&what, &samples_kernel(clamped, 2, true)) else {
+                return;
+            };
+            let mut inputs = LowerInputs::new();
+            inputs.extended_range.insert(SOURCE, form);
+            let a = validate_entry(&bc, "k", &inputs, &p, &what);
+            // Each function's fetches and divisions.
+            let w = &a.module.words;
+            let mut by: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+            let mut current = None;
+            let mut i = 5;
+            while i < w.len() {
+                let (len, op) = ((w[i] >> 16) as usize, w[i] & 0xffff);
+                assert!(len > 0 && i + len <= w.len(), "{what}: malformed module");
+                match op {
+                    OP_FUNCTION => current = Some(w[i + 2]),
+                    OP_FUNCTION_END => current = None,
+                    OP_IMAGE_FETCH => by.entry(current.expect("a fetch")).or_default().0 += 1,
+                    OP_UDIV => by.entry(current.expect("a division")).or_default().1 += 1,
+                    _ => {}
+                }
+                i += len;
+            }
+            assert!(
+                by.values().any(|&(fetches, _)| fetches > 0),
+                "{what}: the taps are fetched"
+            );
+            for (f, (fetches, divisions)) in &by {
+                assert_eq!(
+                    *divisions, 0,
+                    "{what}: function {f} (fetching {fetches} taps) divides"
+                );
+            }
+        }
+    }
 }

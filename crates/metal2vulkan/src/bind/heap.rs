@@ -19,11 +19,13 @@
 //!   sample count above 1 exactly when multisampled, the numeric type, a depth format for a
 //!   depth-comparison class (as a compared slot takes), `ShaderRead` usage for a sampled class and
 //!   `ShaderWrite` or Apple's private `BlockWritesOnly` for a storage one (Metal's validation takes
-//!   a write of either, EV XRR2-usw1), which never holds a depth or stencil format), through its
+//!   a write of either), which never holds a depth or stencil format), through its
 //!   view: a sampled one as a slot's (`plan::resources::sampled_view`), a storage one the direct
-//!   format, which the class's formatless declaration serves exactly when the format's storage
-//!   choice for every access the device lets a heap make (`heap_storage_use`) is `Identity` without
-//!   an alias and the format serves those accesses without a format
+//!   format (an `A8Unorm` texture held in red its `R8_UNORM` image, whose texels a heap access
+//!   converts where the handle carries `A8Unorm`'s class), which the class's formatless declaration
+//!   serves exactly when the format's storage choice for every access the device lets a heap make
+//!   (`heap_storage_use`) is `Identity` (or `AlphaInRed`) without an alias and the format serves
+//!   those accesses without a format
 //!   (`metal::format::without_format_gaps`: the device's features and the format's own
 //!   `VkFormatFeatureFlags2` bits). A fitting member the heap cannot view (another storage choice,
 //!   a format the profile cannot sample or store) is `Unsupported`, as for a slot: a handle may
@@ -88,8 +90,8 @@
 //!   which a consumer lists again then ([`BindingPlan::relisted_sampler_tables`]). A class whose
 //!   least count does not fit the capacity is [`BindError::HeapTooLarge`] at plan time, and a list
 //!   longer than the planned entries at instantiation. Every listed shape must pass
-//!   `metal::sampler::check_sampler` for every use the arrays declare (the plan cannot see which
-//!   sampler a buffer pairs with which use, so a pair that never meets can refuse), and an
+//!   `metal::sampler::check_argument_sampler` for every use the arrays declare (the plan cannot see
+//!   which sampler a buffer pairs with which use, so a pair that never meets can refuse), and an
 //!   opaque-black border among them meets every member a sampled array holds, as a heap sampler's
 //!   does. The table bytes list each listed sampler's `(resource id, element, flags)` with a
 //!   nonzero id, as a texture table does. A listed cubic sampler, whose bicubic filter no stage
@@ -146,7 +148,7 @@ use crate::metal::format::{
     is_depth_stencil, sampled_type, storage_choice, vk_format, without_format_gaps, StorageUse,
 };
 use crate::metal::sampler::{
-    check_border_view, check_sampler, vk_filtering, SamplerUse, SamplerWord,
+    check_argument_sampler, check_border_view, vk_filtering, SamplerUse, SamplerWord,
 };
 use crate::metal::{self, TextureType};
 use crate::pipeline::artifact::RuntimeDependency;
@@ -280,8 +282,8 @@ pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
             false => Fit::No,
         };
     }
-    // A resident texture of a format the table holds no representation of (PVRTC blocks held for
-    // copies) fits no class: its element is the neutral, and nothing is refused, since the heap
+    // A resident texture of a format the table holds no representation of (ASTC's 4x2 and 8x4
+    // footprints) fits no class: its element is the neutral, and nothing is refused, since the heap
     // does not know which of its textures the function reads.
     match sampled_type(pixel_format) {
         _ if !shaped => Fit::No,
@@ -385,11 +387,13 @@ pub fn heap_raw_form(facts: &TextureFacts) -> Option<crate::metal::format::Exten
 
 /// The view through which the heap array of `class` holds a member of facts `shape`, in
 /// `layout`, on `profile` (the module docs): a sampled class's as a slot's
-/// (`plan::resources::sampled_view`), a storage class's the direct format, which the class's
-/// formatless declaration must serve. `Unsupported` where the array cannot view it: an
-/// extended-range format (its raw texels need its function's decode) but a form a heap reads in the
-/// unsigned integer class ([`Fit::Raw`]), its raw view, or a storage member whose storage choice or
-/// format the formatless declaration cannot serve.
+/// (`plan::resources::sampled_view`), a storage class's the direct format (an `A8Unorm` texture
+/// held in red its `R8_UNORM` image), which the class's formatless declaration must serve.
+/// `Unsupported` where the array cannot view it: an extended-range format (its raw texels need its
+/// function's decode) but a form a heap reads in the unsigned integer class ([`Fit::Raw`]), its raw
+/// view, a storage member whose storage choice or format the formatless declaration cannot serve,
+/// or an `A8Unorm` one held in red whose swizzle moves its alpha (its handle's class is not
+/// `A8Unorm`'s).
 fn member_view(
     profile: &DeviceProfile,
     shape: &TextureShape,
@@ -451,13 +455,29 @@ fn member_view(
         // A half-float member's writes take the class its handle carries, as before: the alias
         // a slot only written takes (`StorageImageClass::HalfBits`) is a slot's alone.
         let aliased = c.alias.is_some() && c.class != StorageImageClass::HalfBits;
-        if !per_element || aliased || c.x_channel {
+        // An `A8Unorm` texture held in red (`StorageImageClass::AlphaInRed`): its `R8_UNORM`
+        // image, whose texels a heap access converts where the handle carries `A8Unorm`'s class
+        // (`metal::texel_format::heap_alpha_in_red_index`), which a swizzle that moves its alpha
+        // does not keep.
+        let alpha_in_red = c.class == StorageImageClass::AlphaInRed;
+        if alpha_in_red
+            && crate::metal::texel_format::heap_class_index(pixel_format, shape.swizzle())
+                != crate::metal::texel_format::heap_alpha_in_red_index()
+        {
             return Err(BindError::Unsupported(Unsupported::not_implemented(
                 Feature::ArgumentBufferTextures,
             )));
         }
-        let format = crate::metal::format::direct_format(pixel_format)
-            .ok_or_else(|| internal("a storage heap member without a format"))?;
+        if !(per_element || alpha_in_red) || aliased || c.x_channel {
+            return Err(BindError::Unsupported(Unsupported::not_implemented(
+                Feature::ArgumentBufferTextures,
+            )));
+        }
+        let format = match alpha_in_red {
+            true => c.vk_format,
+            false => crate::metal::format::direct_format(pixel_format)
+                .ok_or_else(|| internal("a storage heap member without a format"))?,
+        };
         // The declaration names no format, so the member's format must serve those accesses
         // without one.
         let gaps = without_format_gaps(format, use_, profile);
@@ -687,7 +707,7 @@ struct HeapFilter {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct SamplerAdmission {
     /// The classes of the plan's sampler arrays: each is a use that every listed shape must pass
-    /// (`metal::sampler::check_sampler`).
+    /// (`metal::sampler::check_argument_sampler`).
     pub classes: Vec<HandleClass>,
     /// Every stage with a sampler table tests its entries for a cubic filter
     /// (`RuntimeFact::CubicArgumentSampler`).
@@ -710,13 +730,13 @@ impl SamplerAdmission {
     }
 
     /// Whether the plan holds a state of shape `s` on `profile` as it holds a listed one: `s`
-    /// passes `check_sampler` for every use, [`cubic_held`](Self::cubic_held), and an
+    /// passes `check_argument_sampler` for every use, [`cubic_held`](Self::cubic_held), and an
     /// opaque-black border only where the members were checked against one. Where no array
     /// samples (a function that only names the states), every shape.
     fn admits(&self, s: &SamplerShape, profile: &DeviceProfile) -> bool {
         let sampled = self.uses().next().is_some();
         self.uses()
-            .all(|use_| check_sampler(s, use_, profile).is_ok())
+            .all(|use_| check_argument_sampler(s, use_, profile).is_ok())
             && self.cubic_held(s)
             && (!sampled || !s.opaque_black_border || self.opaque_black)
     }
@@ -949,7 +969,7 @@ impl<'a> HeapPlanner<'a> {
             }
             for s in &a.shapes {
                 for &use_ in &sampler_uses {
-                    check_sampler(s, use_, profile).map_err(bind_error)?;
+                    check_argument_sampler(s, use_, profile).map_err(bind_error)?;
                 }
             }
             // A cubic sampler's bicubic filter through an argument buffer is not built.
@@ -1243,12 +1263,14 @@ impl<'a> HeapPlanner<'a> {
         }
         let image = match class {
             HandleClass::Image(image) => image,
-            // The array's `VkSampler`s depend on the comparison and the texel class alone; a
-            // cube-gradient use in the isotropic form refuses an anisotropic listed state at
-            // plan time.
+            // The array's `VkSampler`s are made for its use: the comparison, the texel class, and
+            // a cube's explicit gradients in the isotropic form, which makes a listed anisotropic
+            // state isotropic.
             HandleClass::Sampler {
-                compare, integer, ..
-            } => return self.sampler_array(set, b, compare, integer),
+                compare,
+                integer,
+                cube_gradient,
+            } => return self.sampler_array(set, b, (compare, integer, cube_gradient)),
             HandleClass::FunctionTable => return self.function_table_array(set, b),
         };
         let expected = if image.access == ImageAccess::Storage {
@@ -1364,15 +1386,14 @@ impl<'a> HeapPlanner<'a> {
         })
     }
 
-    /// The writes of the sampler array `b` of set `set` for the use (`compare`, `integer`): element
-    /// 0 the use's neutral sampler, element `i + 1` argument sampler `i` made for the use, through
-    /// the class's entries.
+    /// The writes of the sampler array `b` of set `set` for the use (`compare`, `integer`,
+    /// `cube_gradient`): element 0 the use's neutral sampler, element `i + 1` argument sampler `i`
+    /// made for the use, through the class's entries.
     fn sampler_array(
         &self,
         set: u32,
         b: &DescriptorBinding,
-        compare: bool,
-        integer: bool,
+        (compare, integer, cube_gradient): (bool, bool, bool),
     ) -> Result<Vec<DescriptorWrite>, BindError> {
         if b.ty != vk::DescriptorType::SAMPLER {
             return Err(internal(format!(
@@ -1403,6 +1424,7 @@ impl<'a> HeapPlanner<'a> {
                     index: element - 1,
                     compare,
                     integer,
+                    cube_gradient,
                 },
             ));
         }
@@ -1797,7 +1819,7 @@ fn handle_table_bytes(
 /// The depth class of a texture of pixel format `pf` in its table entry's flags: how Metal compares
 /// its texels against a depth comparison's reference, as measured. `Depth16Unorm` compares codes,
 /// the texel's against the reference's ([`FLAG_DEPTH_CODES`]); `Depth32Float` compares values, and
-/// `Depth32Float_Stencil8` as `Depth32Float` (EV MSFZ-m4-d32s8; [`FLAG_DEPTH_VALUES`]). Every other
+/// `Depth32Float_Stencil8` as `Depth32Float` ([`FLAG_DEPTH_VALUES`]). Every other
 /// format has no measured class, 0: the device compares a heap comparison of it, which the module
 /// records (`DeviceDepthComparison`).
 fn depth_flags(pf: metal::PixelFormat) -> u32 {
@@ -1960,11 +1982,12 @@ impl BindingPlan {
     /// plan, made on `device`, holds that list: no more samplers than each table's planned
     /// entries hold beside the null entry (twice the class's entries, the module docs), each of
     /// a shape the plan was made for or one that passes the plan's checks of a listed shape
-    /// (`metal::sampler::check_sampler` for every use of its sampler arrays, a cubic filter only
-    /// beside stages that test for it, an opaque-black border only where the members were checked
-    /// against one). A consumer whose function reaches a sampler state by its ID as the command
-    /// runs, as Metal's does, lists the states live as the command buffer commits over the
-    /// command's own, and writes their elements with [`WriteSource::ArgumentSampler`]'s rule.
+    /// (`metal::sampler::check_argument_sampler` for every use of its sampler arrays, a cubic
+    /// filter only beside stages that test for it, an opaque-black border only where the members
+    /// were checked against one). A consumer whose function reaches a sampler state by its ID as
+    /// the command runs, as Metal's does, lists the states live as the command buffer commits
+    /// over the command's own, and writes their elements with [`WriteSource::ArgumentSampler`]'s
+    /// rule.
     /// `None` where the plan does not hold the list (more states than its tables hold, or a shape
     /// its checks refuse), or has no sampler table: the command cannot reach the states as Metal's
     /// would.

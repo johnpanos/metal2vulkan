@@ -5,19 +5,24 @@
 //! the device's where it has one, which a command buffer that completed gave back
 //! ([`spares`](super::spares)). Its event waits and signals split its encoders into batches
 //! ([`batches`]); `commit` hands them to the device's scheduler ([`scheduler`](super::scheduler)),
-//! which submits each once the events it waits for are reached ([`submit`]), and the completion
-//! thread ([`completion`]) sees them complete. One encoder is open at a time; an encoder dropped
-//! without `end_encoding` loses its commands, so the command buffer can no longer be committed.
+//! which submits each once the events it waits for are reached ([`submit`]), and their
+//! `VkQueue`'s waiter ([`completion`]) sees them complete. One encoder is open at a time; an
+//! encoder dropped without `end_encoding` loses its commands, so the command buffer can no longer
+//! be committed.
 //!
 //! Statuses follow Metal's: `NotEnqueued`, then `Committed` at `commit`, `Scheduled`, and
 //! `Completed` or `Error`. The transitions after `Committed` run in the queue's serial context on
 //! the device's handler threads ([`contexts`](super::contexts)), in the queue's order: to
 //! `Scheduled` once its last batch is submitted (every wait of it satisfied), with its scheduled
-//! handlers; to `Completed` once its work completed, with its completed handlers and the release
-//! of what it retained. As on Metal, a queue's command buffer whose work completed stays
-//! `Committed` while an earlier transition of its queue, a handler, still runs. Its submission
-//! handlers (a runtime extension) run before its transition to `Scheduled`, on the thread that
-//! submitted its last batch, which the transition waits for.
+//! handlers; to `Completed` once its work completed, with its completed handlers and the release of
+//! what it retained. A transition that runs none of the program's code runs where it is seen
+//! instead, where its context is free: to `Scheduled` on the scheduler's thread
+//! (`CommandBufferShared::schedule`), to `Completed` on the queue waiter
+//! (`CommandBufferShared::finish_here`). As on Metal, a queue's command buffer whose work completed
+//! stays `Committed` while an earlier transition of its queue, a handler, still runs. Its
+//! submission handlers (a runtime extension) run before its transition to `Scheduled`, on the
+//! thread that took its last batch for its queue (submitted it, or held it for one kernel
+//! submission with later batches: `group.rs`), which the transition waits for.
 //!
 //! Encoders write their commands' own data (tables, neutral buffers) into the command buffer's
 //! upload arena ([`upload`](super::upload)), and the execution status words its commands share; the
@@ -30,6 +35,7 @@ pub(super) mod completion;
 pub(super) mod fences;
 mod first_submission;
 pub(super) mod gate;
+mod group;
 pub(super) mod kept_barriers;
 pub(super) mod own;
 mod reencode;
@@ -38,6 +44,8 @@ mod submit;
 
 pub(super) use completion::Completion;
 pub(super) use first_submission::NotedTable;
+pub(super) use group::{Group, GroupEnd, GROUP_BATCHES};
+pub(super) use submit::{BatchLists, Submitting};
 
 use super::contexts::{self, Run};
 use super::deferred::{Deferred, Prepared};
@@ -48,20 +56,24 @@ use super::device::relay::Relayed;
 use super::encoder::{Recorded, Segment};
 use super::error::{
     internal, invalid, vulkan, CommandBufferError, DeadlockCause, Error, FailedPipeline,
-    MeshRecordsOverflow, PipelineCreationCause, Problem, TimedOut,
+    MeshRecordsOverflow, PipelineCreationCause, Problem, TessellationRecordsOverflow, TimedOut,
 };
 use super::event::{EventRef, EventShared};
 use super::execution::Execution;
 use super::exit_guard::{self, Call};
 use super::function_table::TableSnapshot;
 use super::gpu_pools::{IndexPool, PoolKind, PoolLease};
-use super::gpu_time::{self, Stamped, Times};
+use super::gpu_time::{self, KernelTimes, Life, Placement, Stamped, Times};
 use super::heap::Heap;
 use super::heap_sets::HeapUse;
+use super::live_buffers::LiveTable;
+use super::pipeline::budget::Urgency;
 use super::pipeline::kept::StepNumbers;
 use super::predication::Predication;
+use super::program_objects;
 use super::queue::Slot;
 use super::rebind::{Holds, SubmittedHolds, Taken};
+use super::recorder::{self, Replays};
 use super::replay::Replay;
 use super::residency::Residency;
 use super::resource::ResourceKey;
@@ -76,7 +88,7 @@ use super::tracker::Footprint;
 use super::upload::{Upload, Uploads};
 use super::used_resources::{EncoderKind, EncoderRecord, Reached, ReadRecord};
 use super::values::CommandBufferStatus;
-use super::{CommandQueue, Device};
+use super::{Buffer, CommandQueue, Device};
 use crate::release;
 use ash::vk;
 use batches::Batches;
@@ -96,7 +108,7 @@ use own::{
 use std::any::Any;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -161,6 +173,44 @@ pub(super) struct CommandBufferShared {
     /// step records: the recordings after its commit into its pool take turns, as Vulkan
     /// synchronizes a pool's command buffers' recording externally.
     reencoding: Mutex<()>,
+    /// The `VkCommandBuffer`s of its pool its recordings ended ([`CommandBuffer::end_raw`]):
+    /// where they are every one the pool handed out and it completed, it gives the pool back
+    /// with none recording (`spares.rs`).
+    raws_ended: AtomicU64,
+    /// Its kernel times, apart from the state, which the scheduler holds while it replays and
+    /// submits a batch: a read waits for neither (`gpu_time.rs`).
+    kernel: KernelTimes,
+    /// Its status as `status` answers it, apart from the state for the same reason: each
+    /// transition of the state's status stores it here under the state's lock
+    /// ([`CommandBufferShared::answer`]), its raw value with release ordering, and a read loads
+    /// it with acquire ordering and takes no lock. Metal's reads wait for no submission.
+    status: AtomicU8,
+    /// Its error as `error` answers it: set once, by the completion that fails it, before that
+    /// stores the `Error` status, so a read that loads `Error` finds it. A commit takes nothing
+    /// here: no lock is taken first at a commit (on Apple's hosts a mutex allocates at its first
+    /// lock).
+    error: OnceLock<CommandBufferError>,
+    /// Whether a batch of it is held in the scheduler's group, and whether a thread waits for its
+    /// completion: a group kept past a pass goes at once once one does (`group.rs`).
+    group_hold: AtomicU8,
+}
+
+/// The word [`CommandBufferShared::status`] holds for `status`: its raw value.
+fn status_word(status: CommandBufferStatus) -> u8 {
+    status.raw() as u8
+}
+
+/// The status whose word ([`status_word`]) `word` is: every word stored is one of a status, the
+/// last of them `Error`'s.
+fn status_of(word: u8) -> CommandBufferStatus {
+    match word {
+        0 => CommandBufferStatus::NotEnqueued,
+        1 => CommandBufferStatus::Enqueued,
+        2 => CommandBufferStatus::Committed,
+        3 => CommandBufferStatus::Scheduled,
+        4 => CommandBufferStatus::Completed,
+        _ => CommandBufferStatus::Error,
+    }
 }
 
 /// How [`CommandBuffer::commit_failed`] fails a command buffer: a runtime extension, no Metal
@@ -228,7 +278,7 @@ pub(super) enum FailedSignals {
     Dropped,
     /// Those encoded before ended encoder `n`: Metal fails a command buffer from a render pass
     /// without attachments past 16384 a side, and signals what was encoded before the pass,
-    /// not after it (EV RRS-probe-13b-m4).
+    /// not after it.
     From(usize),
 }
 
@@ -366,20 +416,40 @@ pub(super) struct State {
     /// The pool every `VkCommandBuffer` of this command buffer comes from, with those made from
     /// it; `None` until the first, and once given back to the device's spares.
     pool: Option<CommandPool>,
+    /// Its encoders' deferred command buffers and their replays, where the device records them
+    /// so (`recorder`): `None` until the first, and once let go of.
+    pub(super) replays: Option<Arc<Replays>>,
     /// The ended encoders' recordings, in encoding order.
     recorded: Vec<Recorded>,
+    /// The last ended encoder's last `VkCommandBuffer`, still recording: its batch's end goes
+    /// into it as the batch ends ([`CommandBufferShared::close_tail`]), or it ends as it is where
+    /// a later encoder joins its batch.
+    pub(super) tail: Option<vk::CommandBuffer>,
+    /// The batches whose end went into their last `VkCommandBuffer` (`submit.rs`): each batch's
+    /// index, that command buffer, and whether it wrote the command buffer's end timestamp.
+    folds: Vec<Fold>,
+    /// The first encoder's first `VkCommandBuffer`, where its first commands write the start into
+    /// the slot's third query (`gpu_time.rs`): the first batch writes the start there alone where
+    /// it plans nothing before that encoder and the command buffer reaches the queue as recorded
+    /// (`submit.rs`).
+    pub(super) prefix: Option<vk::CommandBuffer>,
     /// The encoders split at the event and binary semaphore waits and signals.
     batches: Batches<Arc<EventShared>, vk::Semaphore>,
     scheduled: VecDeque<Handler>,
     /// Its submission handlers ([`CommandBuffer::add_submission_handler`]): run on the thread
-    /// that submits its last batch, before its transition to `Scheduled`.
+    /// that takes its last batch for its queue (submits it, or holds it in a group), before its
+    /// transition to `Scheduled`.
     submission: VecDeque<Handler>,
-    /// The thread that submitted its last batch has its submission handlers to run: its
-    /// transition to `Scheduled` waits until they ran.
+    /// The thread that took its last batch has its submission handlers to run, or the
+    /// switch of storage forms riding on it to end (`texture/storage_form.rs`): its transition to
+    /// `Scheduled` waits until it did.
     submitting: bool,
     /// Its scheduled handlers ran: `wait_until_scheduled` returns, as Metal's does only once
-    /// they ran (EV SUB-sched1-m4).
+    /// they ran.
     scheduled_ran: bool,
+    /// The threads sleeping on its `changed` condition variable: a change wakes it only where
+    /// one does ([`CommandBufferShared::wake_parked`]).
+    parked: usize,
     /// Why a batch could not be submitted: the command buffer finishes with it, and its
     /// scheduled handlers never run. Or the failure `commit_failed` chose, with which it
     /// finishes once its batches completed, its scheduled handlers run.
@@ -418,6 +488,11 @@ pub(super) struct State {
     /// state made without `supportIndirectCommandBuffers`): as it commits, they run nothing, and
     /// it completes with `CommandBufferError::PageFault`.
     faulted: BTreeSet<usize>,
+    /// The shadowed textures its ended encoders' passes took as attachments
+    /// (`render/shadows.rs`), each once.
+    shadow_attachments: Vec<ResourceKey>,
+    /// The shadowed textures its ended encoders copied in first (`shadow.rs`), each once.
+    shadows_copied_in: Vec<ResourceKey>,
     /// The pools of its commands' set 0 (`descriptor_arena.rs`), given back or released with
     /// the uploads.
     pub(super) descriptors: DescriptorArena,
@@ -482,6 +557,9 @@ pub(super) struct State {
     root_ranges: HashSet<ResidentRange>,
     /// The resident set its root tables search, once made; released as it completes.
     resident: Option<Resident>,
+    /// The live buffers' tables its host steps resolved against (`CommandBuffer::residency`),
+    /// each once ([`State::keep_stepped_table`]); released as it completes.
+    stepped_tables: Vec<Arc<LiveTable>>,
     /// What its commit listed among the live buffers (`LiveBuffers::reach`), and the list's
     /// generation then: listed again at its first submission where the list changed since.
     listing: Option<Listing>,
@@ -518,6 +596,19 @@ pub(super) struct State {
     /// An encoder of it used command predication: its commit lets go of every log, as a command
     /// encoded again after the commit would run outside its block.
     pub(super) predicated: bool,
+    /// The device's trail mark as it completed (`trails.rs`): its waiters return once no trail
+    /// numbered below is open. 0 before, which waits for none.
+    trail_mark: u64,
+}
+
+/// A batch whose end went into its last `VkCommandBuffer` ([`State::folds`]).
+struct Fold {
+    /// The batch's index.
+    batch: usize,
+    /// The command buffer.
+    raw: vk::CommandBuffer,
+    /// It wrote the command buffer's end timestamp.
+    stamped: bool,
 }
 
 /// The resident set a command buffer's root tables search (`live_buffers.rs`): the device's live
@@ -563,8 +654,17 @@ impl State {
             taken,
             replay: None,
             executions: 0..0,
+            held: Vec::new(),
         });
         self.ended.len() - 1
+    }
+
+    /// Ended encoder `encoder` holds the images `held` in their attachment layout
+    /// (`texture/held_depth.rs`).
+    pub(super) fn encoder_holds(&mut self, encoder: usize, held: Vec<ResourceKey>) {
+        if let Some(record) = self.ended.get_mut(encoder) {
+            record.held = held;
+        }
     }
 
     /// Keep `replay`, the log of ended encoder `encoder`, whose executions take `executions`
@@ -646,6 +746,25 @@ impl State {
             }
         }
         reached
+    }
+
+    /// Hold `table`, the live buffers' table a host step resolves against, each once: so the
+    /// step's own hold, let go of on the scheduler's thread, is never the last of a released
+    /// buffer's pages, whose release runs the program's code (`exit_guard::program_release`).
+    /// From the first submission on the commands the step records may reach the table's
+    /// buffers, so the command buffer holds it until it completes, as it holds its first
+    /// submission's. One a step took before then (a step of commands the GPU may write never
+    /// runs before it, its batch never the first, `Batches::host_step`; another kind's may) goes
+    /// at the first submission, at once, as the set is made of the list as it stands then
+    /// (`first_submission.rs`). `commit` holds none.
+    fn keep_stepped_table(&mut self, table: &Arc<LiveTable>) {
+        let kept = self
+            .stepped_tables
+            .iter()
+            .any(|kept| Arc::ptr_eq(kept, table));
+        if self.status != CommandBufferStatus::NotEnqueued && !kept {
+            self.stepped_tables.push(Arc::clone(table));
+        }
     }
 
     /// Let go of what its ended encoders' commands use, as it completes: their keys, and what
@@ -860,6 +979,34 @@ impl State {
         self.fails_from.get_or_insert((encoder, error));
     }
 
+    /// Note the shadowed textures an ended encoder's pass took as attachments: how many of them
+    /// no pass of the command buffer took before.
+    pub(super) fn shadows_attached(&mut self, keys: &[ResourceKey]) -> usize {
+        let mut first = 0;
+        for &key in keys {
+            if !self.shadow_attachments.contains(&key) {
+                self.shadow_attachments.push(key);
+                first += 1;
+            }
+        }
+        first
+    }
+
+    /// Note the shadowed textures an ended encoder copied in first, each copy's texture and
+    /// texels: the texels of those an earlier encoder of the command buffer copied in too.
+    pub(super) fn shadows_copied_in(&mut self, copies: &[(ResourceKey, u64)]) -> u64 {
+        let earlier = self.shadows_copied_in.len();
+        let mut again = 0;
+        for &(key, texels) in copies {
+            if self.shadows_copied_in[..earlier].contains(&key) {
+                again += texels;
+            } else if !self.shadows_copied_in.contains(&key) {
+                self.shadows_copied_in.push(key);
+            }
+        }
+        again
+    }
+
     /// Metal's GPU faults ended encoder `encoder` (`faulted`).
     pub(super) fn fault(&mut self, encoder: usize) {
         self.faulted.insert(encoder);
@@ -878,19 +1025,66 @@ impl State {
         self.batches.host_step();
     }
 
-    /// A resource state encoder ended with `recorded`: it starts a batch of its own, unless the
-    /// batch so far holds only such encoders, so its updates bind before every encoder after it.
-    pub(super) fn end_sparse_encoder(&mut self, recorded: Recorded) {
+    /// A resource state encoder of `command_buffer` ended with `recorded`: it starts a batch of
+    /// its own, unless the batch so far holds only such encoders, so its updates bind before
+    /// every encoder after it.
+    pub(super) fn end_sparse_encoder(
+        &mut self,
+        command_buffer: &CommandBuffer,
+        recorded: Recorded,
+    ) {
         self.batches.sparse();
-        self.end_encoder(recorded);
+        self.end_encoder(command_buffer, recorded);
     }
 
-    /// An encoder ended with `recorded`: it joins the current batch, or a new one after the
-    /// batch's signals.
-    pub(super) fn end_encoder(&mut self, recorded: Recorded) {
+    /// An encoder of `command_buffer` ended with `recorded`: it joins the current batch, or a
+    /// new one after the batch's signals. The tail before it ends: with its batch's end where
+    /// that batch ended before this encoder ([`CommandBufferShared::close_tail`]).
+    pub(super) fn end_encoder(&mut self, command_buffer: &CommandBuffer, recorded: Recorded) {
         self.recorded.push(recorded);
         self.batches.encoder();
         self.encoder_open = false;
+        let joined = self.recorded.len() - 1;
+        command_buffer.0.close_tail(self, Some(joined));
+    }
+
+    /// The batch that holds part `part` of the ended encoders.
+    fn batch_of(&self, part: usize) -> usize {
+        let batches = self.batches.all();
+        batches
+            .iter()
+            .position(|batch| batch.end > part)
+            .unwrap_or(batches.len() - 1)
+    }
+
+    /// Whether batch `index`'s end may go into its last `VkCommandBuffer` (`submit.rs`): its
+    /// parts leave no segment or sparse update for its submission (whose recordings go among or
+    /// after the parts' own), nor its last part a write into an ASTC carrier (whose second twin's
+    /// decode its submission may record after it, `texture/decoded_twin.rs`), and name no texture
+    /// over the caller's image that moves between layouts (whose move back its submission plans
+    /// before the end). An event's kept signal that waits for another queue's still goes after
+    /// that wait, in an end of its own at the submission (`submit.rs`).
+    fn may_fold(&self, device: &Device, index: usize) -> bool {
+        let parts = &self.recorded[self.batch_range(index)];
+        parts
+            .iter()
+            .all(|part| part.segments.is_empty() && part.sparse.is_empty())
+            && parts.last().is_none_or(|part| part.twin_writes.is_empty())
+            && device
+                .shared()
+                .interop
+                .wrapped
+                .among(parts.iter().flat_map(|part| part.summary.keys()))
+                .is_empty()
+    }
+
+    /// The `VkCommandBuffer` batch `index`'s end went into, and whether it wrote the command
+    /// buffer's end timestamp; `None` where it went into none.
+    pub(super) fn fold(&self, index: usize) -> Option<(vk::CommandBuffer, bool)> {
+        self.folds
+            .iter()
+            .find(|fold| fold.batch == index)
+            .map(|fold| (fold.raw, fold.stamped))
     }
 
     /// Fail the command buffer as `failure` says ([`CommandBuffer::commit_failed`], or an
@@ -929,10 +1123,10 @@ impl State {
         self.failed_at_commit = Some(failure.encoders);
     }
 
-    /// A failed encoder's recorded `part` runs nothing: its segments (with their recordings)
-    /// and sparse updates go to `retained`, released with what the command buffer retained
-    /// without this lock, its `VkCommandBuffer`s are left unsubmitted, and it keeps its place
-    /// among the batches with its fences' waits and updates alone.
+    /// A failed encoder's recorded `part` runs nothing: its segments (with their recordings),
+    /// sparse updates and writes into ASTC carriers go to `retained`, released with what the
+    /// command buffer retained without this lock, its `VkCommandBuffer`s are left unsubmitted,
+    /// and it keeps its place among the batches with its fences' waits and updates alone.
     pub(super) fn fail_part(part: &mut Recorded, retained: &mut Vec<Box<dyn Any + Send + Sync>>) {
         for segment in part.segments.drain(..) {
             retained.push(Box::new((segment.work, segment.inputs)));
@@ -943,6 +1137,10 @@ impl State {
         }
         for update in part.sparse.drain(..) {
             retained.push(Box::new(update));
+        }
+        // Its writes into ASTC carriers ran nothing, so nothing of them is decoded.
+        for write in part.twin_writes.drain(..) {
+            retained.push(Box::new(write));
         }
         part.raws.clear();
         part.summary = part.summary.fences_only();
@@ -1007,7 +1205,10 @@ impl State {
             return Err(internal("a segment that named a detached buffer submitted"));
         }
         for encoder in encoders {
-            for (before, segment) in encoder.segments.drain(..).enumerate() {
+            // The segments' command buffers placed so far, each segment's after the part's own
+            // before it and the segments' before it.
+            let mut before = 0;
+            for segment in encoder.segments.drain(..) {
                 let Segment {
                     at,
                     executions_at,
@@ -1023,7 +1224,9 @@ impl State {
                 };
                 // The pages its commands took, held until the command buffer completes.
                 done.taken.retain_into(retained);
-                encoder.raws.insert(at + before, done.raw);
+                let raws = done.raws.len();
+                encoder.raws.splice(at + before..at + before, done.raws);
+                before += raws;
                 encoder.summary.join(done.summary);
                 let at = executions_at + *placed;
                 *placed += done.executions.len();
@@ -1130,13 +1333,22 @@ impl Drop for CommandBufferShared {
     fn drop(&mut self) {
         // A command buffer that still holds its pool was never submitted, or ended before its
         // completion gave the pool back: a committed command buffer is held by the scheduler until
-        // its batches were submitted, and by the completion thread until they completed, so
+        // its batches were submitted, and by its queue's waiter until they completed, so
         // nothing of its pool is pending. The device's spares keep it (`spares.rs`), which
         // release it only with the device. A timestamp slot it still holds goes back with its
         // state.
-        let pool = lock(&self.state).pool.take();
+        let (pool, replays) = {
+            let mut state = lock(&self.state);
+            (state.pool.take(), state.replays.take())
+        };
         if let Some(pool) = pool {
-            self.device.shared().spares.give_command_pool(pool);
+            let shared = self.device.shared();
+            shared.spares.give_command_pool(shared, pool, false);
+        }
+        // Its replays end likewise.
+        if let Some((pool, _)) = replays.and_then(|replays| replays.release(false)) {
+            let shared = self.device.shared();
+            shared.spares.give_command_pool(shared, pool, false);
         }
     }
 }
@@ -1163,12 +1375,17 @@ impl CommandBuffer {
                 abandoned: false,
                 committing: false,
                 pool: None,
+                replays: None,
                 recorded: Vec::new(),
+                tail: None,
+                folds: Vec::new(),
+                prefix: None,
                 batches: Batches::default(),
                 scheduled: VecDeque::new(),
                 submission: VecDeque::new(),
                 submitting: false,
                 scheduled_ran: false,
+                parked: 0,
                 failure: None,
                 completed: VecDeque::new(),
                 executed_handlers: Vec::new(),
@@ -1181,6 +1398,8 @@ impl CommandBuffer {
                 unlisted_argument_samplers: false,
                 fails_from: None,
                 faulted: BTreeSet::new(),
+                shadow_attachments: Vec::new(),
+                shadows_copied_in: Vec::new(),
                 descriptors: DescriptorArena::default(),
                 status_words: None,
                 capture_tallies: Vec::new(),
@@ -1204,6 +1423,7 @@ impl CommandBuffer {
                 root_tables: Vec::new(),
                 root_ranges: HashSet::new(),
                 resident: None,
+                stepped_tables: Vec::new(),
                 listing: None,
                 submitted: false,
                 failing: Vec::new(),
@@ -1215,6 +1435,7 @@ impl CommandBuffer {
                 storage_form: None,
                 predication: Predication::default(),
                 predicated: false,
+                trail_mark: 0,
             }),
             changed: Condvar::new(),
             gate: Arc::default(),
@@ -1223,6 +1444,11 @@ impl CommandBuffer {
             own_textures: Mutex::new(Vec::new()),
             reencode: AtomicU64::new(0),
             reencoding: Mutex::new(()),
+            raws_ended: AtomicU64::new(0),
+            kernel: KernelTimes::default(),
+            status: AtomicU8::new(status_word(CommandBufferStatus::NotEnqueued)),
+            error: OnceLock::new(),
+            group_hold: AtomicU8::new(0),
         }))
     }
 
@@ -1264,22 +1490,75 @@ impl CommandBuffer {
     pub(super) fn residency(&self) -> Result<Residency, Error> {
         let residency = self.state().residency.clone().unwrap_or_default();
         // With the device's live buffers, which an address in no resource made resident
-        // resolves against (`live_buffers.rs`).
+        // resolves against (`live_buffers.rs`): a host step's, the command buffer holds until it
+        // completes.
         let device = &self.0.device;
         let live = device.shared().live_buffers.table(device)?;
+        self.state().keep_stepped_table(&live);
         Ok(residency.with_live(live))
     }
 
-    /// A primary `VkCommandBuffer` from this command buffer's pool, made on first use. The
-    /// caller holds `state` (the pool is externally synchronized).
+    /// An encoder's primary command buffer: a deferred one where the device records them so
+    /// (`recorder`), else one from this command buffer's pool, made on first use. The caller holds
+    /// `state` (the pool is externally synchronized).
     pub(super) fn allocate_raw(&self, state: &mut State) -> Result<vk::CommandBuffer, Error> {
-        self.0.allocate_raw(state)
+        self.0
+            .allocate_deferred(state, vk::CommandBufferLevel::PRIMARY)
     }
 
-    /// A secondary `VkCommandBuffer` from this command buffer's pool (a render encoder's draws),
-    /// freed with the pool. The caller holds `state`.
+    /// An encoder's own primary `VkCommandBuffer` from this command buffer's pool, and whether it
+    /// is begun: the pool's primary begun ahead where it holds one (`spares.rs`), else as
+    /// [`allocate_raw`](Self::allocate_raw) hands one out, to begin. The caller holds `state`.
+    pub(super) fn encoder_primary(
+        &self,
+        state: &mut State,
+    ) -> Result<(vk::CommandBuffer, bool), Error> {
+        self.0.encoder_primary(state)
+    }
+
+    /// Write the start into `raw`, the first encoder's first `VkCommandBuffer`, just begun, where
+    /// the command buffer is timed and the encoder opens its first batch (`gpu_time.rs`).
+    pub(super) fn open_start(&self, state: &mut State, raw: vk::CommandBuffer) {
+        self.0.open_start(state, raw);
+    }
+
+    /// End `raw`, a `VkCommandBuffer` of this command buffer's pool, counted among those its
+    /// recordings ended: every `vkEndCommandBuffer` of one goes through here
+    /// (`CommandBufferShared::end_raw`).
+    ///
+    /// # Safety
+    /// `raw` is recording, and only the caller records it, or any command buffer of its pool:
+    /// Vulkan synchronizes both externally.
+    pub(super) unsafe fn end_raw(&self, raw: vk::CommandBuffer) -> Result<(), vk::Result> {
+        // SAFETY: the caller's.
+        unsafe { self.0.end_raw(raw) }
+    }
+
+    /// Give up `raw`, a secondary command buffer recording that nothing will execute (a render
+    /// pass instance its pass replaced or gave up before running it, or the one instance of a
+    /// pass that changes nothing): a deferred one (`recorder`) is left unended, so its log is
+    /// never replayed, and goes with the command buffer's release, as one never ended goes; one
+    /// of this command buffer's pool ends ([`end_raw`](Self::end_raw)), so the pool goes back to
+    /// the device's spares unreset (`spares.rs`). Nothing executes either, so the GPU does the
+    /// same work and every byte it writes is the same; a deferred one's replay only cost the
+    /// recorder's thread a `vkBeginCommandBuffer`, which ANV makes reset the command buffer's
+    /// whole state, and the commands' recording.
+    ///
+    /// # Safety
+    /// As [`end_raw`](Self::end_raw)'s, and no command buffer executes `raw`.
+    pub(super) unsafe fn give_up_raw(&self, raw: vk::CommandBuffer) -> Result<(), vk::Result> {
+        if recorder::is_deferred(raw) {
+            return Ok(());
+        }
+        // SAFETY: the caller's.
+        unsafe { self.end_raw(raw) }
+    }
+
+    /// A secondary command buffer (a render encoder's draws), deferred or from this command
+    /// buffer's pool as [`allocate_raw`](Self::allocate_raw)'s. The caller holds `state`.
     pub(super) fn allocate_secondary(&self, state: &mut State) -> Result<vk::CommandBuffer, Error> {
-        self.0.allocate(state, vk::CommandBufferLevel::SECONDARY)
+        self.0
+            .allocate_deferred(state, vk::CommandBufferLevel::SECONDARY)
     }
 
     /// `addScheduledHandler:`: call `handler` once the command buffer is scheduled, on one of the
@@ -1297,32 +1576,31 @@ impl CommandBuffer {
         Ok(())
     }
 
-    /// Call `handler` once the command buffer's last batch reached its `VkQueue`, on the thread
-    /// that submitted it, before the command buffer becomes `Scheduled`: a runtime extension, no
-    /// Metal call (docs/API.md, "A command buffer's submission handlers"). Metal submits on its
-    /// own thread and tells a program of it only through `Scheduled` (EV SUB-sched1-m4); a
-    /// program that models what Metal does as it submits takes that point here.
+    /// Call `handler` once the runtime took the command buffer's last batch for its `VkQueue`,
+    /// on the thread that took it, before the command buffer becomes `Scheduled`: a runtime
+    /// extension, no Metal call (docs/API.md, "A command buffer's submission handlers"). The
+    /// batch is taken where it is submitted, or held for one kernel submission with the batches
+    /// committed after it (`CompletionPolicy::Grouped`, on a driver that merges submissions): its
+    /// commands and its place in its queue's order are fixed then, so nothing committed later on
+    /// the queue runs before it. Metal submits on its own thread and tells a program of it only
+    /// through `Scheduled`; a program that models what Metal does as it
+    /// submits takes that point here.
     ///
-    /// - **The thread.** The committing thread, inside `commit`, where the commit submits the
-    ///   last batch itself (its every wait met, nothing earlier of its queue held, and no other
-    ///   thread submitting for the device as it commits); else the thread that submits it later:
-    ///   the device's scheduler thread (after an event's value rose, a host step, a check, or a
-    ///   commit that found it submitting), or the thread of another `commit` that submits it in
-    ///   its pass (one that released it, or that was submitting as this commit was made). It
-    ///   runs with no lock of the runtime's held, after the submission's call returned.
+    /// - **The thread.** The device's scheduler thread, which makes every submission: `commit`
+    ///   returns at once, as Metal's does, and submits nothing itself. It runs with no lock of the
+    ///   runtime's held, after the submission's call returned.
     /// - **Before.** Its handlers run, in the order added, before the status reads `Scheduled`,
     ///   before [`wait_until_scheduled`](Self::wait_until_scheduled) returns, before its
     ///   scheduled handlers run, and before it can complete. The GPU may run the work meanwhile:
     ///   a value of an event its work signals can rise before they ran.
-    /// - **Never** for a command buffer that fails before its last batch is submitted (a
-    ///   submission or host step that fails, a lost device); they are dropped with it. A command
-    ///   buffer committed as failed ([`commit_failed`](Self::commit_failed)) submits its batches
-    ///   and runs them.
-    /// - **Keep it short.** It holds back its command buffer's scheduling, `commit` where a
-    ///   commit's thread runs it, and on the scheduler thread the device's other submissions,
-    ///   among them those of a commit left to the pass that submitted this command buffer, which
-    ///   the thread may take in only after its handlers (`scheduler/inbox.rs`). A commit made
-    ///   while it runs that finds no pass under way submits its own ready batches. A wait in it
+    /// - **Never** for a command buffer that fails before its last batch is taken (a submission
+    ///   or host step that fails, a lost device); they are dropped with it. One whose last batch
+    ///   was held ran them, and fails from `Scheduled` where the group's submission fails. A
+    ///   command buffer committed as failed ([`commit_failed`](Self::commit_failed)) submits its
+    ///   batches and runs them.
+    /// - **Keep it short.** It holds back its command buffer's scheduling and the device's other
+    ///   submissions, among them those of a commit made meanwhile, which the thread takes in only
+    ///   after its handlers (`scheduler/inbox.rs`). A wait in it
     ///   for a command buffer, or for a slot of a full queue, that has not happened yet is refused
     ///   (`WaitWouldDeadlock` of [`DeadlockCause::SubmissionHandler`]); it must not wait for GPU
     ///   work otherwise.
@@ -1465,7 +1743,9 @@ impl CommandBuffer {
     }
 
     /// `commit`: hand the batches to the device's scheduler, which submits them in the queue's
-    /// commit order, each once the events it waits for are reached.
+    /// commit order, each once the events it waits for are reached. It returns at once, as
+    /// Metal's does: the scheduler's thread makes every submission, so no driver call holds it
+    /// (`scheduler/inbox.rs`).
     ///
     /// The indirect command buffers' commands the encoders execute are recorded first, from
     /// their records as they are now: each through the plan path, as a dispatch of the encoder
@@ -1517,19 +1797,15 @@ impl CommandBuffer {
     /// [`commit`](Self::commit) for `call`, or, with `failure`,
     /// [`commit_failed`](Self::commit_failed).
     fn commit_as(&self, call: &'static str, failure: Option<CommitFailure>) -> Result<(), Error> {
-        // A switch its scheduler settled since finishes first, on this thread; then the waiting
-        // fetched render targets take their storage form at this commit where it allows
-        // (`storage_form.rs`): two atomic reads where none is under way and none waits.
-        let device = &self.0.device;
-        device.finish_storage_forms();
+        // The waiting fetched render targets take their storage form at this commit where it
+        // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
+        // ends the switch once it submitted the command buffer.
         if !self.take_storage_forms(failure.is_some()) {
             return self.commit_now(call, failure);
         }
         let committed = self.commit_now(call, failure);
-        match committed {
-            // Where the commit submitted it, the switch finishes here, before `commit` returns.
-            Ok(()) => device.finish_storage_forms(),
-            Err(_) => self.give_up_storage_forms(),
+        if committed.is_err() {
+            self.give_up_storage_forms();
         }
         committed
     }
@@ -1578,6 +1854,8 @@ impl CommandBuffer {
         // the lock: what it upgrades may be a resource's last hold.
         let used = reached.list();
         device.shared().live_buffers.reach(&used);
+        let shared = device.shared();
+        (shared.counts).commit_used_host_imports(Buffer::distinct_host_imports(&used.buffers));
         // Listed again at its first submission where the list changed since (a rebind ends a
         // use).
         let listing = Listing::new(device, used);
@@ -1617,9 +1895,6 @@ impl CommandBuffer {
                 state.fail(failure);
             }
             state.prepare(prepared);
-            // Until its first submission it holds what its commands took weakly: a rebind or a
-            // release meanwhile lets the pages go, and the submission finds them moved.
-            state.wait_for_submission(listing);
             state.plan_checks();
             // Its root tables search every live buffer of its own on the device, and what its
             // encoders bound and made resident (`live_buffers.rs`).
@@ -1658,6 +1933,7 @@ impl CommandBuffer {
                 state.retained.push(Box::new(ticket));
             }
             state.status = CommandBufferStatus::Committed;
+            self.0.answer(&state);
             for heap in state.used_heaps.drain(..) {
                 heap.mark_used();
             }
@@ -1667,8 +1943,33 @@ impl CommandBuffer {
             if !keys.is_empty() {
                 device.shared().rebinds.wait_for_replay(&self.0, keys);
             }
+            if let Some(slot) = &mut state.slot {
+                slot.committed();
+            }
+            self.0.time(&mut state);
+            // The last encoder's last command buffer ends, with its batch's end where it may
+            // (`submit.rs`), the slot taken.
+            self.0.close_tail(&mut state, None);
+            // Its submissions record their barriers from its pool, inside sections, where no
+            // spare is taken: one that encoded nothing takes a spare now, if one is free.
+            self.0.take_spare_pool(&mut state);
+            // Until its first submission it holds what its commands took weakly: a rebind or a
+            // release meanwhile lets the pages go, and the submission finds them moved. Only once
+            // its last command buffer ended: what lay in pages a detach replaced while an encoder
+            // held them goes with them (`detach.rs`), and its tail's commands recorded above
+            // name the views of an attachment recorded inline (`render/inline_first.rs`).
+            // Its deferred command buffers replay from now on, on the device's recorder thread,
+            // and hold the pages their commands name until they are replayed; such pages go here
+            // all the same, replayed first (`Replays::commit`).
+            match state.replays.clone() {
+                Some(replays) => drop(replays.commit(device.shared().vk(), |held| {
+                    state.wait_for_submission(listing, held)
+                })),
+                None => state.wait_for_submission(listing, &mut Vec::new()),
+            }
             // Committed, its commands recorded for good: a rebind of what they used takes
             // effect after them (`rebind.rs`); one a host step records holds until completion.
+            // Only once its replays hold the pages, so a rebind finds them held.
             if stepped {
                 let held = &mut *state;
                 let kept = held
@@ -1679,13 +1980,6 @@ impl CommandBuffer {
             } else {
                 state.holds.clear();
             }
-            if let Some(slot) = &mut state.slot {
-                slot.committed();
-            }
-            self.0.time(&mut state);
-            // Its submissions record their barriers from its pool, inside sections, where no
-            // spare is taken: one that encoded nothing takes a spare now, if one is free.
-            self.0.take_spare_pool(&mut state);
             let waits = state
                 .batches
                 .all()
@@ -1725,13 +2019,13 @@ impl CommandBuffer {
         // Each making the batches wait for wakes the scheduler as it finishes, with no lock
         // held (`render/pending.rs`), registered before the scheduler first looks at the batches:
         // a making that finished between that look and a later registration left the batch held
-        // with nothing to wake the scheduler (17 lane tests timed out, EV PPC-lane1-mvk4).
+        // with nothing to wake the scheduler (17 lane tests timed out).
         if !made_later.is_empty() {
             let waker = device.shared().scheduler.waker();
             for work in &made_later {
                 work.when_made(&waker);
                 // Its batch waits for them now: they go before the makings nothing waits for.
-                work.hasten();
+                work.hasten(Urgency::Committed);
             }
         }
         drop(unreplayable);
@@ -1757,14 +2051,18 @@ impl CommandBuffer {
         Ok(())
     }
 
-    /// `status`.
+    /// `status`. Like Metal's, the read waits for no submission in progress and no GPU work.
     pub fn status(&self) -> CommandBufferStatus {
-        self.state().status
+        status_of(self.0.status.load(Ordering::Acquire))
     }
 
-    /// `error`: why the command buffer failed, once its status is `Error`.
+    /// `error`: why the command buffer failed, once its status is `Error`. Like Metal's, the
+    /// read waits for no submission in progress and no GPU work.
     pub fn error(&self) -> Option<CommandBufferError> {
-        self.state().error
+        match self.status() {
+            CommandBufferStatus::Error => self.0.error.get().copied(),
+            _ => None,
+        }
     }
 
     /// `error.localizedDescription`, where the driver relayed Metal's failure of the command
@@ -1827,7 +2125,10 @@ impl CommandBuffer {
     /// On a device with calibrated timestamps (`VK_KHR_calibrated_timestamps` or
     /// `VK_EXT_calibrated_timestamps`, enabled where listed) it is Metal's answer, within the
     /// calibration's deviation. Without, it is the end below less the GPU's duration, which
-    /// stays exact, and the device announces `Degradation::UncalibratedGpuTimes` once. A device
+    /// stays exact, and the device announces `Degradation::UncalibratedGpuTimes` once; so is it
+    /// where the calibration would place the times outside the command buffer's life, from its
+    /// first submission to its completion, by more than its deviation and the clocks' drift (a
+    /// calibration that disagrees with the device's own timestamps, `gpu_time.rs`). A device
     /// whose queue family writes no timestamps refuses it (`Unsupported`, `Feature::GpuTimes`).
     /// So does a command buffer committed while others held every slot of the device's
     /// timestamp pools and no pool more could be made (2048 on MoltenVK; elsewhere only where
@@ -1855,15 +2156,17 @@ impl CommandBuffer {
 
     /// `kernelStartTime`: the host time, in seconds of [`host_time`](super::host_time)'s clock,
     /// at which the device's scheduler began submitting the command buffer's work to Vulkan; 0
-    /// before.
+    /// before. Like Metal's, the read waits for no submission in progress and no GPU work.
     pub fn kernel_start_time(&self) -> f64 {
-        gpu_time::seconds(self.state().times.kernel_start)
+        gpu_time::seconds(self.0.kernel.start())
     }
 
     /// `kernelEndTime`: the host time at which the device's scheduler finished submitting the
-    /// command buffer's work to Vulkan (it is then `Scheduled`); 0 before.
+    /// command buffer's work to Vulkan, or held its last batch for one kernel submission with
+    /// later ones (`CompletionPolicy::Grouped`); it is then `Scheduled`; 0 before. Like Metal's,
+    /// the read waits for no submission in progress and no GPU work.
     pub fn kernel_end_time(&self) -> f64 {
-        gpu_time::seconds(self.state().times.kernel_end)
+        gpu_time::seconds(self.0.kernel.end())
     }
 
     /// The GPU start and end, in nanoseconds of the host's clock: placed from the command
@@ -1931,31 +2234,43 @@ impl CommandBuffer {
         };
         // Read timestamps came from the device's clock.
         let clock = clock.ok_or_else(untimed)?;
-        let pair = state.times.pair;
-        let times = clock.span(pair, start, end, state.times.completed);
+        let (times, placement) = clock.span(
+            state.times.pair,
+            start,
+            end,
+            life(&self.0.kernel, &state.times),
+        );
         state.times.gpu = Some(times);
         drop(state);
-        if pair.is_none() {
-            let reason = if clock.calibration.is_some() {
-                "the device's calibrated timestamps could not be read at its commit"
-            } else {
+        let reason = match placement {
+            Placement::Calibrated => return Ok(times),
+            Placement::Uncalibrated if clock.calibration.is_some() => {
+                "the device's calibrated timestamps could not be read as it completed".to_owned()
+            }
+            Placement::Uncalibrated => {
                 "the device calibrates its timestamps against no host clock the runtime reads"
-            };
-            device.degrade(Degradation::UncalibratedGpuTimes, || {
-                (
-                    "a command buffer's GPU times".to_owned(),
-                    format!(
-                        "{reason} ({}-bit timestamps of {} ns)",
-                        clock.valid_bits, clock.period
-                    ),
-                )
-            });
-        }
+                    .to_owned()
+            }
+            Placement::Disagreed { by, deviation } => format!(
+                "the device's calibration placed them {by} ns outside the command buffer's life, \
+                 between its first submission and its completion, where it stated a deviation of \
+                 {deviation} ns: its timestamps count on another clock than its calibrated one"
+            ),
+        };
+        device.degrade(Degradation::UncalibratedGpuTimes, || {
+            (
+                "a command buffer's GPU times".to_owned(),
+                format!(
+                    "{reason} ({}-bit timestamps of {} ns)",
+                    clock.valid_bits, clock.period
+                ),
+            )
+        });
         Ok(times)
     }
 
     /// `waitUntilScheduled`: block until the command buffer's scheduled handlers ran, or it
-    /// failed. As Metal's (measured on an M4, macOS 27.0.1, EV SUB-sched1-m4), it returns only
+    /// failed. As Metal's (measured on an M4, macOS 27.0.1), it returns only
     /// once every scheduled handler returned, though [`status`](Self::status) reads `Scheduled`
     /// just before they start.
     ///
@@ -1981,25 +2296,33 @@ impl CommandBuffer {
             if exit_guard::closed() {
                 return Err(DeadlockCause::Exiting.into());
             }
+            state.parked += 1;
             state = self
                 .0
                 .changed
                 .wait_timeout(state, exit_guard::WAKE)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
+            state.parked -= 1;
         }
         Ok(())
     }
 
     /// `waitUntilCompleted`: block until the command buffer completed or failed and its
-    /// completed handlers ran. It returns on device loss (the status is then `Error`).
+    /// completed handlers ran. It returns on device loss (the status is then `Error`). Where a
+    /// batch of it is held for one kernel submission with later ones while its queue's earlier
+    /// work runs (`CompletionPolicy::Grouped`), the wait sends it at once.
     ///
-    /// It returns only once the runtime's threads let go of the command buffer, so dropping the
-    /// last handles after it destroys the device on the dropping thread, before the drop
-    /// returns. A program that learns of the completion otherwise (a completed handler, an event
-    /// the command buffer signals, its status) may drop them while a runtime thread still holds
-    /// the command buffer; the device then goes on that thread. An exit meanwhile waits for that
-    /// teardown, or leaves the device to the process's end.
+    /// It returns only once the runtime's threads let go of the command buffer, and of what they
+    /// held to make what its work waited for (a pipeline made on the device's pool, a texture's
+    /// CPU decode, `trails.rs`), so dropping the last handles after it destroys the device on the
+    /// dropping thread, before the drop returns. Such a thread lets go a few drops after its
+    /// signal, so this adds to the wait only where it lost its CPU in between; the completion,
+    /// the status and the completed handlers do not wait for it. A program that learns of the
+    /// completion otherwise (a completed handler, an event the command buffer signals, its
+    /// status) may drop them while a runtime thread still holds the command buffer; the device
+    /// then goes on that thread. An exit meanwhile waits for that teardown, or leaves the device
+    /// to the process's end.
     ///
     /// Once the process is exiting (its exit handlers run), the runtime's threads that finish
     /// command buffers have ended, and no Vulkan call is made: a wait for a command buffer that
@@ -2022,27 +2345,49 @@ impl CommandBuffer {
     ///   cap, above the 256 measured on Metal).
     pub fn wait_until_completed(&self) -> Result<(), Error> {
         let _blocked = match self.completed_wait() {
-            Answer::Return => return Ok(()),
+            Answer::Return => {
+                return self
+                    .trailed(None)
+                    .map_err(|_| DeadlockCause::Exiting.into())
+            }
             Answer::Refuse(cause) => return Err(cause.into()),
             Answer::Wait => None,
             Answer::Block(from) => Some(contexts::block(from, self.0.context())?),
         };
+        self.0.waits_for_completion();
         self.0.gate.wait()?;
-        Ok(())
+        self.trailed(None)
+            .map_err(|_| DeadlockCause::Exiting.into())
     }
 
-    /// [`CommandBuffer::wait_until_completed`] for at most `timeout`. Where that is refused, it
-    /// ends at once with `TimedOut`, as it does once the process is exiting.
+    /// [`CommandBuffer::wait_until_completed`] for at most `timeout`, which bounds the whole call.
+    /// Where that is refused, it ends at once with `TimedOut`, as it does once the process is
+    /// exiting.
     pub fn wait_until_completed_for(&self, timeout: Duration) -> Result<(), TimedOut> {
+        let deadline = Instant::now() + timeout;
         let _blocked = match self.completed_wait() {
-            Answer::Return => return Ok(()),
+            Answer::Return => return self.trailed(Some(deadline)).map_err(|_| TimedOut),
             Answer::Refuse(_) => return Err(TimedOut),
             Answer::Wait => None,
             Answer::Block(from) => {
                 Some(contexts::block(from, self.0.context()).map_err(|_| TimedOut)?)
             }
         };
-        self.0.gate.wait_until(Instant::now() + timeout)
+        self.0.waits_for_completion();
+        self.0.gate.wait_until(deadline)?;
+        self.trailed(Some(deadline)).map_err(|_| TimedOut)
+    }
+
+    /// Once its gate opened, wait until the trails opened before it completed closed
+    /// (`trails.rs`): what the runtime's threads held for the work it waited for is let go. At
+    /// most until `deadline` where one is given. A wait answered before the gate opened (a
+    /// deallocator's, as it releases what it retained) waits for none.
+    fn trailed(&self, deadline: Option<Instant>) -> Result<(), crate::trails::Ended> {
+        if !self.0.gate.is_open() {
+            return Ok(());
+        }
+        let mark = self.state().trail_mark;
+        self.0.device.shared().trails.wait_below(mark, deadline)
     }
 
     /// What a wait for completion answers on this thread.
@@ -2124,6 +2469,26 @@ impl CommandBufferShared {
                     .flat_map(|encoder| &encoder.sparse)
                     .any(SparseUpdate::needs_step),
             pipelines: segments().any(Segment::steps_after_pipelines),
+        }
+    }
+
+    /// Raise the makings of the pipelines batch `index`'s host step records, still being made,
+    /// to a queue's first held batch's (`budget::Urgency::Head`): the scheduler found the batch
+    /// first in its queue's line, every batch after it there waiting behind it. The makings are
+    /// read under the command buffer's lock and hastened with it released, as `commit` hastens
+    /// them.
+    pub(crate) fn hasten_head(&self, index: usize) {
+        let works: Vec<Deferred> = {
+            let state = lock(&self.state);
+            state.recorded[state.batch_range(index)]
+                .iter()
+                .flat_map(|encoder| &encoder.segments)
+                .filter(|segment| segment.steps_after_pipelines())
+                .map(|segment| segment.work.clone())
+                .collect()
+        };
+        for work in &works {
+            work.hasten(Urgency::Head);
         }
     }
 
@@ -2245,8 +2610,8 @@ impl CommandBufferShared {
 
     /// The host step's reading of batch `index`'s indirect sparse updates (`sparse/indirect.rs`),
     /// before its segments' steps: each is replaced, in its place, by the updates its arguments
-    /// state now. A refusal is kept for the batch's submission, which fails the command buffer with
-    /// it, and the rest stay unread.
+    /// state now, and held until the command buffer completes. A refusal is kept for the batch's
+    /// submission, which fails the command buffer with it, and the rest stay unread.
     fn read_mappings(self: &Arc<Self>, index: usize) {
         let device = &self.device;
         let unread: Vec<(usize, usize, SparseUpdate)> = {
@@ -2288,7 +2653,17 @@ impl CommandBufferShared {
             let mut state = lock(&self.state);
             match read {
                 Ok(updates) => {
-                    state.recorded[encoder].sparse.splice(at..at + 1, updates);
+                    // The update read goes to `retained`: its texture and buffer are held until
+                    // the command buffer completes, as Metal's command buffer holds what its
+                    // encoders were given, though its arguments map nothing; and it is released
+                    // outside this lock (the buffer's last release may run a deallocator).
+                    let read: Vec<SparseUpdate> = state.recorded[encoder]
+                        .sparse
+                        .splice(at..at + 1, updates)
+                        .collect();
+                    state
+                        .retained
+                        .extend(read.into_iter().map(|update| Box::new(update) as Box<_>));
                 }
                 Err(failure) => {
                     state.step_failure = Some(match failure {
@@ -2308,6 +2683,72 @@ impl CommandBufferShared {
         self.allocate(state, vk::CommandBufferLevel::PRIMARY)
     }
 
+    /// End `state`'s tail, if it has one ([`State::tail`]). Where its batch ended (before part
+    /// `joined`, which just ended, or at the commit, `joined` `None`) and may end there
+    /// ([`State::may_fold`]), the batch's end goes into it first, as `submit.rs` would record it
+    /// in a command buffer of its own: the barrier to the host, then, at the commit of a timed
+    /// command buffer whose last batch it ends, the end timestamp. Elsewhere it ends as it is.
+    /// A failure to end it abandons the command buffer as an encoder's does (`encoder.rs`); at
+    /// the commit, it fails the command buffer's first submission, before any batch goes to the
+    /// queue.
+    fn close_tail(&self, state: &mut State, joined: Option<usize>) {
+        let Some(raw) = state.tail.take() else {
+            return;
+        };
+        let part = joined.unwrap_or(state.recorded.len()).saturating_sub(1);
+        let batch = state.batch_of(part);
+        let ended = joined.is_none_or(|joined| state.batch_of(joined) != batch);
+        let fold = ended && state.may_fold(&self.device, batch);
+        let last = joined.is_none() && batch + 1 == state.batches.all().len();
+        let stamp = match (fold && last, &state.times.slot) {
+            (true, Some(slot)) => Some((slot.queries(), slot.first())),
+            _ => None,
+        };
+        let device = self.device.shared().vk();
+        if fold {
+            // SAFETY: the tail is recording, outside any render pass (its encoder's passes began
+            // and ended in its own recordings), and only this call records it, under the state
+            // lock; the slot's queries were reset by the batch's start, before it in submission
+            // order (`submit.rs`).
+            unsafe {
+                crate::batch_order::end(self.device.shared().by_ends).record(device, raw);
+                if let Some((queries, first)) = stamp {
+                    let bottom = vk::PipelineStageFlags::BOTTOM_OF_PIPE;
+                    device.cmd_write_timestamp(raw, bottom, queries, first + 1);
+                }
+            }
+        }
+        // SAFETY: as above.
+        match unsafe { self.end_raw(raw) } {
+            Ok(()) if fold => state.folds.push(Fold {
+                batch,
+                raw,
+                stamped: stamp.is_some(),
+            }),
+            Ok(()) => {}
+            Err(_) if joined.is_some() => state.abandoned = true,
+            Err(error) => {
+                let error = recording_error(&self.device, vulkan(error));
+                state.step_failure.get_or_insert(error);
+            }
+        }
+    }
+
+    /// End `raw`, a `VkCommandBuffer` of its pool, counted where it ended: its pool goes back to
+    /// the device's spares unreset only where every one the pool handed out ended (`spares.rs`).
+    ///
+    /// # Safety
+    /// As [`CommandBuffer::end_raw`].
+    unsafe fn end_raw(&self, raw: vk::CommandBuffer) -> Result<(), vk::Result> {
+        // SAFETY: the caller's.
+        let ended = unsafe { self.device.shared().vk().end_command_buffer(raw) };
+        // A deferred one is none of its pool's: its replay ends its own (`recorder`).
+        if ended.is_ok() && !recorder::is_deferred(raw) {
+            self.raws_ended.fetch_add(1, Ordering::Relaxed);
+        }
+        ended
+    }
+
     /// Give a command buffer without a pool yet (one that encoded nothing) a spare pool of the
     /// device's where one is free, on the committing thread: its submissions, which record its
     /// barriers inside sections where no spare is taken, then make no `VkCommandPool` of their
@@ -2324,15 +2765,83 @@ impl CommandBufferShared {
         }
     }
 
+    /// An encoder's command buffer of `level`: where the device records them so, a deferred one
+    /// of its replays, which take a spare pool of the device's for their replays as the first is
+    /// made (outside a section, where a spare is taken; else the first replay makes one);
+    /// elsewhere, or once every deferred handle is live, one from this command buffer's pool
+    /// ([`allocate`](Self::allocate)).
+    fn allocate_deferred(
+        &self,
+        state: &mut State,
+        level: vk::CommandBufferLevel,
+    ) -> Result<vk::CommandBuffer, Error> {
+        match self.deferred(state, level)? {
+            Some(raw) => Ok(raw),
+            None => self.allocate(state, level),
+        }
+    }
+
+    /// A deferred command buffer of `level` of its replays, where the device records them so and
+    /// a handle is free (`recorder`); `None` elsewhere.
+    fn deferred(
+        &self,
+        state: &mut State,
+        level: vk::CommandBufferLevel,
+    ) -> Result<Option<vk::CommandBuffer>, Error> {
+        let shared = self.device.shared();
+        let Some(recorder) = shared.recorder() else {
+            return Ok(None);
+        };
+        if state.replays.is_none() {
+            let family = shared.queue_family_of(self.queue.vk_queue());
+            let spare = shared.spares.command_pool(shared, family)?;
+            state.replays = Some(recorder.replays(family, spare));
+        }
+        let raw = (state.replays.as_ref()).and_then(|replays| replays.make(level));
+        if raw.is_some() {
+            shared.counts.command_buffer_deferred();
+        }
+        Ok(raw)
+    }
+
     /// A `VkCommandBuffer` of `level` from this command buffer's pool, made on first use: a
-    /// spare of the device's, reset, or a new one. A command buffer the pool made before it was
-    /// reset is handed out again before a new one is made. The caller holds `state` (the pool is
-    /// externally synchronized).
+    /// spare of the device's, or a new one. A command buffer the pool made before this command
+    /// buffer took it is handed out again before a new one is made; its begin resets it (the
+    /// pool's `VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`, `spares.rs`). The caller holds
+    /// `state` (the pool is externally synchronized).
     fn allocate(
         &self,
         state: &mut State,
         level: vk::CommandBufferLevel,
     ) -> Result<vk::CommandBuffer, Error> {
+        let pool = self.pool(state)?;
+        if let Some(buffer) = pool.reuse(level) {
+            return Ok(buffer);
+        }
+        let info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool.raw)
+            .level(level)
+            .command_buffer_count(1);
+        let buffer = self.device.allocate_command_buffers(&info)?[0];
+        pool.made(level, buffer);
+        Ok(buffer)
+    }
+
+    /// [`CommandBuffer::encoder_primary`]: a deferred one where the device records them so, to
+    /// begin, whose replay takes the primary its replays' pool holds begun ahead (`recorder`).
+    fn encoder_primary(&self, state: &mut State) -> Result<(vk::CommandBuffer, bool), Error> {
+        if let Some(raw) = self.deferred(state, vk::CommandBufferLevel::PRIMARY)? {
+            return Ok((raw, false));
+        }
+        if let Some(buffer) = self.pool(state)?.take_begun() {
+            return Ok((buffer, true));
+        }
+        Ok((self.allocate_raw(state)?, false))
+    }
+
+    /// This command buffer's pool, taken on first use: a spare of the device's, or a new one.
+    /// The caller holds `state` (the pool is externally synchronized).
+    fn pool<'a>(&self, state: &'a mut State) -> Result<&'a mut CommandPool, Error> {
         let device = &self.device;
         let raw = device.shared().vk();
         if state.pool.is_none() {
@@ -2344,8 +2853,12 @@ impl CommandBufferShared {
             {
                 Some(spare) => spare,
                 None => {
+                    // Its command buffers are reset as they are begun again (`spares.rs`).
                     let info = vk::CommandPoolCreateInfo::default()
-                        .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                        .flags(
+                            vk::CommandPoolCreateFlags::TRANSIENT
+                                | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                        )
                         .queue_family_index(family);
                     // SAFETY: the device is live and `info` valid.
                     let pool = unsafe { raw.create_command_pool(&info, None) };
@@ -2356,25 +2869,16 @@ impl CommandBufferShared {
             };
             state.pool = Some(pool);
         }
-        let Some(pool) = &mut state.pool else {
-            return Err(internal("a command buffer without its command pool"));
-        };
-        if let Some(buffer) = pool.reuse(level) {
-            return Ok(buffer);
-        }
-        let info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool.raw)
-            .level(level)
-            .command_buffer_count(1);
-        let buffer = device.allocate_command_buffers(&info)?[0];
-        pool.made(level, buffer);
-        Ok(buffer)
+        state
+            .pool
+            .as_mut()
+            .ok_or_else(|| internal("a command buffer without its command pool"))
     }
 
     /// Ready `state`'s times at its commit, on the program's thread: where the device writes
     /// timestamps, the slot of the device's timestamp pools the batches write its start and end
-    /// into, and the device's calibration pair. Without a slot free (and no pool more), it has
-    /// no timestamps. One
+    /// into. Without a slot free (and no pool more), it has no timestamps. Its calibration pair
+    /// is taken as it completes (`place_gpu_times`): no reading of the GPU's clock here. One
     /// that encoded nothing and waits for nothing, and every one where the device answers GPU
     /// times from the host, writes none (`gpu_time.rs`).
     fn time(&self, state: &mut State) {
@@ -2390,53 +2894,137 @@ impl CommandBufferShared {
             .any(|batch| !batch.waits.is_empty() || !batch.binary_waits.is_empty());
         if state.recorded.is_empty() && !waits {
             state.times.stamped = Stamped::NoWork;
+            state.times.slot = None;
             return;
         }
         if timing.answers_from_host() {
             state.times.stamped = Stamped::FromHost;
             return;
         }
-        // SAFETY: the device is live.
-        match unsafe { timing.slot(shared.vk()) } {
-            Some(slot) => {
-                shared.counts.timestamp_slot_taken();
-                state.times.slot = Some(slot);
-                state.times.pair = timing.pair();
-            }
-            None => state.times.stamped = Stamped::NoSlot,
+        if !self.take_slot(state) {
+            state.times.stamped = Stamped::NoSlot;
         }
     }
 
+    /// Whether `state` holds a slot of the device's timestamp pools: the one its first encoder
+    /// took as it opened, or one taken now; `false` where every slot is held and no pool more can
+    /// be made.
+    fn take_slot(&self, state: &mut State) -> bool {
+        if state.times.slot.is_some() {
+            return true;
+        }
+        let shared = self.device.shared();
+        // SAFETY: the device is live.
+        let Some(slot) = (unsafe { shared.timing.slot(shared.vk(), &shared.counts) }) else {
+            return false;
+        };
+        shared.counts.timestamp_slot_taken();
+        state.times.slot = Some(slot);
+        true
+    }
+
+    /// Where the device writes timestamps into slots of three queries and `raw`, just begun, is the
+    /// first `VkCommandBuffer` of the command buffer's first encoder, which opens its first batch:
+    /// take the slot now, and write the start into its third query as `raw`'s first commands, the
+    /// reset of the end and of that query (where the device does not reset the slot on the host as
+    /// it takes it), then the timestamp at the top of the pipe (the bottom where batches are
+    /// ordered by their ends: `batch_order.rs`; `gpu_time.rs`). The first batch's submission
+    /// decides which start is read (`submit.rs`).
+    fn open_start(&self, state: &mut State, raw: vk::CommandBuffer) {
+        let timing = &self.device.shared().timing;
+        let first_batch = match state.batches.all() {
+            [batch] => batch.signals.is_empty() && batch.binary_signals.is_empty(),
+            _ => false,
+        };
+        if !state.recorded.is_empty()
+            || !first_batch
+            || !timing.prefixed()
+            || timing.clock().is_none()
+            || timing.answers_from_host()
+            || !self.take_slot(state)
+        {
+            return;
+        }
+        let Some((queries, prefix)) = (state.times.slot.as_ref())
+            .and_then(|slot| slot.prefix().map(|prefix| (slot.queries(), prefix)))
+        else {
+            return;
+        };
+        let device = self.device.shared().vk();
+        // SAFETY: `raw` was just begun, under the state lock, outside any render pass, and only
+        // this call records it now; the end's query is the one before the prefix's, and both are
+        // reset before the timestamp is written, on the host as the slot was taken or here
+        // (`vkCmdResetQueryPool`: "sets the status of query indices [firstQuery, firstQuery +
+        // queryCount - 1] to unavailable").
+        unsafe {
+            if !timing.resets_on_host() {
+                device.cmd_reset_query_pool(raw, queries, prefix - 1, 2);
+                exit_guard::called(Call::CmdResetQueryPool);
+            }
+            let stage = crate::batch_order::start_stage(self.device.shared().by_ends);
+            device.cmd_write_timestamp(raw, stage, queries, prefix);
+            exit_guard::called(Call::CmdWriteTimestamp);
+        }
+        state.prefix = Some(raw);
+    }
+
     /// Read the command buffer's timestamps, now that its work completed, and give its slot
-    /// back: on the completion thread, inside its section.
+    /// back: in the completion turn, inside its section.
     pub(super) fn read_stamps(&self) {
         let mut state = lock(&self.state);
         let Some(slot) = state.times.slot.take() else {
             return;
         };
-        // Each query's value, then its availability.
-        let mut results = [[0u64; 2]; 2];
-        // SAFETY: the slot's two queries were written by work that completed; the results are
-        // 64-bit with availability, two words a query.
-        let read = unsafe {
-            self.device.shared().vk().get_query_pool_results(
-                slot.queries(),
-                slot.first(),
-                &mut results,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
-            )
+        // The start its first batch wrote: the prefix's where its first encoder wrote it alone,
+        // else the one before the barriers (`gpu_time.rs`); then the end, after the first start.
+        let start = match (state.times.prefixed, slot.prefix()) {
+            (true, Some(prefix)) => prefix,
+            _ => slot.first(),
         };
-        exit_guard::called(Call::GetQueryPoolResults);
-        let [[start, started], [end, ended]] = results;
-        state.times.stamped = match read {
-            Ok(()) | Err(vk::Result::NOT_READY) => {
-                Stamped::Read((started != 0 && ended != 0).then_some((start, end)))
+        let device = self.device.shared().vk();
+        // Each query's value, then its availability.
+        let read = |query: u32| {
+            let mut result = [[0u64; 2]; 1];
+            // SAFETY: the query was reset and written by work that completed; the result is
+            // 64-bit with availability, two words.
+            let read = unsafe {
+                device.get_query_pool_results(
+                    slot.queries(),
+                    query,
+                    &mut result,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+                )
+            };
+            exit_guard::called(Call::GetQueryPoolResults);
+            match read {
+                Ok(()) | Err(vk::Result::NOT_READY) => {
+                    let [[value, available]] = result;
+                    Ok((available != 0).then_some(value))
+                }
+                Err(error) => Err(error),
             }
+        };
+        let read = read(start).and_then(|start| Ok(start.zip(read(slot.first() + 1)?)));
+        state.times.stamped = match read {
+            Ok(both) => Stamped::Read(both),
             Err(error) => Stamped::Failed(error),
         };
     }
 
-    /// Place its GPU times among its queue's, now that it completed: on the completion thread,
+    /// Publish the state's status, and its error where it failed, for `status` and `error` to
+    /// read ([`CommandBufferShared::status`]), under the state's lock, so in the order of its
+    /// transitions: the error first, set once (only the completion fails it, and nothing
+    /// follows that), then the status.
+    fn answer(&self, state: &State) {
+        if let Some(error) = state.error {
+            // Set at most once: a second set would be of the same completion's error.
+            let _ = self.error.set(error);
+        }
+        self.status
+            .store(status_word(state.status), Ordering::Release);
+    }
+
+    /// Place its GPU times among its queue's, now that it completed: in the completion turn,
     /// after its timestamps were read, in its queue's order (`gpu_time.rs`). One that wrote no
     /// timestamps takes its times here: encoder-less, where its queue reached it; answered from
     /// the host, its kernel end (or its queue's latest end) and its completion. Every one moves
@@ -2446,8 +3034,13 @@ impl CommandBufferShared {
         let shared = self.device.shared();
         let mut state = lock(&self.state);
         let times = &mut state.times;
+        // The device's calibration pair, taken now, where the GPU that ran the work is awake
+        // (`gpu_time.rs`).
+        if let Stamped::Read(Some(_)) = times.stamped {
+            times.pair = shared.timing.pair(&shared.counts);
+        }
         self.queue.place_gpu_times(|latest_end| {
-            let (kernel_end, completed) = (times.kernel_end, times.completed);
+            let (kernel_end, completed) = (self.kernel.end(), times.completed);
             match times.stamped {
                 Stamped::NoWork => {
                     let at = kernel_end.max(latest_end);
@@ -2462,7 +3055,14 @@ impl CommandBufferShared {
                     end
                 }
                 Stamped::Read(Some((start, end))) => match shared.timing.clock() {
-                    Some(clock) => clock.span(times.pair, start, end, completed).1,
+                    Some(clock) => {
+                        let ((_, end), placement) =
+                            clock.span(times.pair, start, end, life(&self.kernel, times));
+                        if let Placement::Disagreed { .. } = placement {
+                            shared.counts.calibration_disagreed();
+                        }
+                        end
+                    }
                     None => completed,
                 },
                 Stamped::Unread | Stamped::NoSlot | Stamped::Read(None) | Stamped::Failed(_) => {
@@ -2472,11 +3072,11 @@ impl CommandBufferShared {
         });
     }
 
-    /// The scheduler submitted the last batch: in the queue's context, once the submitting
-    /// thread ran its submission handlers, become `Scheduled`, then run the scheduled handlers on
+    /// The scheduler submitted the last batch, or held it in a group (`group.rs`): in the queue's
+    /// context, once the submitting thread ran its submission handlers, become `Scheduled`, then run the scheduled handlers on
     /// this thread, in the order added, then let `wait_until_scheduled` return. Metal's status
     /// reads `Scheduled` just before its first scheduled handler starts, and its wait returns
-    /// once the last returned (EV SUB-sched1-m4: an M4, macOS 27.0.1).
+    /// once the last returned (an M4, macOS 27.0.1).
     fn run_scheduled(self: &Arc<Self>) {
         {
             let mut state = lock(&self.state);
@@ -2486,13 +3086,16 @@ impl CommandBufferShared {
                 if exit_guard::closed() {
                     return;
                 }
+                state.parked += 1;
                 state = self
                     .changed
                     .wait_timeout(state, exit_guard::WAKE)
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .0;
+                state.parked -= 1;
             }
             state.status = CommandBufferStatus::Scheduled;
+            self.answer(&state);
         }
         let buffer = CommandBuffer(Arc::clone(self));
         {
@@ -2505,13 +3108,28 @@ impl CommandBufferShared {
             }
         }
         drop(buffer);
-        lock(&self.state).scheduled_ran = true;
-        self.changed.notify_all();
+        let parked = {
+            let mut state = lock(&self.state);
+            state.scheduled_ran = true;
+            state.parked > 0
+        };
+        self.wake_parked(parked);
     }
 
-    /// Its last batch was submitted on this thread, which holds no lock of the runtime's: run
-    /// its submission handlers here, in the order added, then let its transition to `Scheduled`
-    /// run ([`CommandBuffer::add_submission_handler`]).
+    /// Wake the threads sleeping on `changed`, where `parked` (read under the state's lock the
+    /// change was made under) says one does: a thread that sleeps later looks at the change
+    /// first, and a notify is a system call, sleeper or not. Counted:
+    /// `WorkCounts::wakes_command_buffer_waiters`, `WorkCounts::wakes_spared`.
+    fn wake_parked(&self, parked: bool) {
+        self.device.shared().counts.command_buffer_wake(parked);
+        if parked {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Its last batch was submitted, or held in a group, on this thread, which holds no lock of
+    /// the runtime's: run its submission handlers here, in the order added, then let its
+    /// transition to `Scheduled` run ([`CommandBuffer::add_submission_handler`]).
     pub(crate) fn run_submission_handlers(self: &Arc<Self>) {
         let buffer = CommandBuffer(Arc::clone(self));
         {
@@ -2524,8 +3142,12 @@ impl CommandBufferShared {
             }
         }
         drop(buffer);
-        lock(&self.state).submitting = false;
-        self.changed.notify_all();
+        let parked = {
+            let mut state = lock(&self.state);
+            state.submitting = false;
+            state.parked > 0
+        };
+        self.wake_parked(parked);
     }
 
     /// A batch could not be submitted (the scheduler dropped the rest): the command buffer
@@ -2533,7 +3155,9 @@ impl CommandBufferShared {
     /// submitted value in `values`, and, where a command buffer ends at a fence
     /// ([`fences::ends_at_fence`]), at one submitted after it, as a command buffer whose last
     /// batch was submitted finishes; at the value alone when the queue takes no such fence (a
-    /// lost device). Its submission and scheduled handlers never run; they are dropped with it.
+    /// lost device). Its submission and scheduled handlers never run; they are dropped with it,
+    /// unless it became `Scheduled` as its last batch was held in a group (`group.rs`), which
+    /// then fails from `Scheduled`.
     pub(crate) fn failed(self: &Arc<Self>, error: CommandBufferError, values: &[u64]) {
         let vk_queue = self.queue.vk_queue();
         lock(&self.state).failure = Some(error);
@@ -2564,10 +3188,12 @@ impl CommandBufferShared {
         // SAFETY: a submission of no batch with an unsignaled fence in no pending submission;
         // the `VkQueue` is used under its lock.
         shared.counts.queue_submitted(0);
-        let submitted =
-            shared.submit_logged(queue, Some(fence), &self.relayed, |vk_queue| unsafe {
-                raw.queue_submit(vk_queue, &[], fence)
-            });
+        let submitted = shared.submit_logged(
+            (queue, None),
+            Some(fence),
+            &self.relayed,
+            |vk_queue| unsafe { raw.queue_submit(vk_queue, &[], fence) },
+        );
         exit_guard::called(Call::QueueSubmit);
         match submitted {
             Ok(()) => Some(fence),
@@ -2580,13 +3206,29 @@ impl CommandBufferShared {
         }
     }
 
-    /// The command buffer's last batch is submitted: post its transition to `Scheduled` to its
-    /// queue's context.
-    pub(crate) fn post_scheduled(self: &Arc<Self>) {
-        self.post(Transition {
+    /// The command buffer's last batch is submitted, or held in a group (`group.rs`), on the
+    /// scheduler's thread under its lock: its transition to `Scheduled` runs here where it is [`plain`](Transition::plain) (it has no
+    /// scheduled handler, none is added after the commit, and it waits for no submission handler)
+    /// and its queue's context runs on no thread and holds nothing (`Contexts::run_alone`): its
+    /// status reads `Scheduled`, and `wait_until_scheduled` returns, as its last batch goes, with
+    /// no handler thread woken for it. Else it is posted to that context. The scheduler's own
+    /// holds of the command buffer outlive the transition's, so it never lets go of the last one
+    /// here. Counted: `WorkCounts::scheduled_where_submitted`.
+    pub(crate) fn schedule(self: &Arc<Self>) {
+        let plain = {
+            let state = lock(&self.state);
+            state.scheduled.is_empty() && !state.submitting
+        };
+        let shared = self.device.shared();
+        let item = Item::Transition(Transition {
             buffer: self.hold(),
             to: To::Scheduled,
+            plain,
         });
+        match shared.contexts.run_alone(self.queue.id(), item) {
+            Ok(()) => shared.counts.scheduled_where_submitted(),
+            Err(item) => shared.contexts.post(self.queue.id(), item),
+        }
     }
 
     /// The last batch of the command buffer `buffer` holds finished with `result` (or a batch
@@ -2600,32 +3242,63 @@ impl CommandBufferShared {
         let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
         contexts.post(
             queue,
-            Transition {
-                buffer,
-                to: To::Finished(result),
-            },
+            Item::Transition(Transition::finished(buffer, result)),
         );
     }
 
-    /// Append `transition` to this command buffer's queue's context.
-    fn post(&self, transition: Transition) {
-        self.device
-            .shared()
-            .contexts
-            .post(self.queue.id(), transition);
+    /// The last batch of the command buffer `buffer` holds finished with `result`, as the queue
+    /// waiter on this thread saw: its transition to `Completed` or `Error` runs here, where it is
+    /// [`plain`](Transition::plain), its queue's context runs on no thread and holds only plain
+    /// items, which run here before it (`Contexts::run_here`), and the runtime holds none of the
+    /// program's objects a release drops or runs (`program_objects.rs`), so its release runs none
+    /// of the program's code. A thread waiting for it is then woken from here, as Metal's
+    /// completion wakes it, with no handler thread woken between. Else it is posted, as
+    /// [`post_finished`](Self::post_finished) posts it.
+    ///
+    /// The waiter takes no handle of the device here, and lets each transition's hold go short of
+    /// its command buffer's last reference ([`Transition::run`]): the device's last handle never
+    /// goes here, and none is left here once the gate opens.
+    pub(crate) fn finish_here(
+        buffer: Hold<CommandBufferShared>,
+        result: Result<(), CommandBufferError>,
+    ) {
+        let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
+        let item = Item::Transition(Transition::finished(buffer, result));
+        let item = match program_objects::Unheld::enter() {
+            Some(unheld) => {
+                let ran = contexts.run_here(queue, item);
+                drop(unheld);
+                match ran {
+                    Ok(()) => return,
+                    Err(item) => item,
+                }
+            }
+            None => item,
+        };
+        contexts.post(queue, item);
     }
 
-    /// Finish the command buffer with `result` (or the failure of a batch): set its status,
-    /// decode its status words, release its uploads, run its completed handlers on this thread,
-    /// release what it retained, then open its gate, which releases its waiters once the
-    /// transition's [`Hold`] (and every other) is gone. Waits from inside these steps answer as
-    /// [`own`] says.
+    /// Finish the command buffer with `result` (or the failure of a batch): take the device's
+    /// trail mark (`trails.rs`), set its status, decode its status words, release its uploads,
+    /// run its completed handlers on this thread, give its queue's slot back, release what it
+    /// retained and its encoders' logs, then open its gate, which releases its waiters once the
+    /// transition's [`Hold`] (and every other) is gone, and they wait for the trails below the
+    /// mark. Waits from inside these steps answer as [`own`] says.
     fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
         // A capture replay found a primitive whose reach was not measured: its pass rewrote
         // every tile, announced once the lock is let go (below).
         let mut unmeasured_reach = false;
+        // A thread sleeps on `changed`, as the state's lock below reads.
+        let parked;
+        // Its command pool, where it settled, whose primary the device's spares begin ahead once
+        // its completed handlers ran (below).
+        let mut settled_pool = None;
         {
             let mut state = lock(&self.state);
+            // Every trail of the work it waited for (a pipeline's making, a twin's decode) was
+            // opened before its batches went, so before now: its waiters wait for those to close
+            // (`trails.rs`).
+            state.trail_mark = self.device.shared().trails.mark();
             // A failure the driver relayed for one of its batches is Metal's answer for its work
             // (`device/relay.rs`).
             let result = match (state.failure, self.relayed.failure()) {
@@ -2682,6 +3355,19 @@ impl CommandBufferShared {
                             },
                         ));
                     }
+                    // A scanned emulated tessellation draw drew nothing of records the same pool
+                    // could not hold (`render/tessellation_scan.rs`): the command buffer failed.
+                    if let Some(fault) = report.tessellation_records_overflow {
+                        let budget = state.mesh_pool.as_ref().map_or(0, PoolLease::bytes);
+                        state.status = CommandBufferStatus::Error;
+                        state.error = Some(CommandBufferError::TessellationRecordsOverflow(
+                            TessellationRecordsOverflow {
+                                draw: fault.draw,
+                                records: fault.records,
+                                budget,
+                            },
+                        ));
+                    }
                     // A function that read an argument its function constants removed took zero
                     // for it, Metal's answer under its debug layer: the command buffer completes,
                     // and its report states the read. A function sampled through a cubic sampler an
@@ -2709,6 +3395,9 @@ impl CommandBufferShared {
                     state.error = Some(error);
                 }
             }
+            // The final status, with its error, once: a read sees no `Completed` that a decoded
+            // failure turns to `Error`.
+            self.answer(&state);
             state.status_words = None;
             state.capture_tallies.clear();
             state.index_pool = None;
@@ -2723,7 +3412,25 @@ impl CommandBufferShared {
             // buffer that completed gives back its descriptor pools too, one that failed releases
             // them here.
             if let Some(pool) = state.pool.take() {
-                self.device.shared().spares.give_command_pool(pool);
+                // None of the pool's command buffers is recording where it completed and ended
+                // every one the pool handed out: a recording it left unused leaves one so.
+                let ended = self.raws_ended.load(Ordering::Relaxed);
+                let settled = state.status == CommandBufferStatus::Completed
+                    && u64::try_from(pool.handed_out()).is_ok_and(|handed| handed == ended);
+                settled_pool = settled.then_some(pool.raw);
+                let shared = self.device.shared();
+                shared.spares.give_command_pool(shared, pool, settled);
+            }
+            // Its replays end, any in progress first, and replay nothing more; their pool goes
+            // back as its own does, and holds the primary begun ahead in its place: its encoders'
+            // primaries came from it, and only their replays take that primary (`recorder`).
+            if let Some(replays) = state.replays.take() {
+                let completed = state.status == CommandBufferStatus::Completed;
+                if let Some((pool, settled)) = replays.release(completed) {
+                    settled_pool = settled.then_some(pool.raw);
+                    let shared = self.device.shared();
+                    shared.spares.give_command_pool(shared, pool, settled);
+                }
             }
             if state.status == CommandBufferStatus::Completed {
                 state.descriptors.give_back();
@@ -2731,8 +3438,9 @@ impl CommandBufferShared {
                 state.descriptors.release();
             }
             state.unplaced();
+            parked = state.parked > 0;
         }
-        self.changed.notify_all();
+        self.wake_parked(parked);
         if unmeasured_reach {
             self.device
                 .degrade(Degradation::UnreachedTilesRewritten, || {
@@ -2757,17 +3465,51 @@ impl CommandBufferShared {
                 exit_guard::program(|| handler(&buffer));
             }
         }
+        let handled = Instant::now();
         drop(buffer);
+        // Its queue's slot comes back as its last completed handler returns, as Metal's does: a
+        // make blocked on its full queue returns then, never while a completed handler runs, nor
+        // from one on its own full queue, and does not wait for what the commands used to be
+        // released below (a no-copy buffer's deallocator may run long there); a make after
+        // `wait_until_completed` returned never blocks (probe `slotdealloc`:
+        // `queue.rs`).
+        let slot = lock(&self.state).slot.take();
+        drop(slot);
+        let nanos = u64::try_from(handled.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.device.shared().counts.slot_returned(nanos);
         // What the commands used goes after the completed handlers, as Metal releases it (a
         // no-copy buffer's deallocator runs after them), and before the gate opens, so a waiter
         // returns after it. Each leaves under the lock and drops without it.
         {
             let _running = Running::enter(self.marker(Step::Release));
+            // Its live buffers' tables first: a buffer whose last hold goes below then counts
+            // only the tables of other command buffers, which may still reach its pages, as
+            // holding them past its release (`HostPages::released_listed`); this one's wait ends
+            // here, at its completion, where Metal's hold of what it retained ends too.
+            let resident = lock(&self.state).resident.take();
+            drop(resident);
+            loop {
+                let Some(table) = lock(&self.state).stepped_tables.pop() else {
+                    break;
+                };
+                drop(table);
+            }
             loop {
                 let Some(resource) = lock(&self.state).retained.pop() else {
                     break;
                 };
                 drop(resource);
+            }
+            // Its encoders' logs go here too, back to the device's spares (`replay.rs`): they
+            // hold what their calls named, which Metal holds until the command buffer completed
+            // (a binding replaced before any command among it), and no thread but this one may
+            // hold such a handle past the completion.
+            let logs: Vec<Arc<Replay>> = (lock(&self.state).ended.iter_mut())
+                .filter_map(|record| record.replay.take())
+                .collect();
+            let spares = self.device.shared().scheduler.spare_logs();
+            for log in logs {
+                spares.give_last(log);
             }
             let residency = lock(&self.state).residency.take();
             drop(residency);
@@ -2775,15 +3517,16 @@ impl CommandBufferShared {
             drop(residencies);
             let check = lock(&self.state).check.take();
             drop(check);
-            let resident = lock(&self.state).resident.take();
-            drop(resident);
         }
-        // Its queue's slot comes back after the completed handlers, as Metal's does: a completed
-        // handler's make on its full queue never returns there, and a make after
-        // `wait_until_completed` returned never blocks (RT10-qlprobe3).
-        let slot = lock(&self.state).slot.take();
-        drop(slot);
         self.gate.finish();
+        // Its pool's primary begun ahead, where no command buffer took the pool since
+        // (`spares.rs`), and no thread waits for the gate, which opens only once this
+        // transition's hold goes: a waiter's return is never delayed by the begin, but for one
+        // that came after this check.
+        if let Some(pool) = settled_pool.filter(|_| !self.gate.awaited()) {
+            let shared = self.device.shared();
+            shared.spares.begin_ahead(shared, pool);
+        }
     }
 }
 
@@ -2823,6 +3566,9 @@ pub(crate) struct Transition {
     /// The command buffer, held until the transition ran.
     buffer: Hold<CommandBufferShared>,
     to: To,
+    /// It runs none of the program's code but what a release of the program's objects runs
+    /// (`program_objects.rs`): no handler and no notice.
+    plain: bool,
 }
 
 /// The status a transition goes to.
@@ -2832,18 +3578,77 @@ enum To {
     Finished(Result<(), CommandBufferError>),
 }
 
-impl Run for Transition {
+impl Transition {
+    /// The transition of the command buffer `buffer` holds to `Completed` or `Error`, with
+    /// `result`: plain where it has no completed handler (none is added after the commit) and no
+    /// pass that captured its tiles' reach, the one notice it announces as it completes
+    /// (`render/capture.rs`).
+    fn finished(buffer: Hold<CommandBufferShared>, result: Result<(), CommandBufferError>) -> Self {
+        let plain = {
+            let state = lock(&buffer.state);
+            state.completed.is_empty() && state.capture_tallies.is_empty()
+        };
+        Transition {
+            buffer,
+            to: To::Finished(result),
+            plain,
+        }
+    }
+
     fn run(self) {
+        let on_handler_thread = contexts::on_handler_thread();
         match self.to {
             To::Scheduled => self.buffer.run_scheduled(),
-            To::Finished(result) => self.buffer.complete(result),
+            To::Finished(result) => {
+                if !on_handler_thread {
+                    self.buffer.device.shared().counts.completed_where_seen();
+                }
+                self.buffer.complete(result);
+            }
         }
-        // The hold goes here, after the transition: the gate opens then.
+        // The hold goes here, after the transition: the gate opens then. On a queue's waiter
+        // (`CommandBufferShared::finish_here`) it goes short of the command buffer's last
+        // reference, which holds the device: that last one goes on a handler thread, so the
+        // device's teardown, which stops the waiters, never runs on one, and the waiter holds
+        // nothing of the device once the gate opened, so a program's drop after its wait is the
+        // device's last.
+        if !on_handler_thread {
+            if let Some(last) = self.buffer.let_go_short_of_last() {
+                let (contexts, context) = last.device.elsewhere();
+                contexts.post(context, Item::Release(Box::new(last)));
+            }
+        }
+    }
+}
+
+/// An item of the device's handler threads (`contexts`).
+pub(crate) enum Item {
+    /// A command buffer's transition, in its queue's context.
+    Transition(Transition),
+    /// What a thread that may run none of the program's code let go of, dropped in a context of
+    /// its own (`Device::let_go_elsewhere`): it holds no command buffer, so nothing waits for it
+    /// and it waits for nothing.
+    Release(Box<dyn Send>),
+}
+
+impl Run for Item {
+    fn run(self) {
+        match self {
+            Item::Transition(transition) => transition.run(),
+            Item::Release(held) => drop(held),
+        }
+    }
+
+    fn plain(&self) -> bool {
+        match self {
+            Item::Transition(transition) => transition.plain,
+            Item::Release(_) => false,
+        }
     }
 }
 
 /// Whether `wait_until_scheduled` returns: the command buffer's scheduled handlers ran (Metal's
-/// wait returns only then, EV SUB-sched1-m4), or it finished, or failed without being scheduled.
+/// wait returns only then), or it finished, or failed without being scheduled.
 fn scheduled(state: &State) -> bool {
     state.scheduled_ran
         || matches!(
@@ -2898,5 +3703,14 @@ fn submission_error(device: &Device, error: vk::Result) -> CommandBufferError {
         Error::DeviceLost => CommandBufferError::DeviceLost,
         Error::OutOfMemory(_) => CommandBufferError::OutOfMemory,
         _ => CommandBufferError::Internal(super::error::VkResultCode(error.as_raw())),
+    }
+}
+
+/// The life of the command buffer whose kernel times are `kernel` and other times `times`, as its
+/// timestamps are checked against it (`gpu_time.rs`, `GpuClock::span`).
+fn life(kernel: &KernelTimes, times: &Times) -> Life {
+    Life {
+        kernel_start: kernel.start(),
+        completed: times.completed,
     }
 }

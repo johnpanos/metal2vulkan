@@ -19,7 +19,13 @@
 //!   thread, without its own lock or the command buffer's, it then runs the check of each
 //!   submission that begins in the batch, and again of each that a host step of the batch
 //!   recorded commands for (what they reach is known only then), then submits the batch in its
-//!   order.
+//!   order. Where the scheduler groups batches (`CompletionPolicy::Grouped` on a driver that
+//!   merges submissions, `group.rs`), it runs the checks of up to three batches right behind a
+//!   head that goes with the head's, in commit order, each once its batch is otherwise ready and
+//!   its events' values reached on the device or by the host, none committed after another
+//!   queue's batch: so they go to the driver together. Such a check runs before the previous
+//!   batch's `vkQueueSubmit`, in the pass that submits its own batch, where alone it runs after
+//!   it. `CompletionPolicy::Exact` checks each head alone.
 //! - **Stricter than Metal: the re-check after a host step.** Metal checks a submission once,
 //!   with what it knows as it submits it, and cannot know what the commands the GPU writes into
 //!   an indirect command buffer reach before they run (an earlier encoder of the same submission
@@ -51,12 +57,9 @@ use std::sync::Arc;
 /// whose memory was taken away, as Metal fails it).
 ///
 /// It runs with no lock of the runtime's held, and holds back the scheduler thread's submissions
-/// while it runs. A commit made meanwhile has its ready batches submitted, by itself or by the
-/// pass of another commit's thread it finds under way; where that pass is the last that thread
-/// makes for others, which leaves what it is left to the scheduler's thread
-/// (`scheduler/inbox.rs`), they wait for this check to end, unless a later commit takes them in
-/// first. It must not wait for GPU work, a command buffer or a handler, and should be quick. It
-/// may call the runtime otherwise.
+/// while it runs: a commit made meanwhile returns at once, and its batches wait in the inbox for
+/// the thread's next pass, after this check (`scheduler/inbox.rs`). It must not wait for GPU work,
+/// a command buffer or a handler, and should be quick. It may call the runtime otherwise.
 pub type SubmissionCheck = Arc<dyn Fn(&Submission<'_>) -> Option<NonZeroU64> + Send + Sync>;
 
 /// The `MTLCommandBufferError` code a submission whose check panicked fails with: `Internal`.

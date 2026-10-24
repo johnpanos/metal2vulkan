@@ -16,11 +16,12 @@
 //!   (`Tables::region_record`) in its `ReplayRegionAddress` hole.
 //! - **Textures** a slot binds take the `VkImageView` the plan's view asks for (the texture's,
 //!   made at its first bind, `binding_view.rs`), in the `GENERAL` layout every runtime image
-//!   rests in. **Samplers** take the `VkSampler` of their state for the write's use and the
-//!   bind's LOD clamps (`bind::sampler_desc`, `sampler.rs`), its address modes mapped where the
-//!   slot samples a texture of an address-mode map (`address_map.rs`); a combined write checks the
-//!   view format's filtering against it. A slot with nothing bound takes the device's neutral image
-//!   or sampler (`neutral.rs`).
+//!   rests in; a draw's sampled binding of a texture its render pass instance renders takes the
+//!   texture's copy (`texture/attached_reads.rs`). **Samplers** take the `VkSampler` of their
+//!   state for the write's use and the bind's LOD clamps (`bind::sampler_desc`, `sampler.rs`), its
+//!   address modes mapped where the slot samples a texture of an address-mode map
+//!   (`address_map.rs`); a combined write checks the view format's filtering against it. A slot
+//!   with nothing bound takes the device's neutral image or sampler (`neutral.rs`).
 //! - **Texture buffers** a slot binds take a texel buffer view of their buffer's bytes in the
 //!   format the plan names, over the range it gives (`buffer_texture.rs`); an unbound slot takes
 //!   the device's neutral texel buffer.
@@ -48,15 +49,17 @@ use super::address_map::SamplerMaps;
 use super::argument_table::{ArgumentTable, InlineBytes};
 use super::buffer::Buffer;
 use super::command_buffer::{NotedTable, State};
+use super::device::lock;
 use super::error::{internal, Error, RuntimeGap};
 use super::function_table::{self, TableSnapshot, VisibleFunctionTable};
 use super::heap_sets::{Keeper, TextureTable, HEAP_SET};
+use super::key_hash::KeyMap;
 use super::render_pass::{PassLayout, Target};
 use super::render_target;
 use super::residency::{Residency, Used};
 use super::resource::ResourceKey;
 use super::sampler::{OwnedSampler, SamplerState};
-use super::texture::Texture;
+use super::texture::{Texture, TextureShared};
 use super::tracker::{Access, Use, UseRange};
 use super::upload::Upload;
 use super::Device;
@@ -67,12 +70,12 @@ use metal2vulkan::bind::{
     NeutralResource, PushConstantWrite, PushHole, ResourceUse, RootTable, SamplerDescriptor,
     SamplerSource, UseTarget, ViewSetup, WriteSource,
 };
-use metal2vulkan::metal::sampler::OpaqueBlackBorder;
+use metal2vulkan::metal::sampler::{OpaqueBlackBorder, SamplerUse};
 use metal2vulkan::pipeline::{HandleClass, SlotClass, SlotRef, Stage, StorageAttachmentView};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 /// What an encoder binds: each stage's argument table.
 pub(super) struct Tables<'a> {
@@ -82,6 +85,10 @@ pub(super) struct Tables<'a> {
     /// A render encoder's pass, whose attachments a draw's input and storage attachments read,
     /// and the draw's views of its layers (`render_target::viewed`).
     pass: Option<(&'a PassLayout, ViewSetup)>,
+    /// A draw's render pass instance's attachments: a sampled slot binding of a texture that
+    /// presents one of its color attachments takes the texture's copy
+    /// (`texture/attached_reads.rs`).
+    attached: Option<&'a PassLayout>,
     /// The sampler states the bind state lists as argument samplers, in its order.
     argument_samplers: &'a [SamplerState],
     /// Where the plan's heap writes go, when the command writes a heap.
@@ -128,6 +135,19 @@ pub(super) struct Tables<'a> {
     /// first index where it is indexed. Its `PushHole::CaptureAddress` and
     /// `PushHole::CaptureIndexAddress` take them.
     capture: Option<(u64, Option<u64>)>,
+    /// A de-indexed draw's first index's address (`VariantKey::primitive_id_indices`): its
+    /// `PushHole::CaptureIndexAddress` takes it.
+    indices: Option<u64>,
+    /// A draw's slots read through snapshots (`render/snapshot.rs`): each binds its own texture,
+    /// not a copy, in the feedback loop layout, and its snapshot at `WriteSource::SnapshotTexels`.
+    snapshots: Option<&'a SnapshotViews>,
+}
+
+/// The fragment texture slots a draw reads through snapshots, and the storage view of each one's
+/// snapshot (`render/snapshot.rs`, `Texture::snapshot_texels`).
+pub(super) struct SnapshotViews {
+    pub(super) slots: BTreeSet<u32>,
+    pub(super) views: Vec<(u32, vk::ImageView)>,
 }
 
 impl<'a> Tables<'a> {
@@ -137,6 +157,7 @@ impl<'a> Tables<'a> {
             stages,
             residency: None,
             pass: None,
+            attached: None,
             argument_samplers: &[],
             heap: None,
             texture_table: None,
@@ -153,7 +174,28 @@ impl<'a> Tables<'a> {
             tile_memory: None,
             sampler_maps: SamplerMaps::default(),
             capture: None,
+            indices: None,
+            snapshots: None,
         }
+    }
+
+    /// The tables, with a draw's slots read through snapshots and their snapshots' views
+    /// (`render/snapshot.rs`).
+    pub(super) fn with_snapshots(self, snapshots: &'a SnapshotViews) -> Tables<'a> {
+        Tables {
+            snapshots: Some(snapshots),
+            ..self
+        }
+    }
+
+    /// Whether `slot` is one a draw reads through a snapshot: its binding takes the texture
+    /// itself, in the feedback loop layout, never its copy.
+    fn snapshot_slot(&self, slot: SlotRef) -> bool {
+        slot.stage == Stage::Fragment
+            && slot.class == SlotClass::Texture
+            && self
+                .snapshots
+                .is_some_and(|s| s.slots.contains(&slot.index))
     }
 
     /// The tables, with a capture draw's addresses: of its first capture `records`, and of its
@@ -161,6 +203,14 @@ impl<'a> Tables<'a> {
     pub(super) fn with_capture(self, records: u64, indices: Option<u64>) -> Tables<'a> {
         Tables {
             capture: Some((records, indices)),
+            ..self
+        }
+    }
+
+    /// The tables, with a de-indexed draw's first index's address (`Tables::indices`).
+    pub(super) fn with_indices(self, address: u64) -> Tables<'a> {
+        Tables {
+            indices: Some(address),
             ..self
         }
     }
@@ -188,6 +238,26 @@ impl<'a> Tables<'a> {
             pass: Some((pass, views)),
             ..self
         }
+    }
+
+    /// The tables, with a draw's render pass instance of `instance`'s attachments: a sampled slot
+    /// binding of a texture that presents one of its color attachments takes the texture's copy
+    /// (`texture/attached_reads.rs`).
+    pub(super) fn with_attachments(self, instance: &'a PassLayout) -> Tables<'a> {
+        Tables {
+            attached: Some(instance),
+            ..self
+        }
+    }
+
+    /// Whether a slot binding of `texture` of the kind `storage` reads it where the draw's
+    /// instance renders it: a sampled one of a texture that presents one of its color
+    /// attachments (`texture/attached_reads.rs`).
+    fn attached(&self, texture: &Texture, storage: bool) -> bool {
+        !storage
+            && self
+                .attached
+                .is_some_and(|instance| texture.attached_in(instance))
     }
 
     /// The tables, with the storage view of the shader-side stencil's `shadow`.
@@ -327,10 +397,13 @@ pub(super) struct Command<'a> {
     /// An emulated mesh draw's work buffer and records, for its `MeshWork` and `MeshRecords`
     /// writes.
     pub(super) mesh: Option<MeshRegions>,
+    /// An emulated tessellation draw's work buffer and records, for its `TessellationWork` and
+    /// `TessellationRecords` writes.
+    pub(super) tessellation: Option<MeshRegions>,
 }
 
-/// Where an emulated mesh draw's work buffer and records lie (`render/mesh.rs`), each bound
-/// whole.
+/// Where an emulated mesh or tessellation draw's work buffer and records lie (`render/mesh.rs`,
+/// `render/tessellation_scan.rs`), each bound whole.
 #[derive(Clone, Copy)]
 pub(super) struct MeshRegions {
     pub(super) work: vk::DescriptorBufferInfo,
@@ -381,9 +454,9 @@ pub(super) struct Hole {
     address: u64,
 }
 
-/// What a command records besides its pipeline and its draw or groups.
+/// What a command records besides its pipeline, its draw or groups, and its descriptor writes
+/// ([`bind`]'s).
 pub(super) struct Bound {
-    pub(super) writes: Vec<Write>,
     /// The push holes' addresses, for [`push_writes`].
     pub(super) holes: Vec<Hole>,
     /// The Vulkan samplers the writes name, which the command buffer holds until it completes.
@@ -444,7 +517,9 @@ fn padded(n: usize) -> u64 {
 }
 
 /// The descriptors, uploads, and push hole addresses of `command`, a command (by `call`) of
-/// `plan` over `tables`, uploading into the command buffer's `state`.
+/// `plan` over `tables`, uploading into the command buffer's `state`: the descriptor writes in
+/// `writes`, emptied first, so a caller that keeps the vector writes each command's over the last
+/// one's storage (a draw's, `LiveBind::writes`).
 pub(super) fn bind(
     call: &'static str,
     device: &Device,
@@ -452,9 +527,10 @@ pub(super) fn bind(
     plan: &BindingPlan,
     command: &Command<'_>,
     tables: &Tables<'_>,
-    mut memo: Option<&mut BindMemo>,
+    (mut memo, writes): (Option<&mut BindMemo>, &mut Vec<Write>),
 ) -> Result<Bound, Error> {
-    let mut writes = Vec::with_capacity(plan.descriptors.len());
+    writes.clear();
+    writes.reserve(plan.descriptors.len());
     let mut samplers = Vec::new();
     // The sampler tables, whose regions the command buffer writes again as it commits.
     let sampler_keys = plan.sampler_tables();
@@ -584,12 +660,20 @@ pub(super) fn bind(
                 address: tables
                     .capture
                     .and_then(|(_, indices)| indices)
+                    .or(tables.indices)
                     .ok_or_else(|| internal("a capture index hole without capture indices"))?,
             },
+            // Which of a snapshot variant's draws runs: 0 in the plan's bytes, the drawing draw's,
+            // and set before each draw as it records (`render/snapshot.rs`).
+            PushHole::SnapshotPhase { .. } if tables.snapshots.is_some() => continue,
+            PushHole::SnapshotPhase { .. } => {
+                return Err(internal(
+                    "a snapshot phase hole the runtime did not ask for",
+                ));
+            }
         });
     }
     Ok(Bound {
-        writes,
         holes,
         samplers,
         sampler_tables,
@@ -639,6 +723,7 @@ pub(super) fn argument_sampler_writes(
             index,
             compare,
             integer,
+            cube_gradient,
         } = write.source
         else {
             continue;
@@ -654,8 +739,7 @@ pub(super) fn argument_sampler_writes(
         let desc = metal2vulkan::bind::sampler_desc(
             device.compile_device(),
             state.descriptor(),
-            compare,
-            integer,
+            SamplerUse::new(compare, integer).with_cube_gradient(cube_gradient),
             OpaqueBlackBorder::Stated,
             None,
         )
@@ -742,6 +826,34 @@ pub(super) fn push_writes(
         .into_iter()
         .map(|write| (write.stages.into(), write.offset, write.bytes))
         .collect();
+    fill_holes(&mut filled, holes)?;
+    Ok(filled)
+}
+
+/// [`push_writes`] of `writes`, written over `filled`: each write's bytes copied into the storage
+/// of the write a draw before left at its place, where there is one.
+pub(super) fn push_writes_into(
+    writes: &[PushConstantWrite],
+    holes: &[Hole],
+    filled: &mut Vec<PushWrite>,
+) -> Result<(), Error> {
+    filled.truncate(writes.len());
+    for (at, write) in writes.iter().enumerate() {
+        let stages = write.stages.into();
+        match filled.get_mut(at) {
+            Some(kept) => {
+                (kept.0, kept.1) = (stages, write.offset);
+                kept.2.clear();
+                kept.2.extend_from_slice(&write.bytes);
+            }
+            None => filled.push((stages, write.offset, write.bytes.clone())),
+        }
+    }
+    fill_holes(filled, holes)
+}
+
+/// Fill each of `holes` in the write of `filled` of its own stages that covers its eight bytes.
+fn fill_holes(filled: &mut [PushWrite], holes: &[Hole]) -> Result<(), Error> {
     for hole in holes {
         let write = filled
             .iter_mut()
@@ -754,7 +866,167 @@ pub(super) fn push_writes(
         let at = (hole.offset - write.1) as usize;
         write.2[at..at + 8].copy_from_slice(&hole.address.to_le_bytes());
     }
-    Ok(filled)
+    Ok(())
+}
+
+/// One descriptor of a pushed set 0: [`Write`]'s, without its set number and keeper.
+#[derive(Clone, Copy)]
+pub(super) struct SetWrite {
+    pub(super) binding: u32,
+    pub(super) element: u32,
+    pub(super) ty: vk::DescriptorType,
+    pub(super) info: Info,
+}
+
+impl SetWrite {
+    /// Set 0's `writes`, then a variant's `immutable` pushes (`VariantObjects::immutable_pushes`):
+    /// what a draw pushes.
+    pub(super) fn pushed(writes: &[Write], immutable: &[SetWrite]) -> Vec<SetWrite> {
+        let mut pushed = Vec::new();
+        Self::push_into(writes, immutable, &mut pushed);
+        pushed
+    }
+
+    /// [`pushed`](Self::pushed) in `pushed`, emptied first: over the last draw's storage, where
+    /// the caller keeps it (`LiveBind::pushed`).
+    pub(super) fn push_into(writes: &[Write], immutable: &[SetWrite], pushed: &mut Vec<SetWrite>) {
+        pushed.clear();
+        let writes = writes.iter().map(|write| SetWrite {
+            binding: write.binding,
+            element: write.element,
+            ty: write.ty,
+            info: write.info,
+        });
+        pushed.extend(writes.chain(immutable.iter().copied()));
+    }
+
+    /// Whether it writes what `other` writes.
+    pub(super) fn same(&self, other: &SetWrite) -> bool {
+        (self.binding, self.element, self.ty) == (other.binding, other.element, other.ty)
+            && match (self.info, other.info) {
+                (Info::Buffer(a), Info::Buffer(b)) => {
+                    (a.buffer, a.offset, a.range) == (b.buffer, b.offset, b.range)
+                }
+                (Info::Image(a), Info::Image(b)) => {
+                    (a.sampler, a.image_view, a.image_layout)
+                        == (b.sampler, b.image_view, b.image_layout)
+                }
+                (Info::Texel(a), Info::Texel(b)) => a == b,
+                _ => false,
+            }
+    }
+}
+
+/// `vkCmdPushDescriptorSet` by its core name from Vulkan 1.4 (`api`), else by
+/// `VK_KHR_push_descriptor`'s where the device enabled it; none otherwise.
+///
+/// # Safety
+///
+/// `device` is live, of `instance`, made with `enabled` enabled.
+pub(crate) unsafe fn push_descriptor_command(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    api: metal2vulkan::device::ApiVersion,
+    enabled: &metal2vulkan::device::EnableSet,
+) -> Option<vk::PFN_vkCmdPushDescriptorSetKHR> {
+    let name: &std::ffi::CStr = if api >= (metal2vulkan::device::ApiVersion { major: 1, minor: 4 })
+    {
+        c"vkCmdPushDescriptorSet"
+    } else if enabled
+        .extensions
+        .contains(&metal2vulkan::device::VkExtension::KhrPushDescriptor)
+    {
+        c"vkCmdPushDescriptorSetKHR"
+    } else {
+        return None;
+    };
+    // SAFETY: the caller's; a command the device does not have is null.
+    let command = unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) }?;
+    // SAFETY: the device gave the command of this name, and both names share its signature.
+    Some(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCmdPushDescriptorSetKHR>(
+            command,
+        )
+    })
+}
+
+/// Push `writes` as set 0 of `layout` at `point` into `command_buffer`, in one
+/// `vkCmdPushDescriptorSet` (`push`): their infos on the stack up to [`WRITES_AT_ONCE`], else on
+/// the heap.
+///
+/// # Safety
+///
+/// `command_buffer` is recording, `layout`'s set 0 is a push descriptor set layout, and every
+/// buffer, view and sampler written stays live while the command buffer can run.
+pub(super) unsafe fn push_set(
+    push: vk::PFN_vkCmdPushDescriptorSetKHR,
+    command_buffer: vk::CommandBuffer,
+    point: vk::PipelineBindPoint,
+    layout: vk::PipelineLayout,
+    writes: &[SetWrite],
+) {
+    let count = writes.len();
+    if count <= WRITES_AT_ONCE {
+        let mut buffer_infos = [[vk::DescriptorBufferInfo::default()]; WRITES_AT_ONCE];
+        let mut image_infos = [[vk::DescriptorImageInfo::default()]; WRITES_AT_ONCE];
+        let mut texel_views = [[vk::BufferView::null()]; WRITES_AT_ONCE];
+        let mut raw = [vk::WriteDescriptorSet::default(); WRITES_AT_ONCE];
+        fill_pushed(
+            writes,
+            (&mut buffer_infos, &mut image_infos, &mut texel_views),
+            &mut raw,
+        );
+        // SAFETY: the caller's contract; every array `raw` points at is live for the call.
+        unsafe { push(command_buffer, point, layout, 0, count as u32, raw.as_ptr()) };
+    } else {
+        let mut buffer_infos = vec![[vk::DescriptorBufferInfo::default()]; count];
+        let mut image_infos = vec![[vk::DescriptorImageInfo::default()]; count];
+        let mut texel_views = vec![[vk::BufferView::null()]; count];
+        let mut raw = vec![vk::WriteDescriptorSet::default(); count];
+        fill_pushed(
+            writes,
+            (&mut buffer_infos, &mut image_infos, &mut texel_views),
+            &mut raw,
+        );
+        // SAFETY: as above.
+        unsafe { push(command_buffer, point, layout, 0, count as u32, raw.as_ptr()) };
+    }
+}
+
+/// The infos of a push's `writes` into `infos`, one place each, and its writes into `raw`, each
+/// pointing at its info.
+fn fill_pushed<'a>(
+    writes: &[SetWrite],
+    infos: (
+        &'a mut [[vk::DescriptorBufferInfo; 1]],
+        &'a mut [[vk::DescriptorImageInfo; 1]],
+        &'a mut [[vk::BufferView; 1]],
+    ),
+    raw: &mut [vk::WriteDescriptorSet<'a>],
+) {
+    let (buffer_infos, image_infos, texel_views) = infos;
+    for (i, write) in writes.iter().enumerate() {
+        match write.info {
+            Info::Buffer(info) => buffer_infos[i] = [info],
+            Info::Image(info) => image_infos[i] = [info],
+            Info::Texel(view) => texel_views[i] = [view],
+        }
+    }
+    let infos = buffer_infos
+        .iter()
+        .zip(image_infos.iter())
+        .zip(texel_views.iter());
+    for ((write, ((buffer, image), texel)), raw) in writes.iter().zip(infos).zip(raw) {
+        let set = vk::WriteDescriptorSet::default()
+            .dst_binding(write.binding)
+            .dst_array_element(write.element)
+            .descriptor_type(write.ty);
+        *raw = match write.info {
+            Info::Buffer(_) => set.buffer_info(buffer),
+            Info::Image(_) => set.image_info(image),
+            Info::Texel(_) => set.texel_buffer_view(texel),
+        };
+    }
 }
 
 /// The descriptor writes [`write_sets`] hands the driver in one call: their infos sit on the stack.
@@ -851,10 +1123,12 @@ const KEPT: usize = 8;
 /// holds (a page's tiles) finds every one it bound before.
 const KEPT_VIEWS: usize = 256;
 
-/// The image views and samplers a render encoder's last binds made or found
+/// The image views and samplers render encoders' last binds made or found
 /// ([`image_descriptor`]), kept by everything each is a function of, so that a bind of the same
-/// takes them again without working them out (the encoder's, dropped with it, so it keeps
-/// nothing alive past the textures its draws retain):
+/// takes them again without working them out. An encoder that ends gives its memo to its device
+/// ([`SpareBindMemos`]), and the next render encoder opened takes it, so a pass that binds the
+/// textures and samplers the one before it bound works none out. A memo holds its textures
+/// weakly, so it keeps none alive:
 ///
 /// - **A view** of a texture slot is a function of the texture (its storage, image, decoded and
 ///   depth twins and record are fixed as it is made; its usage shadow is made once and kept), the
@@ -862,27 +1136,63 @@ const KEPT_VIEWS: usize = 256;
 ///   image keeps once made until it lets them all go under its views lock (a rebind's or a
 ///   storage form's new `VkImage`, a detach's stand-in, a reattach). Each letting go counts in
 ///   `DeviceShared::views_epoch`: the views are kept while it holds, and all dropped once it
-///   moves.
+///   moves. A view is kept by its texture's address ([`KeptView`]), which stays the texture's
+///   while the memo keeps the view: a texture found there is the one the view is of.
 /// - **A sampler's description** (`sampler_desc`'s answer) for a sampler slot is a function of
 ///   the descriptor the bind maps the slot's state to (its LOD clamps and the address modes its
-///   textures map), the four facts `sampler_desc` takes beside the device (a comparison, an integer
-///   texture, the opaque black border, the image's format) and the device. The bind still asks the
+///   textures map), the facts `sampler_desc` takes beside the device (the use: a comparison, an
+///   integer texture, a cube's explicit gradients; the opaque black border; the image's format)
+///   and the device. The bind still asks the
 ///   state for its `VkSampler` of the description (`SamplerState::vk_sampler`), so the state keeps
 ///   and forgets its samplers as before.
 ///
-/// A view's key holds its texture, so one seen again is the same object; a sampler's
-/// descriptor is compared exactly, a float field by its bits.
+/// A sampler's descriptor is compared exactly, a float field by its bits.
 #[derive(Default)]
 pub(super) struct BindMemo {
     /// The views epoch the views were kept under.
     epoch: u64,
-    views: HashMap<ViewKey, vk::ImageView>,
+    views: KeyMap<ViewKey, KeptView>,
     samplers: Vec<KeptSampler>,
 }
 
-/// What a view a bind made or found is a function of ([`BindMemo`]): a binding of the texture as
-/// the view, a storage one where the flag is set.
-type ViewKey = (Texture, ImageViewDesc, bool);
+/// What a view a bind made or found is a function of ([`BindMemo`]): a binding of the texture at
+/// the address as the view, a storage one where the first flag is set, of a texture the draw's
+/// instance renders where the second is (`Tables::attached`).
+type ViewKey = (usize, ImageViewDesc, bool, bool);
+
+/// A view a [`BindMemo`] keeps, and its texture, held weakly: a texture that goes leaves its
+/// allocation, and so its address, to its weak handles, so no other texture is at the address
+/// while the view is kept.
+struct KeptView {
+    texture: Weak<TextureShared>,
+    raw: vk::ImageView,
+}
+
+/// The most bind memos a device keeps for its render encoders to take: one per encoder open at
+/// once beyond it starts empty.
+const SPARE_BIND_MEMOS: usize = 4;
+
+/// A device's bind memos that ended render encoders left, which the render encoders it opens
+/// next take ([`BindMemo`]): at most [`SPARE_BIND_MEMOS`], the latest given taken first.
+#[derive(Default)]
+pub(super) struct SpareBindMemos(Mutex<Vec<BindMemo>>);
+
+impl SpareBindMemos {
+    /// The memo a render encoder opening takes: the latest an encoder gave back, else an empty
+    /// one.
+    pub(super) fn take(&self) -> BindMemo {
+        lock(&self.0).pop().unwrap_or_default()
+    }
+
+    /// Keep `memo`, an ended render encoder's, for the next encoder to take, where fewer than
+    /// [`SPARE_BIND_MEMOS`] are kept; else it goes.
+    pub(super) fn give(&self, memo: BindMemo) {
+        let mut spare = lock(&self.0);
+        if spare.len() < SPARE_BIND_MEMOS {
+            spare.push(memo);
+        }
+    }
+}
 
 /// A sampler description a bind worked out ([`BindMemo`]): `descriptor`'s under `facts`.
 struct KeptSampler {
@@ -894,8 +1204,7 @@ struct KeptSampler {
 /// What `sampler_desc` takes of a binding beside its descriptor and the device.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SamplerFacts {
-    compare: bool,
-    integer: bool,
+    use_: SamplerUse,
     opaque_black: OpaqueBlackBorder,
     format: Option<metal2vulkan::vk::Format>,
 }
@@ -931,6 +1240,16 @@ fn image_descriptor(
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL)
     };
+    // A slot a draw reads through a snapshot samples its texture's subresource that the
+    // instance's color attachment holds in the feedback loop layout, the layout its accesses
+    // there name (`render_target::moved_barriers`; "This layout is valid only for image
+    // subresources of images created with the VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT
+    // usage flag set", which `Texture::snapshot_color` checked).
+    let in_feedback =
+        |slot: SlotRef, info: vk::DescriptorImageInfo| match tables.snapshot_slot(slot) {
+            true => info.image_layout(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
+            false => info,
+        };
     // The kept views are dropped once an image of the device let its views go.
     let (mut kept_views, mut kept_samplers) = match memo {
         Some(memo) => {
@@ -948,21 +1267,25 @@ fn image_descriptor(
     let mut texture_view = |slot: SlotRef, view: &ImageViewDesc, storage: bool| {
         let texture = slot_texture(tables, slot)
             .ok_or_else(|| internal("the plan binds an unbound texture slot"))?;
+        let attached = tables.attached(texture, storage) && !tables.snapshot_slot(slot);
         let Some(kept_views) = kept_views.as_deref_mut() else {
-            return texture.slot_view(call, view, storage);
+            return texture.slot_view(call, view, storage, attached);
         };
-        let key = (texture.clone(), *view, storage);
-        if let Some(raw) = kept_views.get(&key) {
-            return Ok(*raw);
+        let key = (texture.address(), *view, storage, attached);
+        if let Some(kept) = kept_views.get(&key) {
+            debug_assert_eq!(kept.texture.as_ptr() as usize, key.0);
+            return Ok(kept.raw);
         }
-        let raw = texture.slot_view(call, view, storage)?;
+        device.shared().counts.bind_view_worked_out();
+        let raw = texture.slot_view(call, view, storage, attached)?;
         if kept_views.len() == KEPT_VIEWS {
             kept_views.clear();
         }
-        kept_views.insert(key, raw);
+        let texture = texture.downgrade();
+        kept_views.insert(key, KeptView { texture, raw });
         Ok::<_, Error>(raw)
     };
-    let mut sampler = |slot: SlotRef, (compare, integer): (bool, bool), opaque_black, format| {
+    let mut sampler = |slot: SlotRef, use_: SamplerUse, opaque_black, format| {
         let (state, clamps) = slot_sampler(tables, slot)
             .ok_or_else(|| internal("the plan binds an unbound sampler slot"))?;
         // Its address modes as the textures it samples map them.
@@ -970,8 +1293,7 @@ fn image_descriptor(
             .sampler_maps
             .sampler(slot, bound_sampler(state, *clamps));
         let facts = SamplerFacts {
-            compare,
-            integer,
+            use_,
             opaque_black,
             format,
         };
@@ -985,8 +1307,7 @@ fn image_descriptor(
                 let desc = metal2vulkan::bind::sampler_desc(
                     device.compile_device(),
                     &descriptor,
-                    compare,
-                    integer,
+                    use_,
                     opaque_black,
                     format,
                 )
@@ -1012,41 +1333,56 @@ fn image_descriptor(
         _ => Err(internal("a neutral sampler of a kind that is no sampler")),
     };
     Ok(match &write.source {
-        WriteSource::Texture { slot, view } => image(texture_view(
+        WriteSource::Texture { slot, view } => in_feedback(
             *slot,
-            view,
-            ty == vk::DescriptorType::STORAGE_IMAGE,
-        )?),
+            image(texture_view(
+                *slot,
+                view,
+                ty == vk::DescriptorType::STORAGE_IMAGE,
+            )?),
+        ),
         WriteSource::CombinedImageSampler {
             image: source,
             sampler: sampler_source,
         } => {
-            let (view, format) = match source {
-                ImageSource::Texture { slot, view } => {
-                    (texture_view(*slot, view, false)?, Some(view.format))
-                }
-                ImageSource::Neutral(kind) => (device.neutral_view(*kind)?, kind.format()),
+            let (view, format, slot) = match source {
+                ImageSource::Texture { slot, view } => (
+                    texture_view(*slot, view, false)?,
+                    Some(view.format),
+                    Some(*slot),
+                ),
+                ImageSource::Neutral(kind) => (device.neutral_view(*kind)?, kind.format(), None),
             };
             let raw = match sampler_source {
                 SamplerSource::Slot {
                     slot,
                     compare,
                     integer,
+                    cube_gradient,
                     opaque_black,
-                } => sampler(*slot, (*compare, *integer), *opaque_black, format)?,
+                } => sampler(
+                    *slot,
+                    SamplerUse::new(*compare, *integer).with_cube_gradient(*cube_gradient),
+                    *opaque_black,
+                    format,
+                )?,
                 SamplerSource::Immutable => vk::Sampler::null(),
                 SamplerSource::Neutral(kind) => neutral_sampler(kind)?,
             };
-            image(view).sampler(raw)
+            match slot {
+                Some(slot) => in_feedback(slot, image(view).sampler(raw)),
+                None => image(view).sampler(raw),
+            }
         }
         WriteSource::Sampler {
             slot,
             compare,
             integer,
+            cube_gradient,
             opaque_black,
         } => vk::DescriptorImageInfo::default().sampler(sampler(
             *slot,
-            (*compare, *integer),
+            SamplerUse::new(*compare, *integer).with_cube_gradient(*cube_gradient),
             *opaque_black,
             None,
         )?),
@@ -1087,14 +1423,14 @@ fn image_descriptor(
         }
         // The attachment's own image, or its sample planes (`sample_planes.rs`), which the
         // encoder made before the draw.
-        // Viewed in `uint_view` where the pipeline reads it so (an 8-bit sRGB attachment's
-        // codes), which the encoder made the image or planes mutable to (it held the view to
-        // `framebuffer_fetch::storage_view_format`, `render.rs`).
+        // Viewed in `view_alias` where the pipeline reads it so (an 8-bit sRGB attachment's
+        // codes, a BGRA-order one's RGBA-order twin), which the encoder made the image or planes
+        // mutable to (it held the view to `framebuffer_fetch::storage_view_format`, `render.rs`).
         WriteSource::TileAttachment {
             color_index,
             format,
             view,
-            uint_view,
+            view_alias,
         } if ty == vk::DescriptorType::STORAGE_IMAGE && tables.pass.is_some() => {
             let color = tables
                 .pass
@@ -1102,7 +1438,7 @@ fn image_descriptor(
                 .and_then(Option::as_ref)
                 .filter(|color| color.target.format == *format)
                 .ok_or_else(|| internal("a storage attachment the pass does not have"))?;
-            let in_format = uint_view.unwrap_or(*format);
+            let in_format = view_alias.unwrap_or(*format);
             match view {
                 StorageAttachmentView::Attachment => {
                     image(render_target::storage_view_in(&color.target, in_format)?)
@@ -1150,6 +1486,17 @@ fn image_descriptor(
                 None => return Err(internal("an extended-range color's shadow the pass lacks")),
             }
         }
+        // A slot's snapshot, which the encoder made before the draw, in `GENERAL`.
+        WriteSource::SnapshotTexels { slot } if ty == vk::DescriptorType::STORAGE_IMAGE => {
+            let view = tables
+                .snapshots
+                .and_then(|s| s.views.iter().find(|(at, _)| at == slot))
+                .map(|&(_, view)| view);
+            match view {
+                Some(view) => image(view),
+                None => return Err(internal("a snapshot the draw did not take")),
+            }
+        }
         // The pass's fragment imageblock storage, which the encoder made before the draw.
         WriteSource::Imageblock if ty == vk::DescriptorType::STORAGE_IMAGE => {
             match tables.imageblock {
@@ -1161,13 +1508,13 @@ fn image_descriptor(
             index,
             compare,
             integer,
+            cube_gradient,
         } => match tables.argument_samplers.get(*index as usize) {
             Some(state) => {
                 let desc = metal2vulkan::bind::sampler_desc(
                     device.compile_device(),
                     state.descriptor(),
-                    *compare,
-                    *integer,
+                    SamplerUse::new(*compare, *integer).with_cube_gradient(*cube_gradient),
                     OpaqueBlackBorder::Stated,
                     None,
                 )
@@ -1289,6 +1636,20 @@ fn descriptor(
             command
                 .mesh
                 .ok_or_else(|| internal("a mesh work write without the draw's dispatch"))?
+                .work
+        }
+        // An emulated tessellation draw's records and work buffer, whole: the draw's own
+        // regions, or the command buffer's records pool (`render/tessellation_scan.rs`).
+        WriteSource::TessellationRecords => {
+            command
+                .tessellation
+                .ok_or_else(|| internal("a tessellation records write without the draw's scan"))?
+                .records
+        }
+        WriteSource::TessellationWork => {
+            command
+                .tessellation
+                .ok_or_else(|| internal("a tessellation work write without the draw's scan"))?
                 .work
         }
         // An indexed patch draw's control-point index buffer.
@@ -1457,7 +1818,24 @@ pub(super) fn command_uses(
     index: Option<(&Buffer, u64)>,
     indirect: Option<(&Buffer, u64)>,
 ) -> Result<CommandUses, Error> {
-    let mut uses = Vec::new();
+    let mut uses = CommandUses::default();
+    command_uses_into(call, (plan, command, tables), (index, indirect), &mut uses)?;
+    Ok(uses)
+}
+
+/// [`command_uses`] in `into`, emptied first: over the last draw's storage, where the caller keeps
+/// it (`LiveBind::uses`).
+pub(super) fn command_uses_into(
+    call: &'static str,
+    (plan, command, tables): (&BindingPlan, &Command<'_>, &Tables<'_>),
+    (index, indirect): (Option<(&Buffer, u64)>, Option<(&Buffer, u64)>),
+    into: &mut CommandUses,
+) -> Result<(), Error> {
+    let CommandUses { uses, resident } = into;
+    uses.clear();
+    resident.clear();
+    // One use at most a resource use of the plan's or the command's: room for them all at once.
+    uses.reserve(plan.uses.len() + command.uses.len());
     // The keys of the buffers made resident the command reaches through the resident set, by
     // address; every other use names its resource (a descriptor, a root table's static, a view).
     // Those it names are gathered once it reaches one so: until then each use names its key.
@@ -1492,15 +1870,21 @@ pub(super) fn command_uses(
                 },
                 SlotClass::Texture => {
                     // An unbound slot takes a neutral image; a texture whose image and usage
-                    // lack the binding's usage, its shadow (`texture/usage_shadow.rs`).
+                    // lack the binding's usage, its shadow (`texture/usage_shadow.rs`), as does
+                    // a draw's sampled one its instance renders (`texture/attached_reads.rs`).
                     if let Some(texture) = slot_texture(tables, slot) {
                         let (read, write) = image_access(resource.class)?;
                         let storage = resource.class == AccessClass::StorageImage;
+                        let attached =
+                            tables.attached(texture, storage) && !tables.snapshot_slot(slot);
                         let used = texture.slot_use(
                             call,
                             storage,
-                            access(read, resource.access.read),
-                            access(write, resource.access.write),
+                            attached,
+                            (
+                                access(read, resource.access.read),
+                                access(write, resource.access.write),
+                            ),
                         )?;
                         name(&mut named, &reached, used.key);
                         uses.push(used);
@@ -1575,15 +1959,15 @@ pub(super) fn command_uses(
             write: access(write, resource.access.write),
         });
     }
-    let resident = reached.difference(&named).copied().collect();
-    Ok(CommandUses { uses, resident })
+    resident.extend(reached.difference(&named).copied());
+    Ok(())
 }
 
 /// A dispatch's or draw's uses (`command_uses`), for the tracker, and the keys among them that
 /// the command reaches through its root tables' resident set alone: buffers and heaps an encoder
 /// made resident, which no use of the command names. The encoder's core takes both
 /// (`EncoderCore::command_reaching`, `note_reaching`); a use added later names its key.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct CommandUses {
     uses: Vec<Use<ResourceKey>>,
     resident: BTreeSet<ResourceKey>,

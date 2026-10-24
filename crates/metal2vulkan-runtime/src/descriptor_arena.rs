@@ -1,10 +1,11 @@
 //! A command buffer's descriptor pools: the set-0 set of each dispatch, draw and tile dispatch it
-//! encodes comes from them, and they go when the command buffer completes, with its uploads and
-//! heap sets (`heap_sets.rs` keeps set 1, one per variant).
+//! encodes comes from them (but one's that pushes its set 0, `pipeline::objects::
+//! pushes_set_zero`), and they go when the command buffer completes, with its uploads and heap
+//! sets (`heap_sets.rs` keeps set 1, one per variant).
 //!
 //! Before, each such command made a `VkDescriptorPool` of its own, which its command buffer
 //! released as it completed: on RADV, ANV and NVIDIA a pool is device memory of its own, so a
-//! pool per command cost more than the rest of its encoding (EV PERF-bench0: 2000 dispatches in
+//! pool per command cost more than the rest of its encoding (2000 dispatches in
 //! one command buffer took 14.5 to 17.8 us each to encode on a Radeon 780M).
 //!
 //! - **Sizing.** A pool holds [`FIRST`] sets of the needs (descriptor counts by type, and pool

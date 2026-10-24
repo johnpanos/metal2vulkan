@@ -387,11 +387,11 @@ fn textures_over_buffers_lie_where_metal_lays_them() {
     });
 }
 
-/// A `Private` texture buffer is made shareable, as Metal makes one (CRF probe 2), and a texture
-/// opened from its handle is a texture buffer over the same texels, with a resource ID of its own:
-/// the case's texels uploaded by a blit into the first, the case run with the second bound, and the
-/// first copied out give the case's own output (`TEXEL_CASES`' writer, which writes four bytes of a
-/// texture buffer). A view of it is not shareable.
+/// A `Private` texture buffer is made shareable, as Metal makes one (a Metal probe on the M3 Max
+/// and an M4), and a texture opened from its handle is a texture buffer over the same texels, with
+/// a resource ID of its own: the case's texels uploaded by a blit into the first, the case run with
+/// the second bound, and the first copied out give the case's own output (`TEXEL_CASES`' writer,
+/// which writes four bytes of a texture buffer). A view of it is not shareable.
 #[test]
 fn a_shared_texture_buffer_opens_over_its_texels() {
     on_device(|device| {
@@ -476,12 +476,11 @@ fn a_shared_texture_buffer_opens_over_its_texels() {
 
 /// A texture buffer over a buffer at an offset off 16 bytes, which Metal's validation alone
 /// stops: a plain run makes it, its functions read and write it from the offset rounded down to
-/// 16 bytes, and its blits and the CPU at the offset itself (an M4 under macOS 27.0.1, EVs
-/// SPCrp-probe1-m4 `lin_tb_off*`, SPCrp-probe6-m4 `tbo_*`). Each of [`TEXEL_CASES`] runs with its
-/// texture buffer at offsets 4, 20 and 33 of a buffer whose bytes from the offset rounded down
-/// are the texture's: the reader gives its own output and leaves the buffer as it was, the
-/// writer's bytes land from the offset rounded down and nowhere else, and `get_bytes` and a blit
-/// read the bytes at the offset itself.
+/// 16 bytes, and its blits and the CPU at the offset itself (an M4 under macOS 27.0.1). Each of
+/// [`TEXEL_CASES`] runs with its texture buffer at offsets 4, 20 and 33 of a buffer whose bytes
+/// from the offset rounded down are the texture's: the reader gives its own output and leaves the
+/// buffer as it was, the writer's bytes land from the offset rounded down and nowhere else, and
+/// `get_bytes` and a blit read the bytes at the offset itself.
 #[test]
 fn a_texture_buffer_off_16_bytes_reads_and_writes_from_below() {
     on_device(|device| {

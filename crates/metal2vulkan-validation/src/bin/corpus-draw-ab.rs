@@ -27,7 +27,12 @@
 //!   textures then carry, each level seeded) or `aniso` (`mip` with an anisotropy of 16), and
 //!   `nearest-px` or `linear-px` (pixel coordinates); a combo `FORMAT:MODE@SLOT=FORMAT2` binds
 //!   `FORMAT2` at texture slot `SLOT` in place of `FORMAT` (A pass that reads its own target's
-//!   format at one slot and samples 8-bit textures at the others). `--primitive TYPE` (`point`,
+//!   format at one slot and samples 8-bit textures at the others); `FORMAT2` a two-plane YCbCr
+//!   format of 8-bit 4:2:0 codes (`YCBCR8_420_2P`, its `_sRGB` twin, `RGB8_420_2P`) binds a
+//!   texture over plane 0 of a `420v` surface of seeded bytes ([`ycbcr_surface`]), as a video
+//!   frame is bound, and a two-plane extended-range format (`RGB10A8_2P_XR10`, its `_sRGB` twin)
+//!   a texture over plane 0 of a `'b3a8'` surface of seeded bytes ([`surface_planes`]), as the
+//!   consumer's drawables are sampled. `--primitive TYPE` (`point`,
 //!   `line`, `line-strip`, `triangle` or `triangle-strip`; `time` takes it too) draws the three
 //!   vertices as `TYPE`, where the draws are of the template's class's list by default (a triangle
 //!   for no class): a strip of three vertices covers what its list does, through a pipeline of the
@@ -102,6 +107,13 @@
 //! palette's bytes (blending and framebuffer reads see them). A run reads back every attachment,
 //! then every buffer and texture the fragment may write, in slot order; that is what it hashes.
 //!
+//! `--policy NAMES` (`run` and `time`) opens the device with those `DevicePolicy` switches at their
+//! accurate forms, where it opens at the default policy otherwise: a comma-separated list of
+//! `exact-answers` (`DevicePolicy::exact_answers`) and field names (`sampling`, `ycbcr_filter`,
+//! `float_maths`, `texel_conversion`, `half_rounding`, `nan_and_min_max`, `rounding_order`,
+//! `half_blend`), each set to its `Exact` form, so a making under an application's exact forms is
+//! timed as it makes them.
+//!
 //! `--device-type` names the device the draw runs on, as validation's other device commands do
 //! (`cpu` matches only a CPU implementation such as lavapipe); the device opens through
 //! `candidate::runtime_case::open_device`, which refuses a GPU while the hang tripwire is set.
@@ -136,6 +148,10 @@
 //! consumer's shaders: they stay on the hosts the guest data rule allows and are never committed.
 
 use metal2vulkan::bind::SamplerDescriptor;
+use metal2vulkan::device::{
+    DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
+    RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, YCbCrFilterPolicy,
+};
 use metal2vulkan::metal::state::DepthStencilDescriptor;
 use metal2vulkan::metal::CompareFunction;
 use metal2vulkan::metal::{
@@ -176,6 +192,7 @@ const USAGE: &str =
      \x20                          [--then-lines yes|together] [--qos CLASS]\n\
      \x20                          [--device-qos CLASS] [--prime-qos CLASS] [--then TYPE]\n\
      \x20                          [--skip-ok yes] [--combo FORMAT:MODE] [--again yes]\n\
+     \x20      (run and time take [--policy NAMES])\n\
      \x20      corpus-draw-ab storm --storm a|b|c|d --air FILE --vertex NAME --fragment NAME\n\
      \x20                           --device-type cpu|gpu --shader-cache DIR --out FILE\n\
      \x20                           [--makings N] [--concurrency C] [--turns T --ahead A]\n\
@@ -286,6 +303,35 @@ fn options(args: &[String]) -> Result<BTreeMap<String, String>, String> {
         out.insert(key.to_string(), value.clone());
     }
     Ok(out)
+}
+
+/// The device policy `--policy` names (the module docs): the default policy with each named
+/// switch at its accurate form.
+fn policy(options: &BTreeMap<String, String>) -> Result<DevicePolicy, String> {
+    let mut policy = DevicePolicy::default();
+    let Some(names) = options.get("policy") else {
+        return Ok(policy);
+    };
+    for name in names.split(',').filter(|name| !name.is_empty()) {
+        match name {
+            "exact-answers" => policy = policy.exact_answers(),
+            "sampling" => policy.sampling = SamplingPolicy::Exact,
+            "ycbcr_filter" => policy.ycbcr_filter = YCbCrFilterPolicy::Exact,
+            "float_maths" => policy.float_maths = FloatMathsPolicy::Exact,
+            "texel_conversion" => policy.texel_conversion = TexelConversionPolicy::Exact,
+            "half_rounding" => policy.half_rounding = HalfRoundingPolicy::Exact,
+            "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
+            "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
+            "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
+            _ => {
+                return Err(format!(
+                    "--policy {name:?}: exact-answers, sampling, ycbcr_filter, float_maths, \
+                     texel_conversion, half_rounding, nan_and_min_max, rounding_order or half_blend"
+                ))
+            }
+        }
+    }
+    Ok(policy)
 }
 
 fn required<'a>(options: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
@@ -474,8 +520,9 @@ fn formats(data: DataType, depth: bool) -> &'static [PixelFormat] {
     }
 }
 
-/// The layout of a two-plane extended-range attachment's surface (`RGB10A8_2P_XR10` and its sRGB
-/// twin), a texture over plane 0 of a `'b3a8'` surface as the consumer's drawables are: plane 0's
+/// The layout of a two-plane extended-range attachment's or sampled texture's surface
+/// (`RGB10A8_2P_XR10` and its sRGB twin), a texture over plane 0 of a `'b3a8'` surface as the
+/// consumer's drawables are: plane 0's
 /// rows of `side` color words, then plane 1's rows of `side` alpha bytes, each row padded to 64
 /// bytes. `None` for every other format. Returns plane 0's `bytesPerRow`, plane 1's offset and
 /// `bytesPerRow`, and the surface's length.
@@ -493,6 +540,25 @@ fn surface_planes(format: PixelFormat, side: u64) -> Option<(u64, u64, u64, u64)
 /// The OSType of the surface a two-plane extended-range attachment stands over (`'b3a8'`), the
 /// one Metal's answers were measured over.
 const B3A8: u32 = u32::from_be_bytes(*b"b3a8");
+
+/// The OSType of the surface a sampled two-plane YCbCr texture stands over (`'420v'`, CoreVideo's
+/// 8-bit 4:2:0 video-range surface, as a video frame's texture is).
+const YUV420V: u32 = u32::from_be_bytes(*b"420v");
+
+/// The layout of the `420v` surface a sampled two-plane YCbCr texture of `format` and `side`
+/// stands over: the luma plane's rows of `side` codes, then the chroma plane's rows of `side /
+/// 2` Cb and Cr pairs, each row padded to 64 bytes, for the 8-bit 4:2:0 formats. `None` for
+/// every other format. Returns the planes' `bytesPerRow`, the chroma plane's offset and the
+/// surface's length.
+fn ycbcr_surface(format: PixelFormat, side: u64) -> Option<(u64, u64, u64)> {
+    use PixelFormat as P;
+    if !matches!(format, P::YCBCR84202P | P::YCBCR84202PSRGB | P::RGB84202P) {
+        return None;
+    }
+    let row = side.next_multiple_of(64);
+    let chroma_at = row * side;
+    Some((row, chroma_at, chroma_at + row * side.div_ceil(2)))
+}
 
 /// The bytes of one texel of `format`, for the formats a draw may use here.
 fn texel_bytes(format: PixelFormat) -> Option<u64> {
@@ -714,6 +780,7 @@ fn setup(options: &BTreeMap<String, String>) -> Result<Setup, Stop> {
     let mut device_options = DeviceOptions::default();
     device_options.shader_cache =
         ShaderCacheOptions::in_directory(required(options, "shader-cache")?);
+    device_options.policy = policy(options)?;
     // Through validation's tripwire-checked open: a GPU only while the hang tripwire is absent.
     let device_type = DeviceType::parse(required(options, "device-type")?)?;
     let device =
@@ -856,6 +923,10 @@ struct BoundTexture {
     descriptor: TextureDescriptor,
     /// Each slice's and level's starting bytes: `(slice, level, bytes)`.
     uploads: Vec<(u64, u64, Buffer)>,
+    /// For a two-plane YCbCr texture, the shared buffer standing for its surface
+    /// ([`ycbcr_surface`]), which holds its starting bytes (it then has no uploads), kept alive
+    /// with the texture.
+    _surface: Option<Buffer>,
 }
 
 /// How a run's samplers filter.
@@ -1062,6 +1133,70 @@ fn inputs(
                         (_, Some(format)) if chosen => format,
                         _ => choices[(run as usize + slot as usize) % choices.len()],
                     };
+                    // A two-plane YCbCr texture stands over a surface of seeded bytes, as a
+                    // video frame's does, one level.
+                    if let Some((row, chroma_at, length)) = ycbcr_surface(format, side) {
+                        if ty != TextureType::Type2D || !chosen {
+                            return Err(format!(
+                                "texture {slot}: {} at a slot not a sampled 2D one",
+                                format.name()
+                            ));
+                        }
+                        let surface = upload(stream | u64::from(element), length)?;
+                        let mut d = TextureDescriptor::texture_2d(format, side, side, false);
+                        d.usage = TextureUsage::SHADER_READ;
+                        d.resource_options = ResourceOptions::shared();
+                        let facts = IoSurfaceYCbCr::new(YUV420V, 0, [side, side], chroma_at, row);
+                        let plane = IoSurfacePlane::new(0, row, true).with_ycbcr(facts);
+                        let texture = surface
+                            .new_texture_with_iosurface_plane(&d, plane)
+                            .map_err(e(format!("texture {slot} of {}", format.name())))?;
+                        inputs
+                            .described
+                            .push_str(&format!(" t{slot}={}", format.name()));
+                        inputs.textures.push(BoundTexture {
+                            index: slot,
+                            texture,
+                            written,
+                            descriptor: d,
+                            uploads: Vec::new(),
+                            _surface: Some(surface),
+                        });
+                        continue;
+                    }
+                    // A two-plane extended-range texture stands over a `'b3a8'` surface of seeded
+                    // bytes, as the consumer's drawables are sampled, one level.
+                    if let Some((color_row, alpha_at, alpha_row, length)) =
+                        surface_planes(format, side)
+                    {
+                        if ty != TextureType::Type2D || !chosen {
+                            return Err(format!(
+                                "texture {slot}: {} at a slot not a sampled 2D one",
+                                format.name()
+                            ));
+                        }
+                        let surface = upload(stream | u64::from(element), length)?;
+                        let mut d = TextureDescriptor::texture_2d(format, side, side, false);
+                        d.usage = TextureUsage::SHADER_READ;
+                        d.resource_options = ResourceOptions::shared();
+                        let facts = IoSurfaceYCbCr::new(B3A8, 0, [side, side], alpha_at, alpha_row);
+                        let plane = IoSurfacePlane::new(0, color_row, true).with_ycbcr(facts);
+                        let texture = surface
+                            .new_texture_with_iosurface_plane(&d, plane)
+                            .map_err(e(format!("texture {slot} of {}", format.name())))?;
+                        inputs
+                            .described
+                            .push_str(&format!(" t{slot}={}", format.name()));
+                        inputs.textures.push(BoundTexture {
+                            index: slot,
+                            texture,
+                            written,
+                            descriptor: d,
+                            uploads: Vec::new(),
+                            _surface: Some(surface),
+                        });
+                        continue;
+                    }
                     let mipmapped = sampling.mode.mipmapped() && !written;
                     let mut d = TextureDescriptor::texture_2d(format, side, side, mipmapped);
                     d.texture_type = ty;
@@ -1115,6 +1250,7 @@ fn inputs(
                         written,
                         descriptor: d,
                         uploads,
+                        _surface: None,
                     });
                 }
             }

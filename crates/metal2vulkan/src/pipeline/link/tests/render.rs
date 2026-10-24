@@ -116,6 +116,62 @@ fn a_rounded_one_zero_blend_takes_no_vulkan_blend() {
     ));
 }
 
+/// A blend of one and zero, added, of a 16-bit float attachment the fragment function rounds, from
+/// a module without fast math (`StageIo::half_blend_colors` for a `half` output,
+/// `StageIo::float_blend_colors` for a `float` one), takes the Vulkan blend: Metal keeps the
+/// destination's product by zero there, which no write of the output stores, and
+/// the pipeline records `HalfOutputPrecision`. Of a module that lists the attachment in neither
+/// set, or into `RGBA8Unorm`, it takes none and records nothing.
+#[test]
+fn a_safe_one_zero_blend_of_a_sixteen_bit_float_attachment_blends() {
+    use crate::metal::BlendFactor;
+    use crate::pipeline::color_writes::pipeline_writes;
+    use crate::pipeline::descriptor::ColorAttachmentDescriptor;
+    let f4 = io_ty(IoNumeric::Float, 4);
+    let va = artifact(iface(Stage::Vertex, vec![], vec![]), None);
+    let mut rounding = io_stage(Stage::Fragment, stage_io(vec![], vec![color(0, 0, f4)]));
+    rounding.interface.io.rounded_colors = vec![0];
+    let mut safe_float = rounding.clone();
+    safe_float.interface.io.float_blend_colors = vec![0];
+    let mut safe_half = rounding.clone();
+    safe_half.interface.io.half_blend_colors = vec![0];
+    let p = profile("lavapipe");
+    let linked = |fragment: &FunctionArtifact, pf: PixelFormat, factor: BlendFactor| {
+        let mut a = ColorAttachmentDescriptor::new(pf);
+        a.blending_enabled = true;
+        a.destination_rgb_blend_factor = factor;
+        let mut r = RenderLinkInputs::new();
+        r.color_attachments[0] = Some(a);
+        let inputs = LinkInputs::Render(Box::new(r));
+        let fragment = compiled_for(fragment, &inputs, &p);
+        let g = crate::pipeline::link::link(&[&va, &fragment], &inputs, &p)
+            .expect("links")
+            .graphics
+            .expect("graphics");
+        let (notes, _) = pipeline_writes(&fragment, &g.color_write_rules, &g.color_attachments)
+            .expect("the rule words");
+        let noted = notes.contains(&crate::pipeline::PrecisionNote::HalfOutputPrecision);
+        (
+            g.color_attachments[0]
+                .expect("attachment 0")
+                .blend
+                .is_some(),
+            noted,
+        )
+    };
+    let (half, unorm) = (PixelFormat::RGBA16Float, PixelFormat::RGBA8Unorm);
+    assert_eq!(linked(&rounding, half, BlendFactor::Zero), (false, false));
+    assert_eq!(linked(&safe_float, half, BlendFactor::Zero), (true, true));
+    assert_eq!(linked(&safe_half, half, BlendFactor::Zero), (true, true));
+    assert_eq!(
+        linked(&safe_float, unorm, BlendFactor::Zero),
+        (false, false)
+    );
+    // Another blend is the device's already, the float output's noted by its conversion.
+    let over = BlendFactor::OneMinusSourceAlpha;
+    assert_eq!(linked(&safe_float, half, over), (true, false));
+}
+
 /// A fragment function links only under the color writes its pipeline gives the attachments it
 /// writes. On lavapipe and RADV a `float4` output to an `RGBA8Unorm` attachment rounds by the unorm
 /// rule, blended with (one, zero) too; under another blend, and for alpha-to-coverage's alpha, the
@@ -1317,7 +1373,7 @@ fn an_interlocked_fetch_links_only_into_the_state_it_was_compiled_for() {
                 &p
             ),
             view: StorageAttachmentView::Attachment,
-            uint_view: None,
+            view_alias: None,
             kept: vk::ColorComponentFlags::empty(),
         }]
     );
@@ -2130,12 +2186,13 @@ fn the_raster_sample_count_needs_the_framebuffer_sample_counts() {
 /// and centroid varyings, its point and barycentric coordinates, and its sample mask as the
 /// pixel's. Vulkan runs per sample only under sample shading, which `SampleId` turns on, a `Sample`
 /// input may, and the pipeline enables for a function that writes memory; it moves those reads to
-/// the sample there. Link refuses a per-sample function with a pixel read it has no pixel form for;
-/// the same pipelines at one sample, a pixel-rate function that reads them (but its
-/// `[[sample_mask]]` on lavapipe, whose split of a clipped triangle's fragments changes it), a
-/// per-sample one that does not, and one compiled for the pipeline that reads `[[position]]`'s x
-/// and y or its center varyings at the pixel, link, with sample shading exactly where the function
-/// writes memory at four samples. A per-sample function whose pixel reads all have forms on the
+/// the sample there. The same pipelines at one sample, a pixel-rate function that reads them (but
+/// its `[[sample_mask]]` on lavapipe, whose split of a clipped triangle's fragments changes it), a
+/// per-sample one that does not, one compiled for the pipeline that reads `[[position]]`'s x and y
+/// or its center varyings at the pixel, and a per-sample one that reads `[[position]]`'s z or w, a
+/// centroid varying, or its point or barycentric coordinates where Vulkan evaluates them (which
+/// the compile layer notes), link, with sample shading exactly where the function writes memory
+/// at four samples. A per-sample function whose pixel reads all have forms on the
 /// device, compiled without `multisampled`, needs that input. A center varying has no pixel form on
 /// `moltenvk-m3` at a release not measured to read it at the pixel center itself (1.4.0), whose
 /// `InterpolateAtOffset` reads off the center, which the refusal names; at 1.4.1, measured so, its
@@ -2193,7 +2250,6 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum At4 {
         Links,
-        Refused,
         // Every pixel read has a form the device has, which a function compiled without
         // `multisampled` does not use.
         Recompile,
@@ -2203,7 +2259,7 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
         // The pixel's coverage, which no device gives a per-sample invocation.
         Coverage,
     }
-    use At4::{Center, Coverage, Links, Recompile, Refused};
+    use At4::{Center, Coverage, Links, Recompile};
     let cases = [
         // Pixel rate, no side effect: every pixel read is the pixel's in both APIs.
         (
@@ -2230,14 +2286,15 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
             ),
             Links,
         ),
-        // Sample rate beside a pixel read.
+        // Sample rate beside a pixel read: a center varying needs its pixel form; the others read
+        // where Vulkan evaluates them, which the compile layer notes.
         (
             fragment(vec![center.clone()], vec![B::SampleId], false),
             Center,
         ),
         (
             fragment(vec![centroid.clone()], vec![B::SampleId], false),
-            Refused,
+            Links,
         ),
         (
             fragment(vec![sample.clone(), center.clone()], vec![], false),
@@ -2245,7 +2302,7 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
         ),
         (
             fragment(vec![sample.clone(), centroid.clone()], vec![], false),
-            Refused,
+            Links,
         ),
         (
             fragment(vec![], vec![B::FragCoord, B::SampleId], false),
@@ -2253,13 +2310,13 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
         ),
         (
             fragment(vec![], vec![B::PointCoord, B::SampleId], false),
-            Refused,
+            Links,
         ),
         (
             fragment(vec![], vec![B::SampleId, B::SampleMaskIn], false),
             Coverage,
         ),
-        (fragment(vec![], vec![B::SampleId, bary], false), Refused),
+        (fragment(vec![], vec![B::SampleId, bary], false), Links),
         (
             fragment(vec![sample.clone()], vec![B::FragCoord], false),
             Recompile,
@@ -2273,14 +2330,14 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
             fragment(vec![sample.clone()], vec![B::SampleMaskOut], false),
             Links,
         ),
-        // Compiled for the pipeline: the pixel forms link, the reads without one do not.
+        // Compiled for the pipeline: the pixel forms link, and so do the reads without one.
         (
             compiled(vec![], vec![B::FragCoord, B::SampleId], false, false),
             Links,
         ),
         (
             compiled(vec![], vec![B::FragCoord, B::SampleId], false, true),
-            Refused,
+            Links,
         ),
         (
             compiled(
@@ -2297,11 +2354,11 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
         ),
         (
             compiled(vec![centroid.clone()], vec![B::SampleId], true, false),
-            Refused,
+            Links,
         ),
         (
             compiled(vec![], vec![B::PointCoord, B::SampleId], true, false),
-            Refused,
+            Links,
         ),
         (
             compiled(vec![sample], vec![B::SampleMaskIn], true, false),
@@ -2415,8 +2472,21 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
                         split,
                     )))
                 }
+                // ... and a centroid varying of a function that sample shading may leave at pixel
+                // rate (only a `Sample` input makes it per sample); one that surely runs per sample
+                // reads it at its sample, which no split moves.
+                Links
+                    if p.fields().workarounds.contains(&split)
+                        && fa.interface.io.inputs.contains(&centroid)
+                        && !fa.interface.io.builtins.contains(&B::SampleId)
+                        && !fa.interface.writes_memory =>
+                {
+                    Err(Error::Unsupported(Unsupported::driver_defect(
+                        Feature::CentroidVarying,
+                        split,
+                    )))
+                }
                 Links => Ok(()),
-                Refused => Err(refused.clone()),
                 Coverage => Err(coverage.clone()),
                 Recompile => Err(recompile.clone()),
                 Center if biased => Err(needs_centered.clone()),
@@ -2456,8 +2526,8 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
 
 /// Lavapipe rasterizes a triangle it clips as several, so at more than one sample a pixel-rate
 /// fragment runs once per piece in a pixel on their shared edge, with that piece's coverage.
-/// Measured with a bare Vulkan program (EVs MSFF-probe2, MSFF-probe3): `SampleMask` holds part of
-/// the pixel's samples and a `Centroid` input moves to the first covered sample; a center input
+/// Measured with a bare Vulkan program: `SampleMask` holds part of the pixel's samples and a
+/// `Centroid` input moves to the first covered sample; a center input
 /// stays at the pixel center. So every committed profile whose driver is lavapipe, and only those,
 /// carries the defect, and link refuses there exactly a multisampled pixel-rate function that reads
 /// `[[sample_mask]]` or a centroid varying, naming the defect; at one sample, and with a center or

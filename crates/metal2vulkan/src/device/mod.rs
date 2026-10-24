@@ -66,21 +66,23 @@ pub use enables::{EnableSet, Exposure};
 pub(crate) use mechanism::mechanism;
 pub use metal::{MetalDeviceProperties, SimdSupport, StageSimd};
 pub use policy::{
-    ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-    NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
-    Unorm8LinearFilterPolicy,
+    BatchOrderPolicy, CompletionPolicy, ContainmentPolicy, DecodedTexelsPolicy, DevicePolicy,
+    FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy, NanMinMaxPolicy,
+    ResolvePolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+    Unorm8LinearFilterPolicy, YCbCrFilterPolicy,
 };
 pub(crate) use profile::whole_point_size;
 pub use profile::{DeviceProfile, SpirvValidation};
 // The vocabulary the device surface reaches: description and policy inputs, and the requirement
 // vocabulary of `Requirements`, `Capability`, and `DeviceDescription`.
 pub use profile::{
-    EnabledCaps, FloatControls, FloatWidthControls, FragmentCaps, FramebufferFetchPolicy,
-    GuestIsolation, HandleDomain, ImageCaps, Independence, Limits, MeshLimits, PointerDomain,
+    EnabledCaps, FloatControls, FloatWidthControls, FragmentCaps, GuestIsolation, HandleDomain,
+    ImageCaps, Independence, Limits, MeshLimits, PointerDomain,
 };
 // The profile's facts a consumer or a validation tool reads: its descriptor capabilities, its
-// subgroup model and simdgroup tiers, and how it contains an out-of-bounds access.
-pub use profile::{Containment, DescriptorCaps, Robustness};
+// subgroup model and simdgroup tiers, how it contains an out-of-bounds access, and the Function
+// storage a thread holds.
+pub use profile::{Containment, DescriptorCaps, FunctionStorage, Robustness};
 pub use subgroup::{SimdClass, StageSubgroup, SubgroupModel, SubgroupSizes, Tier};
 // The driver defect a refusal names (`Needs::DriverDefect`).
 pub use profile::DriverWorkaround;

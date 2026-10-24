@@ -278,6 +278,7 @@ fn a_numeric_slot_binds_either_integer_type() {
             diagnostics: Vec::new(),
             uses: Vec::new(),
             template: Default::default(),
+            alpha_red_texels: Default::default(),
         };
         let (write, _) = planner
             .plain_texture(0, 1, vk::DescriptorType::STORAGE_IMAGE, texture, false)
@@ -380,11 +381,11 @@ fn view_aspects_and_the_default_storage_choice() {
     assert_eq!(storage_class(Some(&bgra)), StorageFormatClass::Unknown);
 }
 
-/// Metal reads a depth texel through a colour texture type as `(d, d, d, 1)` (EV SPN2-dc1-m4, Apple
-/// M4: `Depth16Unorm`, `Depth32Float` and `Depth32Float_Stencil8` through `texture2d<float>` and
+/// Metal reads a depth texel through a colour texture type as `(d, d, d, 1)` (Apple M4:
+/// `Depth16Unorm`, `Depth32Float` and `Depth32Float_Stencil8` through `texture2d<float>` and
 /// `texture2d<half>`, read, sampled, gathered and sampled with gradients, in a kernel and a
-/// fragment function), and a stencil texel through `texture2d<uint>` as `(s, 0, 0, 1)` (EV
-/// SPN2-dc2-m4), which Vulkan's identity reads too. So every depth format's sampled view that no
+/// fragment function), and a stencil texel through `texture2d<uint>` as `(s, 0, 0, 1)`, which
+/// Vulkan's identity reads too. So every depth format's sampled view that no
 /// comparison reads replicates the depth with alpha one, on every committed profile where the
 /// format is sampled; a comparison's view and every stencil view keep the identity, and the
 /// border check reads the depth through the same mapping.
@@ -527,11 +528,12 @@ fn a_depth_twin_is_read_through_its_colour_image_and_compared_through_its_twin()
 }
 
 /// A bound runtime sampler's values are checked at plan time from its shape, with exactly the
-/// verdict `vk_sampler` gives the descriptor for the binding's use: anisotropy needs
-/// `samplerAnisotropy`, mirror-clamp `samplerMirrorClampToEdge`, and NaN or inverted LOD clamps are
-/// invalid descriptors; a min reduction reads the weighted average, refused nowhere, and an axis
-/// clamping to zero beside one clamping to a white border reads the one color, refused nowhere.
-/// Every refusal kind occurs on some committed profile.
+/// verdict `vk_sampler` gives the descriptor for the binding's use: mirror-clamp needs
+/// `samplerMirrorClampToEdge`, and NaN or inverted LOD clamps are invalid descriptors; anisotropy is
+/// refused nowhere (without `samplerAnisotropy` the Vulkan sampler is isotropic and the module
+/// emulates Metal's filter or announces the device's), a min reduction reads the weighted average,
+/// refused nowhere, and an axis clamping to zero beside one clamping to a white border reads the one
+/// color, refused nowhere. Every refusal kind occurs on some committed profile.
 #[test]
 fn runtime_sampler_values_are_checked_at_plan_time() {
     use crate::bind::state::SamplerDescriptor;
@@ -593,6 +595,7 @@ fn runtime_sampler_values_are_checked_at_plan_time() {
                     diagnostics: Vec::new(),
                     uses: Vec::new(),
                     template: Default::default(),
+                    alpha_red_texels: Default::default(),
                 };
                 let planned = planner.sampler(slot);
                 match vk_sampler(desc, SamplerUse::new(compare, false), &p) {
@@ -603,6 +606,7 @@ fn runtime_sampler_values_are_checked_at_plan_time() {
                                 slot,
                                 compare,
                                 integer: false,
+                                cube_gradient: false,
                                 opaque_black: crate::metal::sampler::OpaqueBlackBorder::Stated,
                             }),
                             "{stem} {name} compare={compare}"
@@ -627,6 +631,7 @@ fn runtime_sampler_values_are_checked_at_plan_time() {
                 diagnostics: Vec::new(),
                 uses: Vec::new(),
                 template: Default::default(),
+                alpha_red_texels: Default::default(),
             };
             assert_eq!(
                 planner.sampler(slot),
@@ -634,17 +639,21 @@ fn runtime_sampler_values_are_checked_at_plan_time() {
             );
         }
     }
-    for name in ["anisotropic", "mirror clamp"] {
-        assert!(refused.contains_key(name), "{name} is refused somewhere");
-        assert!(accepted.contains_key(name), "{name} is accepted somewhere");
-    }
+    assert!(
+        refused.contains_key("mirror clamp"),
+        "mirror clamp is refused somewhere"
+    );
+    assert!(
+        accepted.contains_key("mirror clamp"),
+        "mirror clamp is accepted somewhere"
+    );
     for name in ["NaN LOD", "inverted LOD"] {
         assert!(
             !accepted.contains_key(name),
             "{name} is never a Vulkan sampler"
         );
     }
-    for name in ["default", "min", "zero beside a border"] {
+    for name in ["default", "anisotropic", "min", "zero beside a border"] {
         assert!(!refused.contains_key(name), "{name} is refused");
     }
 }
@@ -703,6 +712,7 @@ fn an_immutable_linear_sampler_needs_a_filterable_view() {
                 diagnostics: Vec::new(),
                 uses: Vec::new(),
                 template: Default::default(),
+                alpha_red_texels: Default::default(),
             };
             let immutable = vk_sampler(&linear, SamplerUse::new(false, integer), &p).expect("maps");
             let sampler = CombinedSampler::new(SamplerRef::Constexpr([0, 0]), false, integer);
@@ -803,6 +813,7 @@ fn a_linear_compare_sampler_needs_no_filterable_view() {
                     diagnostics: Vec::new(),
                     uses: Vec::new(),
                     template: Default::default(),
+                    alpha_red_texels: Default::default(),
                 };
                 let immutable =
                     vk_sampler(&pcf, SamplerUse::new(compare, false), &p).expect("maps");
@@ -898,6 +909,7 @@ fn bicubic_texels_follow_the_bound_format() {
             diagnostics: Vec::new(),
             uses: Vec::new(),
             template: Default::default(),
+            alpha_red_texels: Default::default(),
         };
         planner.bicubic_texels(texture)
     };
@@ -924,13 +936,15 @@ fn bicubic_texels_follow_the_bound_format() {
 
 /// A combined binding with the cube-gradient bit (a cube's explicit gradients in Metal's isotropic
 /// footprint, which a function takes through a runtime sampler where the device's cube-gradient
-/// route is not measured) refuses an anisotropic runtime sampler at plan time, on every committed
-/// profile, as `NotImplemented(SamplerAnisotropy)`: the function chose the isotropic form when it
-/// compiled. An isotropic sampler is accepted for it, and the same anisotropic sampler for a
-/// binding without the bit (every other cube-gradient binding, whose footprint the sampler's word
-/// chooses) gets the ordinary verdict (`samplerAnisotropy`).
+/// route is not measured) takes an anisotropic runtime sampler on every committed profile, without
+/// `samplerAnisotropy` too: its Vulkan sampler is isotropic (no anisotropy handed), and Metal's
+/// anisotropic filter is the function's emulation, whose taps read explicit levels, under the
+/// variant naming the slot (`anisotropic_variant`) wherever the function states
+/// `RuntimeFact::AnisotropicSampler` for it. An isotropic sampler is accepted for it, and the same
+/// anisotropic sampler for a binding without the bit (every other cube-gradient binding, whose
+/// footprint the sampler's word chooses) gets the ordinary verdict (`samplerAnisotropy`).
 #[test]
-fn an_explicit_cube_gradient_binding_refuses_an_anisotropic_sampler() {
+fn an_explicit_cube_gradient_binding_takes_an_anisotropic_sampler_isotropically() {
     use crate::bind::state::SamplerDescriptor;
     use crate::metal::sampler::{vk_sampler, SamplerUse};
     let texture = SlotRef {
@@ -946,7 +960,7 @@ fn an_explicit_cube_gradient_binding_refuses_an_anisotropic_sampler() {
     let isotropic = SamplerDescriptor::new();
     let mut anisotropic = isotropic;
     anisotropic.max_anisotropy = 4;
-    let (mut refused, mut compiled) = (0, 0);
+    let (mut isotropic_taken, mut compiled) = (0, 0);
     for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
         let t = slot_iface(TextureType::Cube, SampledType::Float);
         let slots = BTreeMap::from([
@@ -981,7 +995,7 @@ fn an_explicit_cube_gradient_binding_refuses_an_anisotropic_sampler() {
                 stage
                     .samplers
                     .insert(sampler_slot.index, BoundSampler::new(desc).shape());
-                let shape = BTreeMap::from([(Stage::Kernel, stage)]);
+                let shape = BTreeMap::from([(Stage::Kernel, stage.clone())]);
                 let mut planner = ResourcePlanner {
                     profile: &p,
                     shape: &shape,
@@ -992,6 +1006,7 @@ fn an_explicit_cube_gradient_binding_refuses_an_anisotropic_sampler() {
                     diagnostics: Vec::new(),
                     uses: Vec::new(),
                     template: Default::default(),
+                    alpha_red_texels: Default::default(),
                 };
                 let sampler =
                     CombinedSampler::new(SamplerRef::Slot(sampler_slot.index), false, false)
@@ -1003,13 +1018,39 @@ fn an_explicit_cube_gradient_binding_refuses_an_anisotropic_sampler() {
                     &p,
                 );
                 if name == "anisotropic" && cube_gradient {
-                    let gap = Unsupported::not_implemented(Feature::SamplerAnisotropy);
-                    assert!(
-                        matches!(&verdict, Err(Error::Unsupported(u)) if *u == gap),
-                        "{stem}: {verdict:?}"
+                    let made = verdict.unwrap_or_else(|e| panic!("{stem}: {e:?}"));
+                    assert_eq!(made.max_anisotropy, None, "{stem}: {made:?}");
+                    // The write carries the use, so the binder's `VkSampler` (`sampler_desc`)
+                    // is the isotropic one too.
+                    let Ok(WriteSource::CombinedImageSampler {
+                        sampler:
+                            SamplerSource::Slot {
+                                compare,
+                                integer,
+                                cube_gradient: true,
+                                ..
+                            },
+                        ..
+                    }) = planned
+                    else {
+                        panic!("{stem}: {planned:?}");
+                    };
+                    let use_ = SamplerUse::new(compare, integer).with_cube_gradient(true);
+                    assert_eq!(vk_sampler(&desc, use_, &p), Ok(made), "{stem}");
+                    let mut bind = crate::bind::state::BindShape::default();
+                    bind.stages.insert(Stage::Kernel, stage);
+                    let stated = [crate::pipeline::RuntimeDependency::new(
+                        crate::pipeline::facts::RuntimeFact::AnisotropicSampler {
+                            slot: sampler_slot,
+                        },
+                        crate::pipeline::facts::Mechanism::Variant,
+                    )];
+                    assert_eq!(
+                        crate::bind::plan::slots::anisotropic_variant(&stated, &bind),
+                        BTreeSet::from([sampler_slot]),
+                        "{stem}"
                     );
-                    assert_eq!(planned, Err(BindError::Unsupported(gap)), "{stem}");
-                    refused += 1;
+                    isotropic_taken += 1;
                 } else {
                     match verdict {
                         Ok(_) => {
@@ -1026,8 +1067,8 @@ fn an_explicit_cube_gradient_binding_refuses_an_anisotropic_sampler() {
         }
     }
     assert!(
-        refused > 0 && compiled > 0,
-        "{refused} refused, {compiled} accepted"
+        isotropic_taken > 0 && compiled > 0,
+        "{isotropic_taken} taken isotropically, {compiled} accepted"
     );
 }
 
@@ -1073,6 +1114,7 @@ fn sampler_state_follows_the_bound_sampler() {
             diagnostics: Vec::new(),
             uses: Vec::new(),
             template: Default::default(),
+            alpha_red_texels: Default::default(),
         };
         [W::PIXEL_COORDINATES, W::PIXEL_NEAREST, W::FIELDS]
             .map(|fields| planner.sampler_state(slot, fields) as u32)
@@ -1140,6 +1182,7 @@ fn texel_format_follows_the_bound_format() {
             diagnostics: Vec::new(),
             uses: Vec::new(),
             template: Default::default(),
+            alpha_red_texels: Default::default(),
         };
         planner.texel_format(texture)
     };
@@ -1176,7 +1219,7 @@ fn texel_format_follows_the_bound_format() {
         assert_eq!(plan(texture2d(pf)), u64::from(want.0), "{pf:?}");
     }
     assert_eq!(
-        plan(texture2d(PixelFormat::ETC2RGB8SRGB)),
+        plan(texture2d(PixelFormat::BGRA10XRSRGB)),
         u64::from(C::OTHER.0)
     );
     // A cube gather's corner alone: its field, without border texels; and a packed format's family,
@@ -1358,6 +1401,7 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
                     diagnostics: Vec::new(),
                     uses: Vec::new(),
                     template: Default::default(),
+                    alpha_red_texels: Default::default(),
                 };
                 // The runtime pair.
                 let runtime =
@@ -1379,6 +1423,7 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
                         slot: sampler_slot,
                         compare: false,
                         integer: false,
+                        cube_gradient: false,
                         opaque_black: crate::metal::sampler::OpaqueBlackBorder::Stated,
                     },
                     None => WriteSource::Neutral(NeutralResource::Sampler { compare: false }),
@@ -1411,4 +1456,135 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
         !refused.is_empty() && !passed.is_empty(),
         "refused on {refused:?}, passed on {passed:?}"
     );
+}
+
+/// On a device without `A8_UNORM` (lavapipe's profile), an `A8Unorm` texture buffer's bytes are
+/// viewed as `R8_UNORM`, Metal's alpha in red: a storage slot through its choice's class
+/// (`StorageImageClass::AlphaInRed`), whose swizzle stays the texture's; a uniform one with no
+/// class, whose swizzle takes the alpha from red (`TextureSwizzleChannels::alpha_in_red`). A
+/// uniform slot that reads without applying the swizzle is refused there. Where the device has
+/// `A8_UNORM` (MoltenVK's), the uniform view is `A8_UNORM` and its swizzle the texture's.
+#[test]
+fn an_a8_texture_buffer_without_a8_unorm_views_its_bytes_in_red() {
+    use crate::metal::{TextureSwizzle as S, TextureSwizzleChannels};
+    use crate::pipeline::facts::{Mechanism, RuntimeFact};
+    let slot = |index| SlotRef {
+        stage: Stage::Kernel,
+        class: SlotClass::Texture,
+        index,
+    };
+    let (uniform, storage) = (slot(0), slot(1));
+    let mut read = slot_iface(TextureType::TextureBuffer, SampledType::Float);
+    read.access = TextureAccess::new(false, true, false);
+    let mut read_write = read;
+    read_write.access = TextureAccess::new(false, true, true);
+    let slots = BTreeMap::from([
+        (uniform, SlotInterface::Texture(read)),
+        (storage, SlotInterface::Texture(read_write)),
+    ]);
+    let shape = |swizzle| {
+        let mut stage = StageShape::default();
+        for index in [0, 1] {
+            let pixel_format = PixelFormat::A8Unorm;
+            let buffer = TextureShape::Buffer {
+                pixel_format,
+                swizzle,
+            };
+            stage.textures.insert(index, buffer);
+        }
+        BTreeMap::from([(Stage::Kernel, stage)])
+    };
+    let swizzle = TextureSwizzleChannels::new(S::Alpha, S::Zero, S::Green, S::One);
+    let swizzled = shape(swizzle);
+    let stated = [uniform, storage].map(|slot| {
+        let fact = RuntimeFact::TextureSwizzle { slot };
+        RuntimeDependency::new(fact, Mechanism::Specialization)
+    });
+    fn make<'a>(
+        profile: &'a DeviceProfile,
+        shape: &'a BTreeMap<Stage, StageShape>,
+        slots: &'a BTreeMap<SlotRef, SlotInterface>,
+        dependencies: &'a [RuntimeDependency],
+    ) -> ResourcePlanner<'a> {
+        ResourcePlanner {
+            profile,
+            shape,
+            slots,
+            dependencies,
+            stage_flags: |_| vk::PipelineStageFlags2::COMPUTE_SHADER,
+            variant: VariantKey::new(),
+            diagnostics: Vec::new(),
+            uses: Vec::new(),
+            template: Default::default(),
+            alpha_red_texels: Default::default(),
+        }
+    }
+    let uniform_ty = vk::DescriptorType::UNIFORM_TEXEL_BUFFER;
+    let storage_ty = vk::DescriptorType::STORAGE_TEXEL_BUFFER;
+    for (profile, held) in [("lavapipe", true), ("moltenvk-m3", false)] {
+        let p = crate::pipeline::testing::profile(profile, crate::device::DevicePolicy::default())
+            .expect("profile");
+        let a8 = PixelFormat::A8Unorm;
+        assert_eq!(
+            crate::metal::format::alpha_in_red(a8, &p),
+            held,
+            "{profile}"
+        );
+        let mut planner = make(&p, &swizzled, &slots, &stated);
+        let own = match held {
+            true => vk::Format::R8_UNORM,
+            false => vk::Format::A8_UNORM,
+        };
+        let planned = planner.plain_texture(0, 0, uniform_ty, uniform, false);
+        let Ok((WriteSource::TexelBuffer { format, .. }, _)) = planned else {
+            panic!("{profile}: {planned:?}");
+        };
+        assert_eq!(format, own, "{profile}: the uniform view");
+        let planned = planner.plain_texture(0, 1, storage_ty, storage, false);
+        let Ok((WriteSource::TexelBuffer { format, .. }, _)) = planned else {
+            panic!("{profile}: {planned:?}");
+        };
+        // A storage view takes `R8_UNORM` wherever `A8_UNORM` does not serve the use, the device's
+        // images aside.
+        let class = planner
+            .variant
+            .storage_images
+            .get(&storage)
+            .map(|c| c.class);
+        let in_red = class == Some(StorageImageClass::AlphaInRed);
+        assert!(in_red || !held, "{profile}: {class:?}");
+        let view = match in_red {
+            true => vk::Format::R8_UNORM,
+            false => vk::Format::A8_UNORM,
+        };
+        assert_eq!(format, view, "{profile}: the storage view");
+        let read_swizzle = match held {
+            true => TextureSwizzleChannels::new(S::Red, S::Zero, S::Zero, S::One),
+            false => swizzle,
+        };
+        assert_eq!(
+            planner.texture_swizzle(uniform),
+            u64::from(read_swizzle.word()),
+            "{profile}: the uniform slot's swizzle"
+        );
+        assert_eq!(
+            planner.texture_swizzle(storage),
+            u64::from(swizzle.word()),
+            "{profile}: the storage slot's swizzle"
+        );
+        // A read that does not apply the swizzle.
+        let plain = shape(TextureSwizzleChannels::DEFAULT);
+        let mut planner = make(&p, &plain, &slots, &[]);
+        let planned = planner.plain_texture(0, 0, uniform_ty, uniform, false);
+        match held {
+            true => assert_eq!(
+                planned.map(|(w, _)| w),
+                Err(BindError::Unsupported(Unsupported::not_implemented(
+                    Feature::Format
+                ))),
+                "{profile}"
+            ),
+            false => assert!(planned.is_ok(), "{profile}: {planned:?}"),
+        }
+    }
 }

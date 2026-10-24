@@ -3,8 +3,8 @@
 //! A runtime device owns or adopts the Vulkan instance, physical device, `VkDevice` and its
 //! queue, and holds what every object made from it shares: the compile-and-plan layer's
 //! [`metal2vulkan::device::Device`] (built from the description restricted to what was actually
-//! enabled), the memory sub-allocator, the Metal address space, the scheduler, the completion
-//! thread, and the handler threads.
+//! enabled), the memory sub-allocator, the Metal address space, the scheduler, the queues'
+//! waiters, and the handler threads.
 //!
 //! - **Create** ([`Device::system_default`], [`Device::all`], `create.rs`) makes the instance and
 //!   one device per physical device with the description's recommended enables, then adopts
@@ -19,6 +19,7 @@ mod adopt;
 pub(super) mod argument_buffers;
 mod compiles;
 pub(super) mod create;
+pub(super) mod float_tininess;
 pub(super) mod functions;
 mod handles;
 pub(super) mod instance_requirements;
@@ -27,7 +28,7 @@ pub(super) mod prime;
 pub(super) mod properties;
 pub(crate) mod relay;
 mod staging;
-mod submit;
+pub(super) mod submit;
 
 pub use adopt::RawDevice;
 pub use create::{
@@ -42,15 +43,16 @@ use super::attachmentless::KeptPasses;
 use super::capabilities::DeviceProperties;
 use super::color_resolve::ColorResolveObjects;
 use super::command_buffer::fences::Fences;
-use super::command_buffer::{Completion, Transition};
+use super::command_buffer::{Completion, Item};
 use super::contexts::{Contexts, THREADS};
 use super::degradation::{Announced, Degradation};
 use super::depth_copy::DepthCopyObjects;
 use super::depth_stencil_resolve::DepthStencilResolveObjects;
 use super::draw_source::{sized_index_bind, SizedIndexBind};
-use super::dynamic_state::ExtendedDynamicState;
+use super::dynamic_state::{ColorWriteMasks, ExtendedDynamicState};
 use super::error::{vulkan, Error};
 use super::exit_guard::{self, Call};
+use super::freed_memory::Parking;
 use super::function_table::TableShared;
 use super::generated_commands::Commands;
 use super::gpu_pools::GpuPools;
@@ -60,10 +62,11 @@ use super::host_memory::Importer;
 use super::interop::Interop;
 use super::loader_word::LoaderWord;
 use super::memory::Memory;
+use super::memory_log::MemoryLog;
 use super::mipmap_scratch::MipmapScratch;
 use super::owned_kernel::OwnedKernels;
-use super::render_state::{depth_bias_command, DepthBiasCommand};
-use super::render_target::KeptCompatible;
+use super::render_state::{depth_bias_command, DepthBiasCommand, DepthRanges};
+use super::render_target::KeptRenderPasses;
 use super::resource_ids::{ResourceIds, SamplerIdReads};
 use super::sample_planes::PlanesObjects;
 use super::sampler::{SamplerCount, SamplerKey, SamplerShared};
@@ -75,18 +78,21 @@ use super::sparse::device::SparseDevice;
 use super::stencil_copy::StencilCopyObjects;
 use super::texture::TextureState;
 use super::unique_identifier::UniqueIdentifiers;
+use crate::image_barrier::MemoryReads;
+use crate::recorder::{Command, MeshDraws, Recorder, RecorderShared, Slot};
 use crate::release;
 use ash::vk::{self, Handle};
-use functions::Functions;
+use functions::{Functions, Vk};
 use metal2vulkan::bind::RegionLimits;
 use metal2vulkan::device::{DeviceDescription, EnableSet};
+use metal2vulkan::error::RuntimeDriverDefect;
 use metal2vulkan::vk::DriverId;
 use relay::Flights;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
-use submit::Internal;
+use submit::{Internal, OwnTimeline};
 
 /// A Metal device (`MTLDevice`) on a Vulkan device. Cheap to clone (a retain); `Send + Sync`.
 #[derive(Clone)]
@@ -158,8 +164,9 @@ pub(super) struct DeviceShared {
     /// The instance outlives the device.
     pub(super) instance: Arc<InstanceShared>,
     pub(super) physical: vk::PhysicalDevice,
-    /// The device's functions: through [`DeviceShared::vk`] only.
-    functions: Functions,
+    /// The device's functions: through [`DeviceShared::vk`] only, or a share that holds nothing
+    /// of the device ([`DeviceShared::functions`]).
+    functions: Arc<Functions>,
     /// The primary queue family: its first queue's, where internal submissions go.
     pub(super) queue_family: u32,
     /// The `VkQueue`s the runtime submits to, the primary family's first queue first: at least
@@ -168,8 +175,6 @@ pub(super) struct DeviceShared {
     /// The families of those queues, the primary first, each once: what the device's buffers and
     /// images are shared among (`sharing.rs`).
     pub(super) queue_families: Vec<u32>,
-    /// The identity the next logical queue takes.
-    next_queue: AtomicU64,
     /// How many of `queues`, the first, logical queues share round robin; the rest are reserved
     /// for presenting queues.
     round_robin: usize,
@@ -181,6 +186,9 @@ pub(super) struct DeviceShared {
     presenting_made: AtomicU64,
     /// The compile-and-plan device: the description restricted to what is enabled.
     compile: metal2vulkan::device::Device,
+    /// What `compile`'s profile takes of viewport depth ranges past `[0, 1]`, which draws read
+    /// (`render_state::native_depth_range`).
+    pub(super) depth_ranges: DepthRanges,
     /// What the `VkDevice` enabled, in the compile layer's vocabulary.
     enabled: EnableSet,
     properties: DeviceProperties,
@@ -191,7 +199,9 @@ pub(super) struct DeviceShared {
     /// The alignment of every upload (`upload.rs`): 16 bytes, and the device's storage and
     /// uniform buffer offset alignments.
     pub(super) upload_alignment: u64,
-    pub(super) memory: Mutex<Memory>,
+    /// Shared with the releases of freed memory posted to the handler threads, which hold
+    /// nothing of the device (`freed_memory.rs`).
+    pub(super) memory: Arc<Mutex<Memory>>,
     pub(super) addresses: Mutex<AddressSpace>,
     /// The resource IDs of textures and sampler states (`resource_ids.rs`).
     pub(super) resource_ids: Arc<Mutex<ResourceIds>>,
@@ -223,6 +233,19 @@ pub(super) struct DeviceShared {
     /// a dispatch of the state that made it (`function_table.rs`).
     pub(super) function_tables: Mutex<BTreeMap<u64, Weak<TableShared>>>,
     internal: Mutex<Option<Internal>>,
+    /// The internal submissions' timeline as the host saw it complete (`submit.rs`).
+    internal_done: OwnTimeline,
+    /// The staging copies' timeline as the host saw it complete (`staging.rs`).
+    staging_done: OwnTimeline,
+    /// Each batch with work makes what completed work wrote visible by a command buffer of
+    /// barriers that starts it, and waits for no timeline the host saw complete: the driver's
+    /// submissions stall on semaphore operations (`DriverFact::SemaphoreOperationsStallSubmits`,
+    /// `command_buffer/submit.rs`).
+    pub(super) completed_by_barrier: bool,
+    /// Each batch ends with `Barrier::to_all`, so a later batch of its `VkQueue` plans no barrier
+    /// for its accesses, and a batch's start timestamp is written at the bottom of the pipe
+    /// (`batch_order.rs`).
+    pub(crate) by_ends: bool,
     /// The last sparse binding of a no-copy buffer's dma-bufs (`dma_buf.rs`) the host has not
     /// seen complete: the internal timeline and the value it signals, which every later
     /// submission that may use the buffer waits for (`submit.rs`).
@@ -230,11 +253,17 @@ pub(super) struct DeviceShared {
     /// The queue reserved for staging copies, where the device has one (`staging.rs`).
     staging: Option<staging::StagingQueue>,
     pub(super) scheduler: Scheduler,
+    /// The scheduler's nudge, a timeline semaphore its wakers signal where its thread waits for
+    /// the GPU (`scheduler/mod.rs`): made on every device, used where the driver's wait for any
+    /// of several semaphores loses no signal (not MoltenVK's).
+    nudge: vk::Semaphore,
     pub(super) completion: Completion,
     /// The idle fences the batches that end command buffers signal (`command_buffer/fences.rs`).
     pub(super) fences: Fences,
-    /// The queues' serial contexts: every command buffer's transitions and handlers run there.
-    pub(super) contexts: Contexts<Transition>,
+    /// The queues' serial contexts: every command buffer's transitions and handlers run there,
+    /// and the releases handed off a thread that may run none of the program's code
+    /// ([`Device::let_go_elsewhere`]).
+    pub(super) contexts: Contexts<Item>,
     loader_word: LoaderWord,
     /// The runtime created the `VkDevice` and destroys it.
     owned: bool,
@@ -256,7 +285,30 @@ pub(super) struct DeviceShared {
     /// `VK_EXT_depth_bias_control` (`render_state.rs`).
     pub(super) depth_bias_command: Option<DepthBiasCommand>,
     /// The mesh draw commands, where the device enabled `meshShader` (`render/mesh.rs`).
-    pub(super) mesh_draws: Option<ash::ext::mesh_shader::Device>,
+    pub(super) mesh_draws: Option<MeshDraws>,
+    /// `vkCmdPushDescriptorSet`, from Vulkan 1.4 or `VK_KHR_push_descriptor`
+    /// (`binding::push_set`); none where the driver has
+    /// `RuntimeDriverDefect::PushedBufferSizesUnset`.
+    pub(super) push_descriptor: Option<vk::PFN_vkCmdPushDescriptorSetKHR>,
+    /// A draw after a pipeline bind pushes at least one of set 0's descriptors, the first where
+    /// none changed (`render/bound.rs`), where the driver has
+    /// `RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds`.
+    pub(super) pushes_after_pipeline_binds: bool,
+    /// The command that sets a draw's color write masks, where the device enabled everything a
+    /// draw that reads its own pass's texture through a snapshot takes (`render/snapshot.rs`).
+    pub(super) color_write_masks: Option<ColorWriteMasks>,
+    /// The device's slot among those its commands go through (`recorder`), where it took one:
+    /// let go of after `vkDestroyDevice` (it drops after the teardown, `Drop`). Held, not read.
+    _recording: Option<Slot>,
+    /// The thread that replays its encoders' deferred command buffers, where it has a slot
+    /// (`recorder`).
+    recorder: Option<Recorder>,
+    /// The reasons a draw that reads its pass's texture took the split that the device said
+    /// already, where `METAL2VULKAN_LOG_PIPELINES` is set (`render/snapshot.rs`).
+    pub(super) snapshot_fallbacks: Mutex<Vec<&'static str>>,
+    /// The draws the area rule weighed, by size, where `METAL2VULKAN_LOG_PIPELINES` is set
+    /// (`render/snapshot.rs`, `reader_sizes.rs`).
+    pub(super) reader_sizes: Mutex<crate::reader_sizes::ReaderSizes>,
     /// The command buffers' index and mesh records pools: their bytes and spare blocks
     /// (`gpu_pools.rs`).
     pub(super) gpu_pools: GpuPools,
@@ -289,6 +341,12 @@ pub(super) struct DeviceShared {
     /// The variants' shader modules by their exact SPIR-V, shared device-wide
     /// (`pipeline/content_keyed.rs`).
     pub(super) shader_modules: Mutex<crate::pipeline::ShaderModules>,
+    /// The variants' pipeline layouts by their exact definition, shared device-wide
+    /// (`pipeline/shared_layouts.rs`).
+    pub(crate) pipeline_layouts: Mutex<crate::pipeline::shared_layouts::SharedLayouts>,
+    /// The variants' makings in the air, by their compile, which a twin's waits for to land
+    /// (`pipeline/flight.rs`).
+    pub(crate) flights: crate::pipeline::flight::Flights,
     /// The exact color resolve's pipelines and passes, made on first use (`color_resolve.rs`).
     pub(super) color_resolves: Mutex<ColorResolveObjects>,
     /// The multisampled stencil's copies without colour copies: the split kernel and the plane
@@ -303,8 +361,9 @@ pub(super) struct DeviceShared {
     /// The render passes of its passes without attachments, one per sample count, made on first
     /// use (`attachmentless.rs`).
     pub(super) attachmentless: Mutex<KeptPasses>,
-    /// The compatible passes it keeps, by shape (`render_target::shared_compatible_pass`).
-    pub(super) compatible_passes: Mutex<KeptCompatible>,
+    /// The render passes it keeps: compatible ones and those instances begin, by what each is
+    /// made of (`render_target::KeptRenderPasses`).
+    pub(super) render_passes: Mutex<KeptRenderPasses>,
     /// The caller's images that move between layouts, and the events' timeline semaphores
     /// (`interop.rs`).
     pub(super) interop: Interop,
@@ -321,6 +380,10 @@ pub(super) struct DeviceShared {
     pub(super) owners: super::used_resources::Owners,
     /// The program's live buffers of their own, and their resident set (`live_buffers.rs`).
     pub(super) live_buffers: super::live_buffers::LiveBuffers,
+    /// The imports of the caller's dma-bufs it releases while idle, and the thread that releases
+    /// them (`host_residency.rs`).
+    #[cfg(unix)]
+    pub(super) residency: super::host_residency::Sweeper,
     /// How its command buffers are timed on the GPU (`gpu_time.rs`).
     pub(super) timing: Timing,
     /// Its Vulkan views may present an image in another component layout: it has no portability
@@ -347,8 +410,19 @@ pub(super) struct DeviceShared {
     /// The command pools and descriptor pools command buffers that completed gave back, for the
     /// next to take (`spares.rs`).
     pub(super) spares: Spares,
+    /// The bind states its ended render encoders left, which the next ones start from
+    /// (`live_bind.rs`).
+    pub(super) live_binds: crate::live_bind::SpareLiveBinds,
+    /// The bind memos its ended render encoders left, which the next ones take (`binding.rs`).
+    pub(super) bind_memos: crate::binding::SpareBindMemos,
+    /// The rooms of the draws its render encoders kept for instances recorded inline after a
+    /// split, which the next such instances take (`render/inline_splits.rs`).
+    pub(super) kept_rooms: crate::render::SpareKept,
     /// Counts of its commit path's work, for the lanes (`work_counts.rs`).
     pub(super) counts: super::work_counts::Counters,
+    /// Where the driver fails pending work as memory a device-address buffer lay in is freed,
+    /// the record of its batches the memory's blocks that go wait by (`freed_memory.rs`).
+    pub(crate) parking: OnceLock<Arc<Parking>>,
     /// Its command buffers made and not committed, over all its queues (`queue.rs`).
     pub(super) uncommitted: Arc<super::queue::Uncommitted>,
     /// The threads that make `VkPipeline`s ahead of the draws that record them
@@ -357,6 +431,9 @@ pub(super) struct DeviceShared {
     /// The thread that lets go of what a released state's pool pieces gave back as they ended
     /// (`pipeline/reaper.rs`).
     pub(super) reaper: crate::pipeline::reaper::Reaper,
+    /// The trails its threads open between a signal and their last let-go of what they held for
+    /// the work, which a command buffer's waiters wait for (`trails.rs`).
+    pub(crate) trails: Arc<crate::trails::Trails>,
     /// Its graphics pipeline libraries, by part and content, where it links its render
     /// pipelines from libraries (`pipeline/libraries.rs`, `create.rs`); `None` where it makes
     /// each whole.
@@ -389,8 +466,59 @@ impl DeviceShared {
     /// the exit guard, or while they run the program's code, and a section reaches only the exit
     /// guard's table of entry points; builds with debug assertions end the process otherwise
     /// (`functions.rs`).
-    pub(crate) fn vk(&self) -> &ash::Device {
+    pub(crate) fn vk(&self) -> &Vk {
         self.functions.get()
+    }
+
+    /// A share of the device's functions, which holds nothing of the device: for the releases
+    /// posted to its handler threads, which its teardown waits for (`freed_memory.rs`). Reached
+    /// through [`Functions::get`] alone, as [`vk`](Self::vk) reaches them.
+    pub(crate) fn functions(&self) -> Arc<Functions> {
+        Arc::clone(&self.functions)
+    }
+
+    /// What its encoders' deferred command buffers' replays share, where it records them so
+    /// (`recorder`).
+    pub(crate) fn recorder(&self) -> Option<&Arc<RecorderShared>> {
+        self.recorder.as_ref().map(Recorder::shared)
+    }
+
+    /// `vkAllocateCommandBuffers` of `info`: the loader serves it and reads the device's loader
+    /// word first ([`LoaderWord`]).
+    pub(super) fn allocate_command_buffers(
+        &self,
+        info: &vk::CommandBufferAllocateInfo<'_>,
+    ) -> Result<Vec<vk::CommandBuffer>, Error> {
+        // SAFETY: the device is live; `info` names one of its pools, which the caller holds
+        // exclusively.
+        let allocated = unsafe {
+            self.loader_word.restore();
+            self.vk().allocate_command_buffers(info)
+        };
+        exit_guard::called(Call::AllocateCommandBuffers);
+        allocated.map_err(super::error::vulkan)
+    }
+
+    /// Name `pipeline`, just made and held by this thread alone, `name` for the layers' messages,
+    /// where the device's instance reports messages (`Vk::object_name`): the loader serves the
+    /// call and reads the device's loader word first ([`LoaderWord`]). A failure to name it is
+    /// ignored: the name serves messages alone.
+    pub(crate) fn name_pipeline(&self, pipeline: vk::Pipeline, name: &std::ffi::CStr) {
+        let functions = self.vk();
+        let Some(object_name) = functions.object_name() else {
+            return;
+        };
+        let info = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(pipeline)
+            .object_name(name);
+        // SAFETY: the device is live and `pipeline` its own, which no other thread holds yet; the
+        // instance enables `VK_EXT_debug_utils` (it reports messages), and the function is the
+        // device's.
+        let _ = unsafe {
+            self.loader_word.restore();
+            object_name(functions.handle(), &info)
+        };
+        exit_guard::called(Call::SetDebugUtilsObjectName);
     }
 
     /// How the device's buffers and images are shared among its queue families (`sharing.rs`).
@@ -402,6 +530,11 @@ impl DeviceShared {
     /// pools of what it runs are made for.
     pub(crate) fn queue_family_of(&self, index: usize) -> u32 {
         self.queues[index].family
+    }
+
+    /// The queue flags of the family of the device's `VkQueue` at `index`.
+    pub(crate) fn queue_flags_of(&self, index: usize) -> vk::QueueFlags {
+        self.queues[index].flags
     }
 
     /// A Vulkan sampler of `info`, counted against the device's `maxSamplerAllocationCount`
@@ -440,6 +573,17 @@ impl Drop for DeviceShared {
         let Some(_busy) = exit_guard::enter() else {
             return;
         };
+        // The watch of the program's marks and the releases of freed memory, posted to the
+        // handler threads, hold nothing of the device: those that begin from here on call
+        // nothing, and the threads' stop below waits for those running (`freed_memory.rs`).
+        if let Some(parking) = self.parking.get() {
+            parking.close();
+        }
+        // The draws the snapshot's area rule weighed since the last line (`reader_sizes.rs`).
+        if let Some(text) = lock(&self.reader_sizes).last_line() {
+            let sink = self.instance.sink();
+            crate::driver_facts::inform_through(sink, "metal2vulkan-snapshot-readers", text);
+        }
         // Nothing of the device is in flight: its failures are no longer relayed.
         if let Some(relay) = self.instance.relay() {
             relay.forget(&self.lost);
@@ -452,6 +596,9 @@ impl Drop for DeviceShared {
         // What the reaper is handed holds the device: none is left, and it only stops, unless
         // this teardown runs on its thread.
         self.reaper.stop();
+        // What the residency thread releases holds the device: none is left.
+        #[cfg(unix)]
+        self.residency.stop();
         self.completion.stop();
         self.contexts.stop();
         // SAFETY: the device is live; waiting for idle covers any work the consumer of an
@@ -460,12 +607,18 @@ impl Drop for DeviceShared {
         unsafe {
             let _ = self.vk().device_wait_idle();
             exit_guard::called(Call::DeviceWaitIdle);
+            // The scheduler's thread, which waited on its nudge, has stopped.
+            release::object(self.vk(), self.nudge);
             for queue in &self.queues {
                 release::object(self.vk(), queue.timeline);
                 // The marks after the last uses of the queue outside a batch (`relay.rs`).
                 for fence in queue.flights.get().map(|f| f.drain()).unwrap_or_default() {
                     release::object(self.vk(), fence);
                 }
+            }
+            // Nor the marks of the program's uses of the queues (`freed_memory.rs`).
+            if let Some(parking) = self.parking.get() {
+                parking.release(self.vk());
             }
             // No fence is pending either: each command buffer's was given back as it finished.
             self.fences.release(self.vk());
@@ -484,6 +637,8 @@ impl Drop for DeviceShared {
             staging.destroy(self.vk());
         }
         lock(&self.textures.neutrals).destroy(self.vk(), &mut lock(&self.memory));
+        // No framebuffer is left to hold a placeholder (`storage_placeholder.rs`).
+        lock(&self.textures.storage_placeholders).destroy(self.vk(), &mut lock(&self.memory));
         // The zeros new resources' first work copied from (`texture/first_move.rs`).
         (self.textures.first_moves).destroy(self.vk(), &mut lock(&self.memory));
         lock(&self.heaps).destroy(self.vk(), &mut lock(&self.memory));
@@ -497,7 +652,7 @@ impl Drop for DeviceShared {
         lock(&self.depth_copies).destroy(self.vk());
         lock(&self.depth_stencil_resolves).destroy(self.vk());
         lock(&self.attachmentless).destroy(self.vk());
-        lock(&self.compatible_passes).destroy(self.vk());
+        lock(&self.render_passes).destroy(self.vk());
         // What released variants left (`pipeline/kept.rs`).
         lock(&self.kept).destroy(self);
         // The graphics pipeline libraries, after every pipeline they linked: each linked
@@ -512,6 +667,9 @@ impl Drop for DeviceShared {
         // nothing), and the kept ones let go of theirs above (`pipeline/content_keyed.rs`).
         let modules = lock(&self.shader_modules).drain();
         modules.destroy(&*self);
+        // The pipeline layouts, likewise (`pipeline/shared_layouts.rs`).
+        let layouts = lock(&self.pipeline_layouts).drain();
+        layouts.destroy(&*self);
         // The immutable sampler sets, likewise, each counted back as its samplers go: the
         // layouts that baked them are gone.
         let sampler_sets = lock(&self.sampler_sets).drain();
@@ -519,7 +677,10 @@ impl Drop for DeviceShared {
         // Every other pipeline was destroyed with its state (each holds this device); the cache
         // thread stops.
         self.shader_cache.close();
-        lock(&self.memory).destroy(self.vk());
+        // What waited with blocks of its memory (a host import's deallocators) goes once they are
+        // freed, with no lock held.
+        let after = lock(&self.memory).destroy(self.vk());
+        drop(after);
         // The device's record of pipeline makings goes, before `vkDestroyDevice`: in builds with
         // debug assertions, no making is in progress (`compiles.rs`).
         compiles::unregister(self.vk().handle());
@@ -540,6 +701,9 @@ pub(super) struct QueueSlot {
     raw: Mutex<vk::Queue>,
     /// The queue's family, which the command pools of what it runs are made for.
     pub(super) family: u32,
+    /// The family's queue flags: the commands it runs, and so the accesses a barrier recorded
+    /// for it may name (`image_barrier.rs`).
+    flags: vk::QueueFlags,
     /// The queue's loader word, which MoltenVK overwrites where a message names the queue
     /// (`relay.rs`): put back before each use.
     word: LoaderWord,
@@ -554,6 +718,10 @@ pub(super) struct QueueSlot {
     /// The value of the last batch submitted here: what the exit hook waits for on a device
     /// whose queues run in this process ([`exit_guard::InProcess`]).
     submitted: AtomicU64,
+    /// The value of the submission before the last that signalled the timeline here: while it is
+    /// not seen complete, two or more submissions here are in flight
+    /// ([`pending_beyond_one`](Self::pending_beyond_one)).
+    submitted_before: AtomicU64,
 }
 
 impl QueueSlot {
@@ -576,9 +744,23 @@ impl QueueSlot {
     }
 
     /// A batch signalling `value` was submitted here, inside its section of the exit guard: the
-    /// hook, which waits for that section, sees it.
+    /// hook, which waits for that section, sees it. Submissions here are made under the queue's
+    /// lock, so the last two values move together.
     pub(super) fn submitted(&self, value: u64) {
-        self.submitted.fetch_max(value, Ordering::AcqRel);
+        let before = self.submitted.fetch_max(value, Ordering::AcqRel);
+        if before < value {
+            self.submitted_before.store(before, Ordering::Release);
+        }
+    }
+
+    /// Where two or more submissions that signalled the timeline here are not seen complete, the
+    /// value of the one before the last, whose completion leaves one in flight: each submission
+    /// signals a higher value, and the timeline completes them in order
+    /// (`command_buffer/group.rs`). Read without the queue's lock, so a submission made meanwhile
+    /// is seen or not.
+    pub(super) fn pending_beyond_one(&self) -> Option<u64> {
+        let before = self.submitted_before.load(Ordering::Acquire);
+        (self.completed_value() < before).then_some(before)
     }
 
     /// The value of the last batch submitted here; 0 before the first.
@@ -655,7 +837,7 @@ impl Device {
     }
 
     /// Wait for the work submitted to each of the device's queues to end, each queue under its
-    /// lock, the waits one section of the exit guard: what the completion thread does after a
+    /// lock, the waits one section of the exit guard: what a completion turn does after a
     /// failed wait, before that wait's command buffers let go of what they used
     /// (`command_buffer/completion.rs`). Once the process is exiting it waits for nothing, and
     /// the releases that follow make no Vulkan call.
@@ -685,10 +867,27 @@ impl Device {
         shared.counts.queue_drain();
     }
 
+    /// Let go of `held` at once on one of the device's handler threads, in a context of its own
+    /// (an identity no logical queue takes, so it waits behind no queue's handlers): what the
+    /// scheduler's thread lets go of under its locks where its drop may run the program's code,
+    /// which may not run there (`exit_guard::program_release`). Its drop runs there as on the
+    /// program's own thread, with no command buffer's step marked.
+    pub(crate) fn let_go_elsewhere(&self, held: Box<dyn Send>) {
+        let (contexts, context) = self.elsewhere();
+        contexts.post(context, Item::Release(held));
+    }
+
+    /// Where [`let_go_elsewhere`](Self::let_go_elsewhere) posts: the device's handler threads,
+    /// and a context of its own. The handle of the pool holds nothing of the device, so what holds
+    /// the device can be posted with no handle of it taken here.
+    pub(crate) fn elsewhere(&self) -> (Contexts<Item>, u64) {
+        (self.0.contexts.clone(), self.0.contexts.fresh())
+    }
+
     /// A new logical queue's identity, and the index of the `VkQueue` it submits to: round
     /// robin over the device's queues that are not reserved for presenting.
     pub(super) fn next_queue(&self) -> (u64, usize) {
-        let id = self.0.next_queue.fetch_add(1, Ordering::Relaxed);
+        let id = self.0.contexts.fresh();
         let made = self.0.round_robin_made.fetch_add(1, Ordering::Relaxed);
         (id, (made % self.0.round_robin as u64) as usize)
     }
@@ -700,25 +899,17 @@ impl Device {
         if reserved == 0 {
             return None;
         }
-        let id = self.0.next_queue.fetch_add(1, Ordering::Relaxed);
+        let id = self.0.contexts.fresh();
         let made = self.0.presenting_made.fetch_add(1, Ordering::Relaxed);
         Some((id, self.0.round_robin + (made % reserved as u64) as usize))
     }
 
-    /// `vkAllocateCommandBuffers` of `info`: the loader serves it and reads the device's loader
-    /// word first ([`LoaderWord`]).
+    /// `vkAllocateCommandBuffers` of `info` (`DeviceShared::allocate_command_buffers`).
     pub(super) fn allocate_command_buffers(
         &self,
         info: &vk::CommandBufferAllocateInfo<'_>,
     ) -> Result<Vec<vk::CommandBuffer>, Error> {
-        // SAFETY: the device is live; `info` names one of its pools, which the caller holds
-        // exclusively.
-        let allocated = unsafe {
-            self.0.loader_word.restore();
-            self.0.vk().allocate_command_buffers(info)
-        };
-        exit_guard::called(Call::AllocateCommandBuffers);
-        allocated.map_err(super::error::vulkan)
+        self.0.allocate_command_buffers(info)
     }
 }
 
@@ -769,10 +960,6 @@ pub(super) struct Parts {
     /// `adopt.rs`, where the consumer lists it), outside `enabled`'s vocabulary: its render
     /// pipelines are linked from libraries (`pipeline/libraries.rs`).
     pub(super) graphics_pipeline_library: bool,
-    /// It enables `VK_EXT_metal_objects` (`create.rs`), outside `enabled`'s vocabulary: textures
-    /// over no-copy buffers are Metal textures over their imports' `MTLBuffer`s
-    /// (`metal_texture.rs`).
-    pub(super) metal_objects: bool,
     /// It enables `VK_EXT_pipeline_creation_feedback` (`create.rs`), outside `enabled`'s
     /// vocabulary, wherever listed: each making of a program's pipeline reads whether its cache
     /// held the pipeline (`shader_cache/mod.rs`).
@@ -785,6 +972,9 @@ pub(super) struct Parts {
     /// The sparse members of the core features it enables, outside `enabled`'s vocabulary
     /// (`sparse/device.rs`).
     pub(super) sparse_features: vk::PhysicalDeviceFeatures,
+    /// The reads its global memory barriers name (`image_barrier::MemoryReads`): those of the
+    /// primary queue family's commands with the extensions it enables.
+    pub(super) memory_reads: MemoryReads,
     pub(super) owned: bool,
     /// The shader cache, its directory opened before any Vulkan object was made.
     pub(super) cache: CacheSetup,
@@ -823,11 +1013,11 @@ impl Device {
             host_image_copy,
             linear_color_attachment,
             graphics_pipeline_library,
-            metal_objects,
             creation_feedback,
             dma_buf,
             dma_buf_images,
             sparse_features,
+            memory_reads,
             owned,
             cache,
             metal_level,
@@ -835,6 +1025,10 @@ impl Device {
         // Every pipeline made on the device from here on is made at the user-initiated class.
         // SAFETY: the device is live (the caller's contract), and its functions are its own.
         let raw = unsafe { compiles::route(raw) };
+        // Every command recorded with the device's functions goes through a slot of its own
+        // (`recorder`), dropped with the device after `vkDestroyDevice`.
+        // SAFETY: as above; its functions were routed for its pipeline makings alone.
+        let (raw, recording) = unsafe { crate::recorder::route(raw) };
         // What the runtime made from the device, destroyed with it when a later step fails.
         let undo = |timelines: &[vk::Semaphore]| {
             // The record of pipeline makings first, as in the teardown (`compiles.rs`).
@@ -851,8 +1045,9 @@ impl Device {
                 }
             }
         };
-        let mut timelines = Vec::with_capacity(queue_places.len());
-        for _ in &queue_places {
+        // Each `VkQueue`'s timeline, then the scheduler's nudge (`scheduler/mod.rs`).
+        let mut timelines = Vec::with_capacity(queue_places.len() + 1);
+        for _ in 0..=queue_places.len() {
             let mut kind = vk::SemaphoreTypeCreateInfo::default()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
                 .initial_value(0);
@@ -866,9 +1061,13 @@ impl Device {
                 }
             }
         }
+        // Each batch ends with a barrier that orders all its commands before every later one of
+        // its queue, where the driver runs a queue's submissions one after another anyway
+        // (`batch_order.rs`).
+        let by_ends = crate::batch_order::by_ends(compile.policy(), description.driver_id);
         let threads = Contexts::start(THREADS).and_then(|contexts| {
             match Completion::start(queue_places.len()) {
-                Ok(completion) => match Scheduler::start(queue_places.len()) {
+                Ok(completion) => match Scheduler::start(queue_places.len(), by_ends) {
                     Ok(scheduler) => Ok((contexts, completion, scheduler)),
                     Err(error) => {
                         completion.stop();
@@ -889,6 +1088,16 @@ impl Device {
                 return Err(error);
             }
         };
+        // SAFETY: `physical` belongs to `instance`.
+        let families = unsafe {
+            instance
+                .raw
+                .get_physical_device_queue_family_properties(physical)
+        };
+        let flags_of = |family: u32| {
+            (families.get(family as usize)).map_or(vk::QueueFlags::empty(), |p| p.queue_flags)
+        };
+        let nudge = timelines[queue_places.len()];
         let queues: Vec<QueueSlot> = queue_places
             .iter()
             .zip(&timelines)
@@ -902,12 +1111,14 @@ impl Device {
                 QueueSlot {
                     raw: Mutex::new(queue),
                     family,
+                    flags: flags_of(family),
                     // SAFETY: the queue was just returned, its word the loader's.
                     word: unsafe { LoaderWord::of_handle(queue.as_raw()) },
                     flights: OnceLock::new(),
                     timeline,
                     completed: AtomicU64::new(0),
                     submitted: AtomicU64::new(0),
+                    submitted_before: AtomicU64::new(0),
                 }
             })
             .collect();
@@ -923,18 +1134,10 @@ impl Device {
             unsafe {
                 loader_word.restore();
                 let queue = raw.get_device_queue(family, index);
-                staging::StagingQueue::new(family, queue, &queue_families)
+                staging::StagingQueue::new(family, flags_of(family), queue, &queue_families)
             }
         });
-        // SAFETY: `physical` belongs to `instance`.
-        let family = unsafe {
-            instance
-                .raw
-                .get_physical_device_queue_family_properties(physical)
-        }
-        .get(queue_family as usize)
-        .copied()
-        .unwrap_or_default();
+        let family = (families.get(queue_family as usize).copied()).unwrap_or_default();
         let timestamp_bits = family.timestamp_valid_bits;
         // SAFETY: as above.
         let sparse_properties =
@@ -954,8 +1157,118 @@ impl Device {
                         .get_device_proc_addr(raw.handle(), name.as_ptr())
                 })
             }
+            .map(|commands| commands.routed(recording.as_ref()))
         } else {
             None
+        };
+        // None where the driver's pushed sets lose their buffers' sizes
+        // (`RuntimeDriverDefect::PushedBufferSizesUnset`): every draw and dispatch binds set 0
+        // there, as on a device without the command.
+        let pushes_whole_sets = !crate::driver_defects::of(&description)
+            .contains(&metal2vulkan::error::RuntimeDriverDefect::PushedBufferSizesUnset);
+        // At least one write of set 0 pushed after each pipeline bind where the driver's pushed
+        // descriptors go stale across one
+        // (`RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds`).
+        let pushes_after_pipeline_binds = crate::driver_defects::of(&description).contains(
+            &metal2vulkan::error::RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds,
+        );
+        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
+        let push_descriptor = unsafe {
+            loader_word.restore();
+            crate::binding::push_descriptor_command(
+                &instance.raw,
+                &raw,
+                description.api_version,
+                &enabled,
+            )
+        }
+        .filter(|_| pushes_whole_sets)
+        .map(|push| {
+            // SAFETY: the device's own command of that name.
+            unsafe {
+                crate::recorder::through(recording.as_ref(), Command::CmdPushDescriptorSet, push)
+            }
+        });
+        // Its naming of an object, where its instance reports messages: a graphics pipeline that
+        // reads its input attachments in rasterization order is named for the layers' messages
+        // (`pipeline/graphics.rs`).
+        let object_name = match instance.sink() {
+            // SAFETY: as above; the instance enables `VK_EXT_debug_utils` where it reports
+            // messages, and the loader serves `vkGetDeviceProcAddr` once the word is put back.
+            Some(_) => unsafe {
+                loader_word.restore();
+                instance
+                    .raw
+                    .get_device_proc_addr(raw.handle(), c"vkSetDebugUtilsObjectNameEXT".as_ptr())
+            },
+            None => None,
+        }
+        .map(|function| {
+            // SAFETY: the device gave the function of this name.
+            unsafe {
+                std::mem::transmute::<
+                    unsafe extern "system" fn(),
+                    vk::PFN_vkSetDebugUtilsObjectNameEXT,
+                >(function)
+            }
+        });
+        // Its calibrated timestamps, where its queue family writes timestamps: a completion turn
+        // reads them (`gpu_time.rs`).
+        // SAFETY: the device enables `calibration`'s form where it is set; the loader serves
+        // `vkGetDeviceProcAddr` once the word is put back.
+        let calibrated = unsafe {
+            loader_word.restore();
+            gpu_time::calibrated(&instance.entry, &instance.raw, physical, &raw, calibration)
+        }
+        .filter(|_| timestamp_bits > 0);
+        // The render encoder's commands of extensions and of Vulkan 1.3, which priming makes too.
+        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
+        let extended_dynamic_state = unsafe {
+            loader_word.restore();
+            ExtendedDynamicState::load(
+                &instance.raw,
+                &raw,
+                description.api_version,
+                &enabled,
+                recording.as_ref(),
+            )
+        };
+        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
+        let sized_index_bind = unsafe {
+            loader_word.restore();
+            sized_index_bind(&instance.raw, &raw, &enabled)
+        }
+        .map(|bind| {
+            // SAFETY: the device's own command of that name.
+            unsafe {
+                crate::recorder::through(recording.as_ref(), Command::CmdBindIndexBuffer2, bind)
+            }
+        });
+        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
+        let depth_bias_command = unsafe {
+            loader_word.restore();
+            depth_bias_command(&instance.raw, &raw, &enabled)
+        }
+        .map(|bias| {
+            // SAFETY: the device's own command of that name.
+            unsafe { crate::recorder::through(recording.as_ref(), Command::CmdSetDepthBias2, bias) }
+        });
+        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
+        let color_write_masks = unsafe {
+            loader_word.restore();
+            ColorWriteMasks::load(&instance.raw, &raw, &enabled)
+        }
+        .map(|ColorWriteMasks(masks)| {
+            // SAFETY: the device's own command of that name.
+            ColorWriteMasks(unsafe {
+                crate::recorder::through(recording.as_ref(), Command::CmdSetColorWriteMask, masks)
+            })
+        });
+        let drawn = prime::PrimedDraws {
+            dynamic: extended_dynamic_state,
+            color_write_masks,
+            depth_bias: depth_bias_command,
+            sized_index_bind,
         };
         // Before the exit hook is registered for this device (below): the first call of each
         // entry point of the exit guard's table (`prime.rs`).
@@ -966,18 +1279,37 @@ impl Device {
             prime::prime(
                 &instance.raw,
                 physical,
-                &raw,
+                &Vk::new(
+                    raw.clone(),
+                    memory_reads,
+                    push_descriptor,
+                    object_name,
+                    Default::default(),
+                ),
                 &loader_word,
                 queue_family,
                 &queues,
                 Sharing::new(&queue_families),
-                prime::Has {
+                drawn.has(prime::Has {
                     timestamps: timestamp_bits > 0,
+                    // A device the runtime created enables it (`enables.rs`).
+                    host_query_reset: owned,
                     device_addresses: device_address,
                     generated_commands: generated_commands.is_some(),
                     sparse_binding: sparse.binds(),
-                },
+                    push_descriptor: push_descriptor.is_some(),
+                    calibration: calibrated.is_some(),
+                    object_names: object_name.is_some(),
+                    extended_dynamic_state: false,
+                    primitive_restart: false,
+                    color_write_masks: false,
+                    depth_bias: false,
+                    sized_index_bind: false,
+                }),
                 generated_commands.as_ref(),
+                push_descriptor,
+                calibrated,
+                drawn,
             )
         } {
             scheduler.stop();
@@ -995,13 +1327,21 @@ impl Device {
         // SAFETY: as above.
         let memory_properties =
             unsafe { instance.raw.get_physical_device_memory_properties(physical) };
-        let memory = Memory::new(
+        // Freed memory waits for the batches in flight where the driver fails pending work as
+        // memory a device-address buffer lay in is freed (`freed_memory.rs`).
+        let parking = (properties.driver_defects)
+            .contains(&RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork)
+            .then(|| Arc::new(Parking::new(queues.len())));
+        let mut memory = Memory::new(
             &memory_properties,
             max_allocation,
             device_address,
             properties.has_unified_memory,
             queue_families.clone(),
+            parking.clone(),
+            properties.description.driver_id,
         );
+        memory.log_to(MemoryLog::new(instance.sink()));
         // SAFETY: as above.
         let physical_properties = unsafe { instance.raw.get_physical_device_properties(physical) };
         let limits = physical_properties.limits;
@@ -1027,31 +1367,9 @@ impl Device {
                 &enabled,
                 super::buffer::usage(device_address),
                 &loader_word,
-                metal_objects,
-                instance.sink().is_some(),
                 dma_buf,
                 dma_buf_images,
             )
-        };
-        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
-        let extended_dynamic_state = unsafe {
-            loader_word.restore();
-            ExtendedDynamicState::load(
-                &instance.raw,
-                &raw,
-                properties.description.api_version,
-                &enabled,
-            )
-        };
-        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
-        let sized_index_bind = unsafe {
-            loader_word.restore();
-            sized_index_bind(&instance.raw, &raw, &enabled)
-        };
-        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
-        let depth_bias_command = unsafe {
-            loader_word.restore();
-            depth_bias_command(&instance.raw, &raw, &enabled)
         };
         // The host image copy functions, where the device enabled `hostImageCopy` and copies to
         // and from `GENERAL` on the host: by their core names from Vulkan 1.4, else by the
@@ -1087,7 +1405,8 @@ impl Device {
             // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put
             // back.
             unsafe { loader_word.restore() };
-            Some(ash::ext::mesh_shader::Device::new(&instance.raw, &raw))
+            let loaded = ash::ext::mesh_shader::Device::new(&instance.raw, &raw);
+            Some(MeshDraws::new(&loaded, recording.as_ref()))
         } else {
             None
         };
@@ -1116,32 +1435,49 @@ impl Device {
         } else {
             None
         };
+        // What completed work wrote is made visible to a batch by a barrier where semaphore
+        // operations stall the driver's submissions, else by waits (`command_buffer/submit.rs`).
+        let completed_by_barrier = properties
+            .description
+            .driver_facts()
+            .contains(&metal2vulkan::device::DriverFact::SemaphoreOperationsStallSubmits);
         // One timestamp pool at most where each is one of Metal's scarce counter sample buffers.
         let scarce_pools = properties
             .description
             .driver_facts()
             .contains(&metal2vulkan::device::DriverFact::TimestampPoolsAreCounterSampleBuffers);
-        // SAFETY: as above, `calibration` enabled; the loader serves `vkGetDeviceProcAddr` once
-        // the word is put back.
-        let timing = unsafe {
-            loader_word.restore();
-            Timing::new(
-                &instance.entry,
-                &instance.raw,
-                physical,
-                &raw,
-                timestamp_bits,
-                limits.timestamp_period,
-                calibration,
-                from_host,
-                scarce_pools,
-            )
-        };
+        let timing = Timing::new(
+            timestamp_bits,
+            limits.timestamp_period,
+            calibrated,
+            from_host,
+            scarce_pools,
+            // A command buffer's first encoder writes its start where its first batch can begin
+            // with no command buffer of barriers (`gpu_time.rs`).
+            !completed_by_barrier,
+            // Its slots are reset on the host where the device enables `hostQueryReset`: every
+            // device the runtime created (`enables.rs`).
+            owned,
+        );
         // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
         let functions = unsafe {
             loader_word.restore();
-            Functions::new(&instance.raw, raw.clone())
+            Functions::new(
+                &instance.raw,
+                raw.clone(),
+                memory_reads,
+                push_descriptor,
+                object_name,
+                recording.as_ref(),
+            )
         };
+        // Its encoders' commands replay on a thread of its own where it has a slot (`recorder`).
+        // SAFETY: the device's handle, live, its word the loader's (put back just now).
+        let recorder = recording.as_ref().and_then(|slot| {
+            Recorder::start(slot, &functions, unsafe {
+                LoaderWord::of_device(raw.handle())
+            })
+        });
         let shader_cache = match ShaderCache::start(
             cache,
             &physical_properties,
@@ -1189,18 +1525,19 @@ impl Device {
         }
         let resource_ids: Arc<Mutex<ResourceIds>> = Arc::default();
         let sampler_ids = lock(&resource_ids).sampler_id_reads();
+        let depth_ranges = DepthRanges::of(compile.profile());
         let shared = Arc::new(DeviceShared {
             instance,
             physical,
-            functions,
+            functions: Arc::new(functions),
             queue_family,
             round_robin: queues.len() - present_queues,
             queues,
             queue_families,
-            next_queue: AtomicU64::new(0),
             round_robin_made: AtomicU64::new(0),
             presenting_made: AtomicU64::new(0),
             compile,
+            depth_ranges,
             enabled,
             properties,
             announced: Announced::new(&announce_each),
@@ -1208,7 +1545,7 @@ impl Device {
             views_epoch: AtomicU64::new(0),
             device_address,
             upload_alignment,
-            memory: Mutex::new(memory),
+            memory: Arc::new(Mutex::new(memory)),
             addresses: Mutex::new(AddressSpace::new()),
             resource_ids,
             identifiers: Arc::default(),
@@ -1221,9 +1558,14 @@ impl Device {
             heap_nan_residue: NanResidue::default(),
             function_tables: Mutex::default(),
             internal: Mutex::new(None),
+            internal_done: OwnTimeline::default(),
+            staging_done: OwnTimeline::default(),
+            completed_by_barrier,
+            by_ends,
             bound_at: Mutex::new(None),
             staging,
             scheduler,
+            nudge,
             completion,
             fences: Fences::default(),
             contexts,
@@ -1237,6 +1579,13 @@ impl Device {
             sized_index_bind,
             depth_bias_command,
             mesh_draws,
+            push_descriptor,
+            pushes_after_pipeline_binds,
+            color_write_masks,
+            _recording: recording,
+            recorder,
+            snapshot_fallbacks: Mutex::new(Vec::new()),
+            reader_sizes: Mutex::new(Default::default()),
             gpu_pools,
             max_framebuffer: [
                 limits.max_framebuffer_width,
@@ -1255,12 +1604,14 @@ impl Device {
             interleave: Mutex::default(),
             kept: Mutex::default(),
             shader_modules: Mutex::default(),
+            pipeline_layouts: Mutex::default(),
+            flights: crate::pipeline::flight::Flights::default(),
             color_resolves: Mutex::new(ColorResolveObjects::default()),
             stencil_copies: Mutex::new(StencilCopyObjects::default()),
             depth_copies: Mutex::new(DepthCopyObjects::default()),
             depth_stencil_resolves: Mutex::new(DepthStencilResolveObjects::default()),
             attachmentless: Mutex::default(),
-            compatible_passes: Mutex::default(),
+            render_passes: Mutex::default(),
             interop: Interop::default(),
             heap_keys: Default::default(),
             rebinds: Default::default(),
@@ -1268,6 +1619,8 @@ impl Device {
             fresh: Default::default(),
             owners: Default::default(),
             live_buffers: Default::default(),
+            #[cfg(unix)]
+            residency: Default::default(),
             timing,
             view_reinterpretation,
             generated_commands,
@@ -1275,10 +1628,15 @@ impl Device {
             host_copies,
             sparse,
             spares: Spares::default(),
+            live_binds: Default::default(),
+            bind_memos: Default::default(),
+            kept_rooms: Default::default(),
             counts: Default::default(),
+            parking: parking.map_or_else(OnceLock::new, OnceLock::from),
             uncommitted: Arc::default(),
             pipeline_pool: Default::default(),
             reaper: Default::default(),
+            trails: Arc::default(),
             libraries: graphics_pipeline_library.then(Default::default),
         });
         // A CPU device runs the work submitted to it on the process's own threads: the exit hook
@@ -1287,9 +1645,20 @@ impl Device {
             let device: Weak<dyn exit_guard::InProcess> = Arc::<DeviceShared>::downgrade(&shared);
             exit_guard::runs_in_process(device);
         }
+        // The scheduler's thread waits for the GPU itself where heads wait for signals to land,
+        // but on MoltenVK, whose wait for any of several semaphores loses a signal that lands
+        // while it registers a later one (`command_buffer/completion.rs`).
+        if !moltenvk {
+            (shared.scheduler).wait_on_gpu(Functions::clone(&shared.functions), shared.nudge);
+        }
         let device = Device(shared);
+        // The pages its replays held last go on its handler threads (`recorder`).
+        if let Some(recorder) = device.shared().recorder() {
+            recorder.set_elsewhere(device.elsewhere());
+        }
         device.say_unmeasured_driver();
         device.degrade_argument_buffers_unread();
+        device.degrade_float_tininess();
         if let Some((kind, notice)) = metal_level.announcement() {
             device.degrade(kind, || notice);
         }

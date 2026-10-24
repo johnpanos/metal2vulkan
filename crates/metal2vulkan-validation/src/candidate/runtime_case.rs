@@ -85,14 +85,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod commands;
 mod host_wait_gap;
 pub(crate) mod imageblock;
-mod metal_import_gap;
+mod raster_order_gap;
 mod render;
 mod sparse;
 mod tile;
 pub use commands::{encoded_execution, pipeline_states, CaseCommands, TemplateState};
 pub use render::{
-    commit_render, encoded_render, render_pipeline_descriptor, render_pipeline_state,
-    CommittedRender, EncodedRender, RenderInputs,
+    commit_render, encoded_mesh, encoded_render, mesh_pipeline_state, render_pipeline_descriptor,
+    render_pipeline_state, CommittedRender, EncodedRender, MeshInputs, RenderInputs,
 };
 pub use tile::{encoded_tile, tile_descriptor, tile_tables};
 
@@ -190,13 +190,13 @@ pub(crate) fn report_each_message() {
 ///
 /// Two layer gaps pass, on the layer releases whose source was read with their cause in place:
 /// the layer's synchronization validation forgetting a semaphore chain once the host waited on a
-/// timeline (`runtime_case/host_wait_gap.rs`), and the layer's image state not modelling an image
-/// made of an imported Metal texture, which Vulkan treats as bound, so that it reports the
-/// runtime's such images (named so) as used with no memory bound
-/// (`runtime_case/metal_import_gap.rs`). Each message passed prints a `LAYER-GAP` line with the
+/// timeline (`runtime_case/host_wait_gap.rs`); and the layer's synchronization validation not
+/// reading rasterization-order attachment access, so that it reports an input attachment read of
+/// the runtime's pipelines made with it (named so) after an earlier draw's color write
+/// (`runtime_case/raster_order_gap.rs`). Each message passed prints a `LAYER-GAP` line with the
 /// layer's source, and a test's count of them prints once its messages go. On any other release
-/// each fails, marked "re-read WaitForSemaphore in layer X.Y.Z" or "re-read the image state in
-/// layer X.Y.Z".
+/// each fails, marked "re-read WaitForSemaphore in layer X.Y.Z" or "re-read the input attachment
+/// ordering in layer X.Y.Z".
 ///
 /// One message about the driver passes too, once the runtime announced it: the layer's report
 /// of a vertex module's subgroup operations outside `subgroupSupportedStages`
@@ -211,7 +211,7 @@ pub struct Messages(Arc<Mutex<Reported>>);
 struct Reported {
     failing: Vec<DebugMessage>,
     notices: Vec<DebugMessage>,
-    /// How many of the layer gaps' messages passed.
+    /// How many of the layer gap's messages passed.
     layer_gaps: usize,
     /// Whether a device announced `Degradation::UnadvertisedVertexSimdgroups`.
     unadvertised_vertex: bool,
@@ -335,7 +335,7 @@ impl Messages {
     }
 
     /// How many of the layer gaps' messages passed so far (`runtime_case/host_wait_gap.rs`,
-    /// `runtime_case/metal_import_gap.rs`).
+    /// `runtime_case/raster_order_gap.rs`).
     pub fn layer_gaps(&self) -> usize {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).layer_gaps
     }
@@ -402,13 +402,13 @@ impl Messages {
                 );
                 return;
             }
-            let metal_gap = metal_import_gap::shape(&message.id_name, &message.text);
-            if metal_gap && layer.is_some_and(metal_import_gap::read) {
+            let raster_gap = raster_order_gap::shape(message.id, &message.id_name, &message.text);
+            if raster_gap && layer.is_some_and(raster_order_gap::read) {
                 reported.layer_gaps += 1;
                 eprintln!(
-                    "LAYER-GAP {}: passed, the layer's Metal-import gap ({}): {} ({}): {}",
+                    "LAYER-GAP {}: passed, the layer's rasterization-order gap ({}): {} ({}): {}",
                     reported.test,
-                    metal_import_gap::SOURCE,
+                    raster_order_gap::SOURCE,
                     message.id_name,
                     message.id,
                     message.text.replace('\n', " ")
@@ -416,14 +416,14 @@ impl Messages {
                 return;
             }
             let mut message = message.clone();
-            if metal_gap {
-                let read: Vec<String> = metal_import_gap::READ
+            if raster_gap {
+                let read: Vec<String> = raster_order_gap::READ
                     .iter()
                     .map(|&version| host_wait_gap::release(version))
                     .collect();
                 message.text = format!(
-                    "re-read the image state in layer {}: the layer's Metal-import gap passes \
-                     only on the releases read ({}). {}",
+                    "re-read the input attachment ordering in layer {}: the layer's \
+                     rasterization-order gap passes only on the releases read ({}). {}",
                     layer.map_or_else(|| "of an unknown release".into(), host_wait_gap::release),
                     read.join(", "),
                     message.text

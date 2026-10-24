@@ -116,10 +116,9 @@ impl BicubicTexels {
     /// 894]` first, on `1/(8 · 510)`. The sums are signed and reach past `±1` (up to twice the
     /// grid); a 2D or 3D linear sum truncates a color lane's terms onto `2^-7` of its grid steps
     /// and alpha's onto `2^-4`, where a bicubic sum (the 2D exact routine's) truncates none; and a
-    /// `half` result rounds an `_sRGB` color lane's value with ties away from zero (EVs
-    /// TXN-xrprobe3 and TXN-xrprobe4, an Apple M3 Max and an Apple M4; the bicubic filter's,
-    /// `lower::sampler::extended`). [`texels`] never sets it: an extended-range slot's samples
-    /// read the format's bits as constants under its variant.
+    /// `half` result rounds an `_sRGB` color lane's value with ties away from zero (an Apple M3 Max
+    /// and an Apple M4; the bicubic filter's, `lower::sampler::extended`). [`texels`] never sets
+    /// it: an extended-range slot's samples read the format's bits as constants under its variant.
     pub const EXTENDED: u32 = 1 << 11;
     /// Bit `BORDER + 3c + b` is set when channel `c` (0 red to 3 alpha) of a tap outside the
     /// texture under a border address reads 1, not 0, for border color `b`, `MTLSamplerBorderColor`'s
@@ -240,15 +239,45 @@ pub fn texels(pf: PixelFormat) -> Option<BicubicTexels> {
         P::RG16Float => (T::HALF, RG),
         P::RG11B10Float | P::RGB9E5Float => (T::HALF, RGB),
         P::RGBA16Float => (T::HALF, RGBA),
-        // An RGBX format reads as its RGBA twin with alpha 1 (EV FPV-pf6-m4): the twin's family,
+        // An RGBX format reads as its RGBA twin with alpha 1: the twin's family,
         // red, green and blue.
         P::RGBX32Float => (T::LINEAR, RGB),
         P::RGBX8Unorm => (exact8u, RGB),
         P::RGBX8UnormSRGB => (T::UNORM, RGB),
         P::RGBX8Snorm => (exact8s, RGB),
         P::RGBX16Float => (T::HALF, RGB),
-        // A BC sRGB form reads its codes through its unorm view, as an 8-bit sRGB format does.
-        P::BC1RGBASRGB | P::BC2RGBASRGB | P::BC3RGBASRGB | P::BC7RGBAUnormSRGB => (T::UNORM, RGBA),
+        // A 4:2:2 format reads as an `RGBA8Unorm` texture of its decoded codes, alpha 1 (our probe
+        // on an Apple M3 Max under macOS 27.0.1: reads, nearest, linear and bicubic samples and
+        // gathers bit for bit, `bind::ChromaDecode`): `RGBX8Unorm`'s treatment.
+        P::GBGR422 | P::BGRG422 => (exact8u, RGB),
+        // A BC sRGB form reads its codes through its unorm view, as an 8-bit sRGB format does;
+        // so does a PVRTC, ETC2 or EAC sRGB form (its linear form's codes, `bind::PvrtcDecode`,
+        // `bind::EtcDecode`), an RGB one's alpha 1, and an ASTC sRGB form its decoded twin's
+        // (`bind::AstcDecode`; a device with the format decodes it itself, and the binder takes
+        // this treatment there for none, `metal::texel_format::srgb_raw_on`).
+        P::BC1RGBASRGB
+        | P::BC2RGBASRGB
+        | P::BC3RGBASRGB
+        | P::BC7RGBAUnormSRGB
+        | P::PVRTCRGBA2BPPSRGB
+        | P::PVRTCRGBA4BPPSRGB
+        | P::ETC2RGB8A1SRGB
+        | P::EACRGBA8SRGB
+        | P::ASTC4x4SRGB
+        | P::ASTC5x4SRGB
+        | P::ASTC5x5SRGB
+        | P::ASTC6x5SRGB
+        | P::ASTC6x6SRGB
+        | P::ASTC8x5SRGB
+        | P::ASTC8x6SRGB
+        | P::ASTC8x8SRGB
+        | P::ASTC10x5SRGB
+        | P::ASTC10x6SRGB
+        | P::ASTC10x8SRGB
+        | P::ASTC10x10SRGB
+        | P::ASTC12x10SRGB
+        | P::ASTC12x12SRGB => (T::UNORM, RGBA),
+        P::PVRTCRGB2BPPSRGB | P::PVRTCRGB4BPPSRGB | P::ETC2RGB8SRGB => (T::UNORM, RGB),
         _ => return None,
     };
     Some(T::new(flags, channels).with_border(pf, TextureSwizzleChannels::DEFAULT))
@@ -336,12 +365,14 @@ mod tests {
         for pf in [
             PixelFormat::BGR10XR,
             PixelFormat::BC1RGBA,
-            PixelFormat::GBGR422,
+            PixelFormat::ETC2RGB8,
             PixelFormat::RGBA8Uint,
             PixelFormat::Stencil8,
         ] {
             assert_eq!(texels(pf), None, "{pf:?}");
         }
+        // A 4:2:2 format takes `RGBX8Unorm`'s treatment.
+        assert_eq!(t(PixelFormat::GBGR422).0, t(PixelFormat::RGBX8Unorm).0);
     }
     /// Metal's weights at every fraction `k`, four per `k` in units of `2^-16`, read from the
     /// impulse responses of authored case `628c2f53` (both axes answered alike). `k = 75` and
@@ -440,7 +471,7 @@ mod tests {
         }
     }
 
-    /// The border texels (EV UNV-metal-probe-1): per border color, the channels reading 1 after the
+    /// The border texels: per border color, the channels reading 1 after the
     /// format's channels and the swizzle. `R8Unorm` reads `(0, 0, 0, 1)` under transparent black
     /// and `(1, 0, 0, 1)` under white; `A8Unorm`'s alpha is the color's red, so its opaque black
     /// reads `(0, 0, 0, 0)`; a swizzle moves the channels, `ga0r` on `RGBA16Float` under opaque

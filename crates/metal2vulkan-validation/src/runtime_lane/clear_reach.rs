@@ -1,7 +1,7 @@
 //! Device tests of attachments larger than their pass's render area (the runtime's
 //! `clear_reach.rs`) on the device the cfg selects, under the validation layer.
 //!
-//! Each pass is one EVs RRS-probe-2 and RRS-probe-5 measured (the M3 Max with macOS 26.7 and an
+//! Each pass is one that our probes measured (the M3 Max with macOS 26.7 and an
 //! M4 with 27.0.1, the same answers, each case with and without Metal's API validation): a
 //! 128x128 attachment whose texels the test sets first (a color's bytes 0x11, a depth 0.75, a
 //! stencil 0x22), a render area of 40x40 (the descriptor's target size, or a smaller attachment),
@@ -13,16 +13,19 @@
 //! a pass of one layer that does not; a `DontCare` load keeps the texels in a pass that does not
 //! draw and clears to zero (a color) or the clear value (depth, stencil) in one that does, which
 //! is Metal's answer in each tile a draw touches and a near-equivalent elsewhere, announced once
-//! ([`DONT_CARE_LOADS`]).
+//! ([`DONT_CARE_LOADS`]). A pass without a draw call that clears and resolves nothing records
+//! nothing at all, its texels kept ([`a_pass_that_changes_no_texel_records_nothing`]).
 
 use super::degrade_notices::{assert_made_once, forced, made_render_kinds};
 use super::degrade_notices::{shared_in_system_memory, twins_depth};
+use super::hidden_depth::replayed_but_unrun;
 use super::{buffer_with, read_buffer, validated_device, Messages, ScratchCache, WAIT};
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{
-    CompareFunction, PixelFormat, PrimitiveType, StencilOperation, TextureType, TextureUsage,
+    ColorWriteMask, CompareFunction, PixelFormat, PrimitiveType, StencilOperation, TextureType,
+    TextureUsage,
 };
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_devtools::{engine_dir, llvm_assemble};
@@ -385,18 +388,26 @@ pub(super) fn quiet(lane: Lane, messages: &Messages) {
 }
 
 /// A case of `a_clear_reaches_past_the_render_area_as_metal_s`: its name, the render area, the
-/// load, the draw, and the reach Metal clears to.
-type ColorCase = (&'static str, [u64; 2], LoadAction, Draw, [u64; 2]);
+/// load, the draw, the reach Metal clears to, and whether the pass's first instance records inline.
+type ColorCase = (&'static str, [u64; 2], LoadAction, Draw, [u64; 2], bool);
 
-/// A color attachment's `Clear` load reaches past the render area as Metal's (EV
-/// RRS-probe-2's `c_rgba8_draw`, `c_rgba8_nodraw`, `c_rgba8_a40x24_draw`, `c_rgba8_nothing`,
-/// `c_rgba8_a100x100_draw`, `c_rgba8_small_depth_draw`, `c_rgba8_load_draw`; RRS-probe-5's
+/// How many of the device's passes recorded their first instance inline so far.
+fn inline_passes(lane: &Lane) -> u64 {
+    lane.device.work_counts().inline_passes
+}
+
+/// A color attachment's `Clear` load reaches past the render area as Metal's (the probe's
+/// `c_rgba8_draw`, `c_rgba8_nodraw`, `c_rgba8_a40x24_draw`, `c_rgba8_nothing`,
+/// `c_rgba8_a100x100_draw`, `c_rgba8_small_depth_draw`, `c_rgba8_load_draw`; our probe's
 /// `c_rgba8_level1_draw`, `c_rgba8_layered_nodraw`, `c_rgba8_emptydraw`): to whole 32x32 tiles
 /// in a pass with a draw call (one wholly outside the target, or of no vertex, included), the
 /// whole attachment in one without, the smaller attachment's extent setting the render area
 /// alike, clipped to the attachment, at the attachment's level alone, and to the tiles of each
 /// layer of a layered pass without a draw call; a `Load` keeps the texels past the render area. So does a texture without
-/// `RenderTarget` usage, which renders through a stand-in.
+/// `RenderTarget` usage, which renders through a stand-in. A pass whose draw records renders its
+/// first instance inline over the reach where nothing else rules it out
+/// (`render/inline_first.rs`), and one without such a draw, or with a depth attachment or a
+/// stand-in, clears the reach before the pass: both Metal's answer.
 #[test]
 fn a_clear_reaches_past_the_render_area_as_metal_s() {
     let (messages, _cache, lane) = lane();
@@ -411,6 +422,7 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Clear,
             Draw::Full,
             [64, 64],
+            true,
         ),
         (
             "c_rgba8_nodraw",
@@ -418,6 +430,7 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Clear,
             Draw::None,
             [SIDE, SIDE],
+            false,
         ),
         (
             "c_rgba8_a40x24_draw",
@@ -425,6 +438,7 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Clear,
             Draw::Full,
             [64, 32],
+            true,
         ),
         (
             "c_rgba8_nothing",
@@ -432,6 +446,7 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Clear,
             Draw::Outside,
             [64, 64],
+            true,
         ),
         (
             "c_rgba8_emptydraw",
@@ -439,6 +454,7 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Clear,
             Draw::Empty,
             [64, 64],
+            false,
         ),
         (
             "c_rgba8_a100x100_draw",
@@ -446,6 +462,7 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Clear,
             Draw::Full,
             [SIDE, SIDE],
+            true,
         ),
         (
             "c_rgba8_load_draw",
@@ -453,11 +470,18 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
             LoadAction::Load,
             Draw::Full,
             [AREA, AREA],
+            true,
         ),
     ];
-    for (name, area, load, draw, reach) in cases {
+    for (name, area, load, draw, reach, inline) in cases {
         let texture = lane.old_color(rgba8, PLAIN, target);
+        let before = inline_passes(&lane);
         lane.run(&color_pass(&texture, load, area), draw, Some(&pipeline));
+        assert_eq!(
+            inline_passes(&lane) - before,
+            u64::from(inline),
+            "{name}: inline"
+        );
         let drawn = (draw == Draw::Full).then_some(&DRAWN[..]);
         let cleared = if load == LoadAction::Clear {
             &RED
@@ -484,7 +508,13 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
     descriptor.depth_attachment.texture = Some(depth);
     descriptor.depth_attachment.load_action = LoadAction::Clear;
     descriptor.depth_attachment.store_action = StoreAction::DontCare;
+    let before = inline_passes(&lane);
     lane.run(&descriptor, Draw::Full, Some(&small_depth));
+    assert_eq!(
+        inline_passes(&lane),
+        before,
+        "c_rgba8_small_depth_draw: not inline"
+    );
     assert_eq!(
         lane.read(&texture, (0, 0), 4, BlitOption::None),
         expected(SIDE, [AREA, AREA], [64, 64], (Some(&DRAWN), &RED, &OLD)),
@@ -499,7 +529,13 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
     let texture = lane.old_color(rgba8, mipmapped, target);
     let mut descriptor = color_pass(&texture, LoadAction::Clear, [AREA, AREA]);
     descriptor.color_attachments[0].level = 1;
+    let before = inline_passes(&lane);
     lane.run(&descriptor, Draw::Full, Some(&pipeline));
+    assert_eq!(
+        inline_passes(&lane) - before,
+        1,
+        "c_rgba8_level1_draw: inline"
+    );
     assert_eq!(
         lane.read(&texture, (0, 0), 4, BlitOption::None),
         OLD.repeat((4 * SIDE * SIDE) as usize),
@@ -525,10 +561,16 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
     }
     // A texture without `RenderTarget` usage, through its stand-in.
     let texture = lane.old_color(rgba8, PLAIN, TextureUsage::SHADER_READ);
+    let before = inline_passes(&lane);
     lane.run(
         &color_pass(&texture, LoadAction::Clear, [AREA, AREA]),
         Draw::Full,
         Some(&pipeline),
+    );
+    assert_eq!(
+        inline_passes(&lane),
+        before,
+        "a stand-in's texture: not inline"
     );
     assert_eq!(
         lane.read(&texture, (0, 0), 4, BlitOption::None),
@@ -538,11 +580,90 @@ fn a_clear_reaches_past_the_render_area_as_metal_s() {
     quiet(lane, &messages);
 }
 
-/// A clear of a `half` NaN writes Metal's canonical quiet NaN (RRS probe 14's
-/// `nan_1_half_nan`: `0x7e00`) over the reach any clear has, through the scratch image of an
+/// Two color attachments of a pass over a 40x24 render area, color 0 a 128x128 texture cleared,
+/// color 1 one the fragment function leaves alone (its write mask none), white drawn over the
+/// whole target: where both are 128x128 textures cleared, the clears reach alike, to 64x32, and
+/// the pass records its first instance inline over that reach (`render/inline_first.rs`); where
+/// color 1 is a 48x48 texture cleared, its clear reaches 48x32, and where it is loaded it keeps
+/// its texels past the render area: the pass records as before, counted by the reach the
+/// attachments do not share (`WorkCounts::passes_not_inline_actions_unequal_reach`). Each texture
+/// holds Metal's answer (the probe's `c_rgba8_a40x24_draw`, each attachment's reach its own).
+#[test]
+fn colors_whose_clears_reach_alike_record_inline_over_their_reach() {
+    let (messages, _cache, lane) = lane();
+    let rgba8 = PixelFormat::RGBA8Unorm;
+    let target = TextureUsage::RENDER_TARGET;
+    let mut descriptor = lane.descriptor(&[rgba8, rgba8], (None, None), 1);
+    let mut leaves = ColorAttachmentDescriptor::new(rgba8);
+    leaves.write_mask = ColorWriteMask::NONE;
+    descriptor.color_attachments[1] = Some(leaves);
+    let pipeline = lane
+        .device
+        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
+        .unwrap();
+    let area = [40, 24];
+    let unequal = |lane: &Lane| {
+        lane.device
+            .work_counts()
+            .passes_not_inline_actions_unequal_reach
+    };
+    let small = Shape { side: 48, ..PLAIN };
+    // Color 1's side, load, the reach Metal clears it to, and whether the pass records inline.
+    let cases = [
+        ("alike", PLAIN, LoadAction::Clear, [64, 32], true),
+        (
+            "a smaller texture",
+            small,
+            LoadAction::Clear,
+            [48, 32],
+            false,
+        ),
+        ("loaded", PLAIN, LoadAction::Load, area, false),
+    ];
+    for (name, shape, load, reach, inline) in cases {
+        let first = lane.old_color(rgba8, PLAIN, target);
+        let second = lane.old_color(rgba8, shape, target);
+        let mut pass = color_pass(&first, LoadAction::Clear, area);
+        let other = &mut pass.color_attachments[1];
+        other.texture = Some(second.clone());
+        other.load_action = load;
+        other.clear_color = ClearColor::new(0.5, 0.0, 0.0, 1.0);
+        other.store_action = StoreAction::Store;
+        let (before, unequal_before) = (inline_passes(&lane), unequal(&lane));
+        lane.run(&pass, Draw::Full, Some(&pipeline));
+        assert_eq!(
+            inline_passes(&lane) - before,
+            u64::from(inline),
+            "{name}: inline"
+        );
+        assert_eq!(
+            unequal(&lane) - unequal_before,
+            u64::from(!inline),
+            "{name}: counted by its reach"
+        );
+        assert_eq!(
+            lane.read(&first, (0, 0), 4, BlitOption::None),
+            expected(SIDE, area, [64, 32], (Some(&DRAWN), &RED, &OLD)),
+            "{name}: color 0"
+        );
+        let cleared = match load {
+            LoadAction::Clear => &RED,
+            _ => &OLD,
+        };
+        assert_eq!(
+            lane.read(&second, (0, 0), 4, BlitOption::None),
+            expected(shape.side, area, reach, (None, cleared, &OLD)),
+            "{name}: color 1"
+        );
+    }
+    quiet(lane, &messages);
+}
+
+/// A clear of a `half` NaN writes Metal's canonical quiet NaN (Metal probe case `nan_1_half_nan` on
+/// the M3 Max and an M4: `0x7e00`) over the reach any clear has, through the scratch image of an
 /// integer format the runtime clears it in (`nan_clear.rs`): to the tiles in a pass with a draw
-/// call, over the whole attachment in one without, and through a stand-in. A 4-sample
-/// attachment's clear runs valid (Metal's resolve of its NaN samples is unmeasured).
+/// call, over the whole attachment in one without, and through a stand-in. A 4-sample attachment's
+/// clear runs valid (Metal's resolve of its NaN samples is unmeasured).
 #[test]
 fn a_nan_clear_reaches_as_metal_s() {
     let (messages, _cache, lane) = lane();
@@ -592,8 +713,8 @@ fn a_nan_clear_reaches_as_metal_s() {
     quiet(lane, &messages);
 }
 
-/// Depth and stencil attachments' `Clear` loads reach past the render area as a color's (EV
-/// RRS-probe-2's `d_d32_draw`, `d_d32_nodraw`, `d_d16_draw`, `s_s8_draw`, `ds_d32s8_draw`, and a
+/// Depth and stencil attachments' `Clear` loads reach past the render area as a color's (the
+/// probe's `d_d32_draw`, `d_d32_nodraw`, `d_d16_draw`, `s_s8_draw`, `ds_d32s8_draw`, and a
 /// 4-sample color's `c_rgba8_ms4_draw`, read through a second pass that loads and resolves it
 /// whole): 0.25 drawn and 0.5 cleared past the render area to the tiles, 0.75 past them; the
 /// stencil 0x41 and 0x40, 0x22 past them.
@@ -724,8 +845,129 @@ fn depth_stencil_and_multisampled_clears_reach_past_the_render_area_as_metal_s()
     quiet(lane, &messages);
 }
 
-/// A `DontCare` load of an attachment the pass stores (EV RRS-probe-5's `dl_rgba8_emptydraw`,
-/// `dl_rgba8_full`, `dl_rgba8_nodraw`, `dl_rgba8_nothing` and `dl_d32_touch00`): kept in a pass
+/// A pass without a draw call that clears nothing and resolves nothing keeps every texel, Metal's
+/// answer, and the runtime records nothing for it (`WorkCounts::untouched_passes_skipped`): a color
+/// loaded `DontCare` or `Load` and stored `Store` or `DontCare`, and beside a depth loaded
+/// `DontCare` and stored. A `Clear` load clears the whole attachment there, a draw call of no
+/// vertex keeps the texels, and a pass with a visibility result buffer keeps them: each records its
+/// pass as before. The pass beside a depth, whose first instance never records inline, began its
+/// draws' secondary as it opened: given up unused (`WorkCounts::unrun_instances_ended`), it is
+/// never replayed (`CommandBuffer::give_up_raw`).
+#[test]
+fn a_pass_that_changes_no_texel_records_nothing() {
+    let (messages, _cache, lane) = lane();
+    let rgba8 = PixelFormat::RGBA8Unorm;
+    let target = TextureUsage::RENDER_TARGET;
+    let pipeline = lane.pipeline(&[rgba8], (None, None), 1);
+    let whole = [SIDE, SIDE];
+    let skipped = || lane.device.work_counts().untouched_passes_skipped;
+    let old = OLD.repeat((SIDE * SIDE) as usize);
+    for (load, store) in [
+        (LoadAction::DontCare, StoreAction::Store),
+        (LoadAction::Load, StoreAction::Store),
+        (LoadAction::Load, StoreAction::DontCare),
+    ] {
+        let texture = lane.old_color(rgba8, PLAIN, target);
+        let mut descriptor = color_pass(&texture, load, whole);
+        descriptor.color_attachments[0].store_action = store;
+        let before = skipped();
+        lane.run(&descriptor, Draw::None, None);
+        let what = format!("{load:?} and {store:?}, no draw call");
+        assert_eq!(skipped() - before, 1, "{what}: passes skipped");
+        assert_eq!(
+            lane.read(&texture, (0, 0), 4, BlitOption::None),
+            old,
+            "{what}: the texels"
+        );
+    }
+    // Beside a depth loaded `DontCare` and stored, which keeps its texels too.
+    let texture = lane.old_color(rgba8, PLAIN, target);
+    let depth = PixelFormat::Depth32Float;
+    let kept = lane.old_depth_stencil(depth, PLAIN, (true, false));
+    let mut descriptor = color_pass(&texture, LoadAction::Load, whole);
+    descriptor.depth_attachment.texture = Some(kept.clone());
+    descriptor.depth_attachment.load_action = LoadAction::DontCare;
+    descriptor.depth_attachment.store_action = StoreAction::Store;
+    let before = skipped();
+    let counted = lane.device.work_counts();
+    lane.run(&descriptor, Draw::None, None);
+    assert_eq!(skipped() - before, 1, "a depth beside: passes skipped");
+    let after = lane.device.work_counts();
+    let unrun = after.unrun_instances_ended - counted.unrun_instances_ended;
+    assert_eq!(unrun, 1, "a depth beside: secondaries given up");
+    let (replayed, deferred) = replayed_but_unrun(&counted, &after);
+    eprintln!(
+        "a pass beside a depth that changes nothing on {}: {unrun} secondaries given up, \
+         {replayed} of {deferred} deferred command buffers begun replayed",
+        lane.device.name()
+    );
+    assert_eq!(
+        replayed,
+        deferred - unrun,
+        "a depth beside: command buffers replayed of those begun deferred"
+    );
+    assert_eq!(
+        lane.read(&texture, (0, 0), 4, BlitOption::None),
+        old,
+        "a depth beside: the color's texels"
+    );
+    assert_eq!(
+        lane.read(&kept, (0, 0), 4, BlitOption::None),
+        0.75f32.to_le_bytes().repeat((SIDE * SIDE) as usize),
+        "a depth beside: the depth's texels"
+    );
+    // A `Clear` load clears the whole attachment in a pass without a draw call.
+    let texture = lane.old_color(rgba8, PLAIN, target);
+    let before = skipped();
+    lane.run(
+        &color_pass(&texture, LoadAction::Clear, whole),
+        Draw::None,
+        None,
+    );
+    assert_eq!(skipped() - before, 0, "a Clear load: passes skipped");
+    assert_eq!(
+        lane.read(&texture, (0, 0), 4, BlitOption::None),
+        RED.repeat((SIDE * SIDE) as usize),
+        "a Clear load: the texels"
+    );
+    // A draw call of no vertex, and a visibility result buffer: recorded, the texels kept.
+    let texture = lane.old_color(rgba8, PLAIN, target);
+    let before = skipped();
+    lane.run(
+        &color_pass(&texture, LoadAction::DontCare, whole),
+        Draw::Empty,
+        Some(&pipeline),
+    );
+    assert_eq!(
+        skipped() - before,
+        0,
+        "a draw call of no vertex: passes skipped"
+    );
+    assert_eq!(
+        lane.read(&texture, (0, 0), 4, BlitOption::None),
+        old,
+        "a draw call of no vertex: the texels"
+    );
+    let texture = lane.old_color(rgba8, PLAIN, target);
+    let mut descriptor = color_pass(&texture, LoadAction::Load, whole);
+    descriptor.visibility_result_buffer = Some(buffer_with(&lane.device, &[0; 64]).unwrap());
+    let before = skipped();
+    lane.run(&descriptor, Draw::None, None);
+    assert_eq!(
+        skipped() - before,
+        0,
+        "a visibility result buffer: passes skipped"
+    );
+    assert_eq!(
+        lane.read(&texture, (0, 0), 4, BlitOption::None),
+        old,
+        "a visibility result buffer: the texels"
+    );
+    drop((pipeline, kept));
+    quiet(lane, &messages);
+}
+
+/// A `DontCare` load of an attachment the pass stores: kept in a pass
 /// that does not draw (a draw call of no vertex, or through a pipeline that rasterizes nothing,
 /// included), as Metal keeps it, with no notice; cleared to zero over every tile, Metal's answer
 /// with no notice, where such a pass clears and stores its depth (the clear rule); in one that
@@ -751,9 +993,8 @@ fn a_dont_care_load_is_metal_s_in_the_tiles_draws_touch() {
         OLD.repeat((SIDE * SIDE) as usize),
         "dl_rgba8_emptydraw"
     );
-    // A draw call of no vertex in a pass that clears and stores its depth reaches every tile (EV
-    // RRS3-reach3's `clear_depth_store_instances0`): zero over the render area rounded up to
-    // whole tiles, as the depth's clear reaches.
+    // A draw call of no vertex in a pass that clears and stores its depth reaches every tile: zero
+    // over the render area rounded up to whole tiles, as the depth's clear reaches.
     let texture = lane.old_color(rgba8, PLAIN, target);
     let depth = PixelFormat::Depth32Float;
     let cleared = lane.old_depth_stencil(depth, PLAIN, (true, false));
@@ -775,10 +1016,9 @@ fn a_dont_care_load_is_metal_s_in_the_tiles_draws_touch() {
         expected(SIDE, area, [64, 64], (None, &word(0.5), &word(0.75))),
         "dl_rgba8_emptydraw_depth_cleared, depth"
     );
-    // A draw through a pipeline that rasterizes nothing reaches no tile (EV RRS3-reach4c's
-    // `no_raster_t11`): the owned fixture `rvc_draw_bases`'s vertex function, which returns
-    // nothing, as Metal requires there, and writes 16 bytes at element `(iid * 8 & 24) | (vid &
-    // 7)` of buffer 0.
+    // A draw through a pipeline that rasterizes nothing reaches no tile: the owned fixture
+    // `rvc_draw_bases`'s vertex function, which returns nothing, as Metal requires there, and
+    // writes 16 bytes at element `(iid * 8 & 24) | (vid & 7)` of buffer 0.
     let bitcode = llvm_assemble(&engine_dir().join("rvc_draw_bases.ll")).unwrap();
     let library = lane.device.new_library_with_air(&bitcode).unwrap();
     let vertex = library
@@ -891,7 +1131,7 @@ fn a_dont_care_load_is_metal_s_in_the_tiles_draws_touch() {
 
 /// A `DontCare` load of a 128x128 attachment the pass stores, over the whole of it, in a pass
 /// whose triangle over the whole target draws through a 40x40 viewport at (48, 48), or under a
-/// 40x40 scissor rectangle there (EV XRB-pdc2's shapes on an Apple M4: the viewport and the
+/// 40x40 scissor rectangle there (the probe's shapes on an Apple M4: the viewport and the
 /// scissor each bound the tiles a draw zeroes exactly): the rectangle holds the draw's color, the
 /// rest of its four 32x32 tiles, from (32, 32) to (96, 96), zero, and every other tile keeps its
 /// texels, Metal's answer. A pass of a 16x16 tile (`tileWidth`, `tileHeight`; XRB's probes

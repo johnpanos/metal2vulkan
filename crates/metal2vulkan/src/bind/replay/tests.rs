@@ -19,7 +19,7 @@ use crate::bind::status::{ExecutionStatus, StatusReport};
 use crate::device::{DeviceDescription, DevicePolicy};
 use crate::indirect_commands::{Action, BufferBinding};
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources};
-use crate::spirv::testing::assert_valid;
+use crate::spirv::testing::{assert_valid, int_constants};
 
 /// Device addresses of the harness's objects.
 const SCRATCH: u64 = 0x0000_0030_0000_0000;
@@ -310,6 +310,7 @@ fn run_preprocess(
             PushHole::CaptureAddress { .. } | PushHole::CaptureIndexAddress { .. } => {
                 panic!("the preprocess captures no vertex")
             }
+            PushHole::SnapshotPhase { .. } => panic!("the preprocess draws no snapshot"),
         };
         push[offset as usize..offset as usize + 8].copy_from_slice(&address.to_le_bytes());
     }
@@ -1800,40 +1801,6 @@ fn a_flat_dispatch_is_described_only_as_a_flat_variant_runs_it() {
     assert!(FlatIndirect::new(ARGUMENTS + 4, threads, [4, 1, 1], 1).is_some());
 }
 
-/// The constants of SPIR-V `words` by id: `(width, value)` of each 32- or 64-bit integer
-/// `OpConstant`.
-fn int_constants(words: &[u32]) -> std::collections::BTreeMap<u32, (u32, u64)> {
-    let mut widths = std::collections::BTreeMap::new();
-    let mut out = std::collections::BTreeMap::new();
-    let mut i = 5;
-    while let Some(&w) = words.get(i) {
-        let (len, op) = ((w >> 16) as usize, w & 0xFFFF);
-        let at = |k: usize| words.get(i + k).copied().unwrap_or(0);
-        match op {
-            // OpTypeInt result, width.
-            21 => {
-                widths.insert(at(1), at(2));
-            }
-            // OpConstant type, result, value words.
-            43 => match widths.get(&at(1)) {
-                Some(&32) => {
-                    out.insert(at(2), (32, u64::from(at(3))));
-                }
-                Some(&64) => {
-                    out.insert(at(2), (64, u64::from(at(3)) | (u64::from(at(4)) << 32)));
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        if len == 0 {
-            break;
-        }
-        i += len;
-    }
-    out
-}
-
 /// The replay's modules test a product's overflow only by `OpUMulExtended`'s high word, never by
 /// the forms NVIDIA's compiler (615.71.09) refuses beside the preprocess's other arithmetic: a
 /// division of the largest `u64` (`b > (2^64 - 1) / a`), or a comparison with `2^32 - 1` of a
@@ -2028,7 +1995,7 @@ fn the_predication_step_module_is_valid_where_device_addresses_are() {
 
 /// Each op moves the counter as the module docs state, from 0, 1, 2 and 5; an If reads its word,
 /// and the others read their own record, never Metal's word (it lies in no buffer for them, which
-/// the interpreter traps on) nor address 0 (llvmpipe faulted there, EV PRD-lane2-lvpx86).
+/// the interpreter traps on) nor address 0 (llvmpipe faulted there).
 #[test]
 fn a_predication_step_moves_its_counter_as_metals_blocks_nest() {
     let step = |op| PredicationStep::new(STEP_COUNTER, op);
@@ -2116,10 +2083,9 @@ fn a_predication_step_gates_its_dispatches() {
     assert_eq!(step_run(dead, 0, None, &gates).1, vec![[0; 3]; 3]);
 }
 
-/// A pass of the gate loop past the table's count, which llvmpipe runs with its uniform loads made
-/// (EVs PRD-lane2-lvpx86, PRD-lane5-lvpx86), reads the entry after the gates: every table, the
-/// record's own empty one included, names there the record's sink gate, which lies inside the
-/// record.
+/// A pass of the gate loop past the table's count, which llvmpipe runs with its uniform loads made,
+/// reads the entry after the gates: every table, the record's own empty one included, names there
+/// the record's sink gate, which lies inside the record.
 #[test]
 fn a_predication_table_ends_at_the_records_sink_gate() {
     let sink = STEP_RECORD + PredicationStep::SINK_GATE_OFFSET;

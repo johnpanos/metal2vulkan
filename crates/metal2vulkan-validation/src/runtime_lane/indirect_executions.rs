@@ -7,8 +7,8 @@
 //!   leaves undefined, zeroed in both as the Metal oracle records them), the same execution
 //!   report, and the same compiled variant planned for the same shape.
 //! - Commands run as their records stand at commit; a command Metal runs nothing for (no
-//!   dispatch, an empty or oversized threadgroup) is left out and its neighbours run (probe
-//!   `RT7-icb-probe1`); an inheriting buffer runs the encoder's pipeline state and buffers.
+//!   dispatch, an empty or oversized threadgroup) is left out and its neighbours run; an inheriting
+//!   buffer runs the encoder's pipeline state and buffers.
 //! - A buffer address resolves against what any encoder of the command buffer made resident,
 //!   before the execution or after it; one in no resident resource misses, counted in the execution
 //!   report; the segment runs between the encoder's commands, after what they wrote and before what
@@ -22,8 +22,8 @@ use super::degrade_notices::counts;
 use super::host_memory::{host_page, no_copy, not_importable, Mapping};
 use super::{
     bound_buffers, compute_descriptor, encode_case, in_shard, public_case, public_cases,
-    read_buffer, validated_device, validated_device_with, CaseResources, Messages, PublicCase,
-    ScratchCache, WAIT,
+    read_buffer, validated_device, validated_device_with, wait_for_device, CaseResources,
+    DeviceWait, Messages, PublicCase, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::candidate::engine::{ComputeCase, ComputeOutput};
@@ -48,6 +48,7 @@ use metal2vulkan_runtime::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A kernel whose threads each write their threadgroup's size and position, over a ragged grid.
 const RAGGED: &str = "a-ragged-thread-grid-observes-each-threadgroups-size-and-position";
@@ -215,10 +216,18 @@ struct Run {
 
 /// Why a run did not complete: the runtime's error at the dispatch or the commit, the command
 /// buffer's error once it completed (with the driver's Vulkan error for the command whose
-/// pipeline it did not make, `CommandBuffer::failed_pipeline`), or anything else.
+/// pipeline it did not make, `CommandBuffer::failed_pipeline`), its not completing within its
+/// bound of the device's own time (`wait_for_device`), or anything else.
 enum Failed {
     Runtime(Error),
     Command(Option<CommandBufferError>, Option<VkResultCode>),
+    /// The command buffer did not complete within `bound` of the device's own time; `drained`,
+    /// whether it then completed within as long again, which the run waited for so that the next
+    /// run's work never queues behind its own (`run`).
+    TimedOut {
+        bound: Duration,
+        drained: bool,
+    },
     Other(String),
 }
 
@@ -227,6 +236,16 @@ impl std::fmt::Display for Failed {
         match self {
             Failed::Runtime(error) => write!(f, "{error}"),
             Failed::Command(error, _) => write!(f, "the command buffer failed: {error:?}"),
+            Failed::TimedOut { bound, drained } => write!(
+                f,
+                "timed out: the command buffer did not complete within {} ms of the device's \
+                 own time{}",
+                bound.as_millis(),
+                match drained {
+                    true => "",
+                    false => ", nor within as long again",
+                }
+            ),
             Failed::Other(why) => f.write_str(why),
         }
     }
@@ -286,13 +305,56 @@ fn compile_failed_alike(
 
 /// `case` run on `device` with `pipeline` (the case's state, `icb_state`): its buffers made
 /// resident, then its dispatch from an indirect command when `indirect`, else as the encoder's
-/// own dispatch.
+/// own dispatch; with what the wait for its command buffer saw, where the run got that far
+/// ([`wait_for_device`]).
+///
+/// A command buffer that does not complete within `bound` of the device's own time is waited
+/// for as long again before the run returns, so that the next run's work does not queue behind
+/// it on the device (lavapipe runs one queue): its timeout fails its own run alone.
 fn run(
     device: &Device,
     case: &PublicCase,
     pipeline: &ComputePipelineState,
     indirect: bool,
-) -> Result<Run, Failed> {
+    bound: Duration,
+) -> (Result<Run, Failed>, Option<DeviceWait>) {
+    let committed = match commit(device, case, pipeline, indirect) {
+        Ok(committed) => committed,
+        Err(failed) => return (Err(failed), None),
+    };
+    let waited = wait_for_device(&committed.command_buffer, bound);
+    if !waited.completed {
+        let drained = wait_for_device(&committed.command_buffer, bound).completed;
+        return (Err(Failed::TimedOut { bound, drained }), Some(waited));
+    }
+    (finish(committed, &case.compute), Some(waited))
+}
+
+/// The bound of the dispatch form's run of a census case ([`run`]), of the device's own time: a
+/// guard against a hang alone. Generous, since how long a case's work takes is the device's (on
+/// lavapipe one core runs it, of the kind and at the clock the host's scheduler gives it); with
+/// the wait as long again after a timeout, within the test's own end (`.config/nextest.toml`), so
+/// the census names a hung case itself.
+const HANG: Duration = Duration::from_secs(300);
+
+/// The bound of the command form's run of a census case ([`run`]), of the device's own time,
+/// after the dispatch form's run waited as `direct`: the same work on the same device, so twice
+/// the dispatch's own time, for the device's speed changing between the runs, and [`WAIT`] more;
+/// [`WAIT`] where the dispatch reached no wait.
+fn command_bound(direct: Option<DeviceWait>) -> Duration {
+    let own = direct.map_or(Duration::ZERO, |waited| {
+        waited.wall.saturating_sub(waited.queued)
+    });
+    own * 2 + WAIT
+}
+
+/// [`run`]'s command buffer of `case`, encoded and committed.
+fn commit(
+    device: &Device,
+    case: &PublicCase,
+    pipeline: &ComputePipelineState,
+    indirect: bool,
+) -> Result<Committed, Failed> {
     let compute = &case.compute;
     let resources = CaseResources::new(device, case)?;
     let buffers = bound_buffers(device, compute, &resources).map_err(|e| format!("{e:?}"))?;
@@ -319,9 +381,18 @@ fn run(
     }
     encoder.end_encoding().map_err(|e| e.to_string())?;
     command_buffer.commit().map_err(Failed::Runtime)?;
-    command_buffer
-        .wait_until_completed_for(WAIT)
-        .map_err(|_| "the command buffer did not complete".to_owned())?;
+    Ok(Committed {
+        command_buffer,
+        buffers,
+        resources,
+        attachments: Default::default(),
+        executions: Vec::new(),
+    })
+}
+
+/// What [`run`]'s `committed` command buffer, which completed, observed of `compute`.
+fn finish(committed: Committed, compute: &ComputeCase) -> Result<Run, Failed> {
+    let command_buffer = &committed.command_buffer;
     if command_buffer.status() != CommandBufferStatus::Completed {
         return Err(Failed::Command(
             command_buffer.error(),
@@ -337,13 +408,6 @@ fn run(
         .execution_report()
         .ok_or_else(|| "no report".to_owned())?;
     let executions = command_buffer.executions();
-    let committed = Committed {
-        command_buffer,
-        buffers,
-        resources,
-        attachments: Default::default(),
-        executions: Vec::new(),
-    };
     let output = committed.output(compute).map_err(|e| format!("{e:?}"))?;
     Ok(Run {
         output,
@@ -391,7 +455,13 @@ fn same_variant(a: &Execution, b: &Execution) -> bool {
 /// encoder's own dispatch of it runs, on one pipeline state of the case: the same output (the
 /// bytes of its declared out-of-bounds reads, undefined, zeroed in both, `metal_recorded`), the
 /// same execution report, and one execution of the same compiled variant planned for the same
-/// shape. A case the runtime refuses directly is refused the same from a command.
+/// shape. A case the runtime refuses directly is refused the same from a command. A run whose
+/// command buffer does not complete within its bound of the device's own time ([`run`]) fails as
+/// timed out: the dispatch's, [`HANG`], against a hang alone; the command's, held to the
+/// dispatch's own time ([`command_bound`]). A case whose dispatch timed out runs no command;
+/// where the device still runs its work after as long again, the shard stops there and says how
+/// many of its cases did not run. Each case's waits print with their wall time and the part of it
+/// a thread of the process waited for a CPU.
 ///
 /// The cases are split into `SHARDS` tests by their place in the cases' order, every
 /// `SHARDS`th case to one, so nextest runs the pieces in parallel (one test of all of them took
@@ -407,14 +477,17 @@ fn every_case_of_buffers_alone_runs_from_a_command_as_its_dispatch(shard: usize)
     .unwrap();
     let messages = Messages::default();
     let (mut alike, mut refused, mut failed) = (Vec::new(), Vec::new(), Vec::new());
-    let mut compile_failed = Vec::new();
+    let (mut compile_failed, mut timed_out) = (Vec::new(), Vec::new());
     let mut skipped = 0;
+    // The case whose work the device still ran after its timeout, that timeout's bound, and how
+    // many cases followed it.
+    let mut stopped = None;
     let device_name;
     {
         let cache = ScratchCache::new().unwrap();
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
         device_name = device.name().to_owned();
-        for (name, case) in &cases {
+        for (at, (name, case)) in cases.iter().enumerate() {
             let Ok(case) = case else {
                 skipped += 1;
                 continue;
@@ -430,10 +503,21 @@ fn every_case_of_buffers_alone_runs_from_a_command_as_its_dispatch(shard: usize)
                     continue;
                 }
             };
-            let direct = run(&device, case, &pipeline, false);
+            let (direct, direct_waited) = run(&device, case, &pipeline, false, HANG);
             let direct_reported = messages.take();
-            let indirect = run(&device, case, &pipeline, true);
+            let (indirect, indirect_waited) = match timed(&direct) {
+                true => (Err(Failed::Other("not run".to_owned())), None),
+                false => run(&device, case, &pipeline, true, command_bound(direct_waited)),
+            };
             let indirect_reported = messages.take();
+            eprintln!(
+                "{name}: {}; {}",
+                clocks("the dispatch", direct_waited),
+                clocks("the command", indirect_waited)
+            );
+            if let Some(bound) = still_running(&direct).or(still_running(&indirect)) {
+                stopped = Some((name, bound, cases.len() - at - 1));
+            }
             // The device's own failure making the pipeline, reported for both runs alike.
             let mut device_failure = false;
             match (direct, indirect) {
@@ -463,6 +547,13 @@ fn every_case_of_buffers_alone_runs_from_a_command_as_its_dispatch(shard: usize)
                     } else {
                         failed.push(format!("{name}: {}", differs.join("; ")));
                     }
+                }
+                (direct, indirect) if timed(&direct) || timed(&indirect) => {
+                    timed_out.push(format!(
+                        "{name}: the dispatch gave {:?}, the command {:?}",
+                        direct.err().map(|e| e.to_string()),
+                        indirect.err().map(|e| e.to_string())
+                    ))
                 }
                 (Err(direct), Err(indirect))
                     if compile_failed_alike(
@@ -497,43 +588,91 @@ fn every_case_of_buffers_alone_runs_from_a_command_as_its_dispatch(shard: usize)
                     "{name}: the validation layer reported {reported:#?}"
                 ));
             }
+            if stopped.is_some() {
+                break;
+            }
         }
     }
     let leaked = messages.take();
     eprintln!(
         "runtime indirect commands on {device_name}, shard {shard} of {SHARDS}: {} match their \
-         own dispatch, {} refused alike, {} failed to compile alike on the device, {} failed, of \
-         {} cases of buffers alone ({skipped} others)",
+         own dispatch, {} refused alike, {} failed to compile alike on the device, {} timed out, \
+         {} failed, of {} cases of buffers alone ({skipped} others)",
         alike.len(),
         refused.len(),
         compile_failed.len(),
+        timed_out.len(),
         failed.len(),
-        cases.len() - skipped
+        cases.len() - skipped - stopped.map_or(0, |(_, _, after)| after)
     );
+    if let Some((name, bound, after)) = stopped {
+        eprintln!(
+            "stopped at {name}: the device still ran its work after twice {} ms of its own \
+             time; the {after} cases after it in the shard did not run",
+            bound.as_millis()
+        );
+    }
+    for why in &timed_out {
+        eprintln!("timed out: {why}");
+    }
     for why in &refused {
         eprintln!("refused: {why}");
     }
     if !compile_failed.is_empty() {
         eprintln!(
             "compile failed alike: the device's own failure making the pipeline; \
-             docs/FAST-PATHS.md's known gaps record 3cf0a3f0's (Apple's compiler, on MoltenVK)"
+             docs/FAST-PATHS.md's known gaps record authored-four-iteration-loop's (3cf0a3f0; \
+             Apple's compiler, on MoltenVK)"
         );
     }
     for why in &compile_failed {
         eprintln!("compile failed alike: {why}");
     }
     assert!(
-        failed.is_empty() && leaked.is_empty(),
-        "failed:\n{}\nat device destruction: {leaked:#?}",
-        failed.join("\n")
+        failed.is_empty() && timed_out.is_empty() && leaked.is_empty(),
+        "failed:\n{}\ntimed out:\n{}\nat device destruction: {leaked:#?}",
+        failed.join("\n"),
+        timed_out.join("\n")
     );
     assert!(!alike.is_empty(), "no case ran alike");
 }
 
+/// Whether `run` timed out ([`Failed::TimedOut`]).
+fn timed(run: &Result<Run, Failed>) -> bool {
+    matches!(run, Err(Failed::TimedOut { .. }))
+}
+
+/// The bound `run` timed out at, where the device still ran its work after as long again.
+fn still_running(run: &Result<Run, Failed>) -> Option<Duration> {
+    match run {
+        Err(Failed::TimedOut {
+            bound,
+            drained: false,
+        }) => Some(*bound),
+        _ => None,
+    }
+}
+
+/// What `form`'s wait for its command buffer saw ([`wait_for_device`]): its wall time and the
+/// part of it that a thread of the process waited for a CPU.
+fn clocks(form: &str, waited: Option<DeviceWait>) -> String {
+    match waited {
+        Some(waited) => format!(
+            "{form} waited {} ms, {} ms of it for a CPU{}",
+            waited.wall.as_millis(),
+            waited.queued.as_millis(),
+            match waited.completed {
+                true => "",
+                false => ", and timed out",
+            }
+        ),
+        None => format!("{form} reached no wait"),
+    }
+}
+
 /// The pieces `every_case_of_buffers_alone_runs_from_a_command_as_its_dispatch` is split into. At
-/// 8 a piece took 31-93 s on the M4 under the validation layer (EVs CPF-ktex-base-mvk4 and
-/// CPF-ktex-tip-mvk4), past the Mac lane's 60 s a test; at 32, mostly 9-17 s, but five pieces
-/// took 22-54 s in a whole lane's run on a busy mini (EVs CPF2-shards-mvk4, CPF2-lane3-mvk4). 64
+/// 8 a piece took 31-93 s on the M4 under the validation layer, past the Mac lane's 60 s a test; at
+/// 32, mostly 9-17 s, but five pieces took 22-54 s in a whole lane's run on a busy mini. 64
 /// halves each piece.
 const SHARDS: usize = 64;
 
@@ -607,7 +746,7 @@ census_shards!(
 
 /// A command runs as its record stands when the command buffer is committed: one written after
 /// the execution was encoded and the encoder ended runs, and the reset command beside it runs
-/// nothing (probe `RT7-icb-probe1`, `exec_cpu_written_after_encode`).
+/// nothing (`exec_cpu_written_after_encode`).
 #[test]
 fn commands_run_as_their_records_stand_at_commit() {
     on_device(|device, _| {
@@ -642,7 +781,7 @@ pub(super) const NIL_OFFSETS: [Degradation; 1] = [Degradation::IndirectNilBuffer
 
 /// A command holding a nil buffer set at an offset whose low 32 bits are not 0 runs, binding no
 /// buffer there, and announces `indirect-nil-buffer-offset` once a device: Metal's kernel sees
-/// the bits as the buffer's address (EV API-icbget2-m4), the host execution's sees none. A nil
+/// the bits as the buffer's address, the host execution's sees none. A nil
 /// buffer at offset 0 announces nothing.
 #[test]
 fn a_nil_buffer_at_an_offset_binds_none_and_is_announced() {
@@ -690,8 +829,8 @@ fn a_nil_buffer_at_an_offset_binds_none_and_is_announced() {
 
 /// A `Private` buffer's commands are the CPU's to encode as a `Shared` one's: a command encoded
 /// on it reads back as set and runs as the encoder's own dispatch, as plain Metal encodes, reads
-/// back and runs it where its validation stops the call (probe `RT7-icb-probe3`,
-/// `encode_private` and `execute_private_cpu_encoded`, an M3 Max and an M4).
+/// back and runs it where its validation stops the call (`encode_private` and
+/// `execute_private_cpu_encoded`, an M3 Max and an M4).
 #[test]
 fn a_private_buffer_s_commands_are_encoded_and_run() {
     on_device(|device, _| {
@@ -725,7 +864,7 @@ fn a_private_buffer_s_commands_are_encoded_and_run() {
 
 /// A command's reset keeps the pipeline state it executes with: encoded in full, reset, and its
 /// buffers and dispatch encoded again with no pipeline state set, it runs the state it had, as
-/// Metal's does (probe `ICBV-copyprobe3`, `host_reset_then_dispatch`, on the M3 Max and the M4),
+/// Metal's does (`host_reset_then_dispatch`, on the M3 Max and the M4),
 /// while `commands` reads none, as Metal's getter reports none. A buffer reset with
 /// `reset_with_range` is unmeasured and keeps nothing: the same command there runs nothing.
 #[test]
@@ -768,7 +907,7 @@ fn a_reset_command_keeps_the_pipeline_it_runs() {
 
 /// A command names its state without holding it, as Metal's does, so once the program releases
 /// the state a state made after takes its ID; but the command holds what the state runs, and
-/// runs it, as Metal's command the CPU encoded does (EV RRS2-icbprobe1-m4): whether no state
+/// runs it, as Metal's command the CPU encoded does: whether no state
 /// takes the ID, a compute state of another interface ([`CHAIN`]'s kernel) does, or a render
 /// state does. Nothing is announced, reading the command (`IndirectCommandBuffer::commands`)
 /// included.
@@ -978,11 +1117,10 @@ fn commands_that_run_nothing_leave_their_neighbours_running() {
 }
 
 /// A buffer that inherits its pipeline state and buffers runs the encoder's, as they are at the
-/// call (probe `RT7-icb-probe1`, `exec_cpu_inherited`), with the command's own threadgroup
-/// lengths. With no pipeline state set, a range that is not empty is refused, and an empty one,
-/// at the start or at the size, runs nothing, as plain Metal's (EV CFR-probe2-m4
-/// `fixed_empty_nopipeline`). Buffers the command sets anyway are kept but not bound, as plain
-/// Metal's (EV RFC-probe1-m4 `icb_inherit_buffers_compute`): theirs stay as they were.
+/// call (`exec_cpu_inherited`), with the command's own threadgroup lengths. With no pipeline state
+/// set, a range that is not empty is refused, and an empty one, at the start or at the size, runs
+/// nothing, as plain Metal's. Buffers the command sets anyway are kept but not bound, as plain
+/// Metal's: theirs stay as they were.
 #[test]
 fn inheriting_commands_run_the_encoder_s_state() {
     on_device(|device, _| {
@@ -1036,8 +1174,7 @@ fn inheriting_commands_run_the_encoder_s_state() {
 
 /// A command's kernel buffer set without a stride, where the pipeline's stage-in layout of
 /// `MTLBufferLayoutStrideDynamic` reads it, refuses the commit (`UnstridedBuffer`): Metal reads it
-/// at stride 2^32 - 1, past element 0 whatever memory lies 4 GiB on (EVs `ICBV-plainstride2-m3`,
-/// `-m4`, `ICBV-plainstride3-m3`, `-m4`).
+/// at stride 2^32 - 1, past element 0 whatever memory lies 4 GiB on.
 #[test]
 fn a_command_s_unstrided_stage_in_buffer_is_refused() {
     on_device(|device, _| {
@@ -1103,7 +1240,7 @@ fn addresses_outside_the_resident_resources_miss() {
     });
 }
 
-/// Residency is the command buffer's (the consumer's report on an M3 Max, and EV RFL-res-m4 on
+/// Residency is the command buffer's (the consumer's report on an M3 Max, and our probe on
 /// an M4, every run): a command's buffers that only an earlier encoder, or a later compute or
 /// render encoder, made resident run as those its own encoder made resident, with no miss; and
 /// so do buffers of their own that no encoder made resident.
@@ -1203,7 +1340,7 @@ fn placed(device: &Device, buffers: &BTreeMap<u32, Buffer>) -> (Heap, BTreeMap<u
 }
 
 /// A command's buffers placed in a heap reach where an encoder of the command buffer used the
-/// heap, earlier or later (EV RFL-res-m4, an M4: reached, every run), and the execution report
+/// heap, earlier or later (an M4: reached, every run), and the execution report
 /// counts no miss.
 #[test]
 fn commands_reach_a_heap_any_encoder_of_their_command_buffer_used() {
@@ -1290,10 +1427,9 @@ fn no_copies(
 }
 
 /// A command's buffers that are no-copy buffers no command used are not reached, as on Metal's
-/// M3 Max and M4 (EVs RFL-reach-m3 and RFL-reach2-m4 `nocopy.icb`, every run; the consumer's
-/// `compute_indirect_command_buffer`): each slot misses, as the execution report counts. Made
-/// resident by the command's encoder they are reached, and from then on though no encoder names
-/// them (EVs RFL-warm-m3 and RFL-reach2-m4 `nocopy.icb.*.warm`).
+/// M3 Max and M4 (every run; the consumer's `compute_indirect_command_buffer`): each slot misses,
+/// as the execution report counts. Made resident by the command's encoder they are reached, and
+/// from then on though no encoder names them.
 #[test]
 fn commands_reach_a_no_copy_buffer_once_a_command_used_it() {
     on_device(|device, _| {
@@ -1450,8 +1586,7 @@ fn commands_reach_a_rebound_no_copy_buffer_once_a_command_used_it_again() {
 
 /// What Metal's validation stops is refused at the call, changing nothing: a range that ends
 /// past the size. An empty range runs nothing, and so does a buffer of no command types, as
-/// plain Metal's, directly or through a range in a buffer (EVs RFC-probe2-m4 `t0_exec_compute`,
-/// RFC-probe3-m4 `t0_exec_indirect`).
+/// plain Metal's, directly or through a range in a buffer.
 #[test]
 fn ranges_past_the_size_are_refused() {
     on_device(|device, _| {

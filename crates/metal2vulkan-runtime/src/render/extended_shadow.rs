@@ -12,8 +12,9 @@
 //!   every runtime image, holding pixel `(x, y)`'s `half` values at texel `(x, y)`; made at the
 //!   draw where it starts, one per color and pass, bound where the plan writes
 //!   `WriteSource::ExtendedShadow`. Each draw that binds it reads and writes it in the fragment
-//!   shader, inside the pixel interlock that orders the color's own storage form, so the barrier
-//!   between such draws (`InterlockedStorage`'s colors) orders it too.
+//!   shader, inside the pixel interlock that orders the color's own storage form, so what orders
+//!   that form between draws orders it too (`InterlockedStorage`'s colors: a barrier, or the
+//!   interlock alone on a driver measured to order such draws).
 //! - **The start.** The pass's instances keep their draws for recording again
 //!   (`render/reroute.rs`) on every device while the pass has such a color, single-sampled, of
 //!   one layer, without a rasterization-rate map, fetching in the pixel interlock. At the draw
@@ -40,6 +41,7 @@
 use super::RenderCommandEncoder;
 use crate::blit::TRANSFER;
 use crate::command_buffer::CommandBuffer;
+use crate::device::functions::Vk;
 use crate::error::{internal, Error};
 use crate::image_plan::ImagePlan;
 use crate::owned_kernel::{OwnedKernel, OwnedModule};
@@ -219,13 +221,16 @@ impl ExtendedShadows {
 
     /// The settings before each of the pass's `count` instances, of the colors of `layout` (the
     /// pass's at the end of its encoder) that instance first holds the shadows of, and their
-    /// uses.
+    /// uses: no list at all where the pass sets no shadow, every instance's settings then empty.
     pub(super) fn settings(
         &self,
         device: &Device,
         layout: &PassLayout,
         count: usize,
     ) -> Result<(Vec<Vec<ShadowFill>>, Vec<Use<ResourceKey>>), Error> {
+        if self.fills.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let mut settings: Vec<Vec<ShadowFill>> = (0..count).map(|_| Vec::new()).collect();
         let mut uses = Vec::new();
         for &(at, c) in &self.fills {
@@ -334,7 +339,7 @@ impl ShadowFill {
     /// `raw` is the encoder's command buffer, recording outside a render pass, which only the
     /// encoder records; the shadow, the codes and the setting's objects are live until it
     /// completes and rest in `GENERAL`.
-    pub(super) unsafe fn record_in(&self, device: &ash::Device, raw: vk::CommandBuffer) {
+    pub(super) unsafe fn record_in(&self, device: &Vk, raw: vk::CommandBuffer) {
         // SAFETY: the caller's.
         unsafe {
             Barrier::everything().record(device, raw);
@@ -409,10 +414,11 @@ fn color(
 impl RenderCommandEncoder {
     /// The shadows a draw binds: the held ones, none while the encoder records an execution's
     /// commands or a capture draw.
-    pub(super) fn extended_shadows_bound(&self) -> BTreeSet<u32> {
+    pub(super) fn extended_shadows_bound(&self) -> &BTreeSet<u32> {
+        static NONE: BTreeSet<u32> = BTreeSet::new();
         match self.replaying || self.capture_addresses().is_some() {
-            true => BTreeSet::new(),
-            false => self.extended.live.clone(),
+            true => &NONE,
+            false => &self.extended.live,
         }
     }
 
@@ -473,7 +479,7 @@ impl RenderCommandEncoder {
             self.extended.pending.extend(starting);
             return Ok(());
         }
-        let mut colors: Vec<u32> = self.current.shape.storage.clone();
+        let mut colors: Vec<u32> = self.current.shape.storage.to_vec();
         colors.extend(starting.iter().copied());
         colors.sort_unstable();
         colors.dedup();
@@ -525,8 +531,7 @@ impl RenderCommandEncoder {
             return;
         }
         let graphics = &pipeline.base().graphics;
-        let touched: Vec<u32> = bound
-            .into_iter()
+        let touched: Vec<u32> = (bound.iter().copied())
             .filter(|&c| reads_color(graphics, c) || writes_color(graphics, c))
             .collect();
         self.extended.end(&touched);

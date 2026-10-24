@@ -44,7 +44,7 @@ use crate::pipeline::interface::PushLoc;
 use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module,
-    typed_module_with, AssembleError,
+    typed_module_with, AssembleError, Scratch,
 };
 use crate::pipeline::{
     ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor, LoweringInputs, Reconvergence,
@@ -94,13 +94,11 @@ fn assemble(stem: &str) -> Option<Vec<u8>> {
 
 /// `text` assembled from a scratch file.
 fn assemble_text(tag: &str, text: &str) -> Option<Vec<u8>> {
-    let dir = std::env::temp_dir().join(format!("m2v-simd-emulated-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let scratch = Scratch::new(&format!("m2v-simd-emulated-{tag}"));
+    let dir = scratch.path();
     let path = dir.join("kernel.ll");
     std::fs::write(&path, text).expect("write");
-    let bc = assemble_file(&path, tag);
-    let _ = std::fs::remove_dir_all(&dir);
-    bc
+    assemble_file(&path, tag)
 }
 
 /// Every word of buffer 0 after one workgroup of local size `local` ran `m` (planned as `plan`)
@@ -393,12 +391,14 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
                 u32::from(l == 5) + (b + 5) * 10
             }
         }
+        // Metal's backend speculates the branch's arm (`air::canon::speculate`), so every lane of
+        // the quad votes, one that skips the arm too: the M3 Max (macOS 27.0.1) answers 95 on
+        // thread 0 (its mask 0xF) and 159 on thread 8 (lane 9 in the mask and the `any`).
         "quad_ballot_k" => {
-            let active = |u: u32| u % 7 != 2;
-            if !active(t) {
+            if t % 7 == 2 {
                 return 99;
             }
-            let quad: Vec<u32> = g.quad(t).filter(|&u| active(u)).collect();
+            let quad: Vec<u32> = g.quad(t).collect();
             let mask = quad.iter().fold(0u32, |a, &u| a | (1 << (u & 3)));
             let first = quad.first().copied() == Some(t);
             u32::from(first)
@@ -559,14 +559,15 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         }
         // `simd_masks`: a quad ballot's bit `j` is quad lane `j`; a simdgroup's active mask (its
         // zero upper half folded in) has bit `i` for each active lane `i`.
+        // The divergent kernel's arm is speculated as Metal's backend does
+        // (`air::canon::speculate`): a lane that skips it votes too (the M3 Max, macOS 27.0.1,
+        // answers 2 on thread 8, the skipping lane 9's).
         "mask_quad_ballot_k" | "mask_quad_ballot_divergent_k" => {
-            let divergent = kernel == "mask_quad_ballot_divergent_k";
-            let active = |u: u32| !divergent || u % 7 != 2;
-            if !active(t) {
+            if kernel == "mask_quad_ballot_divergent_k" && t % 7 == 2 {
                 return 99;
             }
             g.quad(t)
-                .filter(|&u| active(u) && u % 3 == 0)
+                .filter(|&u| u % 3 == 0)
                 .fold(0u32, |a, u| a | (1 << (u & 3)))
         }
         "mask_simd_active_k" | "mask_simd_active_divergent_k" => {

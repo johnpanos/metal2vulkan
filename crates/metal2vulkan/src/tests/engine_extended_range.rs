@@ -7,14 +7,15 @@
 //!   measured rule of `metal::format::ExtendedRange`), and writing it back stores Metal's raw
 //!   texel: the same codes, the bits Metal does not read written as Metal writes them, and alpha
 //!   clamped to its codes.
-//! - A read outside the texture is Metal's zero texel, alpha the format's (measured, EV
-//!   TXN-xrprobe3-m3), on a profile whose device robustness would return the raw zero.
+//! - A read outside the texture is Metal's zero texel, alpha the format's (measured), on a profile
+//!   whose device robustness would return the raw zero.
 //! - `ARGB8Unorm`'s storage slot rotates its bytes in the shader (`RotateArgb`), and a half-float
 //!   storage slot of `HalfTowardZero` rounds each written `float` toward zero, one of
 //!   `HalfQuietNan` its NaN alone.
 //! - The binder joins a slot bound in an extended-range format to the plan's variant, the
 //!   variant's plan states the same key, and it views the image in the raw format.
-//! - Samples of such a texture are Metal's (`samples`).
+//! - Samples of such a texture are Metal's (`samples`), at Metal's level and through a linear
+//!   mip filter's trilinear sum (`levels`), and a 3D texture's (`volumes`).
 //!
 //! `llvm-as` assembles the kernels; without it the tests skip visibly.
 
@@ -45,8 +46,10 @@ use crate::spirv::ir::TypedModule;
 
 mod bicubic;
 mod heap;
+mod levels;
 mod samples;
 mod targets;
+mod volumes;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
@@ -170,8 +173,10 @@ fn inputs(form: ExtendedRange, source: Source) -> LowerInputs {
     i
 }
 
+/// The profiles the extended-range tests compile for: the site code's (lavapipe, MoltenVK) and a
+/// routine's (the RTX 5080 Laptop GPU, whose driver keeps a `DontInline` call a call).
 fn profiles() -> Vec<(&'static str, crate::device::profile::DeviceProfile)> {
-    ["lavapipe", "moltenvk-m3"]
+    ["lavapipe", "moltenvk-m3", "nvidia-rtx5080-laptop"]
         .into_iter()
         .map(|stem| {
             (
@@ -477,7 +482,7 @@ fn reads_and_writes_of_every_code_are_metals() {
 }
 
 /// A read outside the texture is Metal's zero texel with the format's alpha (measured on the M3
-/// Max, EV TXN-xrprobe3-m3): `BGR10_XR` reads alpha 1, which the slot's `OutOfBoundsAlpha`
+/// Max): `BGR10_XR` reads alpha 1, which the slot's `OutOfBoundsAlpha`
 /// specialization states, and `BGRA10_XR` 0, never the decode of the raw zero a device's
 /// robustness returns (`-0.752941`).
 #[test]
@@ -517,7 +522,7 @@ fn bfloat_codes(n: u32) -> [u32; 4] {
 /// a `float` result, is Metal's value bit for bit, the channels a form lacks 0 and alpha 1
 /// whatever the image's other components hold; written back, it is Metal's code of that value
 /// (a `half` read's `half` widened): the code itself, a NaN `0x7fc0`. A read outside the texture
-/// is Metal's zero texel, alpha 1 where the form has none (EVs FPV-pf5-m4 and FPV-pf8-m4).
+/// is Metal's zero texel, alpha 1 where the form has none.
 #[test]
 fn bfloat_reads_and_writes_are_metals() {
     let forms = [
@@ -661,7 +666,7 @@ fn argb8_storage_slots_rotate_their_bytes() {
 
 /// A half-float storage slot of `HalfTowardZero` (formatless, and declared `Rgba16f`) writes each
 /// `float` channel rounded toward zero to the `half` Metal stores, as the `f32` that holds it: a
-/// finite value past 65504 as 65504, an infinity kept, a NaN as `0x7fc00000` (EV TXN-hkw-m4);
+/// finite value past 65504 as 65504, an infinity kept, a NaN as `0x7fc00000`;
 /// one of `HalfQuietNan` (a device's that rounds as Metal does: MoltenVK's here) writes it as
 /// computed but a NaN as `0x7fc00000`. The held lanes cover
 /// every tie between neighbouring halves and its neighbours, past the largest, the infinities
@@ -992,7 +997,7 @@ fn a_slot_bound_in_an_extended_range_format_joins_the_variant() {
 /// (`swizzled_storage`) at a sampled slot as at a storage slot: its view holds raw codes, which
 /// a swizzle in the view's component mapping would move before the function decodes them, so the
 /// view takes none (`shader_swizzle`) and the variant's function swizzles the decoded texel
-/// under the slot's `TextureSwizzle` specialization, the swizzle's word (EV FPV-sw1-m4). An
+/// under the slot's `TextureSwizzle` specialization, the swizzle's word. An
 /// unswizzled texture leaves the variant. On every committed profile.
 #[test]
 fn a_swizzled_extended_texture_joins_the_variant_at_a_sampled_slot() {

@@ -3,18 +3,18 @@
 //!
 //! The runtime enables exactly the [`EnableSet`] it computed (the description's
 //! `recommended_enables` for the policy, closed by `with_enabled`), plus the extensions the
-//! caller's options name and `timelineSemaphore`, which the runtime needs itself. Each feature is
-//! one `VkBool32` member of one feature structure ([`MEMBERS`]); a structure is chained when one
-//! of its members is set, and an extension structure only through its enabled extension, or from
-//! the core version that promoted it (`Structure::promotion`, the registry's promotions, which
-//! the tests hold to the description's), at the device's version (its own, capped by the
-//! instance's). From Vulkan 1.3 a member 1.3 promoted is set in
-//! `VkPhysicalDeviceVulkan13Features` ([`CORE_1_3`]), never in its extension structure; from 1.4
-//! a member 1.4 promoted is set in its own structure, which 1.4 makes core
+//! caller's options name, `timelineSemaphore` and `hostQueryReset`, which the runtime needs itself
+//! (each required in Vulkan 1.2). Each feature is one `VkBool32` member of one feature structure
+//! ([`MEMBERS`]); a structure is chained when one of its members is set, and an extension structure
+//! only through its enabled extension, or from the core version that promoted it
+//! (`Structure::promotion`, the registry's promotions, which the tests hold to the description's),
+//! at the device's version (its own, capped by the instance's). From Vulkan 1.3 a member 1.3
+//! promoted is set in `VkPhysicalDeviceVulkan13Features` ([`CORE_1_3`]), never in its extension
+//! structure; from 1.4 a member 1.4 promoted is set in its own structure, which 1.4 makes core
 //! (`ash 0.38` has no `VkPhysicalDeviceVulkan14Features`), as the description reads it
-//! (`ash_interop::query`); a feature core without a member from its version (extended dynamic
-//! state from 1.3) sets nothing. Each extension of the vocabulary is enabled under the first of
-//! its names the device lists ([`EXTENSIONS`]).
+//! (`ash_interop::query`); a feature core without a member from its version (extended dynamic state
+//! from 1.3) sets nothing. Each extension of the vocabulary is enabled under the first of its names
+//! the device lists ([`EXTENSIONS`]).
 
 use super::error::{Error, ExtensionFeature, RuntimeGap};
 use ash::vk;
@@ -376,6 +376,10 @@ pub(super) enum Structure {
     ExtendedDynamicState,
     /// `VkPhysicalDeviceExtendedDynamicState2FeaturesEXT`.
     ExtendedDynamicState2,
+    /// `VkPhysicalDeviceExtendedDynamicState3FeaturesEXT`.
+    ExtendedDynamicState3,
+    /// `VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT`.
+    FeedbackLoop,
     Robustness2,
     ImageRobustness,
     PortabilitySubset,
@@ -463,6 +467,8 @@ impl Structure {
             | Structure::RayQuery
             | Structure::Acceleration
             | Structure::MeshShader
+            | Structure::ExtendedDynamicState3
+            | Structure::FeedbackLoop
             | Structure::Robustness2
             | Structure::PortabilitySubset
             | Structure::GeneratedCommands
@@ -515,6 +521,8 @@ impl Structure {
             Structure::MeshShader => &[X::ExtMeshShader],
             Structure::ExtendedDynamicState => &[X::ExtExtendedDynamicState],
             Structure::ExtendedDynamicState2 => &[X::ExtExtendedDynamicState2],
+            Structure::ExtendedDynamicState3 => &[X::ExtExtendedDynamicState3],
+            Structure::FeedbackLoop => &[X::ExtAttachmentFeedbackLoopLayout],
             Structure::Robustness2 => &[X::ExtRobustness2],
             Structure::ImageRobustness => &[X::ExtImageRobustness],
             Structure::PortabilitySubset => &[X::KhrPortabilitySubset],
@@ -573,6 +581,8 @@ struct FeatureChain {
     mesh_shader: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
     extended_dynamic_state: vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static>,
     extended_dynamic_state2: vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT<'static>,
+    extended_dynamic_state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static>,
+    feedback_loop: vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static>,
     robustness2: vk::PhysicalDeviceRobustness2FeaturesEXT<'static>,
     image_robustness: vk::PhysicalDeviceImageRobustnessFeatures<'static>,
     portability_subset: vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'static>,
@@ -648,12 +658,14 @@ members! {
     Core.core.multi_viewport => MultiViewport;
     Core.core.occlusion_query_precise => OcclusionQueryPrecise;
     Core.core.full_draw_index_uint32 => FullDrawIndexUint32;
+    Core.core.shader_tessellation_and_geometry_point_size => ShaderTessellationAndGeometryPointSize;
     V11.v11.storage_buffer16_bit_access => StorageBuffer16BitAccess;
     V11.v11.uniform_and_storage_buffer16_bit_access => UniformAndStorageBuffer16BitAccess;
     V11.v11.storage_push_constant16 => StoragePushConstant16;
     V11.v11.storage_input_output16 => StorageInputOutput16;
     V11.v11.multiview => Multiview;
     V11.v11.multiview_tessellation_shader => MultiviewTessellationShader;
+    V11.v11.multiview_geometry_shader => MultiviewGeometryShader;
     V11.v11.shader_draw_parameters => ShaderDrawParameters;
     V12.v12.sampler_mirror_clamp_to_edge => SamplerMirrorClampToEdge;
     V12.v12.storage_buffer8_bit_access => StorageBuffer8BitAccess;
@@ -739,6 +751,7 @@ members! {
     RasterOrder.raster_order.rasterization_order_depth_attachment_access => RasterizationOrderDepthAttachmentAccess;
     RasterOrder.raster_order.rasterization_order_stencil_attachment_access => RasterizationOrderStencilAttachmentAccess;
     Maintenance8.maintenance8.maintenance8 => Maintenance8;
+    ShaderFma.shader_fma.shader_fma_float16 => ShaderFmaFloat16;
     ShaderFma.shader_fma.shader_fma_float32 => ShaderFmaFloat32;
     Maintenance5.maintenance5.maintenance5 => Maintenance5;
     BorderColorSwizzle.border_color_swizzle.border_color_swizzle => BorderColorSwizzle;
@@ -756,6 +769,8 @@ members! {
     MeshShader.mesh_shader.mesh_shader => MeshShader;
     ExtendedDynamicState.extended_dynamic_state.extended_dynamic_state => ExtendedDynamicState;
     ExtendedDynamicState2.extended_dynamic_state2.extended_dynamic_state2 => ExtendedDynamicState2;
+    ExtendedDynamicState3.extended_dynamic_state3.extended_dynamic_state3_color_write_mask => ExtendedDynamicState3ColorWriteMask;
+    FeedbackLoop.feedback_loop.attachment_feedback_loop_layout => AttachmentFeedbackLoopLayout;
     Robustness2.robustness2.robust_buffer_access2 => RobustBufferAccess2;
     Robustness2.robustness2.robust_image_access2 => RobustImageAccess2;
     Robustness2.robustness2.null_descriptor => NullDescriptor;
@@ -895,6 +910,14 @@ const EXTENSIONS: &[(VkExtension, &CStr)] = {
             X::ExtExtendedDynamicState2,
             c"VK_EXT_extended_dynamic_state2",
         ),
+        (
+            X::ExtExtendedDynamicState3,
+            c"VK_EXT_extended_dynamic_state3",
+        ),
+        (
+            X::ExtAttachmentFeedbackLoopLayout,
+            c"VK_EXT_attachment_feedback_loop_layout",
+        ),
         (X::KhrPushDescriptor, c"VK_KHR_push_descriptor"),
         (
             X::ExtTextureCompressionAstcHdr,
@@ -928,6 +951,7 @@ const EXTENSIONS: &[(VkExtension, &CStr)] = {
         (X::KhrCooperativeMatrix, c"VK_KHR_cooperative_matrix"),
         (X::KhrShaderBfloat16, c"VK_KHR_shader_bfloat16"),
         (X::QcomTileShading, c"VK_QCOM_tile_shading"),
+        (X::KhrFormatFeatureFlags2, c"VK_KHR_format_feature_flags2"),
     ]
 };
 
@@ -1065,6 +1089,8 @@ macro_rules! link_extensions {
             MeshShader => mesh_shader,
             ExtendedDynamicState => extended_dynamic_state,
             ExtendedDynamicState2 => extended_dynamic_state2,
+            ExtendedDynamicState3 => extended_dynamic_state3,
+            FeedbackLoop => feedback_loop,
             Robustness2 => robustness2,
             ImageRobustness => image_robustness,
             PortabilitySubset => portability_subset,
@@ -1109,9 +1135,11 @@ impl Enables {
             linked: BTreeSet::new(),
             names: Vec::new(),
         };
-        // The runtime's own need, outside the vocabulary: events and the completion of command
-        // buffers are timeline semaphores (core and required in Vulkan 1.2).
+        // The runtime's own needs, outside the vocabulary, each core and required in Vulkan 1.2:
+        // events and the completion of command buffers are timeline semaphores, and timestamp
+        // slots are reset on the host (`gpu_time.rs`).
         enables.chain.v12.timeline_semaphore = vk::TRUE;
+        enables.chain.v12.host_query_reset = vk::TRUE;
         for &extension in &set.extensions {
             let name = names_of(extension)
                 .find(|name| listed.contains(*name))
@@ -1278,6 +1306,11 @@ impl Enables {
             self.linked.insert(structure);
         }
         Ok(())
+    }
+
+    /// The names of the extensions it enables.
+    pub(super) fn names(&self) -> impl Iterator<Item = &CStr> {
+        self.names.iter().map(CString::as_c_str)
     }
 
     fn push_name(&mut self, name: CString) {

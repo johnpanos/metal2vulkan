@@ -95,9 +95,9 @@ fn a_texture_record_presents_its_whole_image() {
     assert_eq!((r.array_length(), r.extent()), (2, [16, 16, 1]));
 }
 
-/// Every view-format pair probe 2 measured, with plain Metal's verdict: Metal's API validation
-/// also stops the pairs `plain` marks on a texture without `PixelFormatView` usage, which plain
-/// Metal makes (RT5 probes 1 and 2).
+/// Every view-format pair probe 2 measured, with plain Metal's verdict: Metal's API validation also
+/// stops the pairs `plain` marks on a texture without `PixelFormatView` usage, which plain Metal
+/// makes (Metal probes on the M3 Max and the M4).
 #[test]
 fn view_formats_follow_metals_measured_verdicts() {
     use PixelFormat as P;
@@ -200,7 +200,7 @@ fn view_formats_follow_metals_measured_verdicts() {
     );
     match check_view(
         &source,
-        &ViewRequest::of_format(&source, P::PVRTCRGB2BPP),
+        &ViewRequest::of_format(&source, P::ASTC4x2HDR),
         device.profile(),
     ) {
         Err(ViewRefusal::Unsupported(u)) => assert_eq!(u.feature, Feature::Format),
@@ -208,7 +208,7 @@ fn view_formats_follow_metals_measured_verdicts() {
     }
     // Metal views an extended-range format as its sRGB twin alone, and no other format as one,
     // though their bytes per pixel match (the consumer's report, an M3 Max: 116 pairs abort;
-    // the two-plane ones' 72 pairs abort on an M4, EV APX2-xv1-m4).
+    // the two-plane ones' 72 pairs abort on an M4).
     let xr = [
         P::BGRA10XR,
         P::BGRA10XRSRGB,
@@ -322,8 +322,8 @@ fn view_types_follow_metals_measured_verdicts() {
             0..1,
             Ok(()),
         ),
-        // A texture buffer views as a texture buffer only; Metal asserts on the others, plain
-        // and validated (TOB probes 1 and 2).
+        // A texture buffer views as a texture buffer only; Metal asserts on the others, plain and
+        // validated (Metal probes on the M3 Max and an M4).
         (T::TextureBuffer, 1, T::TextureBuffer, 0..1, Ok(())),
         (
             T::TextureBuffer,
@@ -510,7 +510,7 @@ fn swizzled_views_keep_the_private_usage_bits_metal_keeps() {
     }
 }
 
-/// Bit 0x8, which Metal's descriptor keeps and its texture drops (EV API-usage8-m4, an Apple M4):
+/// Bit 0x8, which Metal's descriptor keeps and its texture drops (an Apple M4):
 /// a texture of 0x8 alone answers no usage, as its views without a swizzle do, and Metal asserts
 /// on its swizzled view; one of 0x9 answers `ShaderRead`, its swizzled view too. A swizzled view
 /// of a texture of `ShaderWrite`, `RenderTarget` or `Video` alone answers no usage, made.

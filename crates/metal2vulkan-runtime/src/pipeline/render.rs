@@ -49,12 +49,12 @@ use super::texture_access::{TextureAccessMemo, TextureAccesses};
 use super::tile::TileState;
 use super::BufferForms;
 use super::{compile_error, stand_in, PipelineOptions, PIPELINES, PLANS, VARIANTS};
+use crate::argument_table::AtBindViews;
 use crate::binary_archive::{self, Used};
 use crate::color_reformat::Routing;
-use crate::degradation::{BoundFormats, Degradation, Occurrence};
+use crate::degradation::{BoundFormats, CompiledPipeline, Degradation, Occurrence};
 use crate::device::{device_error, lock};
 use crate::error::{internal, invalid, ArchivedPipeline, Error, Problem, RuntimeGap};
-use crate::framebuffer_fetch;
 use crate::render_pass::MAX_COLOR_ATTACHMENTS;
 use crate::render_target::RenderPassObject;
 use crate::residency::{every_render_stage, handle_stages};
@@ -75,8 +75,10 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan::reflection::{LinkedUseAnswers, RenderPipelineReflection};
 use std::any::Any;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+mod residual;
 
 /// A Metal render pipeline state (`MTLRenderPipelineState`): one that draws, or a tile pipeline's
 /// ([`Device::new_tile_render_pipeline_state`]), which dispatches per tile. Cheap to clone (a
@@ -154,6 +156,11 @@ impl std::ops::Deref for StateShared {
 pub(crate) struct Program {
     device: Device,
     descriptor: StateDescriptor,
+    /// For a twin of a color group (`GraphicsState::color_group`), the descriptor its group's
+    /// passes draw it as (`GraphicsState::descriptor`): the group's color attachments alone,
+    /// attachment `colors()[l]` at index `l`, as its variants' outputs and the group's projected
+    /// pass are numbered. Its variants compile from `descriptor`, under the group's key.
+    drawn: Option<StateDescriptor>,
     /// The variant compiled at creation: under the empty key, or under stand-ins for the storage
     /// textures' formats it needs (`stand_in`).
     base: Arc<RenderVariant>,
@@ -176,6 +183,9 @@ pub(crate) struct Program {
     /// The state's single-sample twin (`GraphicsState::single_sample`), made when a pass of one
     /// sample first takes the state.
     single_sample: Mutex<Option<GraphicsState>>,
+    /// The state's twins of its color groups (`GraphicsState::color_group`), in group order, made
+    /// at its creation; none for a state the device draws whole.
+    color_groups: OnceLock<Vec<GraphicsState>>,
     /// `label`: its descriptor's (`PipelineOptions::label`).
     label: Option<String>,
     /// Its functions' texture slots and their accesses (`texture_access.rs`), read when first
@@ -183,24 +193,23 @@ pub(crate) struct Program {
     texture_accesses: TextureAccessMemo,
     /// Its part of the pipeline creation log, while the log is on (`creation_log.rs`).
     log: Option<StateLog>,
-    /// The sets of colors kept out of a draw's subpass whose variant writing them through the
-    /// interlocked storage form the compile refused (`BindState::interlocked_colors`): a draw
-    /// meeting one again records in an instance of its own without asking (`render.rs`). At
-    /// most one per subset of the eight colors.
-    refused_interlocks: Mutex<Vec<BTreeSet<u32>>>,
     /// Its variants' capture forms (`VariantKey::captured_positions`), as capture replay asked for
     /// them (`GraphicsState::capture_variant`): at most [`CAPTURES`].
     captures: Mutex<Lru<VariantKey, Capture>>,
     /// What its last [`SETTLED`] settles of other shapes settled, in which buffer forms, the
     /// latest used first (`GraphicsState::settle_shape`).
     settled: Mutex<VecDeque<(BufferForms, Settled)>>,
-    /// The `VkPipeline` its last draw found made (`RenderVariant::begin_graphics_pipeline`).
-    last_pipeline: Mutex<Option<LastPipeline>>,
+    /// The `VkPipeline`s its last draws found made in their variants' memos, the latest found
+    /// first, at most [`LAST_PIPELINES`] (`RenderVariant::begin_graphics_pipeline`).
+    last_pipelines: Mutex<VecDeque<LastPipeline>>,
     /// Its routing into the pass colors it was last set in a pass of (`GraphicsState::routed`).
     routed: Mutex<Option<(PassColors, Result<Arc<Routing>, u32>)>>,
     /// What its pool pieces hold (`piece_holds.rs`): its draws' makings and its capture forms'
     /// translations, kept here so a pool thread never holds the device's last reference.
     pieces: Arc<PieceHolds<PieceHeld>>,
+    /// Its buffer slots whose bind offset class tells the device's view base alignment apart
+    /// (`argument_table::AtBindViews`), of its base's interface.
+    at_bind_views: AtBindViews,
 }
 
 /// The state's release returns at once: it lets go of what its pool pieces held on its own
@@ -234,9 +243,9 @@ pub(crate) enum PieceHeld {
 /// ([`GraphicsState::routed`]).
 pub(crate) type PassColors = [Option<PixelFormat>; MAX_COLOR_ATTACHMENTS];
 
-/// The `VkPipeline` a state's last draw found made in its variant's memo: the variant (held
-/// weakly, so the state holds it no longer than before, and its address stays its own while
-/// held), the key, and where the memo's entry lies.
+/// A `VkPipeline` a state's draw found made in its variant's memo: the variant (held weakly, so
+/// the state holds it no longer than before, and its address stays its own while held), the key,
+/// and where the memo's entry lies.
 struct LastPipeline {
     variant: Weak<RenderVariant>,
     key: GraphicsKey,
@@ -257,6 +266,12 @@ pub(crate) struct Settled {
 /// state take a few shapes in turn: a pass's first draw binds nothing else, and a later one finds
 /// what the draws of other states left bound (their bytes), which is of its shape.
 const SETTLED: usize = 4;
+
+/// The most `VkPipeline`s a state keeps of those its draws found made
+/// (`RenderVariant::begin_graphics_pipeline`). A window server's draws of one state take a few
+/// keys in turn, as they take a few shapes ([`SETTLED`]): a pass's first draw finds its own bind
+/// shape, whose plan's specialization another draw of the pass does not share.
+const LAST_PIPELINES: usize = 4;
 
 /// The most capture forms of its variants a state keeps (`GraphicsState::capture_variant`): a
 /// settled key's and the key its plan asks for, of each form a pass draws.
@@ -418,8 +433,7 @@ impl StateDescriptor {
     /// Number the samplers of a state of this descriptor on `device`, as Metal's creation
     /// numbers them (`resource_ids/numbered.rs`): the device's own sampler where it has a
     /// fragment function, then its functions' samplers (`interface`'s, the compiled pipeline's)
-    /// in the reverse of its stages, fragment, vertex or mesh, object (EVs TTG-sid6-m4,
-    /// SID-sid10-m4).
+    /// in the reverse of its stages, fragment, vertex or mesh, object.
     fn number_samplers(
         &self,
         device: &Device,
@@ -518,9 +532,8 @@ impl Device {
     /// `NotImplemented(Textures)`). A vertex
     /// function that writes `[[point_size]]` under the line or triangle input primitive topology
     /// class is `Invalid` (`PointSizeTopology`), as Metal's creation answers an error for it
-    /// (measured on an M3 Max and an M4). A framebuffer fetch the compile layer left unordered
-    /// (the device's policy is `AcceptUnordered`) is `Unsupported`, naming rasterization-order
-    /// attachment access: the runtime runs only Metal's ordered fetch. Each stage's imports come
+    /// (measured on an M3 Max and an M4). A framebuffer fetch no ordered form serves on the device
+    /// is `Unsupported{FramebufferFetch}`, naming what each form needs. Each stage's imports come
     /// from its own dynamic libraries (`vertexPreloadedLibraries` in the vertex stage's
     /// function descriptor, `fragmentPreloadedLibraries` in the fragment's, then those its
     /// libraries' install names name), as a compute state's do
@@ -681,8 +694,9 @@ impl RenderPipelineState {
     /// Whether the state's fragment function reads `[[barycentric_coord]]`: a runtime extension,
     /// with no Metal counterpart (`MTLRenderPipelineReflection` does not state it). It is the
     /// compiled pipeline's `GraphicsState::reads_barycentric_coord`, from the translated fragment
-    /// stage's builtins: the weights perspective-correct or not, of any width. Metal declares
-    /// them at the pixel center only, so these are all its forms. `false` for a state without a
+    /// stage's builtins, or its varyings on a device without `fragmentShaderBarycentric`: the
+    /// weights perspective-correct or not, of any width. Metal reads them at the pixel center
+    /// only, so these are all its forms. `false` for a state without a
     /// fragment function, for one whose fragment function reads no barycentric weights, and for
     /// a tile pipeline's, whose function reads none. A primitive's weights follow the order its
     /// vertices are drawn in: a consumer that draws them in another order changes what a draw
@@ -755,7 +769,10 @@ impl RenderPipelineState {
     /// a post-tessellation vertex function's counts, and for a mesh pipeline's state, its mesh
     /// function's. `false` for a tile pipeline's state. As for
     /// [`writes_render_target_array_index`](Self::writes_render_target_array_index), Metal routes
-    /// each primitive by its provoking vertex's index.
+    /// each primitive by its provoking vertex's index. `true` on a device without `multiViewport`
+    /// too, where a draw has one viewport and the function stores no index: there a draw while
+    /// the encoder holds more than one viewport is refused, `Unsupported(LayeredRendering)` needing
+    /// `multiViewport`.
     pub fn writes_viewport_array_index(&self) -> bool {
         match &self.0 {
             Kind::Graphics(state) => state.base().graphics.writes_viewport_index,
@@ -867,7 +884,7 @@ impl RenderPipelineState {
     /// the runtime reads from the descriptor the state was made from the first time it is asked,
     /// and keeps. Metal's own `reflection` property of a state made from a device is nil. The
     /// access is the declared one, measured on an M3 Max and an M4 (`reflection`'s rules in the
-    /// compile layer, a fragment function's slots by EV RFL-tacc-m4):
+    /// compile layer, a fragment function's slots by our probe):
     /// - `ReadOnly` for a texture declared `access::read`, or sampled;
     /// - `WriteOnly` for `access::write`;
     /// - `ReadWrite` for `access::read_write`, whether or not the function both reads and writes
@@ -935,7 +952,7 @@ impl RenderPipelineState {
 
     /// `resourceIndex`, Apple's private property: [`gpu_resource_id`](Self::gpu_resource_id)'s
     /// value, 0 for a state made without `supportIndirectCommandBuffers` (a tile pipeline's
-    /// included), as Metal answers (EV APX2-spi1-m4: equal to `gpuResourceID` for compute and
+    /// included), as Metal answers (equal to `gpuResourceID` for compute and
     /// render states made with and without it).
     pub fn resource_index(&self) -> u64 {
         self.gpu_resource_id().0
@@ -977,7 +994,7 @@ impl RenderPipelineState {
 
     /// `label`: the label of the descriptor the state was made with (a render, mesh or tile
     /// pipeline's, `PipelineOptions::label`), `None` for nil; a state made with additional
-    /// binary functions keeps its original's, as Metal's does (EV CFR-probe5-m4).
+    /// binary functions keeps its original's, as Metal's does.
     pub fn label(&self) -> Option<&str> {
         match &self.0 {
             Kind::Graphics(state) => state.0.label.as_deref(),
@@ -1005,6 +1022,17 @@ impl RenderPipelineState {
                 .single_sample()?
                 .map(|twin| RenderPipelineState(Kind::Graphics(twin)))),
             Kind::Tile(_) => Ok(None),
+        }
+    }
+
+    /// A drawing state's twin of color group `group` (`GraphicsState::color_group`); `None` for
+    /// a tile pipeline's state and a group the state does not have.
+    pub(crate) fn color_group(&self, group: u32) -> Option<RenderPipelineState> {
+        match &self.0 {
+            Kind::Graphics(state) => state
+                .color_group(group)
+                .map(|twin| RenderPipelineState(Kind::Graphics(twin))),
+            Kind::Tile(_) => None,
         }
     }
 
@@ -1362,24 +1390,82 @@ impl GraphicsState {
             });
         }
         let large = large_form(device, descriptor, (&base, &entries), stand_in);
+        // Each color group's variant, where Metal compiles: a refusal of any group's refuses the
+        // creation, as Metal's creation fails (`GraphicsState::color_group`). The first group's
+        // is the base.
+        let group_bases = group_bases(&sources, descriptor, &entries, (&base, stand_in))?;
         // No later step reads an entry: the creation lets them go before it makes its state.
         drop(entries);
+        let grouped = base.pipeline.graphics.color_group.clone().map(|group| {
+            let mut twin = descriptor.clone();
+            // A twin is no state an indirect command names: it takes no ID.
+            twin.support_indirect_command_buffers = false;
+            (twin, group)
+        });
         let descriptor = StateDescriptor::Vertex(descriptor.clone());
         device.degrade_absent_reads(&base.shared_pipeline().dependencies, |stage| {
             descriptor.stage(stage).map_or("none".into(), stage_name)
         });
+        device.degrade_synthesized_geometry(&base.shared_pipeline().dependencies, || {
+            let name = |stage| descriptor.stage(stage).map_or("none".into(), stage_name);
+            format!(
+                "the render pipeline state of vertex function {} and fragment function {}",
+                name(metal2vulkan::pipeline::Stage::Vertex),
+                name(metal2vulkan::pipeline::Stage::Fragment)
+            )
+        });
         let state = GraphicsState::of(
             device,
-            descriptor,
+            (descriptor, None),
             (base, large),
             (stand_in, placement, options.label.clone()),
             added_unsupported,
         )?;
         state.make_neutrals();
-        // Its first draw's predicted `VkPipeline`, made where Metal compiles (`predicted.rs`).
-        state.make_at_creation();
+        // Its first draw's predicted `VkPipeline`, made where Metal compiles (`predicted.rs`):
+        // a state drawn in color groups draws as its twins, which predict their own.
+        if grouped.is_none() {
+            state.make_at_creation();
+        }
         // The pipelines its tested draws' depth stand-in copies by, made where Metal compiles.
         state.make_stand_in_copies();
+        if let Some((twin, grouping)) = grouped {
+            let mut twins = Vec::with_capacity(group_bases.len());
+            for (group, (base, stand_in)) in (0..).zip(group_bases) {
+                // The group's attachments at their locations (`Program::drawn`).
+                let mut of_group = grouping.clone();
+                of_group.group = group;
+                let mut drawn = twin.clone();
+                drawn.color_attachments = Default::default();
+                for (slot, &index) in drawn.color_attachments.iter_mut().zip(of_group.colors()) {
+                    let color = twin
+                        .color_attachments
+                        .get(index as usize)
+                        .cloned()
+                        .flatten();
+                    *slot = color;
+                }
+                let made = GraphicsState::of(
+                    device,
+                    (
+                        StateDescriptor::Vertex(twin.clone()),
+                        Some(StateDescriptor::Vertex(drawn)),
+                    ),
+                    (base, None),
+                    (stand_in, IdPlacement::Any, options.label.clone()),
+                    added_unsupported,
+                )?;
+                made.make_neutrals();
+                made.make_at_creation();
+                made.make_stand_in_copies();
+                twins.push(made);
+            }
+            state
+                .0
+                .color_groups
+                .set(twins)
+                .map_err(|_| internal("a state's color groups made twice"))?;
+        }
         Ok(state)
     }
 
@@ -1427,7 +1513,7 @@ impl GraphicsState {
             Some(&descriptor.mesh)
         })?;
         let budget = options.budget();
-        // As a render state's, in Metal's order (EV RRS3-icbtex17): a fragment function writing
+        // As a render state's, in Metal's order: a fragment function writing
         // depth without a depth attachment, the indirect command buffers' refusal, then the
         // fragment function's stage inputs the linking keeps that the mesh function does not
         // write (`linked_fragment.rs`), before the compile.
@@ -1461,7 +1547,7 @@ impl GraphicsState {
         });
         let state = GraphicsState::of(
             device,
-            descriptor,
+            (descriptor, None),
             (base, None),
             (stand_in, placement, options.label.clone()),
             [0, 0],
@@ -1474,7 +1560,7 @@ impl GraphicsState {
     /// large-buffer form, may bind (`binding::make_neutrals`), at the state's creation, which
     /// may wait, so that no draw's encoding makes one: a neutral image takes memory of its own,
     /// and NVIDIA's `vkAllocateMemory` waited 2.37 s for other processes' GPU work inside an
-    /// encoding (EV XSH-nsu3-3090). Before, only a state that indirect command buffers may draw
+    /// encoding. Before, only a state that indirect command buffers may draw
     /// made them here: an execution's host step may draw it (one made after the commit
     /// included, `render/executions.rs`), and a host step makes no neutral (`neutral.rs`). Each
     /// plan is the one for nothing bound, which writes a neutral at every slot a bind could leave
@@ -1503,10 +1589,11 @@ impl GraphicsState {
     /// The state of `descriptor` whose creation compiled `base`, under stand-ins where
     /// `stand_in`, and `large`, its large-buffer form's variant where it made one, its ID placed
     /// by `placement` where its descriptor supports indirect command buffers, with
-    /// `added_unsupported` (`StateShared::added_unsupported`).
+    /// `added_unsupported` (`StateShared::added_unsupported`); drawn as `drawn` where given
+    /// (`Program::drawn`).
     fn of(
         device: &Device,
-        descriptor: StateDescriptor,
+        (descriptor, drawn): (StateDescriptor, Option<StateDescriptor>),
         (base, large): (Arc<RenderVariant>, Option<Arc<RenderVariant>>),
         (stand_in, placement, label): (bool, IdPlacement, Option<String>),
         added_unsupported: [usize; 2],
@@ -1517,6 +1604,7 @@ impl GraphicsState {
             descriptor.support_indirect_command_buffers(),
         )?;
         let samplers = descriptor.number_samplers(device, &base.shared_pipeline().interface);
+        let at_bind_views = AtBindViews::new(device, &base.shared_pipeline().interface);
         let log = StateLog::new(label.as_deref(), &descriptor.function_names());
         Ok(GraphicsState(Arc::new_cyclic(|state| {
             // The state holds its ID's slot, which lists it among the states an indirect render
@@ -1529,6 +1617,7 @@ impl GraphicsState {
             let program = Program {
                 device: device.clone(),
                 descriptor,
+                drawn,
                 base,
                 stand_in,
                 others: Mutex::new(Lru::counted(VARIANTS)),
@@ -1536,15 +1625,16 @@ impl GraphicsState {
                 scaling: Mutex::new(None),
                 added_unsupported,
                 single_sample: Mutex::new(None),
+                color_groups: OnceLock::new(),
                 log,
                 label,
                 texture_accesses: TextureAccessMemo::new(),
-                refused_interlocks: Mutex::new(Vec::new()),
                 captures: Mutex::new(Lru::counted(CAPTURES)),
                 settled: Mutex::new(VecDeque::with_capacity(SETTLED)),
-                last_pipeline: Mutex::new(None),
+                last_pipelines: Mutex::new(VecDeque::with_capacity(LAST_PIPELINES)),
                 routed: Mutex::new(None),
                 pieces: PieceHolds::new(),
+                at_bind_views,
             };
             StateShared {
                 id,
@@ -1555,9 +1645,10 @@ impl GraphicsState {
         })))
     }
 
-    /// The descriptor the state was made from.
+    /// The descriptor the state draws as: the one it was made from, but for a twin of a color
+    /// group, whose colors are its group's alone (`Program::drawn`).
     pub(crate) fn descriptor(&self) -> &StateDescriptor {
-        &self.0.descriptor
+        self.0.drawn.as_ref().unwrap_or(&self.0.descriptor)
     }
 
     /// Its functions' texture slots and their accesses, from the reflection of the descriptor it
@@ -1577,10 +1668,10 @@ impl GraphicsState {
     /// with the default options when a command first asks for it and kept while the state lives.
     /// Its control stage multiplies the factors by the encoder's scale, which the execution sets
     /// to the command's: Metal multiplies them by a kernel's scale whatever the pipeline, while a
-    /// state made with `supportIndirectCommandBuffers` never enables the scale (probe
-    /// `RT7-icb-probe8-m4`). What making it refuses refuses the draw.
+    /// state made with `supportIndirectCommandBuffers` never enables the scale. What making it
+    /// refuses refuses the draw.
     pub(crate) fn factor_scaling(&self) -> Result<Option<GraphicsState>, Error> {
-        if self.base().graphics.tessellation.is_none() {
+        if crate::tessellation::patches(&self.base().graphics).is_none() {
             return Ok(None);
         }
         let Some(descriptor) = self.0.descriptor.vertex() else {
@@ -1634,6 +1725,21 @@ impl GraphicsState {
         Ok(Some(twin))
     }
 
+    /// The state a pass of color group `group` draws this one as, where the device draws its
+    /// color attachments in groups (`metal2vulkan::pipeline::ColorGroup`, the base's
+    /// `GraphicsState::color_group`): its twin of that group, of this state's descriptor, made at
+    /// its creation, drawn as the group's colors alone (`Program::drawn`), whose every variant
+    /// draws that group's attachments (`VariantKey::color_group`), the first group's on this
+    /// state's base. `None` for a group the state does not have, and for a state the device draws
+    /// whole.
+    pub(crate) fn color_group(&self, group: u32) -> Option<GraphicsState> {
+        self.0
+            .color_groups
+            .get()?
+            .get(usize::try_from(group).ok()?)
+            .cloned()
+    }
+
     /// A function of the state reads its raster sample count (`get_num_samples()`, the
     /// `RuntimeFact::SampleCount` it records): of a state of one sample, only that call does.
     pub(crate) fn reads_sample_count(&self) -> bool {
@@ -1685,19 +1791,10 @@ impl GraphicsState {
         &self.0.base.pipeline
     }
 
-    /// Whether the compile refused the variant that writes `colors`, kept out of a draw's
-    /// subpass, through the interlocked storage form (`refuse_interlock`).
-    pub(crate) fn interlock_refused(&self, colors: &BTreeSet<u32>) -> bool {
-        lock(&self.0.refused_interlocks).contains(colors)
-    }
-
-    /// Remember that the compile refused the variant that writes `colors` through the
-    /// interlocked storage form.
-    pub(crate) fn refuse_interlock(&self, colors: &BTreeSet<u32>) {
-        let mut refused = lock(&self.0.refused_interlocks);
-        if !refused.contains(colors) {
-            refused.push(colors.clone());
-        }
+    /// Its buffer slots whose bind offset class tells the device's view base alignment apart
+    /// (`argument_table::AtBindViews`).
+    pub(crate) fn at_bind_views(&self) -> &AtBindViews {
+        &self.0.at_bind_views
     }
 
     /// The render stages whose functions read texture handles from memory (a handle table): only
@@ -1805,8 +1902,9 @@ impl GraphicsState {
 
     /// What a draw of bind shape `shape` runs on in `forms` ([`settle`](Self::settle)'s answer),
     /// through what the state settled last for its latest [`SETTLED`] shapes: a draw of an equal
-    /// shape in the same forms (the very one, which its encoder kept, `live_bind.rs`, or an equal
-    /// one) settles as it did, not planned again; any other settles, and is kept in place of the
+    /// shape in the same forms (the very one, which its encoder kept, `live_bind.rs`, looked for
+    /// first by identity, or an equal one, compared whole where none is the very one) settles as
+    /// it did, not planned again; any other settles, and is kept in place of the
     /// one used least lately. Exact: what `settle` answers is a function of the shape and `forms`
     /// alone. A refused settle keeps nothing, and is answered as `settle` refuses it.
     pub(crate) fn settle_shape(
@@ -1816,9 +1914,13 @@ impl GraphicsState {
     ) -> Result<Settled, Error> {
         {
             let mut kept = lock(&self.0.settled);
-            let found = kept
-                .iter()
-                .position(|(kept, last)| *kept == forms && last.shape == *shape);
+            // The very shape first, as a draw's encoder keeps the one it found here; else an
+            // equal one, compared whole.
+            let found = (kept.iter())
+                .position(|(kept, last)| *kept == forms && Arc::ptr_eq(&last.shape, shape))
+                .or_else(|| {
+                    (kept.iter()).position(|(kept, last)| *kept == forms && last.shape == *shape)
+                });
             if let Some(entry) = found.and_then(|at| kept.remove(at)) {
                 let last = entry.1.clone();
                 kept.push_front(entry);
@@ -1873,7 +1975,7 @@ impl GraphicsState {
         };
         // A post-tessellation vertex function's pipeline tessellates where the descriptor's
         // tessellation state is `None` (Metal's defaults) too.
-        let untessellated = self.base().graphics.tessellation.is_none();
+        let untessellated = crate::tessellation::patches(&self.base().graphics).is_none();
         (untessellated && !self.0.stand_in).then_some(&self.0.base)
     }
 
@@ -1967,7 +2069,7 @@ impl GraphicsState {
                     };
                     let device = match held {
                         PieceHeld::Capture(device) => device,
-                        other => return lease.give_back(other),
+                        other => return lease.give_back(other, None),
                     };
                     let translated = {
                         let sources = Sources::later(&device);
@@ -1979,9 +2081,12 @@ impl GraphicsState {
                                 Remembered::Compiled(pipeline) => pipeline,
                             })
                     };
-                    // Set once, by its one translation.
+                    // Set once, by its one translation: a later draw may take it, and its command
+                    // buffer complete, while this piece still holds the device, until it gave it
+                    // back. A trail spans that (`trails.rs`).
+                    let trail = device.shared().trails.open();
                     let _set = outcome.set(translated);
-                    lease.give_back(PieceHeld::Capture(device));
+                    lease.give_back(PieceHeld::Capture(device), Some(trail));
                 }));
                 return None;
             }
@@ -2025,6 +2130,45 @@ impl GraphicsState {
     }
 }
 
+/// The base variant of each color group of the state of `descriptor` whose creation compiled
+/// `base` (under stand-ins where `stand_in`), with whether it was compiled under stand-ins
+/// (`GraphicsState::color_group`): the first group's is `base`, each later one's compiled as the
+/// base was, under the empty key of that group (`VariantKey::color_group`), or under the
+/// stand-ins its compile asks for. None where the device draws the pipeline's colors whole. Its
+/// stages' specialized entries are the creation's (`entries`).
+fn group_bases(
+    sources: &Sources<'_>,
+    descriptor: &RenderPipelineDescriptor,
+    entries: &StageEntries,
+    (base, stand_in): (&Arc<RenderVariant>, bool),
+) -> Result<Vec<(Arc<RenderVariant>, bool)>, Error> {
+    let device = sources.device();
+    let Some(groups) = base
+        .pipeline
+        .graphics
+        .color_group
+        .as_ref()
+        .map(|g| g.groups())
+    else {
+        return Ok(Vec::new());
+    };
+    let profile = device.compile_device().profile();
+    let later = (1..groups).map(|group| {
+        let (found, mut key) = stand_in::compile_with_stand_ins(profile, |key| {
+            let mut key = key.clone();
+            key.color_group = group;
+            RenderVariant::compiled(sources, descriptor, &key, entries)
+        })
+        .map_err(|error| compile_error(device, error))?;
+        key.color_group = group;
+        let stand_in = !key.storage_images.is_empty();
+        Ok((RenderVariant::of(device, key, found)?, stand_in))
+    });
+    std::iter::once(Ok((Arc::clone(base), stand_in)))
+        .chain(later)
+        .collect()
+}
+
 /// The variant in the large-buffer form of the state of `descriptor` whose creation compiled
 /// `base` (under stand-ins where `stand_in`), compiled now, where Metal compiles: the variant an
 /// execution's host step draws a command the GPU may write on (`BufferForms::Large`,
@@ -2043,7 +2187,7 @@ fn large_form(
 ) -> Option<Arc<RenderVariant>> {
     if !descriptor.support_indirect_command_buffers
         || stand_in
-        || base.pipeline.graphics.tessellation.is_some()
+        || crate::tessellation::patches(&base.pipeline.graphics).is_some()
     {
         return None;
     }
@@ -2128,12 +2272,14 @@ impl RenderVariant {
             )?));
         }
         let pipeline = compile.compile_render_variant(&linked, key, &budget)?;
+        // Held to the driver's compiler word bound, translated again from the functions where its
+        // largest stage passes it; it keeps its key, so the cache stores and finds it as compiled.
+        let pipeline = compile.fit_render_variant(descriptor, key, &budget, pipeline)?;
         Ok(Remembered::Compiled(sources.linked_render(pipeline)))
     }
 
     /// The variant of `key` of what the memo or a compile `found`: the live variant, or one made
-    /// of the pipeline, its objects made, which the memo then knows live. A pipeline whose
-    /// framebuffer fetch is unordered is refused first (`framebuffer_fetch::ordered`).
+    /// of the pipeline, its objects made, which the memo then knows live.
     fn of(
         device: &Device,
         key: VariantKey,
@@ -2150,9 +2296,8 @@ impl RenderVariant {
             }
             Remembered::Compiled(pipeline) => pipeline,
         };
-        framebuffer_fetch::ordered(&pipeline.graphics)?;
         // Before the variant's shader modules, whose creation the layer reports.
-        device.degrade_requirements(&pipeline.requirements, Occurrence::Made);
+        device.degrade_pipeline(CompiledPipeline::Render(&pipeline), Occurrence::Made);
         // Where the creation log is on, the stages' SPIR-V it names hashed on a thread of its
         // own while the objects are made: the hash its first line reads, off the creation's path.
         let (objects, kept) = std::thread::scope(|scope| {
@@ -2171,7 +2316,7 @@ impl RenderVariant {
                 Compiled::Render(pipeline.key),
                 &pipeline.layout,
                 &pipeline.stages,
-                Some(&pipeline.requirements),
+                CompiledPipeline::Render(&pipeline),
             )
         })?;
         let stages = handle_stages(&pipeline.layout, every_render_stage());
@@ -2253,30 +2398,44 @@ impl RenderVariant {
         if let Some(plan) = lock(&self.plans).get(shape) {
             return Ok(Arc::clone(plan));
         }
-        let plan = Arc::new(
-            self.pipeline
-                .plan(device.compile_device(), shape)
-                .map_err(Error::Bind)?,
-        );
+        let mut plan = self
+            .pipeline
+            .plan(device.compile_device(), shape)
+            .map_err(Error::Bind)?;
+        // The binder's key names no color group (`BindingPlan::variant`): a plan of a group's
+        // variant asks for a variant of that group, as every draw of the group's pass draws it
+        // (`render/color_groups.rs`).
+        plan.variant.color_group = self
+            .pipeline
+            .graphics
+            .color_group
+            .as_ref()
+            .map_or(0, |g| g.group);
+        let plan = Arc::new(plan);
         lock(&self.plans).insert(shape.clone(), Arc::clone(&plan), 1);
         Ok(plan)
     }
 
     /// The `VkPipeline` of `key`, from the memo or made now against `render_pass`, a pass of
     /// `key.pass`; made once, outside the memo's lock (`making.rs`), for a draw of `state` that
-    /// binds `formats`, whose part of the pipeline creation log logs it.
+    /// binds `formats`, whose part of the pipeline creation log logs it. Where it is not made and
+    /// its residual form's is, the draw takes that one, and `key`'s is made on the device's pool
+    /// (`render/residual.rs`).
     pub(crate) fn graphics_pipeline(
-        &self,
+        self: &Arc<Self>,
         key: &GraphicsKey,
-        render_pass: &RenderPassObject,
+        render_pass: &Arc<RenderPassObject>,
         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
     ) -> Result<Arc<RawPipeline>, Error> {
+        if let Some(drawn) = self.residual_drawn(key, render_pass, (state, formats)) {
+            return Ok(drawn);
+        }
         self.pipelines.get_or_make(key, || {
             let make = || {
                 self.objects.graphics_pipeline(
                     &self.pipeline,
                     key,
-                    (render_pass, Notices::Now(Some(formats))),
+                    (&**render_pass, Notices::Now(Some(formats))),
                     None,
                 )
             };
@@ -2415,7 +2574,8 @@ impl RenderVariant {
     /// the pool where a specialized note tests them, `VariantObjects::tested_formats`), whose part
     /// of the pipeline creation log logs it as [`graphics_pipeline`](Self::graphics_pipeline)
     /// does. The draw goes on meanwhile; its command buffer's batch is submitted once it is made
-    /// (`render/pending.rs`).
+    /// (`render/pending.rs`). Where it is not made and its residual form's is, the draw takes that
+    /// one, and nothing waits for `key`'s making (`render/residual.rs`).
     pub(crate) fn begin_graphics_pipeline(
         self: &Arc<Self>,
         device: &Device,
@@ -2423,23 +2583,30 @@ impl RenderVariant {
         compatible: &Arc<RenderPassObject>,
         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
     ) -> DrawPipeline {
-        // A draw of this variant and a key equal to the state's last draw's finds that entry
-        // again, made, where it stays, and uses it as a lookup of the key would: the key is
-        // compared, not hashed, nor made.
-        let last = lock(&state.0.last_pipeline)
-            .as_ref()
-            .filter(|last| std::ptr::eq(last.variant.as_ptr(), Arc::as_ptr(self)))
-            .filter(|last| key.is(&last.key))
+        // A draw of this variant and a key equal to one the state's last draws found made finds
+        // that entry again, made, where it stays, and uses it as a lookup of the key would: the
+        // key is compared, not hashed, nor made. An entry that went is forgotten here too.
+        let ours = |last: &LastPipeline| std::ptr::eq(last.variant.as_ptr(), Arc::as_ptr(self));
+        let last = lock(&state.0.last_pipelines)
+            .iter()
+            .find(|last| ours(last) && key.is(&last.key))
             .map(|last| last.at);
-        if let Some(made) = last.and_then(|at| self.pipelines.made_at(at)) {
-            return DrawPipeline::Made(made);
+        if let Some(at) = last {
+            match self.pipelines.made_at(at) {
+                Some(made) => return DrawPipeline::Made(made),
+                None => lock(&state.0.last_pipelines).retain(|last| !(ours(last) && last.at == at)),
+            }
         }
         device.shared().counts.graphics_pipeline_looked_up();
         let key = &key.key();
         match self.pipelines.begin_at(key) {
             (Begun::Made(made), at) => {
                 if let Some(at) = at {
-                    *lock(&state.0.last_pipeline) = Some(LastPipeline {
+                    let mut kept = lock(&state.0.last_pipelines);
+                    if kept.len() == LAST_PIPELINES {
+                        kept.pop_back();
+                    }
+                    kept.push_front(LastPipeline {
                         variant: Arc::downgrade(self),
                         key: key.clone(),
                         at,
@@ -2447,93 +2614,136 @@ impl RenderVariant {
                 }
                 DrawPipeline::Made(made)
             }
-            (Begun::Pending(pending), _) => DrawPipeline::Making(pending),
-            (Begun::Yours(ticket), _) => {
-                // Its libraries claimed on the draw's thread, the device's where it links them.
-                // Where its shaders' libraries are made it is linked here, in milliseconds, and
-                // the draw takes it: no making in the pool, and nothing waits.
-                let claimed = self.claim_libraries(key);
-                if let Some(linked) = claimed.as_ref().filter(|linked| linked.shaders_made()) {
-                    let line = state.0.log.as_ref().map(|log| {
-                        log.begin((&self.key, &self.pipeline, key, self.logged_spirv()))
-                    });
-                    let make = || {
-                        self.objects.graphics_pipeline(
-                            &self.pipeline,
-                            key,
-                            (&**compatible, Notices::Now(Some(formats))),
-                            Some(linked.clone()),
-                        )
-                    };
-                    let made = match line {
-                        None => make(),
-                        Some(line) => line.made(&self.objects.device, make),
-                    };
-                    let pending = ticket.pending();
-                    return match ticket.settle(made) {
-                        Ok(made) => DrawPipeline::Made(made),
-                        // The draw's batch meets the failure as it meets a pool's.
-                        Err(_) => DrawPipeline::Making(pending),
-                    };
+            // A draw of a key another caller makes takes the key's residual form where it is made
+            // (`render/residual.rs`).
+            (Begun::Pending(pending), _) => match self.residual_made(key) {
+                Some(drawn) => {
+                    device.shared().counts.residual_form_drawn();
+                    DrawPipeline::Made(drawn)
                 }
-                device.shared().counts.pipeline_pooled();
-                // Its specialized notices now, on the draw's thread in the guest's order: the
-                // pool decides nothing the guest or host sees.
-                self.objects.device.degrade_specialized(
-                    &self.objects.specialized,
-                    &key.specialization,
-                    Some(formats),
-                    Occurrence::Made,
-                );
-                let pending = ticket.pending();
-                // Its creation log line numbered here, on the draw's thread in the guest's order.
-                let line =
-                    state.0.log.as_ref().map(|log| {
-                        log.begin((&self.key, &self.pipeline, key, self.logged_spirv()))
-                    });
-                let key = key.clone();
-                let keeping = state.0.pieces.keep(PieceHeld::Draw(
-                    Arc::clone(self),
-                    Arc::clone(compatible),
-                    Box::new(ticket),
-                ));
-                let place = device.shared().pipeline_pool.run(Box::new(move || {
-                    // Where the state let go meanwhile, the piece stops: its ticket went with the
-                    // state, failing the making.
-                    let Some((lease, held)) = keeping.start() else {
-                        return;
-                    };
-                    let (variant, compatible, ticket) = match held {
-                        PieceHeld::Draw(variant, compatible, ticket) => {
-                            (variant, compatible, *ticket)
+                None => DrawPipeline::Making(pending),
+            },
+            (Begun::Yours(ticket), _) => {
+                match self.make_drawn(device, key, compatible, (state, formats), ticket) {
+                    // Handed to the pool: the draw takes the key's residual form where it is made,
+                    // and nothing waits for the making (`render/residual.rs`).
+                    DrawPipeline::Making(pending) => match self.residual_made(key) {
+                        Some(drawn) => {
+                            device.shared().counts.residual_form_making();
+                            device.shared().counts.residual_form_drawn();
+                            DrawPipeline::Made(drawn)
                         }
-                        other => return lease.give_back(other),
-                    };
-                    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-                    super::pool::held::mid_making();
-                    let make = || {
-                        variant.objects.graphics_pipeline(
-                            &variant.pipeline,
-                            &key,
-                            (&*compatible, Notices::Announced),
-                            claimed,
-                        )
-                    };
-                    let made = match line {
-                        None => make(),
-                        Some(line) => line.made(&variant.objects.device, make),
-                    };
-                    // Its callers take it from the making.
-                    drop(ticket.settle(made));
-                    lease.give_back(PieceHeld::Drawn {
-                        _variant: variant,
-                        _pass: compatible,
-                    });
-                }));
-                pending.queued_at(place);
-                DrawPipeline::Making(pending)
+                        None => DrawPipeline::Making(pending),
+                    },
+                    made => made,
+                }
             }
         }
+    }
+
+    /// The making of `key`, this caller's (`ticket`), for a draw of `state` that binds `formats`
+    /// ([`begin_graphics_pipeline`](Self::begin_graphics_pipeline)): linked here, against
+    /// `compatible`, where its shaders' libraries are made; else handed to `device`'s pool, the
+    /// draw going on meanwhile.
+    fn make_drawn(
+        self: &Arc<Self>,
+        device: &Device,
+        key: &GraphicsKey,
+        compatible: &Arc<RenderPassObject>,
+        (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
+        ticket: Ticket<GraphicsKey, RawPipeline>,
+    ) -> DrawPipeline {
+        // Its libraries claimed on the draw's thread, the device's where it links them.
+        // Where its shaders' libraries are made it is linked here, in milliseconds, and
+        // the draw takes it: no making in the pool, and nothing waits.
+        let claimed = self.claim_libraries(key);
+        if let Some(linked) = claimed.as_ref().filter(|linked| linked.shaders_made()) {
+            let line = state
+                .0
+                .log
+                .as_ref()
+                .map(|log| log.begin((&self.key, &self.pipeline, key, self.logged_spirv())));
+            let make = || {
+                self.objects.graphics_pipeline(
+                    &self.pipeline,
+                    key,
+                    (&**compatible, Notices::Now(Some(formats))),
+                    Some(linked.clone()),
+                )
+            };
+            let made = match line {
+                None => make(),
+                Some(line) => line.made(&self.objects.device, make),
+            };
+            let pending = ticket.pending();
+            return match ticket.settle(made) {
+                Ok(made) => DrawPipeline::Made(made),
+                // The draw's batch meets the failure as it meets a pool's.
+                Err(_) => DrawPipeline::Making(pending),
+            };
+        }
+        device.shared().counts.pipeline_pooled();
+        // Its specialized notices now, on the draw's thread in the guest's order: the
+        // pool decides nothing the guest or host sees.
+        self.objects.device.degrade_specialized(
+            &self.objects.specialized,
+            &key.specialization,
+            Some(formats),
+            Occurrence::Made,
+        );
+        let pending = ticket.pending();
+        // Its creation log line numbered here, on the draw's thread in the guest's order.
+        let line = state
+            .0
+            .log
+            .as_ref()
+            .map(|log| log.begin((&self.key, &self.pipeline, key, self.logged_spirv())));
+        let key = key.clone();
+        let keeping = state.0.pieces.keep(PieceHeld::Draw(
+            Arc::clone(self),
+            Arc::clone(compatible),
+            Box::new(ticket),
+        ));
+        let place = device.shared().pipeline_pool.run(Box::new(move || {
+            // Where the state let go meanwhile, the piece stops: its ticket went with the
+            // state, failing the making.
+            let Some((lease, held)) = keeping.start() else {
+                return;
+            };
+            let (variant, compatible, ticket) = match held {
+                PieceHeld::Draw(variant, compatible, ticket) => (variant, compatible, *ticket),
+                other => return lease.give_back(other, None),
+            };
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            super::pool::held::mid_making();
+            let make = || {
+                variant.objects.graphics_pipeline(
+                    &variant.pipeline,
+                    &key,
+                    (&*compatible, Notices::Announced),
+                    claimed,
+                )
+            };
+            let made = match line {
+                None => make(),
+                Some(line) => line.made(&variant.objects.device, make),
+            };
+            // Its callers take it from the making: from the settle, the batches that wait
+            // for it may run and complete while this piece still holds the variant and the
+            // pass, and the device with them, until it gave them back. A trail spans that
+            // (`trails.rs`).
+            let trail = variant.objects.device.shared().trails.open();
+            drop(ticket.settle(made));
+            lease.give_back(
+                PieceHeld::Drawn {
+                    _variant: variant,
+                    _pass: compatible,
+                },
+                Some(trail),
+            );
+        }));
+        pending.queued_at(place);
+        DrawPipeline::Making(pending)
     }
 
     /// The compute `VkPipeline`s of the variant's emulated object and mesh functions under a

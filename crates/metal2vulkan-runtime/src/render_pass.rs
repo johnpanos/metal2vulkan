@@ -1,35 +1,34 @@
 //! `RenderPassDescriptor` (`MTLRenderPassDescriptor`) and the checks a render encoder makes of one
 //! when it opens.
 //!
-//! The descriptor is a plain value with Metal's defaults (measured on an Apple M4, RT6 probe 1):
-//! a color attachment loads `DontCare`, stores `Store` and clears to opaque black; the depth and
-//! stencil attachments load `Clear`, store `DontCare` and clear to 1.0 and 0; the pass sizes,
-//! array length and default sample count are 0.
+//! The descriptor is a plain value with Metal's defaults (measured on an Apple M4 with macOS
+//! 27.0.1): a color attachment loads `DontCare`, stores `Store` and clears to opaque black; the
+//! depth and stencil attachments load `Clear`, store `DontCare` and clear to 1.0 and 0; the pass
+//! sizes, array length and default sample count are 0.
 //!
 //! [`layout`] checks a descriptor as Metal's API validation does, then states what the encoder
 //! renders into ([`PassLayout`]):
 //!
 //! - **Attachments.** An attachment's texture needs a format of the attachment's kind; its level
-//!   and slice lie in the texture (a view counts its own). A color texture without
-//!   `RenderTarget` usage, which Metal's validation stops, renders as plain Metal renders it
-//!   (EV RRS-probe-1-m4, an M4: cleared, drawn, loaded and stored as a render target is, and
-//!   left as it was under a `DontCare` store; RT6 probe 1's `usage_missing`) through a stand-in
-//!   image that has it (`attachment_stand_in.rs`). So does a depth or stencil one (EV
-//!   RRS-probe-18-m4, an M4: `Depth32Float`, `Depth16Unorm`, `Stencil8` and `Depth32Float_Stencil8`
-//!   of shader-read usage alone cleared, loaded, drawn and stored as a render target is, and left
-//!   as they were under a `DontCare` store): one texture through a stand-in, separate depth and
-//!   stencil textures through their combined scratch image (`depth_stencil_scratch.rs`). A
-//!   memoryless one, one whose format the device does not copy both ways, and a `Depth32Float`
-//!   texture held in a color image beside its depth twin are not built (`NotImplemented(Render)`).
-//!   Every attachment has one sample count, which the pipelines drawn must have. Metal renders into
-//!   the smallest attachment's extent, further limited by a nonzero `renderTargetWidth` and
-//!   `renderTargetHeight` (measured: an 8x8 color and a 4x4 depth attachment, or an 8x8 one under a
-//!   4x4 target size, render 4x4). A pass without attachments needs both target sizes, and
-//!   rasterizes `defaultRasterSampleCount` samples (0, the default, is `Invalid`, as Metal ends the
-//!   process there). Past 16384 on a side Metal makes its encoder and fails the command buffer from
-//!   the pass on (measured): the encoder records into the device's largest framebuffer within it,
-//!   and the command buffer's commit runs nothing from the pass on
-//!   (`PassLayout::fails_command_buffer`).
+//!   and slice lie in the texture (a view counts its own). A color texture without `RenderTarget`
+//!   usage, which Metal's validation stops, renders as plain Metal renders it (an M4: cleared,
+//!   drawn, loaded and stored as a render target is, and left as it was under a `DontCare` store;
+//!   Metal probe case `usage_missing`) through a stand-in image that has it
+//!   (`attachment_stand_in.rs`). So does a depth or stencil one (an M4:
+//!   `Depth32Float`, `Depth16Unorm`, `Stencil8` and `Depth32Float_Stencil8` of shader-read usage
+//!   alone cleared, loaded, drawn and stored as a render target is, and left as they were under a
+//!   `DontCare` store): one texture through a stand-in, separate depth and stencil textures through
+//!   their combined scratch image (`depth_stencil_scratch.rs`). A memoryless one, one whose format
+//!   the device does not copy both ways, and a `Depth32Float` texture held in a color image beside
+//!   its depth twin are not built (`NotImplemented(Render)`). Every attachment has one sample
+//!   count, which the pipelines drawn must have. Metal renders into the smallest attachment's
+//!   extent, further limited by a nonzero `renderTargetWidth` and `renderTargetHeight` (measured:
+//!   an 8x8 color and a 4x4 depth attachment, or an 8x8 one under a 4x4 target size, render 4x4). A
+//!   pass without attachments needs both target sizes, and rasterizes `defaultRasterSampleCount`
+//!   samples (0, the default, is `Invalid`, as Metal ends the process there). Past 16384 on a side
+//!   Metal makes its encoder and fails the command buffer from the pass on (measured): the encoder
+//!   records into the device's largest framebuffer within it, and the command buffer's commit runs
+//!   nothing from the pass on (`PassLayout::fails_command_buffer`).
 //! - **Views of another format** render, and are resolved into, in the view's format, as
 //!   Metal's do (a probe, an M3 Max and an M4: an sRGB view of an `RGBA8Unorm` texture stores the
 //!   sRGB encoding of a clear and a draw and blends in linear, an `R32Uint` view its words' bytes,
@@ -45,9 +44,9 @@
 //!   caller's image) renders through a stand-in made for them (`attachment_stand_in.rs`,
 //!   `sample_positions.rs`).
 //! - **Clear values** are converted as Metal converts them (`clear_value.rs`). Metal's validation
-//!   stops a clear depth outside `[0, 1]` whenever the depth attachment has a texture, whatever
-//!   its load action, and plain Metal clears to the nearer end (RT6 probe 2), as the runtime does;
-//!   a NaN one, unmeasured, is refused.
+//!   stops a clear depth outside `[0, 1]` whenever the depth attachment has a texture, whatever its
+//!   load action, and plain Metal clears to the nearer end (measured on an M4), as the runtime
+//!   does; a NaN one, unmeasured, is refused.
 //! - **Store actions** may be `Unknown` here: the encoder's `set_*_store_action` calls decide
 //!   them before `end_encoding`, which begins the pass. A depth attachment's
 //!   `CustomSampleDepthStore`, the descriptor's or a late one, stores as `Store` does: Metal stores
@@ -64,25 +63,25 @@
 //! - **A rasterization-rate map** is checked as Metal checks it as the encoder opens
 //!   (`rate_mapped_pass.rs`): the map's device, the array length against its layers, and the
 //!   attachments against its largest physical size, or the target size against its screen.
-//! - **Layered passes** (`renderTargetArrayLength` 2 or more; measured on an M4, RT6 Metal probes
-//!   12 and 12b): the pass renders that many layers of every attachment from its slice (a cube's
-//!   face; [`PassLayout::layers`]), loading, clearing and storing those layers alone, and each
-//!   attachment must hold them ([`RenderPassProblem::ArrayLengthPastSlices`], a 2D texture's one
-//!   slice too: plain Metal writes the missing layers into the memory after the texture). A draw
-//!   whose vertex function writes `[[render_target_array_index]]` renders the layer it names, a 2D
-//!   array view's layer in a layered Vulkan framebuffer; one that writes none renders the first. A
-//!   length of 0 or 1 renders the slice alone, whatever index a vertex function writes: at a length
-//!   of 0 plain Metal draws such a function as at 1, where its debug layer stops the draw ("the
+//! - **Layered passes** (`renderTargetArrayLength` 2 or more; measured on an M4 with macOS 27.0.1):
+//!   the pass renders that many layers of every attachment from its slice (a cube's face;
+//!   [`PassLayout::layers`]), loading, clearing and storing those layers alone, and each attachment
+//!   must hold them ([`RenderPassProblem::ArrayLengthPastSlices`], a 2D texture's one slice too:
+//!   plain Metal writes the missing layers into the memory after the texture). A draw whose vertex
+//!   function writes `[[render_target_array_index]]` renders the layer it names, a 2D array view's
+//!   layer in a layered Vulkan framebuffer; one that writes none renders the first. A length of 0
+//!   or 1 renders the slice alone, whatever index a vertex function writes: at a length of 0 plain
+//!   Metal draws such a function as at 1, where its debug layer stops the draw ("the
 //!   renderPipelineState has a vertex shader that writes to render_target_array_index but
-//!   renderTargetArrayLength is set to zero"; RT6 Metal probe 12 on an M4, a probe on an M3 Max and
-//!   an M4). Metal renders an index at or past the length into the first layer, where Vulkan leaves
+//!   renderTargetArrayLength is set to zero"; a Metal probe on an M4, another on an M3 Max and an
+//!   M4). Metal renders an index at or past the length into the first layer, where Vulkan leaves
 //!   the layer undefined, and its fragment function reads the index as written in every pass: the
 //!   compile layer stores `Layer` as 0 there and hands the fragment function the index written. A
 //!   resolve, separate depth and stencil textures and a stand-in for an attachment take every layer
 //!   of the pass: layer `i` resolves into slice `resolveSlice + i` and a layer past the resolve
-//!   texture's slices is not resolved (CRF probe 5, `resolve.rs`); a depth or stencil attachment
-//!   resolves its first layer alone (a probe). The planner refuses a tile dispatch there
-//!   (`NotImplemented(TileShading)`).
+//!   texture's slices is not resolved (a Metal probe on the M3 Max and an M4, `resolve.rs`); a
+//!   depth or stencil attachment resolves its first layer alone (a probe). The planner refuses a
+//!   tile dispatch there (`NotImplemented(TileShading)`).
 //!
 //! Later parts of step 6 lift these refusals (`NotImplemented(Render)`): custom sample
 //! positions, and a resolve of an attachment without a texture. (A texture buffer renders
@@ -100,8 +99,10 @@ use super::command_buffer::CommandBuffer;
 use super::degradation::Degradation;
 use super::depth_stencil_scratch::{self, Separate};
 use super::error::{invalid, nil, CommandBufferError, Error, Problem, RuntimeGap};
+use super::fresh_unwritten::FreshUnwritten;
 use super::image_plan::{block_family, ImagePlan};
 use super::linear_attachment;
+use super::nan_clear::{self, NanDepth};
 use super::rate_map::RasterizationRateMap;
 use super::render::ResolveTarget;
 use super::render_values::{
@@ -111,7 +112,7 @@ use super::render_values::{
 use super::resolve::{self, DepthStencilResolve, Resolve, Wanted};
 use super::sample_planes::Planes;
 use super::sample_positions::{self, Sixteenths};
-use super::texture::Texture;
+use super::texture::{signed_depth, Texture};
 use super::tile_pass::{self, TilePass, TileRefusal};
 use super::view_plan::ViewRecord;
 use super::Device;
@@ -219,9 +220,13 @@ pub struct RenderPassDepthAttachmentDescriptor {
     /// the samples.
     pub store_action_options: StoreActionOptions,
     /// `clearDepth`: 1.0 by default. A value outside `[0, 1]` clears to the nearer end, as plain
-    /// Metal clears it (RT6 probe 2's `depth_clear_range_load`: 2.0 stores 1.0, -1.0 stores 0;
-    /// its validation stops it); a NaN, unmeasured, is refused (`RenderPassProblem::ClearDepth`)
-    /// whenever the attachment has a texture.
+    /// Metal clears it (Metal probe case `depth_clear_range_load` on an M4: 2.0 stores 1.0, -1.0
+    /// stores 0; its validation stops it). A NaN of either sign clears a 32-bit float depth to
+    /// `0x7fc00000`, which a draw in the pass tests above every value, and a `Depth16Unorm` to 0,
+    /// as plain Metal clears them (our probe `nanclear` on the M3 Max); where the device writes no
+    /// such word into the depth, it clears to 1.0, announced (`signed-depth-test`, or
+    /// `restricted-depth-upload` on a device that may clamp a depth). A NaN `Clear` of another
+    /// depth format, unmeasured, is refused (`RenderPassProblem::ClearDepth`).
     pub clear_depth: f64,
     /// `depthResolveFilter`: `Sample0` by default.
     pub depth_resolve_filter: MultisampleDepthResolveFilter,
@@ -388,8 +393,10 @@ pub enum RenderPassProblem {
     AttachmentSubresource(Attachment),
     /// The attachments' sample counts differ.
     SampleCounts,
-    /// The depth attachment's clear depth is NaN (a value outside `[0, 1]` clears to the nearer
-    /// end, as plain Metal clears it).
+    /// The depth attachment's `Clear` load holds a NaN clear depth, on a depth format whose
+    /// store of one is not measured (not `Depth32Float`, `Depth32Float_Stencil8` or
+    /// `Depth16Unorm`, which clear as plain Metal clears them; a value outside `[0, 1]` clears to
+    /// the nearer end).
     ClearDepth,
     /// A store action set by the encoder over one the descriptor knew (not `Unknown`), or set to
     /// `Unknown`; or store action options set by the encoder over a store action the descriptor
@@ -412,8 +419,7 @@ pub enum RenderPassProblem {
     /// under such an action, the descriptor's or a late one, is left untouched and the
     /// attachment stored by the action, as plain Metal does where its validation stops it
     /// ("must be one of MTLStoreActionMultisampleResolve or
-    /// MTLStoreActionStoreAndMultisampleResolve"): a color attachment's, a depth or stencil one's
-    /// (EV RFX-probe2-m4).
+    /// MTLStoreActionStoreAndMultisampleResolve"): a color attachment's, a depth or stencil one's.
     ResolveStoreAction(Attachment),
     /// A resolve of a single-sampled depth or stencil attachment, or a color one's target set
     /// late (measured: Metal's validation stops it; a color attachment's resolving store action
@@ -658,7 +664,7 @@ impl ColorTarget {
     /// resolve texture of another pixel format than the attachment's own (its sRGB twin, the only
     /// other format the runtime resolves into): pixel format identity, not the twin relation.
     /// Where such a pass has no draw call, Metal keeps the samples' earlier texels, its texture
-    /// compressed or not (EV ZIN2-xr1-m4: `RGBA8Unorm`, `BGRA8Unorm` and the extended-range
+    /// compressed or not (`RGBA8Unorm`, `BGRA8Unorm` and the extended-range
     /// formats, each way, an Apple M4 under macOS 27.0.1), where a resolve into the attachment's
     /// own format leaves the clear in a texture it compresses. The attachment's own texture is its
     /// stand-in's where one stands in for it.
@@ -691,6 +697,10 @@ pub(super) struct AspectTarget {
     pub(super) memoryless: bool,
     /// The clear depth, or the clear stencil as a float-free value.
     pub(super) clear: AspectClear,
+    /// The descriptor's `Clear` load held a NaN depth, which Metal stores as `0x7fc00000`: the
+    /// load is `Load`, and that word is written into the texture over the clear's reach before
+    /// the pass (`nan_clear.rs`, [`NanDepth::Written`](super::nan_clear::NanDepth)).
+    pub(super) written_nan: bool,
 }
 
 /// An aspect's clear value.
@@ -731,6 +741,13 @@ pub(super) fn degrade_depth_clear(device: &Device, layout: &PassLayout) {
     }
     let facts = (device.shared().textures).facts(device.compile_device().profile());
     if let Some(loss) = facts.denormal_loss(false) {
+        // Where the device stores it, a later pass that loads the depth tests it over the
+        // smallest normal (`texture/signed_depth.rs`); this one tests it as the device does.
+        if facts.depth_images.denormals {
+            let own = ds.stand_in.as_ref().map_or(&ds.target, |s| &s.own);
+            own.texture
+                .switch_on_signed_depth("render_command_encoder", true);
+        }
         device.degrade(Degradation::DepthDenormals, || {
             let format = ds.target.texture.pixel_format();
             let why = format!("a pass clears its depth to the denormal {cleared:e}: {loss}");
@@ -781,10 +798,10 @@ pub(super) struct DepthStencilTarget {
 impl DepthStencilTarget {
     /// The hidden depth and stencil of a pass without a depth/stencil attachment, rendered into
     /// `target` (`attachment_stand_in::hidden`): what plain Metal tests a draw against where its
-    /// state uses depth or the stencil there (Metal probes, RT6 probes 4 and 4b): a `float` depth
-    /// of 1.0 and a stencil of 0 at the pass's start, kept per sample through the pass and never
-    /// stored. The encoder clears `target` before the pass (`render.rs`), so each instance loads
-    /// it, and none stores it past the last.
+    /// state uses depth or the stencil there (Metal probes on an M4): a `float` depth of 1.0 and a
+    /// stencil of 0 at the pass's start, kept per sample through the pass and never stored. The
+    /// encoder clears `target` before the pass (`render.rs`), so each instance loads it, and none
+    /// stores it past the last.
     pub(super) fn hidden(target: Target) -> DepthStencilTarget {
         let aspect = |clear| AspectTarget {
             load: LoadAction::Load,
@@ -793,6 +810,7 @@ impl DepthStencilTarget {
             options: StoreActionOptions::NONE,
             memoryless: false,
             clear,
+            written_nan: false,
         };
         DepthStencilTarget {
             target,
@@ -911,7 +929,7 @@ pub(super) fn check_target(
         Attachment::Stencil => kind.contains(metal2vulkan::vk::ImageAspectFlags::STENCIL),
     };
     // A 4:2:2 texture as a color attachment: plain Metal makes the pass, whose clear stores the
-    // clear color in the format's encoding (EV RRP-probe11-m4; its validation stops the pass,
+    // clear color in the format's encoding (its validation stops the pass,
     // "not color renderable"). The runtime does not build it: its gap. Likewise a `YCBCR8_420_2P`
     // one, whose pass Metal stores converted back into the surface's two planes (the consumer's
     // report): the runtime's gap. But for a format whose store a rule matches, which renders
@@ -1040,8 +1058,8 @@ fn check_planes(
     })
 }
 
-/// Metal's checks of `which` attachment's `load` (`None` for a late store action) and `store`
-/// where its texture is `memoryless` (RT6 probes 6b to 6d): a pass neither loads nor stores one.
+/// Metal's checks of `which` attachment's `load` (`None` for a late store action) and `store` where
+/// its texture is `memoryless` (a Metal probe on an M4): a pass neither loads nor stores one.
 /// `DontCare` and `Clear` loads and `DontCare`, `MultisampleResolve` and `Unknown` stores pass.
 pub(super) fn check_memoryless(
     call: &'static str,
@@ -1072,8 +1090,8 @@ fn memoryless(texture: &Texture) -> bool {
 }
 
 /// The largest render target width and height Metal renders: a pass without attachments wider or
-/// taller fails its command buffer from the pass on (measured on an M4, RT6 probe 3 and EVs
-/// RRS-probe-13-m4 and -13b-m4: the encoder is made, and the command buffer ends with an internal
+/// taller fails its command buffer from the pass on (measured on an M4, by a Metal probe and our
+/// probes: the encoder is made, and the command buffer ends with an internal
 /// error, with and without API validation; [`past_target_size`]). An attachment is never larger:
 /// Metal's textures are at most 16384 wide and high.
 const MAX_TARGET_SIZE: u64 = 16384;
@@ -1098,14 +1116,14 @@ pub(super) enum DefaultSamples {
 }
 
 /// What plain Metal does with a pass without attachments at `defaultRasterSampleCount`
-/// `count`, by its low 8 bits (EVs RCH-msaa-m4 to RCH-msaa4-m4, an Apple M4 under macOS 27.0.1,
-/// every count from 0 to 256 and 257, 300, 511, 512, 513, 1024, 2^16, 2^31, 2^32, 2^63 and
-/// 2^64 - 1, each of them as its low 8 bits): 1 to 7 run (4x4 passes ended at once, so what 3, 5,
-/// 6 and 7 rasterize is not measured, and no pipeline of those counts is made), 0 (the descriptor's
-/// default), 8 to 15 and 128 to 255 end the process, and 16 to 127 fail the command buffer
-/// ("Internal Error (0000010c:Internal Error)" on the M3 Max under macOS 26.7, `0000010d` on the
-/// M4). The consumer's run of EV RCH-s0-m4's probe on the M3 Max under macOS 26.7 answered every
-/// case it shares alike, 0 included. Metal's API validation stops every count but 1, 2 and 4.
+/// `count`, by its low 8 bits (an Apple M4 under macOS 27.0.1, every count from 0 to 256 and 257,
+/// 300, 511, 512, 513, 1024, 2^16, 2^31, 2^32, 2^63 and 2^64 - 1, each of them as its low 8 bits):
+/// 1 to 7 run (4x4 passes ended at once, so what 3, 5, 6 and 7 rasterize is not measured, and no
+/// pipeline of those counts is made), 0 (the descriptor's default), 8 to 15 and 128 to 255 end the
+/// process, and 16 to 127 fail the command buffer ("Internal Error (0000010c:Internal Error)" on
+/// the M3 Max under macOS 26.7, `0000010d` on the M4). The consumer's run of our probe
+/// on the M3 Max under macOS 26.7 answered every case it shares alike, 0 included. Metal's API
+/// validation stops every count but 1, 2 and 4.
 pub(super) fn pass_default_samples(count: u64) -> DefaultSamples {
     match count & 0xff {
         1..=7 => DefaultSamples::Runs,
@@ -1219,8 +1237,13 @@ pub(super) fn layout(
         }
         _ => descriptor,
     };
-    let mut colors: Vec<Option<ColorTarget>> = Vec::new();
-    let mut extents: Vec<([u32; 2], u32)> = Vec::new();
+    // One entry each color attachment: room for them all at once, so no color target moves.
+    let mut colors: Vec<Option<ColorTarget>> =
+        Vec::with_capacity(descriptor.color_attachments.len());
+    // Each attachment's extent and samples, held in place: at most every color and the
+    // depth/stencil attachment.
+    let mut extents = [([0, 0], 0); MAX_COLOR_ATTACHMENTS + 1];
+    let mut attached = 0;
     let positioned = Some(!descriptor.sample_positions.is_empty());
     for (index, color) in descriptor.color_attachments.iter().enumerate() {
         let which = Attachment::Color(index as u32);
@@ -1303,8 +1326,22 @@ pub(super) fn layout(
         // An extended-range attachment's codes by either of Metal's routes: the pass's encoder
         // chooses as it ends, once it knows whether the pass draws (`ColorTarget::straight_clear`).
         let channels = color.clear_color.channels();
-        let clear = clear_value::color(texture.pixel_format(), channels, ClearRoute::ThroughHalf)
-            .ok_or_else(not_yet)?;
+        // A word attachment clears to the word of Metal's codes.
+        let word = metal2vulkan::metal::format::WordAttachment::of(
+            texture.pixel_format(),
+            device.compile_device().profile(),
+        )
+        .filter(|w| w.word_format() == target.format);
+        let clear = match word {
+            Some(word) => clear_value::word(texture.pixel_format(), channels, word),
+            None => clear_value::held_color(
+                texture.pixel_format(),
+                target.format,
+                channels,
+                ClearRoute::ThroughHalf,
+            ),
+        }
+        .ok_or_else(not_yet)?;
         let straight_clear = ExtendedRange::of(texture.pixel_format()).and_then(|_| {
             clear_value::color(texture.pixel_format(), channels, ClearRoute::Straight)
         });
@@ -1332,7 +1369,8 @@ pub(super) fn layout(
                 None,
             ),
         };
-        extents.push((target.extent, target.samples));
+        extents[attached] = (target.extent, target.samples);
+        attached += 1;
         colors.push(Some(ColorTarget {
             target,
             load: color.load_action,
@@ -1408,8 +1446,10 @@ pub(super) fn layout(
     }
     let depth_stencil = depth_stencil(call, maker, descriptor)?;
     if let Some(ds) = &depth_stencil {
-        extents.push((ds.target.extent, ds.target.samples));
+        extents[attached] = (ds.target.extent, ds.target.samples);
+        attached += 1;
     }
+    let extents = &extents[..attached];
     if let Some(buffer) = &descriptor.visibility_result_buffer {
         if !buffer.device().same(device) {
             return Err(foreign());
@@ -1417,7 +1457,7 @@ pub(super) fn layout(
     }
     let (extent, samples) = area(
         call,
-        &extents,
+        extents,
         [
             descriptor.render_target_width,
             descriptor.render_target_height,
@@ -1427,7 +1467,7 @@ pub(super) fn layout(
     // A pass without attachments past 16384 a side: Metal makes the encoder and fails the command
     // buffer from it on (`CommandBufferError::RenderTargetSize`). Nothing of it runs, so it
     // records into the device's largest framebuffer.
-    let oversized = past_target_size(&extents, extent);
+    let oversized = past_target_size(extents, extent);
     let extent = match oversized {
         true => {
             let [width, height, _] = device.shared().max_framebuffer;
@@ -1621,17 +1661,19 @@ pub(super) fn not_2d(target: &Target) -> bool {
         .is_ok_and(|plan| plan.image_type != metal2vulkan::vk::ImageType::TYPE_2D)
 }
 
-/// The Vulkan format `which` attachment (or resolve target) of a texture presenting
-/// `pixel_format` renders in, over an image of `plan` that has the attachment's usage: the
-/// image's own where the texture presents the image's format. A color view of another format
-/// renders in that format's encoding, as Metal's does (the sRGB twin, `R32Uint` over
-/// `RGBA8Unorm`; TOB probe 1 `r.view_srgb`; a probe): its direct Vulkan format, which the image
-/// takes as a view format (a texture with `PixelFormatView` usage, or the sRGB twin Metal views
-/// without it) and the device renders (`Unsupported` naming the format where it does not). A depth
-/// or stencil view (the stencil view of a combined texture) renders in its image's format, the one
-/// the device represents the view's format by; one the device represents otherwise is not built,
-/// nor is a color view without a direct format or one the image cannot take
-/// (`NotImplemented(Render)`).
+/// The Vulkan format `which` attachment (or resolve target) of a texture presenting `pixel_format`
+/// renders in, over an image of `plan` that has the attachment's usage: the image's own where the
+/// texture presents the image's format. A color view of another format renders in that format's
+/// encoding, as Metal's does (the sRGB twin, `R32Uint` over `RGBA8Unorm`; Metal probe case
+/// `r.view_srgb` on the M3 Max and an M4; a probe): its direct Vulkan format, which the image takes
+/// as a view format (a texture with `PixelFormatView` usage, or the sRGB twin Metal views without
+/// it) and the device renders (`Unsupported` naming the format where it does not). A depth or
+/// stencil view (the stencil view of a combined texture) renders in its image's format, the one the
+/// device represents the view's format by; one the device represents otherwise is not built, nor is
+/// a color view without a direct format or one the image cannot take (`NotImplemented(Render)`).
+/// A color format the device samples but does not render, whose word it renders
+/// (`metal::format::WordAttachment`), renders in the word's format where the image takes that
+/// view, as the pipeline's fragment function writes it.
 pub(super) fn attachment_format(
     which: Attachment,
     plan: &ImagePlan,
@@ -1639,11 +1681,23 @@ pub(super) fn attachment_format(
     device: &Device,
 ) -> Result<metal2vulkan::vk::Format, Error> {
     use metal2vulkan::device::FormatUsage;
+    let profile = device.compile_device().profile();
+    let family = block_family(pixel_format) == block_family(plan.pixel_format);
+    // A color format the device samples but does not render renders through the view of its word
+    // (`metal::format::WordAttachment`), which a pipeline's fragment function writes, where the
+    // image takes that view.
+    if let Attachment::Color(_) = which {
+        if let Some(word) = metal2vulkan::metal::format::WordAttachment::of(pixel_format, profile) {
+            let format = word.word_format();
+            if views_as(plan, format, family) {
+                return Ok(format);
+            }
+        }
+    }
     if plan.pixel_format == pixel_format {
         return Ok(plan.format);
     }
     let not_built = || Error::NotImplemented(RuntimeGap::Render);
-    let profile = device.compile_device().profile();
     if let Attachment::Depth | Attachment::Stencil = which {
         let usages: std::collections::BTreeSet<_> = [FormatUsage::DepthStencilAttachment].into();
         return match vk_format(pixel_format, &usages, profile) {
@@ -1662,7 +1716,6 @@ pub(super) fn attachment_format(
             },
         )));
     }
-    let family = block_family(pixel_format) == block_family(plan.pixel_format);
     if !views_as(plan, direct, family) {
         return Err(not_built());
     }
@@ -1738,7 +1791,14 @@ fn depth_stencil(
                 (d.level, d.slice, d.depth_plane),
                 descriptor.render_target_array_length,
             )?;
-            if d.clear_depth.is_nan() {
+            // A NaN clear depth of a format whose store of one is not measured.
+            let measured = matches!(
+                texture.pixel_format(),
+                PixelFormat::Depth32Float
+                    | PixelFormat::Depth32FloatStencil8
+                    | PixelFormat::Depth16Unorm
+            );
+            if d.load_action == LoadAction::Clear && d.clear_depth.is_nan() && !measured {
                 return Err(invalid(
                     call,
                     Problem::RenderPass(RenderPassProblem::ClearDepth),
@@ -1754,6 +1814,40 @@ fn depth_stencil(
             Some(target)
         }
         None => None,
+    };
+    // A NaN clear depth (`nan_clear.rs`): written before the pass and loaded, or cleared to the
+    // value the pass clears it to.
+    let nan = match &depth {
+        Some(target) if d.load_action == LoadAction::Clear && d.clear_depth.is_nan() => Some(
+            nan_clear::nan_depth(device, target, d.store_action, memoryless(&target.texture)),
+        ),
+        _ => None,
+    };
+    let written_nan = nan == Some(NanDepth::Written);
+    if written_nan {
+        if let Some(target) = &depth {
+            target.texture.degrade_signed_depth(call, true);
+        }
+    }
+    let depth_load = match written_nan {
+        true => LoadAction::Load,
+        false => d.load_action,
+    };
+    // A new texture's depth pattern, a NaN with the sign set, that the pass loads before a write
+    // covered it: Metal's test compares its magnitude, so the depth is switched on as a write that
+    // may store one switches it, before the pass decides its magnitude stand-in below
+    // (`fresh_unwritten.rs`).
+    if let Some(target) = depth.as_ref().filter(|_| d.load_action == LoadAction::Load) {
+        if FreshUnwritten::loads_signed_depth(device, target)?
+            && !target.texture.switch_on_fresh_pattern()
+        {
+            target.texture.degrade_signed_depth("new_texture", true);
+        }
+    }
+    let clear_depth = match nan {
+        Some(NanDepth::Cleared(value)) => value,
+        Some(NanDepth::Written) => 1.0,
+        None => d.clear_depth,
     };
     let stencil = match &s.texture {
         Some(texture) => {
@@ -1789,7 +1883,7 @@ fn depth_stencil(
             let scratch = depth_stencil_scratch::scratch(
                 maker,
                 &separate,
-                [d.load_action, s.load_action],
+                [depth_load, s.load_action],
                 [d.store_action, s.store_action],
             )?;
             (scratch, Some(separate))
@@ -1815,7 +1909,7 @@ fn depth_stencil(
             let scratch = depth_stencil_scratch::scratch(
                 maker,
                 &separate,
-                [d.load_action, s.load_action],
+                [depth_load, s.load_action],
                 [d.store_action, s.store_action],
             )?;
             (scratch, Some(separate))
@@ -1845,13 +1939,39 @@ fn depth_stencil(
     // through a stand-in made for them, each aspect copied in where the pass loads it and back
     // where it stores it (`attachment_stand_in.rs`), as plain Metal renders it at them; so does
     // one without depth/stencil attachment usage.
+    // A depth that may hold a negative value or a NaN, which the pass loads, renders over its
+    // magnitude stand-in, so the device's depth test answers as Metal's
+    // (`texture/signed_depth.rs`): one flag read where the pass loads its depth.
+    let signed = depth
+        .as_ref()
+        .filter(|t| depth_load == LoadAction::Load && t.texture.renders_over_magnitude());
     let cause = match separate.is_none() {
         false => None,
         true if unattachable(&target)? => Some(Cause::Unattachable),
         true if positioned_stand_in(device, descriptor, &target)? => Some(Cause::Positions),
+        true if signed.is_some() => Some(Cause::Magnitude),
         true => None,
     };
+    // Through another image, the pass tests the depth as it is.
+    if let Some(own) = signed.filter(|_| cause != Some(Cause::Magnitude)) {
+        let through = match separate.is_some() {
+            true => "the scratch image of separate depth and stencil textures",
+            false => "a stand-in for the pass's custom sample positions",
+        };
+        signed_depth::degrade_through(device, own, through);
+    }
     let (target, stand_in) = match cause {
+        // The image its texture keeps for the queue, which the pass's copies fill first.
+        Some(Cause::Magnitude) => {
+            let queue = maker.command_queue().id();
+            let stood = attachment_stand_in::kept_backing(maker, &target, queue, true)?;
+            let own = StandIn {
+                own: target,
+                cause: Cause::Magnitude,
+                area: None,
+            };
+            (stood, Some(own))
+        }
         Some(cause) => {
             let stood = attachment_stand_in::stand_in(maker, &target, true)?;
             let own = StandIn {
@@ -1899,7 +2019,7 @@ fn depth_stencil(
     Ok(Some(DepthStencilTarget {
         target,
         depth: depth.map(|_| AspectTarget {
-            load: d.load_action,
+            load: depth_load,
             store: d.store_action,
             late_store: d.store_action == StoreAction::Unknown,
             options: d.store_action_options,
@@ -1908,8 +2028,9 @@ fn depth_stencil(
                 d.texture
                     .as_ref()
                     .map_or(PixelFormat::Depth32Float, Texture::pixel_format),
-                d.clear_depth.clamp(0.0, 1.0),
+                clear_depth.clamp(0.0, 1.0),
             )),
+            written_nan,
         }),
         stencil: stencil.map(|_| AspectTarget {
             load: s.load_action,
@@ -1918,6 +2039,7 @@ fn depth_stencil(
             options: s.store_action_options,
             memoryless: s.texture.as_ref().is_some_and(memoryless),
             clear: AspectClear::Stencil(clear_value::stencil(s.clear_stencil)),
+            written_nan: false,
         }),
         depth_format: d.texture.as_ref().map(Texture::pixel_format),
         keep_depth: d.texture.is_none()
@@ -1971,7 +2093,7 @@ mod tests {
         }
     }
 
-    /// A memoryless attachment is neither loaded nor stored (RT6 probes 6b to 6d); the other
+    /// A memoryless attachment is neither loaded nor stored (a Metal probe on an M4); the other
     /// actions pass, and every action passes for an attachment that is not memoryless.
     #[test]
     fn memoryless_attachments_are_neither_loaded_nor_stored() {
@@ -2050,7 +2172,6 @@ mod tests {
             ),
             (0, 0, 0, 0)
         );
-        // Probe RT11-metal-probe-10's `pass_defaults`.
         assert_eq!(
             (
                 d.tile_width,
@@ -2231,7 +2352,7 @@ mod tests {
     }
 
     /// A layered pass renders its length's layers of every attachment from its slice, and Metal's
-    /// validation stops an attachment without them (RT6 Metal probe 12, an M4: "slice +
+    /// validation stops an attachment without them (a Metal probe on an M4: "slice +
     /// renderTargetArrayLength is 3, but the texture only has 2 slices", a 2D texture's one slice
     /// among them); a length of 0 or 1 renders the slice alone.
     #[test]
@@ -2305,7 +2426,7 @@ mod tests {
             RenderPassProblem::SampleCounts
         );
         // Past 16384 without attachments Metal makes the encoder and fails the command buffer
-        // from the pass on (probe 3, EVs RRS-probe-13-m4 and -13b-m4).
+        // from the pass on (probe 3).
         assert_eq!(
             area("t", &[], [16384, 16384], 1).unwrap(),
             ([16384, 16384], 1)
@@ -2320,12 +2441,11 @@ mod tests {
         }
     }
     /// A pass without attachments at each default sample count measured answers as plain Metal
-    /// did on an Apple M4 under macOS 27.0.1 (EVs RCH-msaa-m4 to RCH-msaa4-m4: every count from
-    /// 0 to 256, and the larger ones below), and on the M3 Max under macOS 26.7 for the counts
-    /// it ran (EV RCH-s0-m4's probe, 0 included): 1 to 7 run, 0, 8 to 15 and 128 to 255 end the
-    /// process, and 16 to 127 fail the command buffer, by the count's low 8 bits. A stopped
-    /// count is `Invalid` making the encoder; a pass with attachments takes its attachments'
-    /// samples, whatever its default.
+    /// did on an Apple M4 under macOS 27.0.1 (every count from 0 to 256, and the larger ones
+    /// below), and on the M3 Max under macOS 26.7 for the counts it ran (the probe's probe, 0
+    /// included): 1 to 7 run, 0, 8 to 15 and 128 to 255 end the process, and 16 to 127 fail the
+    /// command buffer, by the count's low 8 bits. A stopped count is `Invalid` making the encoder;
+    /// a pass with attachments takes its attachments' samples, whatever its default.
     #[test]
     fn a_pass_without_attachments_answers_metal_s_default_sample_counts() {
         use DefaultSamples::{FailsCommandBuffer, Runs, Stops};

@@ -28,7 +28,7 @@
 //!   buffer the GPU may write since) records each such draw once, its secondary executed by the
 //!   recording that is submitted.
 
-use super::bound::Bound;
+use super::bound::{Bound, Recorded};
 use super::{DrawState, Recording};
 use crate::binding::PushWrite;
 use crate::command_buffer::CommandBuffer;
@@ -38,6 +38,7 @@ use crate::dynamic_state::ExtendedDynamicState;
 use crate::error::{vulkan, Error, FailedPipeline, FailedState};
 use crate::pipeline::{Pending, RawPipeline, RenderPipelineState};
 use crate::render_target;
+use crate::tracker::LegacyBarrier;
 use crate::visibility::Lent;
 use ash::vk;
 use metal2vulkan::cache::VariantKey;
@@ -48,7 +49,9 @@ use std::sync::Mutex;
 /// device, the command buffer and the pipeline.
 pub(super) struct OwnedRecording {
     pub(super) layout: vk::PipelineLayout,
+    pub(super) shape: u64,
     pub(super) sets: Vec<vk::DescriptorSet>,
+    pub(super) pushed: Vec<crate::binding::SetWrite>,
     pub(super) heap: Option<vk::DescriptorSet>,
     pub(super) push: Vec<PushWrite>,
     pub(super) vertex_buffers: Vec<(u32, vk::Buffer, u64, u64)>,
@@ -60,6 +63,7 @@ pub(super) struct OwnedRecording {
     pub(super) state: DrawState,
     pub(super) extended: Option<ExtendedDynamicState>,
     pub(super) draw: metal2vulkan::vk::DrawCommand,
+    pub(super) pair: Option<super::snapshot::Pair>,
 }
 
 /// A draw whose pipeline is being made (the module docs).
@@ -79,6 +83,13 @@ pub(super) struct PendingDraw {
     /// The view mask of the storage barrier it records first
     /// (`render_target::between_storage_draws`), where it has one.
     pub(super) storage_barrier: Option<u32>,
+    /// The view mask and destination stages of the barrier from its instance's earlier
+    /// indirect argument reads it records first (`render_target::after_indirect_reads`), where it
+    /// has one.
+    pub(super) indirect_barrier: Option<(u32, vk::PipelineStageFlags)>,
+    /// The view mask and masks of the barrier from its instance's earlier writes before their
+    /// fragments it records first (`render_target::after_geometry_writes`), where it has one.
+    pub(super) geometry_barrier: Option<(u32, LegacyBarrier)>,
     /// The visibility query it counts in.
     pub(super) query: Option<Lent>,
     pub(super) recordings: Vec<OwnedRecording>,
@@ -150,18 +161,28 @@ impl PendingDraw {
             if let Some(view_mask) = self.storage_barrier {
                 render_target::between_storage_draws(raw, cb, view_mask);
             }
+            if let Some((view_mask, stages)) = self.indirect_barrier {
+                render_target::after_indirect_reads(raw, cb, view_mask, stages);
+            }
+            if let Some((view_mask, barrier)) = self.geometry_barrier {
+                render_target::after_geometry_writes(raw, cb, view_mask, barrier);
+            }
             if let Some(query) = &self.query {
                 query.begin(raw, cb);
             }
             let mut bound = Bound::default();
-            let mut recorded = 0;
+            let mut recorded = Recorded::default();
             for owned in &self.recordings {
                 recorded += Recording {
                     raw,
                     command_buffer: cb,
                     layout: owned.layout,
+                    shape: owned.shape,
                     pipeline: pipeline.raw,
                     sets: &owned.sets,
+                    pushed: &owned.pushed,
+                    push_descriptor: shared.push_descriptor,
+                    pushes_after_pipeline_binds: shared.pushes_after_pipeline_binds,
                     heap: owned.heap,
                     push: &owned.push,
                     vertex_buffers: &owned.vertex_buffers,
@@ -174,14 +195,15 @@ impl PendingDraw {
                     extended: owned.extended,
                     mesh: shared.mesh_draws.as_ref(),
                     draw: owned.draw,
+                    pair: owned.pair.clone(),
                 }
                 .record(&mut bound);
             }
-            shared.counts.draw_states_recorded(recorded);
+            recorded.count(&shared.counts);
             if let Some(query) = &self.query {
                 query.end(raw, cb);
             }
-            raw.end_command_buffer(cb).map_err(vulkan)?;
+            command_buffer.end_raw(cb).map_err(vulkan)?;
         }
         Ok(())
     }

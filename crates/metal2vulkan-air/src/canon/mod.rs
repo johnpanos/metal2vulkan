@@ -42,7 +42,10 @@
 //!    declaration that stays is a post-tessellation entry's control-point fetch
 //!    (`air.patch_control_point_function`, whose body Metal synthesizes from the vertex descriptor)
 //!    with the entry's control-point input as its pointer operand; `lower::tessellation` lowers it.
-//! 9. **Rasterization-rate maps**: each `float2` `air.map_*_coordinates` call becomes Apple's GPU
+//! 9. **Arm speculation**: a branch whose short arms Metal's backend runs in every lane of the
+//!    branch's block, and whose arms hold a group operation that answers differently there,
+//!    becomes a jump into its arms with a `select` for each value they join with (`speculate`).
+//!    **Rasterization-rate maps**: each `float2` `air.map_*_coordinates` call becomes Apple's GPU
 //!    decoder of Metal's parameter data (`rate_map_data`) in plain AIR: word loads through the
 //!    call's map pointer and Apple's arithmetic. **AIR 2.7 simdgroup-matrix block loads and
 //!    stores** take their AIR 2.8 form, their extent, stride and origin built from the elements per
@@ -92,6 +95,9 @@ mod renumber;
 mod rewrite;
 mod routine;
 mod sccp;
+mod speculate;
+#[cfg(test)]
+mod speculate_tests;
 mod static_init;
 mod table_copy;
 #[cfg(test)]
@@ -221,6 +227,11 @@ pub struct Entry {
     /// The call stack of the entry's recursion through visible functions: `None` when the entry has
     /// none.
     pub call_stack: Option<CallStack>,
+    /// Whether the body holds a branch whose arms hold a quad or simdgroup operation that Metal's
+    /// backend makes answer over the lanes of the branch's block when it speculates the arms, where
+    /// no measurement says whether it speculates them (an arm of an instruction, size or shape no
+    /// probe covers). Such a branch keeps the AIR's lanes; Metal's may be the block's.
+    pub unmeasured_speculation: bool,
 }
 
 /// An entry's explicit call stack: what its recursion through visible functions runs on. Its stacks
@@ -484,6 +495,7 @@ pub fn specialize_dynamic(
     let emap = erase::erase_consts(&mut parts.consts, m)?;
     erase::erase_globals(parts.globals.values_mut(), &emap);
     erase_functions(&mut parts, &emap, m)?;
+    prune_entry(&mut parts, func, &fcs, &name, m)?;
     // The entry block always runs: a value use there of an unsupplied constant is SCCP's first
     // refusal, known before the inlined body is built.
     let entry_refusal = |consts: &ConstTable, m: &mut Meter| {
@@ -567,11 +579,17 @@ pub fn specialize_dynamic(
     };
     body.release(m);
     let body = solved;
-    // A pointer loaded from a field of a constant global is the field's constant: a `constexpr
-    // sampler` that SCCP's folded select picked is its sampler state. SCCP runs again over a body
-    // that changed, to fold what those constants decide.
-    let (body, folded) = const_loads::fold(body, &mut parts, m)?;
-    let body = if folded {
+    // A value loaded from a field of a constant global is the field's constant: a `constexpr
+    // sampler` that SCCP's folded select picked is its sampler state, and an uber-shader's
+    // configuration struct of function constants is its members. SCCP runs again over a body that
+    // changed, to fold what those constants decide; the two alternate until a round folds nothing.
+    let mut body = body;
+    loop {
+        let (next, folded) = const_loads::fold(body, &mut parts, m)?;
+        if !folded {
+            body = next;
+            break;
+        }
         let solved = {
             let mut cx = sccp::Context {
                 folder: fold::Folder {
@@ -583,15 +601,25 @@ pub fn specialize_dynamic(
                 fcs: &fcs,
                 name: name.clone(),
             };
-            sccp::run(&body, &mut cx, m)?
+            sccp::run(&next, &mut cx, m)?
         };
-        body.release(m);
-        solved
-    } else {
-        body
-    };
+        next.release(m);
+        body = solved;
+    }
     matmul2d::refuse_left(&body, &parts, &ep.stage, &name, m)?;
     post_check(&body, &parts, &stubs, &name, &control_points(ep), m)?;
+    // A branch's short arms that Metal's backend speculates, where a group operation in them
+    // answers over the lanes of the branch's block.
+    let (body, unmeasured_speculation) = {
+        let f = parts
+            .funcs
+            .get(func)
+            .ok_or_else(|| invariant("entry out of range"))?;
+        let Some(Type::Function { params: tys, .. }) = parts.types.get(f.ty) else {
+            return Err(invariant("the entry's type is not a function"));
+        };
+        speculate::expand(body, (&parts.types, &parts.consts), (tys, &f.params), m)?
+    };
     // Rasterization-rate maps: each `float2` map call becomes Apple's GPU decoder of the parameter
     // data, word loads through its own map pointer.
     let body = rate_map::expand(body, &mut parts, m)?;
@@ -669,8 +697,7 @@ pub fn specialize_dynamic(
     let mut static_samplers: Vec<_> = abi.static_samplers.iter().filter_map(kept).collect();
     // A function a table can hold is numbered whole, what the entry reaches of it or not; a
     // private function's or a library symbol's as far as the entry reaches it, as the stage's
-    // own (Metal numbers none of a private function whose call a function constant removed, EV
-    // SID-sid19-m4).
+    // own (Metal numbers none of a private function whose call a function constant removed).
     let mut linked_sampler_groups = Vec::new();
     let unnumbered_linked_samplers = linked_samplers.unknown;
     for (group, origin) in &linked_samplers.groups {
@@ -727,6 +754,7 @@ pub fn specialize_dynamic(
         function_tables,
         lockstep: Lockstep::default(),
         call_stack,
+        unmeasured_speculation,
         module,
     })
 }
@@ -783,6 +811,70 @@ fn erased_entry(
 }
 
 /// Erase every defined function's body in place, one at a time, each body replaced freed.
+/// The entry's own blocks that its function constants leave unreachable, and its loads from
+/// fields of constant globals (`const_loads`), folded before the entry is inlined, so the inliner
+/// copies no callee only a dead block calls. An uber-shader's entry is most of the module and
+/// branches on the constants into every effect it has: QuartzCore's `fixed_frag` entries inlined
+/// 15,700 instructions of which SCCP kept 300, and building, solving and rebuilding the rest was
+/// most of a specialization.
+///
+/// Its calls are opaque here, so what it proves unreachable is unreachable whatever they return,
+/// and the SCCP after inlining reaches the fixed point it reached over the whole body. It runs
+/// only when every declared constant is supplied: an unsupplied constant's taint refuses a use
+/// that only inlining shows is dead (a call argument the callee never reads). Any other refusal
+/// here (a branch on `undef` that a call's constant result would have made dead) leaves the entry
+/// as it was, for the SCCP after inlining to judge; a budget, cancellation or limit is final.
+fn prune_entry(
+    parts: &mut ModuleParts,
+    func: FuncId,
+    fcs: &HashMap<GlobalId, sccp::FcState>,
+    name: &DiagName,
+    m: &mut Meter,
+) -> Result<(), Error> {
+    if fcs.is_empty() || fcs.values().any(|s| !s.supplied) {
+        return Ok(());
+    }
+    let Some(entry) = parts.funcs.get_mut(func).and_then(|f| f.body.take()) else {
+        return Ok(());
+    };
+    let solve = |body: &Body, parts: &mut ModuleParts, m: &mut Meter| {
+        let mut cx = sccp::Context {
+            folder: fold::Folder {
+                types: &parts.types,
+                consts: &mut parts.consts,
+                held: 0,
+            },
+            globals: &parts.globals,
+            fcs,
+            name: name.clone(),
+        };
+        sccp::run(body, &mut cx, m)
+    };
+    let pruned = solve(&entry, parts, m).and_then(|mut body| loop {
+        let (next, folded) = const_loads::fold(body, parts, m)?;
+        if !folded {
+            return Ok(next);
+        }
+        let solved = solve(&next, parts, m);
+        next.release(m);
+        body = solved?;
+    });
+    let kept = match pruned {
+        Ok(body) => {
+            entry.release(m);
+            body
+        }
+        Err(e @ (Error::Budget(_) | Error::Cancelled | Error::LimitExceeded(_))) => return Err(e),
+        Err(_) => entry,
+    };
+    parts
+        .funcs
+        .get_mut(func)
+        .ok_or_else(|| invariant("entry out of range"))?
+        .body = Some(kept);
+    Ok(())
+}
+
 fn erase_functions(
     parts: &mut ModuleParts,
     emap: &[crate::ir::ConstId],

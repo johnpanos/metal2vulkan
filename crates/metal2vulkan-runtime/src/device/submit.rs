@@ -1,29 +1,73 @@
 //! The device's own synchronous submissions: work the runtime does for itself outside any
 //! command buffer (a host copy into or out of a texture, an explicit clear of a live buffer).
 //! Each runs alone on the device's first `VkQueue`, and the caller waits for it, so it completed
-//! (and the host saw it) before any batch that uses its result is submitted; every batch starts
-//! with the barrier that makes such writes visible. Each first does the new resources' first GPU
-//! work that waits (`texture/first_move.rs`), after the batches on other `VkQueue`s that did such
-//! work: no new resource waits for one, so making one waits for no GPU work. That work goes in a
-//! `VkSubmitInfo` of its own just before the work's, in its `vkQueueSubmit`, as a batch's does
-//! (`command_buffer/submit.rs`): one kernel submission on Mesa's drivers.
+//! (and the host saw it) before any batch that uses its result is submitted. Each signals the
+//! internal timeline, and every batch with work waits for that timeline at the value the host saw
+//! it reach ([`OwnTimeline`]), which makes such writes visible to the batch; where the driver's
+//! submissions stall on semaphore operations, the batch's first barrier makes them visible
+//! instead (`command_buffer/submit.rs`). Each first does the
+//! new resources' first GPU work that waits (`texture/first_move.rs`), after the batches on other
+//! `VkQueue`s that did such work: no new resource waits for one, so making one waits for no GPU
+//! work. That work goes in a `VkSubmitInfo` of its own just before the work's, in its
+//! `vkQueueSubmit`, as a batch's does (`command_buffer/submit.rs`): one kernel submission on
+//! Mesa's drivers.
 //!
 //! The one submission no one waits for is a no-copy buffer's sparse binding of its dma-bufs
 //! (`dma_buf.rs`), on the same queue and timeline: it would wait behind the queue's work in
 //! flight. Every submission after it, on every `VkQueue`, waits for it until the host saw it
 //! complete, and the buffer's release waits for it.
 
+use super::functions::Vk;
 use super::relay::By;
 use super::{lock, Device};
 use crate::error::{vulkan, Error};
 use crate::exit_guard::{self, Call};
 use crate::release;
 use crate::resource::ResourceKey;
+use crate::work_counts::Begun;
 use ash::vk;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long one wait for an internal submission lasts before it is repeated.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// A timeline the device's own submissions signal outside the batches (the internal ones here,
+/// the staging queue's copies, `staging.rs`), and the value through which the host saw them
+/// complete. Each batch with work waits for it at that value, once per value on its `VkQueue`
+/// (`command_buffer/submit.rs`), which makes what they wrote visible to the batch and to every
+/// later command there: the submission's "second synchronization scope of each semaphore wait
+/// operation defined by this command includes every command in the same batch that the wait
+/// operation is defined in, and all commands that occur later in submission order", and the
+/// wait's "second access scope includes all memory access performed by the device"
+/// (`vkQueueSubmit`, semaphore waiting).
+#[derive(Default)]
+pub(crate) struct OwnTimeline {
+    semaphore: OnceLock<vk::Semaphore>,
+    completed: AtomicU64,
+}
+
+impl OwnTimeline {
+    /// The timeline and the value through which the host saw its submissions complete; `None`
+    /// before the first completed.
+    pub(crate) fn completed(&self) -> Option<(vk::Semaphore, u64)> {
+        let value = self.completed.load(Ordering::Acquire);
+        let semaphore = *self.semaphore.get()?;
+        (value > 0).then_some((semaphore, value))
+    }
+
+    /// The timeline was made: `semaphore`.
+    pub(super) fn made(&self, semaphore: vk::Semaphore) {
+        // A device makes each of its two own timelines once.
+        let _ = self.semaphore.set(semaphore);
+    }
+
+    /// The host saw the timeline reach `value`.
+    pub(super) fn reached(&self, value: u64) {
+        self.completed.fetch_max(value, Ordering::AcqRel);
+    }
+}
 
 /// The command pool, command buffers and fence of internal submissions, made on first use.
 pub(super) struct Internal {
@@ -73,6 +117,7 @@ impl Internal {
                     return Err(vulkan(error));
                 }
             };
+            device.shared().internal_done.made(timeline);
             Ok(Internal {
                 pool,
                 buffer,
@@ -105,7 +150,7 @@ impl Device {
     /// it. Internal submissions are serialized by the internal lock.
     pub(crate) fn submit_internal(
         &self,
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
         self.submit_internal_naming(|_| false, record)
     }
@@ -116,50 +161,50 @@ impl Device {
     pub(crate) fn submit_internal_naming(
         &self,
         named: impl Fn(ResourceKey) -> bool,
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
         if self.is_lost() {
             return Err(Error::DeviceLost);
         }
         let shared = self.shared();
         let raw = shared.vk();
+        let firsts = &shared.textures.first_moves;
+        // The new resources' first work, given back if the submission is not made, after every
+        // batch on another `VkQueue` that did some. Its place in the submissions' order is held
+        // until it was made.
         let mut internal = lock(&shared.internal);
         if internal.is_none() {
             *internal = Some(Internal::new(self)?);
         }
+        let taken = firsts.take(&named);
         let Some(objects) = internal.as_mut() else {
             unreachable!("made above");
         };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // The new resources' first work, given back if the submission is not made, after every
-        // batch on another `VkQueue` that did some. Its place in the submissions' order is held
-        // until it was made.
-        let firsts = &shared.textures.first_moves;
-        let taken = firsts.take(named);
         let waits = firsts.waits(0, |point| {
             shared.queues[point.queue].completed_value() >= point.value
         });
         // The first work goes in a command buffer and a `VkSubmitInfo` of its own, just before
         // the work's, in its `vkQueueSubmit`: MoltenVK runs each `VkSubmitInfo` as a Metal
         // command buffer of its own, and lost a copy into a new image recorded in the same one as
-        // the image's move (EVs STL-p4a-mvk4, STL-p4b-mvk4).
+        // the image's move.
         let lead = taken.has_first();
         if lead {
             // SAFETY: as below, for the first work's command buffer.
             unsafe { raw.begin_command_buffer(objects.first, &begin) }.map_err(vulkan)?;
-            shared.counts.command_buffer_begun();
+            shared.counts.command_buffer_begun(Begun::Internal);
             // SAFETY: recording, outside a render pass, for the queue family; it is submitted
             // just before the work's submission, which is waited for before anything that uses
             // the resources is submitted after it.
-            unsafe { taken.record(raw, objects.first) };
+            unsafe { taken.record(raw, objects.first, shared.queue_flags_of(0)) };
             // SAFETY: as above.
             unsafe { raw.end_command_buffer(objects.first) }.map_err(vulkan)?;
         }
         // SAFETY: the command buffer is not pending (every submission is waited for below) and
         // the internal lock is held; beginning it resets it (the pool resets command buffers).
         unsafe { raw.begin_command_buffer(objects.buffer, &begin) }.map_err(vulkan)?;
-        shared.counts.command_buffer_begun();
+        shared.counts.command_buffer_begun(Begun::Internal);
         // Host calls' staged copies, after the first work's `VkSubmitInfo`, before the work.
         // SAFETY: recording, outside a render pass; every image's move is in the first work's
         // submission or one before.
@@ -208,6 +253,9 @@ impl Device {
             .into_iter()
             .chain([submit])
             .collect();
+        // Where freed memory waits for the work in flight, it waits for this until it completed
+        // (`freed_memory.rs`).
+        let _own = (shared.parking.get()).map(|parking| parking.own_submission(self));
         // SAFETY: the queue is used under its lock; the command buffers are executable; every
         // signal of the timeline is above its value. Where the queue's failures are relayed, a
         // failure of this submission loses the device (`relay.rs`).
@@ -234,6 +282,7 @@ impl Device {
             } {
                 Ok(()) => {
                     firsts.internal_completed(value);
+                    shared.internal_done.reached(value);
                     return Ok(());
                 }
                 Err(vk::Result::TIMEOUT) => continue,
@@ -291,16 +340,45 @@ impl Device {
         Ok((objects.timeline, value))
     }
 
+    /// The device's own timelines outside the batches, each at the value through which the host
+    /// saw its submissions complete ([`OwnTimeline`]): the internal one, then the staging
+    /// queue's.
+    pub(crate) fn own_completed(&self) -> [Option<(vk::Semaphore, u64)>; 2] {
+        let shared = self.shared();
+        [
+            shared.internal_done.completed(),
+            shared.staging_done.completed(),
+        ]
+    }
+
     /// The last binding of a no-copy buffer's dma-bufs ([`Device::bind_sparse_buffer`]) while
     /// the host has not seen it complete: what a submission waits for, as the buffer may be
-    /// among what it uses.
+    /// among what it uses. The host sees it complete once a wait returned for it
+    /// ([`binding_seen`]), not from its timeline's read alone.
     pub(crate) fn binding_wait(&self) -> Option<(vk::Semaphore, u64)> {
         let shared = self.shared();
+        let raw = shared.vk();
         let mut bound_at = lock(&shared.bound_at);
         let (timeline, value) = (*bound_at)?;
         // SAFETY: the timeline is the device's, live while the device is.
-        let reached = unsafe { shared.vk().get_semaphore_counter_value(timeline) };
-        if reached.is_ok_and(|reached| reached >= value) {
+        let read = unsafe { raw.get_semaphore_counter_value(timeline) };
+        exit_guard::called(Call::GetSemaphoreCounterValue);
+        let reaches = |value: u64| {
+            let semaphores = [timeline];
+            let values = [value];
+            let info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&semaphores)
+                .values(&values);
+            // SAFETY: as the read's above. "If timeout is zero, then vkWaitSemaphores does not
+            // wait".
+            let waited = unsafe { raw.wait_semaphores(&info, 0) };
+            exit_guard::called(Call::WaitSemaphores);
+            waited.map(|()| true).or_else(|error| match error {
+                vk::Result::TIMEOUT => Ok(false),
+                error => Err(error),
+            })
+        };
+        if read.is_ok_and(|read| binding_seen(read, value, reaches)) {
             *bound_at = None;
             return None;
         }
@@ -314,4 +392,20 @@ impl Device {
         }
         vulkan(error)
     }
+}
+
+/// Whether the host saw a binding that signals `value` complete, its timeline read at `read`
+/// ([`Device::binding_wait`]): only once a wait for `value` returned (`reaches`, a wait of no
+/// time: "If the condition is satisfied when `vkWaitSemaphores` is called, then
+/// `vkWaitSemaphores` returns immediately"). Vulkan orders host operations after a signal only
+/// through a wait ("signal operations happening before host operations that wait on them"
+/// system-synchronize-with them, the memory model); `vkGetSemaphoreCounterValue`'s value "may
+/// immediately be out of date" and orders nothing (`command_buffer/completion.rs`). A read below
+/// `value` asks for no wait; a failed wait (a lost device) leaves the binding waited for.
+pub(crate) fn binding_seen<E>(
+    read: u64,
+    value: u64,
+    reaches: impl FnOnce(u64) -> Result<bool, E>,
+) -> bool {
+    read >= value && matches!(reaches(value), Ok(true))
 }

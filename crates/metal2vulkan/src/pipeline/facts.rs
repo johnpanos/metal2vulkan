@@ -249,8 +249,9 @@ pub enum RuntimeFact {
     /// does not write the attachment); a pipeline of another mask is `NeedsInput(FramebufferFetch)`
     /// too. `blend`: the blend the function computes in the shader, from the texel it reads first,
     /// for an extended-range attachment it writes under blending, which the function then need not
-    /// read; a pipeline of another blend there is `NeedsInput(FramebufferFetch)` too. `rounded`:
-    /// that blend is computed without fast math, each product rounded to `half` before the sum
+    /// read, or a 16-bit float one (Metal's blend in the output's arithmetic); a pipeline of another
+    /// blend there is `NeedsInput(FramebufferFetch)` too. `rounded`: that blend is computed
+    /// without fast math, each product rounded before the sum
     /// (`lower::arith::extended_range::blend::BlendMath::Rounded`), whose model holds blends the
     /// fast one refuses; link checks the blend under that math.
     InterlockedFramebufferFetch {
@@ -338,14 +339,13 @@ pub enum RuntimeFact {
     /// The function writes texture slot `slot` (a `write` or an imageblock slice's copy), or,
     /// with `atomic`, updates it by a texture atomic. Metal drops every write a function makes to
     /// a sparse texture, its mapped tiles' included: the texture keeps its contents for the
-    /// writing thread, the threadgroup's other threads, later work, and blits (SPR-probe4-m4,
-    /// SPR-probe8-m4 and SPR-probe8-m3: Apple M4 on macOS 27.0.1 and M3 Max on macOS 26.7; Metal's
-    /// API validation stops the texture's `ShaderWrite` usage instead). Under the slot's
-    /// `SpecKey::SparseTexture` specialization, 1 where the bound texture is sparse, the module
-    /// drops the slot's writes. A texture atomic on a sparse texture has no deterministic answer
-    /// on Metal (the value it returns changes between processes, and it zeroes texels it does not
-    /// address), so with `atomic` the binder refuses a sparse texture at the slot
-    /// (`Unsupported { feature: SparseTexture { slot }, needs: NotRepresentable }`).
+    /// writing thread, the threadgroup's other threads, later work, and blits (Apple M4 on macOS
+    /// 27.0.1 and M3 Max on macOS 26.7; Metal's API validation stops the texture's `ShaderWrite`
+    /// usage instead). Under the slot's `SpecKey::SparseTexture` specialization, 1 where the bound
+    /// texture is sparse, the module drops the slot's writes. A texture atomic on a sparse texture
+    /// has no deterministic answer on Metal (the value it returns changes between processes, and it
+    /// zeroes texels it does not address), so with `atomic` the binder refuses a sparse texture at
+    /// the slot (`Unsupported { feature: SparseTexture { slot }, needs: NotRepresentable }`).
     SparseTextureWrites { slot: SlotRef, atomic: bool },
     /// The tile function reads its threadgroup argument `index` (`[[threadgroup(index)]]`):
     /// memory of its tile that the render pass keeps across its tile dispatches, at the offset
@@ -361,15 +361,14 @@ pub enum RuntimeFact {
     /// The function reads texture buffer slot `slot` (not as `ulong` texels), and applies the
     /// bound texture buffer's swizzle to each read under the slot's `SpecKey::TextureSwizzle`
     /// specialization: Metal returns each channel from the source the swizzle names, a missing
-    /// channel and an out-of-bounds texel included (UNV-metal-probe-3 and -3b, Apple M4 and M3
-    /// Max). The binder specializes it, and refuses a swizzled texture buffer at a slot whose
-    /// stage reads texels without this fact, as `ulong` ones (`Unsupported { feature:
-    /// TextureSwizzle }`); a slot only queried or written binds one. Under
-    /// `LoweringInputs::swizzled_storage` the function states it too for a storage slot it reads or
-    /// writes texels of: it applies the bound texture's swizzle to each read and undoes it on each
-    /// write; and for an extended-range sampled slot of it, whose decoded texels its reads, samples
-    /// and gathers swizzle, and a packed normalized sampled slot of it, whose converted texels they
-    /// swizzle.
+    /// channel and an out-of-bounds texel included (Apple M4 and M3 Max). The binder specializes
+    /// it, and refuses a swizzled texture buffer at a slot whose stage reads texels without this
+    /// fact, as `ulong` ones (`Unsupported { feature: TextureSwizzle }`); a slot only queried or
+    /// written binds one. Under `LoweringInputs::swizzled_storage` the function states it too for a
+    /// storage slot it reads or writes texels of: it applies the bound texture's swizzle to each
+    /// read and undoes it on each write; and for an extended-range sampled slot of it, whose
+    /// decoded texels its reads, samples and gathers swizzle, and a packed normalized sampled slot
+    /// of it, whose converted texels they swizzle.
     TextureSwizzle { slot: SlotRef },
     /// The tile function declares an explicit imageblock that stands alone (no implicit one
     /// beside it, and not aliased onto one), of `data_size` bytes (`air.imageblock_data_size`)
@@ -383,13 +382,13 @@ pub enum RuntimeFact {
     TileImageblock { data_size: u32, alignment: u32 },
     /// The vertex function was compiled under `VariantKey::amplification_draws`
     /// (`LoweringInputs::amplification_draws` of these fields): its pipeline draws each vertex
-    /// amplification as a draw of its own, amplification-major as Metal renders them (AMP Metal
-    /// probe 1), and reads the amplification and its view mapping's offsets from
-    /// `PushField::AmplificationId`, `AmplificationLayerOffset` and
-    /// `AmplificationViewportOffset`, which the binder writes before each of those draws. With
-    /// `layered` it writes `Layer` (the pass has at least two layers), and with `viewports` it
-    /// writes `ViewportIndex` where it writes no viewport index of its own (a mapping offsets the
-    /// viewport). Its plans state the variant the shape's amplification asks for.
+    /// amplification as a draw of its own, amplification-major as Metal renders them (a Metal probe
+    /// on the M3 Max and an M4), and reads the amplification and its view mapping's offsets from
+    /// `PushField::AmplificationId`, `AmplificationLayerOffset` and `AmplificationViewportOffset`,
+    /// which the binder writes before each of those draws. With `layered` it writes `Layer` (the
+    /// pass has at least two layers), and with `viewports` it writes `ViewportIndex` where it
+    /// writes no viewport index of its own (a mapping offsets the viewport). Its plans state the
+    /// variant the shape's amplification asks for.
     AmplificationDraws { layered: bool, viewports: bool },
     /// The vertex function was compiled under `VariantKey::viewport_compensation`
     /// (`LoweringInputs::viewport_compensation` of `depth`): it negates its position's `x` and,
@@ -423,11 +422,12 @@ pub enum RuntimeFact {
     AbsentArgumentRead { stage: Stage },
     /// Under its `SrgbTexture` variant (`LoweringInputs::srgb_textures`), the function still
     /// decodes texels of the 8-bit sRGB texture bound to the slot through the device's sampled
-    /// view, in a form the raw codes do not serve (a `float` gather, a linear mip filter, a
-    /// runtime sampler's sample; `PrecisionNote::SrgbTexelDecode`). Where the device cannot sample
-    /// the bound sRGB format, whose texture it holds as the format's UNORM twin, the planner
-    /// refuses the texture there, needing the format's `SampledImage`; without the fact the
-    /// slot's own binding serves queries alone and takes the twin's view.
+    /// view, in a form the raw codes do not serve (a `float` gather on Metal's own sampler, a
+    /// linear mip filter, a runtime sampler's sample; `PrecisionNote::SrgbTexelDecode`). Where the
+    /// device cannot sample the bound sRGB format, whose texture it holds as the format's UNORM
+    /// twin, the slot's own binding takes the twin's view, and the plan's variant names the slot
+    /// in `VariantKey::srgb_twins`, under which the function decodes what the device samples
+    /// there; without the fact that binding serves queries alone.
     SrgbDeviceDecode { slot: SlotRef },
     /// The fragment function was compiled under `VariantKey::zeroed_colors`
     /// (`LoweringInputs::zeroed_colors`): it writes zero to color attachment `color`, of pixel
@@ -487,8 +487,8 @@ pub enum RuntimeFact {
         early_tests: bool,
         early_variant: bool,
     },
-    /// On a device that orders framebuffer fetch only through the ordered pixel interlock and
-    /// requires it ordered (`FramebufferFetchPolicy::RequireOrdered`), the fragment function writes
+    /// On a device that orders framebuffer fetch only through the ordered pixel interlock, the
+    /// fragment function writes
     /// a color through its first output and does not declare early fragment tests, and it
     /// discards, writes other memory, or returns depth, stencil, or a sample mask. A draw may move
     /// such a color into the interlocked storage form (`BindShape::interlocked_colors`, or an
@@ -515,7 +515,10 @@ pub enum RuntimeFact {
     /// (`VariantKey::ycbcr_textures`, `LoweringInputs::ycbcr_textures`), under which the function
     /// emulates Metal's filter of the slot's samples as a device without the property does, and
     /// notes the samples the emulation does not reach. Bound in any other format, or unbound, the
-    /// slot leaves the variant.
+    /// slot leaves the variant. Recorded only under `YCbCrFilterPolicy::Exact`, and through Metal's
+    /// own sampler also under `SamplingPolicy::Exact`, as is the same fact on a device that samples
+    /// natively (`VkProperty::DeviceSampling`; `ProfileFields::ycbcr_variant`); under the default
+    /// the device's filter answers the slot as any other's, noted, and no draw makes the variant.
     YCbCrTexture { slot: SlotRef },
     /// The tile function reads a builtin whose answer depends on its pipeline's
     /// `threadgroupSizeMatchesTileSize` (its threads per threadgroup, simdgroups or quadgroups
@@ -543,7 +546,7 @@ pub enum RuntimeFact {
     /// The function samples, gathers, or queries a level of a texture through the runtime sampler
     /// bound to the slot, whose min or mag filter may be Metal's `Cubic` (raw value 2): Metal then
     /// samples through the sampler as through a constexpr bicubic sampler of the same state,
-    /// whatever the level (EV GSM2-bcs2-m4). Bound to such a sampler, the slot joins the plan's
+    /// whatever the level. Bound to such a sampler, the slot joins the plan's
     /// variant (`VariantKey::cubic_samplers`, `LoweringInputs::cubic_samplers`) with the bound
     /// word's `SamplerWord::CUBIC_STATE` bits, under which the function emulates the bicubic
     /// filter of that state (`lower::sampler::bicubic`) or refuses what it does not measure. Bound
@@ -631,6 +634,18 @@ pub enum RuntimeFact {
         blend: crate::pipeline::lower_inputs::BlendEquation,
         kept: crate::vk::ColorComponentFlags,
     },
+    /// On a device that orders framebuffer fetch through rasterization-order input attachments,
+    /// the function writes color attachment `color`, which renders through a view of its word
+    /// (`metal::format::WordAttachment`, an 8-bit sRGB one), under a write mask of some of the
+    /// word's channels: it reads the texel's word through the attachment's input attachment
+    /// (`RuntimeFact::FramebufferFetch`) and writes Metal's word of its output with the fields of
+    /// the channels `kept` (those of the word the descriptor's write mask leaves out) taken from
+    /// the word read. Link writes the whole word, and a pipeline of another write mask there is
+    /// `NeedsInput(FramebufferFetch)`.
+    WordInputMerge {
+        color: u32,
+        kept: crate::vk::ColorComponentFlags,
+    },
     /// The function reads, samples or gathers the sampled color texture (not a texture buffer,
     /// a multisampled or a depth texture) bound to the slot only with `float`, `half` or 32-bit
     /// integer results: bound to a texture of a color format whose numeric class is not the
@@ -698,6 +713,76 @@ pub enum RuntimeFact {
     /// no `PrecisionNote::DeviceNanEncoding` for these writes: the consumer announces it at a
     /// draw or dispatch whose heap holds such a texture.
     HeapHalfTexelWrites { stage: Stage, packed: bool },
+    /// The fragment stage writes each depth of a `Depth16Unorm` attachment as Metal's code
+    /// (`LoweringInputs::depth16_codes`), so the device stores Metal's codes without its own
+    /// conversion deciding them. Where `biased`, it stores the depth Metal stores for each fragment,
+    /// its depth bias included: it reads the draw's bias from `PushField::DepthBias`, which the
+    /// binder writes from `BindState::depth_bias`, and adds it to `FragCoord.z` itself, so the
+    /// consumer records the draw's Vulkan depth bias as zero. Otherwise the function returns its
+    /// own depth, which Metal does not bias.
+    Depth16Codes { biased: bool },
+    /// The render pipeline was compiled under `VariantKey::depth16_pass` holding `depth16`: for a
+    /// render pass whose depth is (`depth16`) or is not `Depth16Unorm`, where its own depth format
+    /// says otherwise, so its fragment stage takes Metal's 16-bit codes by the pass's depth
+    /// (`LoweringInputs::depth16_codes`). Its plans state the variant the shape asks for
+    /// (`BindShape::depth16_pass`).
+    Depth16Pass { depth16: bool },
+    /// The render pipeline was compiled under `VariantKey::depth16_biased`: for a draw that biases
+    /// a `Depth16Unorm` depth, on a profile whose unbiased depths the device stores as Metal's
+    /// codes but not its biased ones (`DriverDeviation::MetalDepth16Stores` without
+    /// `DriverDeviation::MetalDepth16BiasedStores`), so its fragment stage adds the bias and
+    /// writes Metal's code itself (`LoweringInputs::depth16_codes`). Its plans state the variant
+    /// the shape asks for (`BindShape::depth16_biased`).
+    Depth16Biased,
+    /// The render pipeline was compiled under `VariantKey::depth16_bias_raises` holding `raises`:
+    /// for a draw whose bias of a `Depth16Unorm` depth the runtime proved never lowers the depth
+    /// (`raises`) or never raises it, so a fragment stage that adds the bias itself declares that
+    /// side (`LoweringInputs::depth16_bias_raises`). Its plans state the variant the shape asks for
+    /// (`BindShape::depth16_bias_raises`).
+    Depth16BiasSide { raises: bool },
+    /// The render pipeline draws through synthesized geometry stages, one per topology class, of
+    /// which a draw runs its class's (`RenderPipeline::runs_stage`): its fragment function reads
+    /// `[[barycentric_coord]]` on a device without `fragmentShaderBarycentric` (`weights`), or its
+    /// vertex function selects its primitive's render target slice (`layer`) or viewport
+    /// (`viewport`) on a device that cannot store `Layer` or `ViewportIndex` from a vertex
+    /// function (`pipeline::link::geometry`). Each draw runs a stage Metal's draw does not, at the
+    /// stage's cost, with Metal's answer; the consumer announces it. Nothing binds it.
+    SynthesizedGeometry {
+        weights: bool,
+        layer: bool,
+        viewport: bool,
+    },
+    /// An object function's `[[threadgroup(n)]]` arguments, whose lengths the render encoder sets
+    /// (`setObjectThreadgroupMemoryLength:atIndex:`, the object stage's
+    /// `StageTable::threadgroup_lengths`), each a `ThreadgroupMemoryLength`: the static part of
+    /// its threadgroup arena (`memory::arena::TgShape::static_bytes`) and its payload's bytes
+    /// (`lower::mesh::payload_extent`), beside which the binder places the lengths, each rounded
+    /// up to 16, and checks the total against the object stage's workgroup memory limit
+    /// (`lower::mesh::stage_workgroup_limit`).
+    ObjectThreadgroupArena {
+        static_bytes: u32,
+        payload: Option<u32>,
+    },
+    /// The pipeline (render, mesh render, compute or tile render) was retranslated with some of the
+    /// consumer's exact forms dropped to native, because its largest stage module exceeded the
+    /// device's compiler word bound and that driver faults compiling a module past it
+    /// ([`DriverWorkaround::RegisterAllocatorOverflowsLargeModules`](crate::device::DriverWorkaround::RegisterAllocatorOverflowsLargeModules):
+    /// ANV's register allocator). Each `true` field is an exact form the pipeline would carry under
+    /// the consumer's policy that the fitting translation gave up to fit the bound (`sampling`
+    /// also for Metal's filter of a two-plane YCbCr texture, `YCbCrFilterPolicy::Exact`, which is
+    /// dropped with it); the stages carry
+    /// the reduced policy's own precision notes besides. The consumer announces it once per device
+    /// (the runtime's `Degradation::ExactFormsOverCompilerLimit`), naming the pipeline and the forms
+    /// dropped. Nothing binds it.
+    ExactFormsOverCompilerLimit {
+        sampling: bool,
+        float_maths: bool,
+        texel_conversion: bool,
+        half_rounding: bool,
+        nan_and_min_max: bool,
+        rounding_order: bool,
+        half_blend: bool,
+    },
 }
 
 /// What one compile made of a slot of a `RuntimeFact::UniformViewRange`.

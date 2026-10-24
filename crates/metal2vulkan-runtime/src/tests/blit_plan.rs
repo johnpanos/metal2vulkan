@@ -209,7 +209,7 @@ fn starts(plan: &BufferCopyPlan) -> Vec<u64> {
 }
 
 /// Layouts off Metal's rules copy where plain Metal places their rows (an M4 under macOS
-/// 27.0.1, EV SPCrp-probe3-m4's sweeps): each row at its offset rounded down to the copy unit or 4
+/// 27.0.1, our probe's sweeps): each row at its offset rounded down to the copy unit or 4
 /// bytes, and Metal's aligned path into a texture from offset 0.
 #[test]
 fn layouts_off_metals_rules_copy_where_plain_metal_places_their_rows() {
@@ -327,7 +327,7 @@ fn unstage(plan: &BufferCopyPlan, texels: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
-/// A `bytesPerImage` off Metal's rules (EV SPH-bpi1-m4, an M4 under macOS 27.0.1; its validation
+/// A `bytesPerImage` off Metal's rules (an M4 under macOS 27.0.1; its validation
 /// stops it): a region of one image ignores it, and the images of a 3D texture are placed as rows
 /// are, at `z * bytesPerImage` rounded down to the copy unit or 4 bytes; out of the texture, images
 /// that overlap are written in turn, the later one's bytes staying.
@@ -447,7 +447,7 @@ fn layouts_vulkan_cannot_state_copy_through_packed_staging() {
         [&buffer[65..68], &buffer[70..73]].concat()
     );
     // A 3D image pitch that is no multiple of the texel: each row moves on its own, at its
-    // offset rounded down to 4 bytes, as plain Metal reads it (EV SPH-bpi1-m4): the second image's
+    // offset rounded down to 4 bytes, as plain Metal reads it: the second image's
     // rows at 24 and 36.
     let t = tex(PixelFormat::RGBA8Unorm, TextureType::Type3D, [2, 2, 2]);
     let plan = into(
@@ -632,10 +632,10 @@ fn level_and_slice_copies_pair_levels_of_one_size() {
     );
 }
 
-/// Plain Metal's copies between textures of different sizes (an M4 under macOS 27.0.1, EV
-/// SPCrp-probe3-m4 `sz_*`): levels of different sizes copy their common region; a whole copy pairs
-/// levels by size from the first pair of one size and copies the levels and slices both textures
-/// have, and aborts where no level pair is of one size.
+/// Plain Metal's copies between textures of different sizes (an M4 under macOS 27.0.1): levels of
+/// different sizes copy their common region; a whole copy pairs levels by size from the first pair
+/// of one size and copies the levels and slices both textures have, and aborts where no level pair
+/// is of one size.
 #[test]
 fn copies_between_textures_of_different_sizes_follow_metal() {
     use TextureType as T;
@@ -828,8 +828,8 @@ fn whole_blocks_of_small_levels_copy_between_textures() {
     );
 }
 
-/// A 4x4 `RGBA8Unorm` texture over a buffer at offset 256, rows 32 bytes apart (TOB probe 1's
-/// layout), two slices 128 bytes apart for an array.
+/// A 4x4 `RGBA8Unorm` texture over a buffer at offset 256, rows 32 bytes apart (the layout of a
+/// Metal probe on the M3 Max and an M4), two slices 128 bytes apart for an array.
 fn over_buffer(slices: u64) -> (Texture, TexelsLayout) {
     let t = texture(TextureDescriptor {
         texture_type: if slices > 1 {
@@ -902,8 +902,8 @@ fn copies_into_textures_over_buffers_move_texel_rows() {
     );
 }
 
-/// Rows that are contiguous in both buffers are one copy, and a copy whose source and
-/// destination rows share a byte meets (TOB probe 1's overlapping copies).
+/// Rows that are contiguous in both buffers are one copy, and a copy whose source and destination
+/// rows share a byte meets (a Metal probe's overlapping copies, the M3 Max and an M4).
 #[test]
 fn texel_rows_merge_and_meet() {
     let (t, texels) = over_buffer(2);
@@ -960,7 +960,7 @@ fn texel_rows_merge_and_meet() {
 }
 
 /// Destination rows that overlap (a rotated texture's rows longer than its plane's pitch) keep
-/// the later row's bytes, as plain Metal writes them (EV ZCI2-rotprobe5-m4): each earlier row
+/// the later row's bytes, as plain Metal writes them: each earlier row
 /// copies only the bytes before the next row's start, the last one its whole row, and the copy
 /// writes every byte once. Each row's bytes come from the same offset of its source row.
 #[test]
@@ -992,7 +992,7 @@ fn overlapping_destination_rows_keep_the_later_rows_bytes() {
     assert_eq!(copy.rows.len(), 1);
 }
 
-/// Plain Metal's block order at a `bytesPerRow` of 0 as EV RRP-probe8-m4 measured it (an M4
+/// Plain Metal's block order at a `bytesPerRow` of 0 as our probe measured it (an M4
 /// under macOS 27.0.1, out of the texture, without the option and with it alike): for each
 /// region, the level's row-major index of the block at each buffer position, `None` where the
 /// copy left the buffer's bytes as they were. The region's own Morton order, counted from its
@@ -1054,7 +1054,7 @@ fn block_order_positions_are_metals_measured_order() {
     }
 }
 
-/// Plain Metal's CPU order of a whole PVRTC level as EV CFR-probe7-m4 measured it (an M4 under
+/// Plain Metal's CPU order of a whole PVRTC level as our probe measured it (an M4 under
 /// macOS 27.0.1; `replaceRegion` and `getBytes` alike, plain and validated, and the 16 x 16 level):
 /// for a level's blocks across and down, the level's row-major index of the block at each position.
 /// Z order with the y bit lowest, the larger axis's extra bits on top; the rows the runtime copies
@@ -1203,7 +1203,7 @@ fn pvrtc_copies_at_a_pitch_of_0_follow_metals_block_order() {
     let rows: Vec<(u64, u64)> = staging.rows.iter().map(|r| (r.dst, r.size)).collect();
     assert_eq!(rows, [(0, 40), (48, 8)]);
     // A region off its blocks is the blocks it is rounded to, its origin down and its size up,
-    // each on its own (EV CFR-probe6-m4).
+    // each on its own.
     for (off, on) in [
         (([2, 0], [8, 8]), ([0, 0], [8, 8])),
         (([0, 0], [6, 8]), ([0, 0], [8, 8])),
@@ -1239,9 +1239,113 @@ fn pvrtc_copies_at_a_pitch_of_0_follow_metals_block_order() {
     assert!(plan(region([8, 4, 0], [12, 8, 1]), 0, 0, 56).is_ok());
 }
 
+/// Between a compressed format and an uncompressed one whose texel is its block's bytes, a region
+/// copy's coordinates are the destination's texels, as our probe on an Apple M3 Max under macOS
+/// 27.0.1 read them: out of BC1 into `RG32Uint` an origin of (4, 4) and a size of 2 x 2 copy the
+/// blocks from the fifth across and down (texels from 16), into BC1 from `RG32Uint` an origin of
+/// (1, 2) and a size of 2 x 2 copy texel (0, 0) alone into the block at (4, 4); ASTC 6x5's
+/// blocks likewise. Units of other bytes stay Metal's refusal; a PVRTC format with an
+/// uncompressed one, two compressed formats of different extents, and a level copy between a
+/// compressed and an uncompressed format, the runtime's gap.
+#[test]
+fn compressed_and_uncompressed_textures_copy_in_the_destination_s_texels() {
+    use PixelFormat as P;
+    let t = |pf, w, h| tex(pf, TextureType::Type2D, [w, h, 1]);
+    let (bc1, rg32) = (t(P::BC1RGBA, 32, 32), t(P::RG32Uint, 8, 8));
+    let out = plan_region_copy(
+        &pair(&bc1, &rg32),
+        &region([4, 4, 0], [2, 2, 1]),
+        0,
+        0,
+        [1, 2, 0],
+    )
+    .unwrap();
+    assert_eq!(
+        (out[0].src.origin, out[0].src.size),
+        ([16, 16, 0], [8, 8, 1])
+    );
+    assert_eq!((out[0].dst.origin, out[0].dst.size), ([1, 2, 0], [2, 2, 1]));
+    let into =
+        |origin, size, at| plan_region_copy(&pair(&rg32, &bc1), &region(origin, size), 0, 0, at);
+    let out = into([1, 2, 0], [2, 2, 1], [4, 4, 0]).unwrap();
+    assert_eq!((out[0].src.origin, out[0].src.size), ([0, 0, 0], [1, 1, 1]));
+    assert_eq!((out[0].dst.origin, out[0].dst.size), ([4, 4, 0], [4, 4, 1]));
+    let out = into([1, 1, 0], [4, 2, 1], [4, 0, 0]).unwrap();
+    assert_eq!((out[0].src.origin, out[0].src.size), ([0, 0, 0], [1, 1, 1]));
+    assert_eq!((out[0].dst.origin, out[0].dst.size), ([4, 0, 0], [4, 4, 1]));
+    let out = into([0, 0, 0], [8, 8, 1], [0, 0, 0]).unwrap();
+    assert_eq!((out[0].src.size, out[0].dst.size), ([2, 2, 1], [8, 8, 1]));
+    // Past the source's blocks: Metal's refusal.
+    assert_eq!(
+        plan_region_copy(
+            &pair(&bc1, &rg32),
+            &region([7, 0, 0], [2, 1, 1]),
+            0,
+            0,
+            [0, 0, 0]
+        ),
+        Err(CopyRefusal::Invalid(CopyProblem::Region))
+    );
+    let (astc, rgba32) = (t(P::ASTC6x5LDR, 48, 40), t(P::RGBA32Uint, 8, 8));
+    let out = plan_region_copy(
+        &pair(&astc, &rgba32),
+        &region([6, 5, 0], [2, 2, 1]),
+        0,
+        0,
+        [1, 2, 0],
+    )
+    .unwrap();
+    assert_eq!(
+        (out[0].src.origin, out[0].src.size),
+        ([36, 25, 0], [12, 10, 1])
+    );
+    let out = plan_region_copy(
+        &pair(&rgba32, &astc),
+        &region([1, 2, 0], [2, 2, 1]),
+        0,
+        0,
+        [6, 5, 0],
+    )
+    .unwrap();
+    assert_eq!((out[0].src.origin, out[0].src.size), ([0, 0, 0], [1, 1, 1]));
+    assert_eq!((out[0].dst.origin, out[0].dst.size), ([6, 5, 0], [6, 5, 1]));
+    let full = region([0, 0, 0], [2, 2, 1]);
+    assert_eq!(
+        plan_region_copy(&pair(&bc1, &t(P::RGBA8Unorm, 8, 8)), &full, 0, 0, [0, 0, 0]),
+        Err(CopyRefusal::Invalid(CopyProblem::Format))
+    );
+    let gap = |r: Result<Vec<ImageCopyRegion>, CopyRefusal>| matches!(&r, Err(CopyRefusal::Unsupported(u)) if u.feature == Feature::Format);
+    let pvrtc = t(P::PVRTCRGBA4BPP, 32, 32);
+    assert!(gap(plan_region_copy(
+        &pair(&pvrtc, &rg32),
+        &full,
+        0,
+        0,
+        [0, 0, 0]
+    )));
+    assert!(gap(plan_region_copy(
+        &pair(&rg32, &pvrtc),
+        &full,
+        0,
+        0,
+        [0, 0, 0]
+    )));
+    let bc7 = t(P::BC7RGBAUnorm, 48, 40);
+    assert!(gap(plan_region_copy(
+        &pair(&astc, &bc7),
+        &full,
+        0,
+        0,
+        [0, 0, 0]
+    )));
+    assert!(gap(plan_levels_copy(&pair(&bc1, &rg32), 0, 0, 0, 0, 1, 1)));
+    let small = t(P::BC1RGBA, 8, 8);
+    assert!(gap(plan_whole_copy(&pair(&rg32, &small))));
+}
+
 /// A 4:2:2 texture copies into the other order, `RG8Unorm` and `R16Uint` byte for byte (macOS
 /// 26.7's rule of one copy unit); a copy into one from another format of its unit is the
-/// runtime's refusal (plain Metal writes `0xff` over part of each row, EV RRP-probe11-m4), and
+/// runtime's refusal (plain Metal writes `0xff` over part of each row), and
 /// one between units Metal's.
 #[test]
 fn four_two_two_texture_copies_take_metals_verdicts() {

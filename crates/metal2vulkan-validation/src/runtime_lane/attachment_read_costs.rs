@@ -1,0 +1,477 @@
+//! What a compositor's reads of its own pass's attachment cost the GPU, on the device the cfg
+//! selects, without the validation layer: report only, in release builds, to weigh the copies a
+//! draw that samples its pass's attachment takes (`texture/attached_reads.rs`, `shadow.rs`) before
+//! and after a change to them.
+//!
+//! The workload is a window server's composite as the consumer's guest replays it, over a
+//! [`WIDTH`]x[`HEIGHT`] `RGBA8Unorm` target of its own image: [`PASSES`] command buffers a frame,
+//! each one render pass that loads and stores the target, of [`STEPS`] steps, each a fill of a
+//! window's rectangle through its scissor, a memory barrier over the render targets and a draw
+//! that reads the target at its own pixels over that rectangle (`tob_read`); then, in every other
+//! pass, a barrier and a draw over a window that samples the target at other pixels
+//! (`a4_fragment_select_sample`). The windows cover more than a fifth of the target, so no own-pixel
+//! read takes a snapshot (`render/snapshot.rs`). The frame waits for its last command buffer.
+//!
+//! [`WARM`] frames run untimed, then [`TIMED`] frames are printed as one `ATTACHMENT-READ-COST`
+//! line: the GPU time per frame (each command buffer's GPU end less its start, summed), the wall
+//! time per frame from the first pass's opening through the last command buffer's completion, and
+//! the device's work counts per frame: reads through copies, own-pixel reads, splits, snapshots,
+//! shadow copies, the copies in of what changed within a rectangle, and the texels each encoder's
+//! first copy in of an image's shadow moves.
+//!
+//! `snapshot_crossover` weighs the two exact forms of a draw that reads its pass's attachment at
+//! its own pixels after a barrier (`render/snapshot.rs`): the snapshot and the split. Over a
+//! [`WIDTH`]x[`HEIGHT`] `BGRA8Unorm` target, a surface over host pages (a texture of an IOSurface
+//! plane over a no-copy buffer, as the consumer's guest makes its framebuffer) or a private
+//! texture, each frame is [`CROSS_PASSES`] command buffers of one pass of [`CROSS_STEPS`] steps:
+//! a fill of a rectangle at the corner of the step's scissor, a barrier over the render targets,
+//! and a reader (`tob_read`) through the scissor whose rectangle, at the same corner, covers a
+//! share of it. The cells cross the scissor's sides ([`SCISSORS`]), the share the reader covers
+//! ([`COVERAGES`]) and the fill: the whole scissor, or at most [`GUEST_FILL`]. The cells run in
+//! turn, round after round, so the GPU's clock weighs on each alike; printed per cell
+//! (`SNAPSHOT-CROSSOVER`): the median GPU time per pass, the readers the device snapshotted and
+//! split, the texels copied in per pass, and the clock (`gt_cur_freq_mhz`) at the first and last
+//! round.
+//!
+//! Ignored by default: measurements, not checks. Run them by name with `--run-ignored all`.
+
+use super::attachment_reads::{floats, function};
+use super::host_memory::{no_copy, Mapping, GUEST_PAGE};
+use super::{open_device, WAIT};
+use crate::gpu::TEST_DEVICE;
+use metal2vulkan::bind::SamplerDescriptor;
+use metal2vulkan::metal::{BarrierScope, PixelFormat, PrimitiveType, RenderStages, TextureUsage};
+use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor};
+use metal2vulkan_runtime::{
+    Buffer, CommandBuffer, CommandQueue, Device, DeviceOptions, IoSurfacePlane, LoadAction,
+    PipelineOptions, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
+    ResourceOptions, SamplerState, ScissorRect, StoreAction, Texture, TextureDescriptor,
+    WorkCounts,
+};
+use std::collections::BTreeMap;
+use std::time::Instant;
+
+/// The target's size, a 1080p framebuffer's.
+const WIDTH: u64 = 1920;
+const HEIGHT: u64 = 1080;
+/// The command buffers of a frame, each one pass.
+const PASSES: u64 = 4;
+/// The fill, barrier and own-pixel read steps of a pass.
+const STEPS: u64 = 3;
+/// The untimed and the timed frames.
+const WARM: usize = 10;
+const TIMED: usize = 60;
+const RGBA8: PixelFormat = PixelFormat::RGBA8Unorm;
+
+/// Step `step` of pass `pass`'s window: 960x720 pixels, at an offset of its own.
+fn window(pass: u64, step: u64) -> [u64; 4] {
+    let (x, y) = (
+        (pass * 211 + step * 97) % 960,
+        (pass * 53 + step * 131) % 360,
+    );
+    [x, y, x + 960, y + 720]
+}
+
+/// The corners, in normalized device coordinates, of the target's pixels `[x0, x1) x [y0, y1)`.
+fn corners([x0, y0, x1, y1]: [u64; 4]) -> Vec<u8> {
+    let x = |p: u64| p as f32 / WIDTH as f32 * 2.0 - 1.0;
+    let y = |p: u64| 1.0 - p as f32 / HEIGHT as f32 * 2.0;
+    floats([x(x0), y(y1), x(x1), y(y0)])
+}
+
+/// The `tob_rect` state with the fragment function `name` of `fixture`, into an unblended color
+/// of `format`.
+fn state(device: &Device, name: &str, fixture: &str, format: PixelFormat) -> RenderPipelineState {
+    let mut d = RenderPipelineDescriptor::new(function(device, "tob_rect", "tob_renders.ll"));
+    d.fragment = Some(function(device, name, fixture));
+    d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(format));
+    device
+        .new_render_pipeline_state(&d, &PipelineOptions::default())
+        .unwrap()
+}
+
+/// Draw over `rect`, through a scissor of it.
+fn draw_over(encoder: &mut RenderCommandEncoder, [x0, y0, x1, y1]: [u64; 4]) {
+    let rect = ScissorRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    };
+    encoder.set_scissor_rect(rect).unwrap();
+    encoder
+        .set_vertex_bytes(&corners([x0, y0, x1, y1]), 0)
+        .unwrap();
+    encoder
+        .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
+        .unwrap();
+}
+
+fn barrier(encoder: &mut RenderCommandEncoder) {
+    encoder.memory_barrier_with_scope(
+        BarrierScope::RENDER_TARGETS,
+        RenderStages::FRAGMENT,
+        RenderStages::FRAGMENT,
+    );
+}
+
+/// The workload's pipelines and sampler.
+struct Draws {
+    fill: RenderPipelineState,
+    read: RenderPipelineState,
+    sample: RenderPipelineState,
+    sampler: SamplerState,
+}
+
+/// One frame over `target` on `queue` (the module docs): its command buffers, committed, the last
+/// waited for.
+fn frame(queue: &CommandQueue, target: &Texture, draws: &Draws) -> Vec<CommandBuffer> {
+    let mut d = RenderPassDescriptor::new();
+    let color = &mut d.color_attachments[0];
+    color.texture = Some(target.clone());
+    color.load_action = LoadAction::Load;
+    color.store_action = StoreAction::Store;
+    let mut committed = Vec::new();
+    for pass in 0..PASSES {
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut encoder = command_buffer.render_command_encoder(&d).unwrap();
+        for step in 0..STEPS {
+            let rect = window(pass, step);
+            encoder.set_render_pipeline_state(&draws.fill).unwrap();
+            let red = (pass * STEPS + step) as f32 / (PASSES * STEPS) as f32;
+            encoder
+                .set_fragment_bytes(&floats([red, 0.5, 0.0, 1.0]), 0)
+                .unwrap();
+            draw_over(&mut encoder, rect);
+            barrier(&mut encoder);
+            encoder.set_render_pipeline_state(&draws.read).unwrap();
+            encoder.set_fragment_texture(Some(target), 0).unwrap();
+            draw_over(&mut encoder, rect);
+        }
+        if pass % 2 == 1 {
+            barrier(&mut encoder);
+            encoder.set_render_pipeline_state(&draws.sample).unwrap();
+            encoder.set_fragment_texture(Some(target), 0).unwrap();
+            encoder.set_fragment_texture(Some(target), 1).unwrap();
+            encoder
+                .set_fragment_sampler_state(Some(&draws.sampler), 0)
+                .unwrap();
+            draw_over(&mut encoder, window(pass, STEPS));
+        }
+        encoder.end_encoding().unwrap();
+        command_buffer.commit().unwrap();
+        committed.push(command_buffer);
+    }
+    let last = committed.last().unwrap();
+    last.wait_until_completed_for(WAIT).unwrap();
+    for command_buffer in &committed {
+        assert_eq!(command_buffer.error(), None);
+    }
+    committed
+}
+
+/// The work counts the module docs name, per frame over `frames` frames.
+fn per_frame(before: &WorkCounts, after: &WorkCounts, frames: usize) -> String {
+    let per = |a: u64, b: u64| (a - b) as f64 / frames as f64;
+    format!(
+        "reads through copies {:.1}, own-pixel reads {:.1}, splits {:.1}, snapshotted {:.1}, \
+         shadow copies {:.1}, bounded {:.1}, image first-copy texels {:.0}",
+        per(
+            after.attachment_reads_through_copies,
+            before.attachment_reads_through_copies
+        ),
+        per(after.own_pixel_reads, before.own_pixel_reads),
+        per(after.attachment_read_splits, before.attachment_read_splits),
+        per(
+            after.reading_draws_snapshotted,
+            before.reading_draws_snapshotted
+        ),
+        per(after.shadow_copies, before.shadow_copies),
+        per(after.bounded_shadow_copies, before.bounded_shadow_copies),
+        per(
+            after.shadow_texels_first_copied_in_images,
+            before.shadow_texels_first_copied_in_images
+        ),
+    )
+}
+
+#[test]
+#[ignore = "a release-mode measurement: run by name"]
+fn attachment_read_costs() {
+    let device = open_device(TEST_DEVICE, DeviceOptions::default()).unwrap();
+    let draws = Draws {
+        fill: state(&device, "tob_solid", "tob_renders.ll", RGBA8),
+        read: state(&device, "tob_read", "tob_renders.ll", RGBA8),
+        sample: state(
+            &device,
+            "a4_fragment_select_sample",
+            "a4_fragment_select_sample.ll",
+            RGBA8,
+        ),
+        sampler: device.new_sampler_state(&SamplerDescriptor::new()).unwrap(),
+    };
+    let mut d = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, WIDTH, HEIGHT, false);
+    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    d.resource_options = ResourceOptions::private();
+    let target = device.new_texture(&d).unwrap();
+    let queue = device.new_command_queue().unwrap();
+    for _ in 0..WARM {
+        frame(&queue, &target, &draws);
+    }
+    let before = device.work_counts();
+    let (mut gpu, started) = (0.0, Instant::now());
+    for _ in 0..TIMED {
+        for command_buffer in frame(&queue, &target, &draws) {
+            gpu +=
+                command_buffer.gpu_end_time().unwrap() - command_buffer.gpu_start_time().unwrap();
+        }
+    }
+    let wall = started.elapsed().as_secs_f64();
+    let after = device.work_counts();
+    println!(
+        "ATTACHMENT-READ-COST on {}: {WIDTH}x{HEIGHT} target of its own image, {PASSES} passes of \
+         {STEPS} steps: GPU {:.3} ms/frame, wall {:.3} ms/frame; {}",
+        device.name(),
+        gpu * 1e3 / TIMED as f64,
+        wall * 1e3 / TIMED as f64,
+        per_frame(&before, &after, TIMED)
+    );
+}
+
+/// The sides of each crossover reader's scissor (`snapshot_crossover`).
+const SCISSORS: [[u64; 2]; 4] = [[320, 180], [960, 540], [1280, 720], [WIDTH, HEIGHT]];
+/// The share of its scissor each crossover reader's rectangle covers, in thousandths.
+const COVERAGES: [u64; 4] = [15, 125, 500, 1000];
+/// The fill's sides at most, where it is not the whole scissor: about the 394K texels the guest's
+/// copies of what changed within a rectangle moved each, on average.
+const GUEST_FILL: [u64; 2] = [640, 616];
+/// The crossover's command buffers a frame, each one pass, and its steps a pass.
+const CROSS_PASSES: u64 = 4;
+const CROSS_STEPS: u64 = 5;
+/// The crossover's rounds of every cell, the first untimed.
+const ROUNDS: usize = 8;
+
+/// One crossover cell (the module docs).
+#[derive(Clone, Copy, Debug)]
+struct Cell {
+    /// The target is the surface over host pages, else the private texture.
+    host: bool,
+    scissor: [u64; 2],
+    /// The reader's rectangle's sides, and the thousandths of the scissor they cover.
+    reader: [u64; 2],
+    coverage: u64,
+    fill: [u64; 2],
+}
+
+/// Every crossover cell, in the order each round runs them.
+fn cells() -> Vec<Cell> {
+    let mut cells = Vec::new();
+    for host in [true, false] {
+        for scissor in SCISSORS {
+            let capped = [scissor[0].min(GUEST_FILL[0]), scissor[1].min(GUEST_FILL[1])];
+            let fills = match capped == scissor {
+                true => vec![scissor],
+                false => vec![scissor, capped],
+            };
+            for coverage in COVERAGES {
+                let side = |s: u64| {
+                    let side = s as f64 * (coverage as f64 / 1000.0).sqrt();
+                    (side.round() as u64).clamp(1, s)
+                };
+                for &fill in &fills {
+                    let reader = [side(scissor[0]), side(scissor[1])];
+                    cells.push(Cell {
+                        host,
+                        scissor,
+                        reader,
+                        coverage,
+                        fill,
+                    });
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// A [`WIDTH`]x[`HEIGHT`] `BGRA8Unorm` surface over `mapping`'s host pages, render target and
+/// shader read usage, as the consumer makes an IOSurface's texture; and its buffer.
+fn surface(device: &Device, mapping: &Mapping) -> (Texture, Buffer) {
+    let row = 4 * WIDTH;
+    let len = ((row * HEIGHT) as usize).next_multiple_of(GUEST_PAGE);
+    // SAFETY: the measurement drops the texture and the buffer before the mapping.
+    let buffer = unsafe {
+        no_copy(
+            device,
+            mapping.pointer(),
+            len,
+            ResourceOptions::default(),
+            None,
+        )
+    }
+    .unwrap();
+    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
+    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    d.resource_options = buffer.resource_options();
+    let texture = buffer
+        .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, row, false))
+        .unwrap();
+    (texture, buffer)
+}
+
+/// The scissor of step `step` of pass `pass` of `cell`: its sides, at a place of its own.
+fn scissor_of(cell: &Cell, pass: u64, step: u64) -> [u64; 2] {
+    let n = pass * CROSS_STEPS + step;
+    let [width, height] = cell.scissor;
+    [
+        n * 211 % (WIDTH - width + 1),
+        n * 131 % (HEIGHT - height + 1),
+    ]
+}
+
+/// One crossover frame of `cell` over `target` on `queue` (the module docs): its GPU time, in
+/// microseconds.
+fn cross_frame(
+    queue: &CommandQueue,
+    target: &Texture,
+    fill: &RenderPipelineState,
+    read: &RenderPipelineState,
+    cell: &Cell,
+) -> f64 {
+    let mut d = RenderPassDescriptor::new();
+    let color = &mut d.color_attachments[0];
+    color.texture = Some(target.clone());
+    color.load_action = LoadAction::Load;
+    color.store_action = StoreAction::Store;
+    let mut committed = Vec::new();
+    for pass in 0..CROSS_PASSES {
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut encoder = command_buffer.render_command_encoder(&d).unwrap();
+        for step in 0..CROSS_STEPS {
+            let [x, y] = scissor_of(cell, pass, step);
+            encoder.set_render_pipeline_state(fill).unwrap();
+            let red = (pass * CROSS_STEPS + step) as f32 / (CROSS_PASSES * CROSS_STEPS) as f32;
+            encoder
+                .set_fragment_bytes(&floats([red, 0.5, 0.0, 1.0]), 0)
+                .unwrap();
+            draw_over(&mut encoder, [x, y, x + cell.fill[0], y + cell.fill[1]]);
+            barrier(&mut encoder);
+            encoder.set_render_pipeline_state(read).unwrap();
+            encoder.set_fragment_texture(Some(target), 0).unwrap();
+            let [width, height] = cell.scissor;
+            encoder
+                .set_scissor_rect(ScissorRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+                .unwrap();
+            let [w, h] = cell.reader;
+            encoder
+                .set_vertex_bytes(&corners([x, y, x + w, y + h]), 0)
+                .unwrap();
+            encoder
+                .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
+                .unwrap();
+        }
+        encoder.end_encoding().unwrap();
+        command_buffer.commit().unwrap();
+        committed.push(command_buffer);
+    }
+    let last = committed.last().unwrap();
+    last.wait_until_completed_for(WAIT).unwrap();
+    let mut gpu = 0.0;
+    for command_buffer in &committed {
+        command_buffer.wait_until_completed_for(WAIT).unwrap();
+        assert_eq!(command_buffer.error(), None);
+        gpu += command_buffer.gpu_end_time().unwrap() - command_buffer.gpu_start_time().unwrap();
+    }
+    gpu * 1e6
+}
+
+/// The GPU's clock now, in MHz, where a DRM card states it (i915's and Xe's `gt_cur_freq_mhz`).
+fn clock() -> String {
+    let mut cards = std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten();
+    cards
+        .find_map(|card| std::fs::read_to_string(card.path().join("gt_cur_freq_mhz")).ok())
+        .map_or_else(|| "-".to_owned(), |mhz| mhz.trim().to_owned())
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+#[test]
+#[ignore = "a release-mode measurement: run by name"]
+fn snapshot_crossover() {
+    let device = open_device(TEST_DEVICE, DeviceOptions::default()).unwrap();
+    let bgra = PixelFormat::BGRA8Unorm;
+    let fill = state(&device, "tob_solid", "tob_renders.ll", bgra);
+    let read = state(&device, "tob_read", "tob_renders.ll", bgra);
+    let mapping = Mapping::anonymous(((4 * WIDTH * HEIGHT) as usize).next_multiple_of(GUEST_PAGE));
+    let (host, buffer) = surface(&device, &mapping);
+    let mut d = TextureDescriptor::texture_2d(bgra, WIDTH, HEIGHT, false);
+    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    d.resource_options = ResourceOptions::private();
+    let private = device.new_texture(&d).unwrap();
+    let queue = device.new_command_queue().unwrap();
+    let cells = cells();
+    let mut times: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut moves: BTreeMap<usize, (WorkCounts, WorkCounts)> = BTreeMap::new();
+    let mut clocks: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for round in 0..ROUNDS {
+        for (index, cell) in cells.iter().enumerate() {
+            let target = if cell.host { &host } else { &private };
+            clocks.entry(index).or_default().push(clock());
+            let before = device.work_counts();
+            let gpu = cross_frame(&queue, target, &fill, &read, cell);
+            let after = device.work_counts();
+            if round == 0 {
+                continue;
+            }
+            if round == 1 {
+                moves.insert(index, (before, after));
+            }
+            times.entry(index).or_default().push(gpu);
+        }
+    }
+    let name = device.name().to_owned();
+    for (index, cell) in cells.iter().enumerate() {
+        let gpu = median(times.remove(&index).unwrap());
+        let (before, after) = &moves[&index];
+        let per = |a: u64, b: u64| (b - a) as f64 / CROSS_PASSES as f64;
+        let clocks = &clocks[&index];
+        println!(
+            "SNAPSHOT-CROSSOVER {name} {} scissor {}x{} reader {}x{} ({}/1000) fill {}x{}: GPU \
+             {:.1} us/pass; per pass: snapshotted {:.2}, splits {:.2}, texels copied in {:.0}; \
+             clock {} .. {} MHz",
+            if cell.host { "host" } else { "private" },
+            cell.scissor[0],
+            cell.scissor[1],
+            cell.reader[0],
+            cell.reader[1],
+            cell.coverage,
+            cell.fill[0],
+            cell.fill[1],
+            gpu / CROSS_PASSES as f64,
+            per(
+                before.reading_draws_snapshotted,
+                after.reading_draws_snapshotted
+            ),
+            per(before.attachment_read_splits, after.attachment_read_splits),
+            per(
+                before.shadow_texels_copied_in,
+                after.shadow_texels_copied_in
+            ),
+            clocks[1],
+            clocks[clocks.len() - 1],
+        );
+    }
+    drop((host, private, buffer));
+    drop(mapping);
+}

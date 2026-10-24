@@ -7,9 +7,10 @@
 //! classed, and so reaches the ledger.
 
 use crate::device::{
-    DevicePolicy, FloatMathsPolicy, FramebufferFetchPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-    NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
-    Unorm8LinearFilterPolicy,
+    BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
+    HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy, NanMinMaxPolicy, ResolvePolicy,
+    RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+    Unorm8LinearFilterPolicy, YCbCrFilterPolicy,
 };
 use crate::pipeline::PrecisionNote;
 use std::collections::BTreeSet;
@@ -59,29 +60,42 @@ fn choices() -> Vec<Choice> {
         containment: _,
         isolation: _,
         // The accuracy choices, below.
-        framebuffer_fetch: _,
         unorm8_linear_filter: _,
         sampling: _,
+        ycbcr_filter: _,
         float_maths: _,
         texel_conversion: _,
         half_rounding: _,
         nan_and_min_max: _,
         rounding_order: _,
         half_blend: _,
-        // The runtime's: whether a texture over padded rows that only reads aliases them.
-        padded_reads: _,
+        // The runtime's: the texels of a carried texture's decoded twin, a heap's compressed
+        // texture's image, when the host sees a command buffer complete, a loaded attachment's
+        // tile store, a multisampled color attachment's resolve, and how a batch begins after the
+        // earlier ones of its queue.
+        decoded_texels: _,
+        heap_compression: _,
+        completion: _,
+        tile_store: _,
+        resolve: _,
+        batch_order: _,
     } = p;
     vec![
-        choice!(p.framebuffer_fetch: FramebufferFetchPolicy { RequireOrdered, AcceptUnordered }),
         choice!(p.unorm8_linear_filter: Unorm8LinearFilterPolicy { Exact, DeviceWithinOneCode }),
         choice!(p.sampling: SamplingPolicy { NativeDevice, Exact }),
+        choice!(p.ycbcr_filter: YCbCrFilterPolicy { Device, Exact }),
         choice!(p.float_maths: FloatMathsPolicy { Native, Exact }),
         choice!(p.texel_conversion: TexelConversionPolicy { Device, Exact }),
         choice!(p.half_rounding: HalfRoundingPolicy { Native, Exact }),
         choice!(p.nan_and_min_max: NanMinMaxPolicy { Native, Exact }),
         choice!(p.rounding_order: RoundingOrderPolicy { Native, Exact }),
         choice!(p.half_blend: HalfBlendPolicy { Device, Exact }),
-        choice!(p.padded_reads: PaddedReadsPolicy { Alias, Shadow }),
+        choice!(p.decoded_texels: DecodedTexelsPolicy { Compact, Exact }),
+        choice!(p.heap_compression: HeapCompressionPolicy { Compressed, Uncompressed }),
+        choice!(p.completion: CompletionPolicy { Grouped, Exact }),
+        choice!(p.tile_store: TileStorePolicy { Device, Exact }),
+        choice!(p.resolve: ResolvePolicy { Device, Exact }),
+        choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
     ]
 }
 
@@ -135,7 +149,7 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             ExtendedRangeFloatBlendSource,
             BicubicFilterArithmetic,
         ],
-        OptIn: [DeviceUnorm8LinearFilter, UnorderedFramebufferFetch],
+        OptIn: [DeviceUnorm8LinearFilter],
         DeviceGap: [
             DeviceDenormals,
             DeviceTexelDenormals,
@@ -144,6 +158,8 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             DeviceInterpolation,
             HalfOutputFastMathBlend,
             ReductionOrder,
+            FunctionStorageAssumed,
+            ColorAttachmentGroups,
         ],
         Elsewhere: [
             F16FmaDoubleRounding,
@@ -169,7 +185,6 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             FloatSampleFilter,
             DeviceGatherFootprint,
             CubeFaceReciprocal,
-            FunctionStorageAssumed,
             QuadsCountedBeforeDiscard,
             DeviceDepthComparison,
             BeyondMeasuredDeviation,
@@ -189,6 +204,10 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             DeviceAnisotropicFilter,
             DevicePointSize,
             ClippedCoverageSplit,
+            TessellationTriangleOrder,
+            UnmeasuredGroupSpeculation,
+            NotMipmappedAnisotropicFilter,
+            DeviceSampleLevel,
         ],
     }
 }
@@ -372,22 +391,111 @@ fn the_ledger_readers_read_names_and_switches() {
     );
 }
 
-/// The runtime's choice for a texture over padded rows that only reads (`padded_reads`) moves no
-/// committed profile's fingerprint: no profile carries it, so no translation, cache key or
-/// recorded row follows it, and the ledger's row is the runtime's alone.
+/// The runtime's choice of a heap's compressed texture's image (`heap_compression`) moves no
+/// committed profile's fingerprint: no profile carries it, so no translation follows it.
 #[test]
-fn the_runtime_s_padded_reads_choice_keys_no_profile() {
+fn the_runtime_s_heap_compression_choice_keys_no_profile() {
     use crate::spirv::testing::committed_profiles_with;
-    let alias = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
-    let shadow = committed_profiles_with(DevicePolicy {
-        padded_reads: PaddedReadsPolicy::Shadow,
+    let compressed = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let uncompressed = committed_profiles_with(DevicePolicy {
+        heap_compression: HeapCompressionPolicy::Uncompressed,
         ..DevicePolicy::UNTRUSTED
     })
     .expect("profiles");
-    assert!(alias.len() >= 10, "{} profiles", alias.len());
-    assert_eq!(alias.len(), shadow.len());
-    for ((stem, a), (other, s)) in alias.iter().zip(&shadow) {
+    assert_eq!(compressed.len(), uncompressed.len());
+    for ((stem, c), (other, u)) in compressed.iter().zip(&uncompressed) {
         assert_eq!(stem, other);
-        assert_eq!(a.fingerprint(), s.fingerprint(), "{stem}");
+        assert_eq!(c.fingerprint(), u.fingerprint(), "{stem}");
+    }
+}
+
+/// The runtime's choice of when the host sees a command buffer complete (`completion`) moves no
+/// committed profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_completion_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let grouped = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        completion: CompletionPolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(grouped.len(), exact.len());
+    for ((stem, g), (other, e)) in grouped.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(g.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// The runtime's choice of a loaded attachment's tile store (`tile_store`) moves no committed
+/// profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_tile_store_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        tile_store: TileStorePolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(device.len(), exact.len());
+    for ((stem, d), (other, e)) in device.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(d.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// The runtime's choice of a multisampled color attachment's resolve (`resolve`) moves no
+/// committed profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_resolve_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        resolve: ResolvePolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(device.len(), exact.len());
+    for ((stem, d), (other, e)) in device.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(d.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// The runtime's choice of how a batch begins after the earlier ones of its queue
+/// (`batch_order`) moves no committed profile's fingerprint: no profile carries it, so no
+/// translation follows it.
+#[test]
+fn the_runtime_s_batch_order_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let ends = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        batch_order: BatchOrderPolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(ends.len(), exact.len());
+    for ((stem, e), (other, x)) in ends.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(e.fingerprint(), x.fingerprint(), "{stem}");
+    }
+}
+
+/// The runtime's choice of a carried texture's decoded twin (`decoded_texels`) moves no committed
+/// profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_decoded_texels_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let codes = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        decoded_texels: DecodedTexelsPolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(codes.len(), exact.len());
+    for ((stem, a), (other, e)) in codes.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(a.fingerprint(), e.fingerprint(), "{stem}");
     }
 }

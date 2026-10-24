@@ -1,7 +1,7 @@
 //! MoltenVK's command-buffer failures, relayed to the command buffer that failed.
 //!
-//! **Metal.** A GPU fault fails the command buffer it struck, and the queue runs on: EV
-//! RFX-probe1-m4 (an M4 with macOS 27.0.1, plain Metal) measured a blit into a buffer over
+//! **Metal.** A GPU fault fails the command buffer it struck, and the queue runs on: our probe (an
+//! M4 with macOS 27.0.1, plain Metal) measured a blit into a buffer over
 //! read-only pages failing with `MTLCommandBufferErrorInternal` (1, "Discarded (victim of GPU
 //! error/recovery)"), as did the command buffer committed after it while it ran, the later ones
 //! completing; an execution range past its buffer failing with `PageFault` (3), the next command
@@ -25,7 +25,7 @@
 //! (`command_buffer/submit.rs`), and, after any other use of the queue (the program's through
 //! `CommandQueue::with_vk_queue`, or the runtime's own outside a batch), a submission of no work
 //! with one, which ends where that use's submissions end. Metal runs one queue's completed
-//! handlers in order, on one thread (EV RFX-probe1-m4's `handlers` and `handlers_fault`: 600
+//! handlers in order, on one thread (the probe's `handlers` and `handlers_fault`: 600
 //! handlers, failures among them, none out of order), so when MoltenVK reports a failure every
 //! submission before the failed one has its fence signaled, and the failed one does not: the
 //! relay gives the first submission whose fence is unsignaled the failure's code, with Metal's
@@ -41,7 +41,7 @@
 //! **The loader word.** MoltenVK writes `ICD_LOADER_MAGIC` over the first word of an object it
 //! names in a message (`loader_word.rs`), the queue's here, where a layer between the loader and
 //! the driver reads the queue's dispatch table (the validation layer then ends the process at
-//! the next submission: EV RFX-explore1-mvk4). The queue's word is put back before each use of
+//! the next submission). The queue's word is put back before each use of
 //! the queue (`QueueSlot::with`) and as the relay hears a message naming it; a submission on
 //! another thread in between still reads the magic.
 //!
@@ -272,19 +272,21 @@ impl Flights {
 
     /// The submissions through the one of the last of `fences` completed (their fences are
     /// signaled, and every earlier submission's): they leave the log. The fences of the ones not
-    /// of a batch, for the caller to reset and give back (a batch's goes back with it).
-    pub(crate) fn settled(&self, fences: &[vk::Fence]) -> Vec<vk::Fence> {
+    /// of a batch go onto `marks`, for the caller to reset and give back (a batch's goes back with
+    /// it).
+    pub(crate) fn settled(&self, fences: &[vk::Fence], marks: &mut Vec<vk::Fence>) {
         let mut log = lock(&self.log);
         let Some(through) = log
             .iter()
             .rposition(|flight| fences.contains(&flight.fence))
         else {
-            return Vec::new();
+            return;
         };
-        log.drain(..=through)
-            .filter(|flight| !matches!(flight.by, By::Batch(_)))
-            .map(|flight| flight.fence)
-            .collect()
+        marks.extend(
+            log.drain(..=through)
+                .filter(|flight| !matches!(flight.by, By::Batch(_)))
+                .map(|flight| flight.fence),
+        );
     }
 
     /// How many of the queue's submissions are in the log: made, and not yet seen complete.
@@ -376,23 +378,38 @@ impl super::DeviceShared {
 
     /// Submit a batch of a command buffer's to `VkQueue` `queue` with `f`, under the queue's
     /// lock: where its failures are relayed, the submission of `fence` is logged first, its
-    /// failure for `failed` ([`By::Batch`]), and dropped from the log again when `f` fails.
+    /// failure for `failed` ([`By::Batch`]), and dropped from the log again when `f` fails. A
+    /// batch that signals the queue's timeline to `value` notes it once submitted (the exit
+    /// hook's value, and where freed memory waits for the batches in flight, theirs, under the
+    /// gate's read lock: `freed_memory.rs`). The time `f` takes, the driver's, is counted
+    /// (`WorkCounts::batch_submit_nanos`).
     pub(crate) fn submit_logged(
         &self,
-        queue: usize,
+        (queue, value): (usize, Option<u64>),
         fence: Option<vk::Fence>,
         failed: &Arc<Relayed>,
         f: impl FnOnce(vk::Queue) -> Result<(), vk::Result>,
     ) -> Result<(), vk::Result> {
         let slot = &self.queues[queue];
         let logged = fence.zip(slot.flights.get());
+        let parking = self.parking.get();
         slot.with(|vk_queue| {
+            let _gate = parking.map(|parking| parking.submitting());
             if let Some((fence, flights)) = logged {
                 flights.push(fence, By::Batch(Arc::clone(failed)));
             }
+            let entered = crate::gpu_time::host_nanos();
             let submitted = f(vk_queue);
-            if let (Err(_), Some((fence, flights))) = (&submitted, logged) {
-                flights.unpush(fence);
+            (self.counts).batch_submitted_in(crate::gpu_time::host_nanos().saturating_sub(entered));
+            match (&submitted, logged, value) {
+                (Err(_), Some((fence, flights)), _) => flights.unpush(fence),
+                (Ok(()), _, Some(value)) => {
+                    slot.submitted(value);
+                    if let Some(parking) = parking {
+                        parking.submitted(queue, value);
+                    }
+                }
+                _ => {}
             }
             submitted
         })
@@ -401,46 +418,91 @@ impl super::DeviceShared {
     /// `f` with `VkQueue` `queue` under its lock: a use outside a batch, `by`'s. Where the
     /// queue's failures are relayed, a submission of no work after `f`'s, under the same lock,
     /// signals a fence logged as `by`'s, which ends where `f`'s submissions end (the module
-    /// docs); the marks before it whose fences are signaled go back first. Each reach of the
+    /// docs); the marks before it whose fences are signaled go back first. Where freed memory
+    /// waits for the work in flight, the program's use takes a value of the queue's timeline of
+    /// such marks before `f` runs, which that submission signals too (`freed_memory.rs`); should
+    /// the submission fail, the value counts as reached once the queue is idle. Each reach of the
     /// device is a section of the exit guard of its own (`f` runs outside one: it may be the
     /// program's); once the process is exiting no mark is made.
     pub(crate) fn use_queue<R>(&self, queue: usize, by: By, f: impl FnOnce(vk::Queue) -> R) -> R {
         let slot = &self.queues[queue];
-        let Some(flights) = slot.flights.get() else {
+        let flights = slot.flights.get();
+        let parking = (self.parking.get()).filter(|_| matches!(by, By::Program));
+        if flights.is_none() && parking.is_none() {
             return slot.with(f);
-        };
-        let fence = exit_guard::enter().and_then(|_busy| {
-            let raw = self.vk();
-            let done = flights.done_marks();
-            if !done.is_empty() {
-                // SAFETY: each is signaled, its submission completed, and out of the log.
-                let reset = unsafe { raw.reset_fences(&done) };
-                exit_guard::called(Call::ResetFences);
-                for fence in reset
-                    .map(|()| self.fences.keep(done.iter().copied()))
-                    .unwrap_or(done)
-                {
-                    // SAFETY: as above.
-                    unsafe { crate::release::object(raw, fence) };
+        }
+        let fence = flights.and_then(|flights| {
+            exit_guard::enter().and_then(|_busy| {
+                let raw = self.vk();
+                let mut done = flights.done_marks();
+                if !done.is_empty() {
+                    // SAFETY: each is signaled, its submission completed, and out of the log.
+                    let reset = unsafe { raw.reset_fences(&done) };
+                    exit_guard::called(Call::ResetFences);
+                    // Kept idle where reset; the rest, and all where the reset failed, released.
+                    if reset.is_ok() {
+                        self.fences.keep(&mut done);
+                    }
+                    for fence in done {
+                        // SAFETY: as above.
+                        unsafe { crate::release::object(raw, fence) };
+                    }
                 }
-            }
-            // SAFETY: the device's fences, inside a section.
-            unsafe { self.fences.take(raw) }.ok()
+                // SAFETY: the device's fences, inside a section.
+                unsafe { self.fences.take(raw) }.ok()
+            })
         });
         slot.with(|vk_queue| {
+            // Taken before `f` submits: a block that goes meanwhile waits for the mark.
+            let mark = parking.and_then(|parking| {
+                let _busy = exit_guard::enter()?;
+                parking.program_use(queue, self.vk())
+            });
             let used = f(vk_queue);
-            if let (Some(fence), Some(_busy)) = (fence, exit_guard::enter()) {
-                let raw = self.vk();
+            let Some(_busy) = exit_guard::enter() else {
+                return used;
+            };
+            let raw = self.vk();
+            let logged = fence.zip(flights);
+            if let Some((fence, flights)) = logged {
                 flights.push(fence, by);
+            }
+            if fence.is_some() || mark.is_some() {
+                let signal = mark.map(|(timeline, value)| ([timeline], [value]));
+                let mut values = vk::TimelineSemaphoreSubmitInfo::default();
+                let mut submit = vk::SubmitInfo::default();
+                if let Some((timelines, signalled)) = &signal {
+                    values = values.signal_semaphore_values(signalled);
+                    submit = submit.signal_semaphores(timelines).push_next(&mut values);
+                }
+                // A mark alone needs a submission of its own; a fence alone none.
+                let submits = match signal.is_some() {
+                    true => std::slice::from_ref(&submit),
+                    false => &[],
+                };
                 self.counts.queue_submitted(0);
-                // SAFETY: a submission of no work with an unsignaled fence in no pending
-                // submission; the queue is used under its lock.
-                let submitted = unsafe { raw.queue_submit(vk_queue, &[], fence) };
+                // SAFETY: a submission of no work, with an unsignaled fence in no pending
+                // submission where it has one, signalling the timeline of marks above every
+                // value signalled there before where it has one; the queue is used under its
+                // lock.
+                let submitted =
+                    unsafe { raw.queue_submit(vk_queue, submits, fence.unwrap_or_default()) };
                 exit_guard::called(Call::QueueSubmit);
                 if submitted.is_err() {
-                    flights.unpush(fence);
-                    // SAFETY: the failed submission is not pending (as a failed batch's fence).
-                    unsafe { crate::release::object(raw, fence) };
+                    if let Some((fence, flights)) = logged {
+                        flights.unpush(fence);
+                        // SAFETY: the failed submission is not pending (as a failed batch's
+                        // fence).
+                        unsafe { crate::release::object(raw, fence) };
+                    }
+                    if let (Some(parking), Some((_, value))) = (parking, mark) {
+                        // The use's submissions completed once the queue is idle (or the device
+                        // is lost); the answer changes nothing.
+                        // SAFETY: the queue is used under its lock.
+                        let _ = unsafe { raw.queue_wait_idle(vk_queue) };
+                        exit_guard::called(Call::QueueWaitIdle);
+                        parking.program_completed(queue, value);
+                    }
                 }
             }
             used
@@ -484,7 +546,7 @@ mod tests {
     use super::failure;
 
     /// MoltenVK 1.4.1's message of a failed Metal command buffer gives its code and Metal's
-    /// description, the device kept or lost; other messages none (the forms EV RFX-explore1-mvk4
+    /// description, the device kept or lost; other messages none (the forms our probe
     /// heard).
     #[test]
     fn a_failure_s_code_and_description_are_read_from_its_message() {

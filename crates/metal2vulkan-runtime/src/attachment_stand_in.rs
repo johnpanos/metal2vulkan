@@ -5,7 +5,9 @@
 //!   pixel interlock reads and writes it as a storage image (`framebuffer_fetch.rs`): neither is
 //!   open to a transient image, which may have no memory and has no `STORAGE` usage. Such a pass
 //!   renders the memoryless attachment into an image of its own. Nothing is copied: Metal neither
-//!   loads nor stores a memoryless texture, so its contents do not survive the pass either way.
+//!   loads nor stores a memoryless texture, so its contents do not survive the pass either way. A
+//!   color's backing is one its queue keeps for its passes of the attachment's shape
+//!   ([`pooled_backing`]).
 //! - **A fetched texture's scratch.** One rule for both forms of framebuffer fetch: a color
 //!   texture whose image lacks the usage its fetch form needs renders, in a pass that fetches
 //!   it, into a scratch image that has it, as its attachment in every instance too. In the
@@ -23,7 +25,8 @@
 //!   the texture keeps its texels, as Apple's GPU keeps them. In the pixel interlock an 8-bit sRGB
 //!   texture renders, in a pass that fetches it, into a scratch made mutable to the
 //!   unsigned-integer view a fetching draw reads and writes it through
-//!   (`framebuffer_fetch::storage_view_format`), to which a texture's image is not made.
+//!   (`framebuffer_fetch::storage_view_format`), to which a texture's image is not made; so does
+//!   a BGRA-order texture viewed in its RGBA-order twin (ANV) whose image does not take that view.
 //!
 //! - **A depth/stencil texture not made for the pass's custom sample positions**. Vulkan rasterizes
 //!   a depth/stencil attachment at custom positions only where its image was made with
@@ -38,7 +41,7 @@
 //!   (`texture/wrapped.rs`). An image of a format the device does not copy both ways (no transfer
 //!   usage) stays refused (`NotImplemented(SamplePositionsAtBegin)`).
 //! - **A depth/stencil texture without `RenderTarget` usage**, whose image lacks depth/stencil
-//!   attachment usage, which plain Metal renders as a render target (EV RRS-probe-18-m4): one
+//!   attachment usage, which plain Metal renders as a render target: one
 //!   texture renders through a stand-in copied as the custom positions' one is, each aspect in
 //!   where Metal loads or keeps it and back where it stores or keeps it, so a `DontCare` store
 //!   leaves the texture as it was, as Metal leaves it. Separate depth and stencil textures render
@@ -49,6 +52,12 @@
 //!   image is linear over the buffer's bytes: Metal leaves the buffer's bytes, so the pass renders
 //!   it through the image its texture keeps, copied into where the pass loads it (`Load`), and
 //!   never back (`kept_bytes.rs`).
+//! - **A render target's depth that may hold a negative value or a NaN**
+//!   (`texture/signed_depth.rs`), which a pass loads: it renders over its magnitude stand-in, the
+//!   image its texture keeps for the queue (`kept_backing`), whose words the pass writes from the
+//!   depth's before it and merges back after it where it stores the depth and may have written
+//!   it: its depth test is Metal's, and so is what it keeps, but for the merge's corner, which
+//!   `signed-depth-test` names.
 //! - **A pass's hidden depth and stencil**. In a pass without a depth/stencil attachment, plain
 //!   Metal tests a draw whose state uses depth or the stencil against a hidden depth of `float`,
 //!   1.0 at the pass's start, and a stencil of 0, kept per sample through the pass. Such a draw
@@ -70,7 +79,8 @@
 //! one takes transfer writes (it may be cleared before the pass, `render.rs`), and a depth/stencil
 //! one transfer reads and writes (the shadow's copies). A stand-in is the pass's own: made with the
 //! draw that needs it and held by the command buffer until it completes, like the depth/stencil
-//! scratch (`depth_stencil_scratch.rs`) and the resolve scratch (`resolve.rs`). The copies cover
+//! scratch (`depth_stencil_scratch.rs`) and the resolve scratch (`resolve.rs`); but a memoryless
+//! color's backing, which its queue keeps ([`pooled_backing`]). The copies cover
 //! the render area and every layer of a layered pass, between barriers from everything before and
 //! to everything after.
 
@@ -86,10 +96,12 @@ use super::nan_clear;
 use super::render_pass::{PassLayout, Target};
 use super::resource::ResourceKey;
 use super::sample_positions;
+use super::texture::Texture;
 use super::texture_descriptor::TextureDescriptor;
 use super::tracker::{Access, Barrier, Use};
 use super::values::ResourceOptions;
 use super::Device;
+use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::device::FormatUsage;
 use metal2vulkan::metal::format::{aspects, FormatMapping};
@@ -138,6 +150,11 @@ pub(super) enum Cause {
     /// buffer keeps its bytes (`kept_bytes.rs`, which announces it, `dont-care-stand-in`): copied
     /// into where the pass loads it, and never back.
     KeptBytes,
+    /// A render target's 32-bit float depth that may hold a negative value or a NaN, which the
+    /// pass loads: it renders over the magnitude stand-in its texture keeps for the queue, written
+    /// from the depth before the pass and merged back after it (`texture/signed_depth.rs`), not
+    /// by the stand-in's own copies.
+    Magnitude,
 }
 
 impl StandIn {
@@ -228,12 +245,133 @@ pub(super) fn kept_backing(
     Ok(made)
 }
 
+/// The most memoryless color backings a queue keeps ([`pooled_backing`]), and the most bytes of
+/// device memory their images take together: past either, the backing passes took least recently
+/// goes (but the one just made, which alone may take more). The count is above the shapes a
+/// frame cycles through: a compositor's frames on the consumer's macOS guest render 11 to 14
+/// extents of one memoryless `RGBA16Float` attachment (1920x1080 down to 192x64), about 40 MB of
+/// backings together, and a pool that keeps fewer than a frame takes, in the same order each
+/// frame, finds none of them kept.
+const MOST_POOLED_BACKINGS: usize = 32;
+const MOST_POOLED_BYTES: u64 = 256 << 20;
+
+/// A memoryless color attachment's backing its queue keeps ([`pooled_backing`]): the shape it
+/// backs (the attachment's pixel format, the format its pass renders it in, its samples, layers
+/// and extent), the bytes its image takes, and the pool's count of takes at its last take.
+struct PooledBacking {
+    pixel_format: PixelFormat,
+    format: metal2vulkan::vk::Format,
+    samples: u32,
+    layers: u32,
+    extent: [u32; 2],
+    bytes: u64,
+    taken: u64,
+    backing: Target,
+}
+
+impl PooledBacking {
+    /// Whether it backs an attachment of `own`'s shape.
+    fn backs(&self, own: &Target) -> bool {
+        self.pixel_format == own.texture.pixel_format()
+            && self.format == own.format
+            && self.samples == own.samples
+            && self.layers == own.layers
+            && self.extent == own.extent
+    }
+}
+
+/// The memoryless color backings one command queue keeps for its passes ([`pooled_backing`]): at
+/// most [`MOST_POOLED_BACKINGS`], over at most [`MOST_POOLED_BYTES`] but for the one just made.
+/// They go with the queue; each command buffer that rendered into one holds it until it
+/// completes.
+#[derive(Default)]
+pub(crate) struct BackingPool {
+    kept: Vec<PooledBacking>,
+    /// The takes so far, the clock each backing's `taken` reads.
+    takes: u64,
+}
+
+impl BackingPool {
+    /// Drop the backings taken least recently while the pool keeps more than its bounds, but
+    /// the last one, just made.
+    fn bound(&mut self) {
+        loop {
+            let bytes: u64 = self.kept.iter().map(|k| k.bytes).sum();
+            let over = self.kept.len() > MOST_POOLED_BACKINGS || bytes > MOST_POOLED_BYTES;
+            let last = self.kept.len().saturating_sub(1);
+            let oldest = self.kept[..last]
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, k)| k.taken)
+                .map(|(at, _)| at);
+            match oldest {
+                Some(at) if over => drop(self.kept.remove(at)),
+                _ => return,
+            }
+        }
+    }
+}
+
+/// The backing of `own`, a memoryless color attachment of a pass of `maker`'s queue that renders
+/// into an image of its own (a framebuffer fetch through the pixel interlock reads it, or the pass
+/// splits): one the queue keeps of `own`'s pixel format, format, samples, layers and extent that
+/// is none of `taken` (the images the pass renders its other attachments into), else one made now
+/// and kept ([`BackingPool`]). Metal neither loads nor stores a memoryless texture
+/// (`render_pass::check_memoryless`), and a pass gives a memoryless color's every texel a draw can
+/// read a value before its draws: its `Clear` load, or the zero its `DontCare` load clears to in a
+/// pass that draws (`clear_reach::dont_care_loads`), before the pass where the pass leaves it out
+/// of its subpass (`render.rs`). A fresh image's texels were undefined there as well. So no pass
+/// reads what another left in the backing, and the passes of one queue that take it are ordered by
+/// their uses of it, as by any texture's: one image serves every pass of the shape, across
+/// command buffers and frames (`WorkCounts::pooled_backings_made`).
+pub(super) fn pooled_backing(
+    maker: &CommandBuffer,
+    own: &Target,
+    taken: &[Texture],
+) -> Result<Target, Error> {
+    let queue = maker.command_queue();
+    let free = |k: &PooledBacking| k.backs(own) && !taken.contains(&k.backing.texture);
+    {
+        let mut pool = lock(queue.memoryless_backings());
+        pool.takes += 1;
+        let takes = pool.takes;
+        if let Some(found) = pool.kept.iter_mut().find(|k| free(k)) {
+            found.taken = takes;
+            let backing = found.backing.clone();
+            drop(pool);
+            // Held as one `maker` made: its first batch moves it to `GENERAL` where the command
+            // buffer that made it has not yet submitted a batch.
+            maker.hold_own_texture(backing.texture.clone());
+            return Ok(backing);
+        }
+    }
+    // Made with no lock held; the pool may keep one another thread made meanwhile beside it.
+    let made = stand_in(maker, own, false)?;
+    maker.device().shared().counts.pooled_backing_made();
+    let mut pool = lock(queue.memoryless_backings());
+    pool.takes += 1;
+    let takes = pool.takes;
+    pool.kept.push(PooledBacking {
+        pixel_format: own.texture.pixel_format(),
+        format: own.format,
+        samples: own.samples,
+        layers: own.layers,
+        extent: own.extent,
+        bytes: made.texture.placed_bytes().unwrap_or(0),
+        taken: takes,
+        backing: made.clone(),
+    });
+    pool.bound();
+    Ok(made)
+}
+
 /// The stand-in for `target`, an attachment the pass renders whole into an image of its own
 /// (the module docs): `copies` where the pass copies between them (a fetched texture's scratch).
 /// A single-sampled color stand-in takes `STORAGE` usage where the device stores the format of a
 /// fetching draw's storage view of it (`framebuffer_fetch::storage_view_format`), which every
 /// fetched format's has (the compile layer's interlock form needs it), and is made mutable to
-/// that view where it is another format (an 8-bit sRGB format's); a multisampled one where the
+/// that view where it is another format (an 8-bit sRGB format's, a BGRA-order one's RGBA-order
+/// twin on ANV); a multisampled one where the
 /// device's fetch reads the attachment's own multisampled image and stores that view at its
 /// sample count. Either takes input attachment usage where the device's
 /// framebuffer fetch reads input attachments, and a multisampled one the sample planes' copies'
@@ -280,8 +418,9 @@ pub(super) fn stand_in_as(
         || (framebuffer_fetch::through_multisampled_storage(profile, target.samples)
             && framebuffer_fetch::stores_samples(profile, target.samples));
     // A fetching draw's storage view is in `view`: an 8-bit sRGB format's, the unsigned-integer
-    // format of its texel size (`framebuffer_fetch::storage_view_format`).
-    let view = framebuffer_fetch::storage_view_format(format);
+    // format of its texel size, a BGRA-order one's, its RGBA-order twin on a device that accesses
+    // its format without one in neither direction (`framebuffer_fetch::storage_view_format`).
+    let view = framebuffer_fetch::storage_view_format(profile, format);
     let stored = color && own_image && profile.supports_format(view, FormatUsage::StorageImage);
     if stored {
         usage |= ImageUsageFlags::STORAGE;
@@ -360,10 +499,10 @@ pub(super) fn stand_in_as(
             | TextureUsage::SHADER_ATOMIC
             | TextureUsage::PIXEL_FORMAT_VIEW,
     };
-    // A stand-in a fetching draw views in another format than its own (an sRGB format's) is
-    // mutable to that view, with extended usage: its `STORAGE` is the view's, which its own
-    // format need not have (a view in its own format serves the draws that do not fetch it, each
-    // view's usage restricted to what it serves, `binding_view.rs`).
+    // A stand-in a fetching draw views in another format than its own (an sRGB format's, an
+    // RGBA-order twin's) is mutable to that view, with extended usage: its `STORAGE` is the
+    // view's, which its own format need not have (a view in its own format serves the draws that
+    // do not fetch it, each view's usage restricted to what it serves, `binding_view.rs`).
     if stored && view != format {
         plan.flags |= ImageCreateFlags::MUTABLE_FORMAT | ImageCreateFlags::EXTENDED_USAGE;
         plan.view_formats = vec![format, view];
@@ -658,7 +797,7 @@ impl StandInCopies {
     ///
     /// `command_buffer` is recording outside a render pass, and only the caller records it; the
     /// images are live until it completes and rest in `GENERAL`.
-    pub(super) unsafe fn record_in(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer) {
+    pub(super) unsafe fn record_in(&self, raw: &Vk, command_buffer: vk::CommandBuffer) {
         let general = vk::ImageLayout::GENERAL;
         // SAFETY: the caller's contract; every image has the transfer usage its copy needs
         // (checked when the stand-in was made), and each region lies in both images.

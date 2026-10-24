@@ -63,7 +63,7 @@
 //!   a tile dispatch only where they hold the tile stage. A compute encoder names none, and its
 //!   dispatches reach every resource it made resident.
 
-use super::buffer::Buffer;
+use super::buffer::{Buffer, ReadApart};
 use super::heap::Heap;
 use super::indirect_command_buffer::IndirectCommandBuffer;
 use super::live_buffers::LiveTable;
@@ -379,7 +379,7 @@ impl Residency {
                     Used::Heap { bytes, .. } => bytes,
                     Used::Texture(_) | Used::IndirectCommandBuffer(_) => return None,
                 };
-                let offset = address.checked_sub(buffer.gpu_address().0)?;
+                let offset = address.checked_sub(buffer.metal_address().0)?;
                 (offset <= buffer.length()).then_some((buffer, offset))
             })
         };
@@ -475,7 +475,7 @@ fn same(a: &Used, b: &Used) -> bool {
 fn stated(buffer: &Buffer, class: ResourceClass, token: u32) -> UsedResource {
     let base = buffer.base();
     let mut used = UsedResource::new(class, token);
-    used.gpu_address = Some(buffer.gpu_address().0 - base);
+    used.gpu_address = Some(buffer.exposed_address(ReadApart::Binding).0 - base);
     used.length = base + buffer.length();
     // A detached buffer's bytes are in no pages: an address reaching them misses and reads 0, as
     // Metal's unnamed reach of a detached buffer does (`detach.rs`), never the stand-in's.

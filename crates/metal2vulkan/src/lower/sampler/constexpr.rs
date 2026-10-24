@@ -101,11 +101,11 @@ fn invariant(detail: &str) -> Error {
 ///
 /// - with pixel coordinates and a compare function (any but `never`, the word's default), it is
 ///   `NotRepresentable(PixelSamplerCompare)`: Apple's compiler rejects such a sampler ("invalid
-///   values combination in sampler initialization", RT13-px-probe-m4), so Metal gives it no
+///   values combination in sampler initialization"), so Metal gives it no
 ///   answer;
 /// - a minimum or maximum reduction reads as the weighted average, as Metal reads it on an Apple
 ///   GPU whose `supportsSamplerReductionMode` answers no (an Apple M4 on macOS 27.0.1: every
-///   channel of `rgba8Unorm`, `rgba16Float` and `r32Float` linear samples, RT13-px3-probe-m4).
+///   channel of `rgba8Unorm`, `rgba16Float` and `r32Float` linear samples).
 pub fn lowered(state: &SamplerState) -> Result<SamplerState, Error> {
     let compares = !matches!(
         state.compare,
@@ -129,7 +129,7 @@ pub fn state_of(words: [u64; 2]) -> Result<SamplerState, Error> {
 /// The level, in sixty-fourths, a clamped LOD query outside a fragment function answers through
 /// constexpr sampler `s` before the texture's last level bounds it:
 /// `metal::sampler::query_min_level` of its descriptor, its `lod_clamp` minimum a `half`'s value
-/// as Metal reads it (EV RFS-lod3-m4: `lod_clamp(0.3, 4)` answered 19/64). A level bias of its
+/// as Metal reads it (`lod_clamp(0.3, 4)` answered 19/64). A level bias of its
 /// own is not measured.
 pub fn query_min_level(s: &SamplerState) -> Result<u32, Error> {
     if s.lod_bias.to_f32() != 0.0 {
@@ -403,11 +403,12 @@ mod tests {
             (d.min_filter, d.mag_filter),
             (vk::Filter::NEAREST, vk::Filter::NEAREST)
         );
+        // Anisotropy maps on every device: its Vulkan sampler is isotropic without the feature.
         let mut s = state(FIXTURE_WORDS[0]);
         s.max_anisotropy = 8;
-        let e = constexpr_desc(state_words(&s), SamplerUse::default(), &p);
+        let d = constexpr_desc(state_words(&s), SamplerUse::default(), &p).expect("maps");
         let aniso_ok = p.fields().images.sampler_anisotropy;
-        assert_eq!(e.is_ok(), aniso_ok, "{e:?}");
+        assert_eq!(d.max_anisotropy.is_some(), aniso_ok, "{d:?}");
         // A bias beyond every device's limit.
         let mut s = state(FIXTURE_WORDS[0]);
         s.lod_bias = Half(0x7bff); // 65504

@@ -50,7 +50,7 @@ use super::binding;
 use super::buffer::Buffer;
 use super::command_buffer::CommandBuffer;
 use super::deferred::Deferred;
-use super::degradation::{BoundFormats, Degradation};
+use super::degradation::{BoundFormats, CompiledPipeline, Degradation};
 use super::device::Device;
 use super::encoder::{EncoderCore, Replayed};
 use super::error::{internal, invalid, Error, Problem, RuntimeGap};
@@ -86,6 +86,7 @@ use metal2vulkan::bind::{
     BindShape, BindState, BindingPlan, Dispatch, FlatIndirect, HeapPlacement, ImageblockSize,
     StageInRegion, UseTarget,
 };
+use metal2vulkan::error::RuntimeDriverDefect;
 use metal2vulkan::metal::{BarrierScope, DispatchType, RenderStages, ResourceUsage};
 use metal2vulkan::pipeline::Stage;
 use std::collections::BTreeMap;
@@ -143,7 +144,9 @@ pub(super) fn imageblock_size(width: u64, height: u64) -> Result<ImageblockSize,
 }
 
 /// A compute encoder (`MTLComputeCommandEncoder`): `Send`, not `Sync`; `end_encoding` consumes
-/// it.
+/// it. Each object a call binds is held until its command buffer completes (or, never committed,
+/// is released), as Metal holds what an encoder was handed: one a later call replaced or unbound
+/// before any dispatch used it, and one bound after the last dispatch, too.
 pub struct ComputeCommandEncoder {
     core: EncoderCore,
     dispatch_type: DispatchType,
@@ -226,7 +229,8 @@ impl CommandBuffer {
             indirect_stage_in: None,
             residency: self.inherited_residency(false),
             captures: Captures::default(),
-            log: self.device().shared().rebinds.any().then(CallLog::new),
+            log: (self.device().shared().rebinds.any())
+                .then(|| self.device().shared().scheduler.spare_logs().compute()),
             dispatches: 0,
         })
     }
@@ -259,7 +263,8 @@ impl ComputeCommandEncoder {
 
     /// End an encoder made by [`replaying`](Self::replaying): what it recorded, and what it made
     /// resident.
-    pub(super) fn finish_replay(self) -> Result<(Replayed, Option<Residency>), Error> {
+    pub(super) fn finish_replay(mut self) -> Result<(Replayed, Option<Residency>), Error> {
+        self.table.let_go_all(&mut self.core);
         let replayed = self.core.finish_replay()?;
         Ok((replayed, Some(self.residency)))
     }
@@ -353,7 +358,7 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|_| ComputeCall::Buffer(buffer.cloned(), offset, index));
         self.table
-            .set_buffer(&self.core, "set_buffer", buffer, offset, index)
+            .set_buffer(&mut self.core, "set_buffer", buffer, offset, index)
     }
 
     /// `setBuffers:offsets:withRange:`: `buffers[i]` at offset `offsets[i]` at index
@@ -369,7 +374,7 @@ impl ComputeCommandEncoder {
             ComputeCall::Buffers(log.buffer_span(buffers), log.word_span(offsets), first)
         });
         self.table
-            .set_buffers(&self.core, "set_buffers", buffers, offsets, first)
+            .set_buffers(&mut self.core, "set_buffers", buffers, offsets, first)
     }
 
     /// `setBufferOffset:atIndex:`, which clears the index's attribute stride
@@ -384,7 +389,7 @@ impl ComputeCommandEncoder {
     pub fn set_buffer_offset(&mut self, offset: u64, index: u32) -> Result<(), Error> {
         self.log(|_| ComputeCall::BufferOffset(offset, index));
         self.table
-            .set_buffer_offset(&self.core, "set_buffer_offset", offset, index)
+            .set_buffer_offset(&mut self.core, "set_buffer_offset", offset, index)
     }
 
     /// `setBuffer:offset:attributeStride:atIndex:`: as [`set_buffer`](Self::set_buffer), the
@@ -403,7 +408,7 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|_| ComputeCall::BufferWithStride(buffer.cloned(), offset, stride, index));
         self.table.set_buffer_with_stride(
-            &self.core,
+            &mut self.core,
             "set_buffer_with_stride",
             buffer,
             offset,
@@ -428,7 +433,7 @@ impl ComputeCommandEncoder {
             ComputeCall::BuffersWithStrides(buffers, offsets, log.word_span(strides), first)
         });
         self.table.set_buffers_with_strides(
-            &self.core,
+            &mut self.core,
             "set_buffers_with_strides",
             buffers,
             offsets,
@@ -449,7 +454,7 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|_| ComputeCall::BufferOffsetWithStride(offset, stride, index));
         self.table.set_buffer_offset_with_stride(
-            &self.core,
+            &mut self.core,
             "set_buffer_offset_with_stride",
             offset,
             stride,
@@ -468,7 +473,7 @@ impl ComputeCommandEncoder {
     pub fn set_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
         self.log(|log| ComputeCall::Bytes(log.byte_span(bytes), index));
         self.table
-            .set_bytes(&self.core, "set_bytes", bytes, None, index)
+            .set_bytes(&mut self.core, "set_bytes", bytes, None, index)
     }
 
     /// `setBytes:length:attributeStride:atIndex:`: as [`set_bytes`](Self::set_bytes), the
@@ -484,7 +489,7 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|log| ComputeCall::BytesWithStride(log.byte_span(bytes), stride, index));
         self.table.set_bytes(
-            &self.core,
+            &mut self.core,
             "set_bytes_with_stride",
             bytes,
             Some(stride),
@@ -503,8 +508,12 @@ impl ComputeCommandEncoder {
         index: u32,
     ) -> Result<(), Error> {
         self.log(|_| ComputeCall::FunctionTable(table.cloned(), index));
-        self.table
-            .set_function_tables(&self.core, "set_visible_function_table", &[table], index)
+        self.table.set_function_tables(
+            &mut self.core,
+            "set_visible_function_table",
+            &[table],
+            index,
+        )
     }
 
     /// `setVisibleFunctionTables:withBufferRange:`: `tables[i]` at buffer index `first + i`.
@@ -519,7 +528,7 @@ impl ComputeCommandEncoder {
             ComputeCall::FunctionTables(tables.iter().map(|table| table.cloned()).collect(), first)
         });
         self.table
-            .set_function_tables(&self.core, "set_visible_function_tables", tables, first)
+            .set_function_tables(&mut self.core, "set_visible_function_tables", tables, first)
     }
 
     /// `setTexture:atIndex:` (`None` unbinds the index). Refused: an index past the table, a
@@ -528,7 +537,7 @@ impl ComputeCommandEncoder {
     pub fn set_texture(&mut self, texture: Option<&Texture>, index: u32) -> Result<(), Error> {
         self.log(|_| ComputeCall::Texture(texture.cloned(), index));
         self.table
-            .set_textures(&self.core, "set_texture", &[texture], index)
+            .set_textures(&mut self.core, "set_texture", &[texture], index)
     }
 
     /// `setTextures:withRange:`: `textures[i]` at index `first + i`. Refused as
@@ -536,7 +545,7 @@ impl ComputeCommandEncoder {
     pub fn set_textures(&mut self, textures: &[Option<&Texture>], first: u32) -> Result<(), Error> {
         self.log(|log| ComputeCall::Textures(log.texture_span(textures), first));
         self.table
-            .set_textures(&self.core, "set_textures", textures, first)
+            .set_textures(&mut self.core, "set_textures", textures, first)
     }
 
     /// `setSamplerState:atIndex:` (`None` unbinds the index). Refused: an index past the table, a
@@ -548,7 +557,7 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         self.log(|_| ComputeCall::Sampler(sampler.cloned(), index));
         self.table
-            .set_samplers(&self.core, "set_sampler_state", &[sampler], None, index)
+            .set_samplers(&mut self.core, "set_sampler_state", &[sampler], None, index)
     }
 
     /// `setSamplerStates:withRange:`: `samplers[i]` at index `first + i`. Refused as
@@ -565,7 +574,7 @@ impl ComputeCommandEncoder {
             )
         });
         self.table
-            .set_samplers(&self.core, "set_sampler_states", samplers, None, first)
+            .set_samplers(&mut self.core, "set_sampler_states", samplers, None, first)
     }
 
     /// `setSamplerState:lodMinClamp:lodMaxClamp:atIndex:`: the state with its LOD clamps
@@ -584,7 +593,7 @@ impl ComputeCommandEncoder {
             ComputeCall::SamplerWithLodClamps(sampler.cloned(), lod_min_clamp, lod_max_clamp, index)
         });
         self.table.set_samplers(
-            &self.core,
+            &mut self.core,
             "set_sampler_state_with_lod_clamps",
             &[sampler],
             Some((&[lod_min_clamp], &[lod_max_clamp])),
@@ -612,7 +621,7 @@ impl ComputeCommandEncoder {
             }))
         });
         self.table.set_samplers(
-            &self.core,
+            &mut self.core,
             "set_sampler_states_with_lod_clamps",
             samplers,
             Some((lod_min_clamps, lod_max_clamps)),
@@ -1011,9 +1020,8 @@ impl ComputeCommandEncoder {
     /// empty, no pipeline state set where `icb` inherits it. A buffer of render command types is
     /// `NotImplemented(IndirectRenderCommands)`: Metal's validation lets it through, and what its
     /// commands do in a compute encoder is not measured. An empty range runs nothing, whatever
-    /// the encoder's pipeline state (EV CFR-probe2-m4 `fixed_empty_nopipeline`), and so does a
-    /// buffer of no command types, as plain Metal's. What a command's dispatch would be refused
-    /// refuses the commit ([`CommandBuffer::commit`]).
+    /// the encoder's pipeline state, and so does a buffer of no command types, as plain Metal's.
+    /// What a command's dispatch would be refused refuses the commit ([`CommandBuffer::commit`]).
     pub fn execute_commands_in_buffer(
         &mut self,
         icb: &IndirectCommandBuffer,
@@ -1027,13 +1035,12 @@ impl ComputeCommandEncoder {
         }
         let range = icb.command_range(CALL, range)?;
         // An empty range runs nothing before the inherited pipeline state is looked at, as plain
-        // Metal's with none set (EV CFR-probe2-m4 `fixed_empty_nopipeline`).
+        // Metal's with none set.
         if range.is_empty() {
             return Ok(());
         }
         let pipeline = self.inherited_pipeline(CALL, icb)?;
-        // A buffer of no command types runs nothing, as plain Metal's (EV RFC-probe2-m4
-        // `t0_exec_compute`).
+        // A buffer of no command types runs nothing, as plain Metal's.
         if icb.has_no_command_types() {
             return Ok(());
         }
@@ -1077,8 +1084,7 @@ impl ComputeCommandEncoder {
         }
         indirect_execute::check_range_buffer(CALL, range_buffer.length(), offset)?;
         let pipeline = self.inherited_pipeline(CALL, icb)?;
-        // A buffer of no command types runs nothing, as plain Metal's (EV RFC-probe3-m4
-        // `t0_exec_indirect`); its range is not read.
+        // A buffer of no command types runs nothing, as plain Metal's; its range is not read.
         if icb.has_no_command_types() {
             return Ok(());
         }
@@ -1179,8 +1185,10 @@ impl ComputeCommandEncoder {
         }
     }
 
-    /// Set the encoder's state back to `state`.
+    /// Set the encoder's state back to `state`: what the table it replaces binds is held until
+    /// the command buffer completes (`ArgumentTable::let_go_all`).
     pub(super) fn restore_state(&mut self, state: EncoderState) {
+        self.table.let_go_all(&mut self.core);
         self.pipeline = state.pipeline;
         self.table = state.table;
         self.threadgroup_lengths = state.threadgroup_lengths;
@@ -1194,8 +1202,10 @@ impl ComputeCommandEncoder {
         &mut self.captures
     }
 
-    /// `endEncoding`.
-    pub fn end_encoding(self) -> Result<(), Error> {
+    /// `endEncoding`. What it binds is held until the command buffer completes, as Metal holds
+    /// what an encoder was handed.
+    pub fn end_encoding(mut self) -> Result<(), Error> {
+        self.table.let_go_all(&mut self.core);
         // Its log, which its command buffer keeps where a rebind may need it (`replay.rs`).
         let replay = self.log.map(|log| Replay::Compute {
             dispatch_type: self.dispatch_type,
@@ -1217,7 +1227,7 @@ impl ComputeCommandEncoder {
     /// where the size passes (`2^62 + 1` by 4 ran 4 threads), and nothing where those axes hold
     /// other threads than the size counts (an M4 under macOS 27.0.1, both dispatch forms: `2^64 -
     /// 1` by `2^64 - 1`, `2^64 - 2` by `2^64 - 2`, and `2^64 - 1` by 1 by `2^64 - 1`, of sizes 1, 4
-    /// and 1; EV RRP-probe1-m4). The two counts agree modulo `2^32`, so such axes hold at least
+    /// and 1). The two counts agree modulo `2^32`, so such axes hold at least
     /// `2^32` threads, past any state's limit: a threadgroup the GPU cannot run.
     ///
     /// Refused: no pipeline state set (plain Metal faults).
@@ -1320,12 +1330,13 @@ impl DispatchTables<'_> {
         function_tables: &[VisibleFunctionTable],
     ) -> BindState {
         // A buffer where the kernel reads a table reads as a null table.
-        let mut table = self
-            .table
-            .stage_table_reading(Stage::Kernel, self.pipeline.interface());
+        let views = self.pipeline.at_bind_views();
+        let mut table =
+            (self.table).stage_table_reading(Stage::Kernel, self.pipeline.interface(), views);
         table.threadgroup_lengths = self.threadgroup_lengths.clone();
         let mut state = BindState::default();
         state.stages.insert(Stage::Kernel, table);
+        state.view_base_alignment = views.alignment();
         if self.pipeline.imageblock_cell_bytes().is_some() {
             state.imageblock_size = self.imageblock;
         }
@@ -1560,6 +1571,7 @@ fn record(
             .map(|blob| (Stage::Kernel, blob))
             .collect(),
         mesh: None,
+        tessellation: None,
     };
     let mut uses = binding::command_uses(call, &plan, &command, &bound_tables, None, None)?;
     if let Some((call, _)) = &flat {
@@ -1595,6 +1607,7 @@ fn record(
         }
         false => Vec::new(),
     };
+    let mut writes = Vec::new();
     let bound = {
         let mut state = core.command_buffer().state();
         binding::bind(
@@ -1604,7 +1617,7 @@ fn record(
             &plan,
             &command,
             &bound_tables,
-            None,
+            (None, &mut writes),
         )?
     };
     let mut push = Vec::with_capacity(commands.regions.len());
@@ -1615,7 +1628,7 @@ fn record(
     let objects = std::sync::Arc::clone(variant.objects());
     // Set 0 per dispatch; set 1 the device's (written below, once nothing refuses).
     let (heap_writes, writes): (Vec<_>, Vec<_>) =
-        bound.writes.into_iter().partition(|write| write.set > 0);
+        writes.into_iter().partition(|write| write.set > 0);
     let set = objects.set_zero(&mut core.command_buffer().state().descriptors)?;
     // The dispatch binds the variant: the kinds its making announces at every occurrence.
     let formats: BoundFormats<'_> = &|slot| bound_tables.bound_format(slot);
@@ -1639,8 +1652,20 @@ fn record(
                     RegionPipeline::Making(_) => None,
                 })
                 .collect();
+            // Where the driver loses a layout's baked samplers after a copy in the same
+            // `VkCommandBuffer` (`RuntimeDriverDefect::ImmutableSamplersLostAfterCopies`), a
+            // variant that bakes them records in one of its own, as one being made does.
+            let apart = objects.bakes_samplers()
+                && device
+                    .properties()
+                    .driver_defects
+                    .contains(&RuntimeDriverDefect::ImmutableSamplersLostAfterCopies);
             match made {
-                Some(made) => (made, None),
+                Some(made) if !apart => (made, None),
+                Some(_) => {
+                    device.shared().counts.baked_sampler_dispatch_apart();
+                    (Vec::new(), Some((dispatch, begun)))
+                }
                 None => (Vec::new(), Some((dispatch, begun))),
             }
         }
@@ -1652,10 +1677,16 @@ fn record(
             (made, None)
         }
     };
-    // SAFETY: the set was just allocated and no command uses it yet; every buffer, view and
-    // sampler written is live (the command buffer retains them below, and a refusal leaves the
-    // set unused in its pool).
-    unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
+    let pushed = match objects.pushes_set_zero() {
+        true => binding::SetWrite::pushed(&writes, objects.immutable_pushes()),
+        false => {
+            // SAFETY: the set was just allocated and no command uses it yet; every buffer, view
+            // and sampler written is live (the command buffer retains them below, and a refusal
+            // leaves the set unused in its pool).
+            unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
+            Vec::new()
+        }
+    };
     let textures = tables
         .table
         .textures
@@ -1692,9 +1723,13 @@ fn record(
     // Recording starts here: nothing below can be refused (but a `VkCommandBuffer` that does not
     // end, which abandons the command buffer).
     core.shadow_copies(&copies);
+    if !pushed.is_empty() {
+        device.shared().counts.dispatch_pushing_set_zero();
+    }
     let recording = Recording {
         layout: objects.layout(),
         set,
+        pushed,
         heap: heap_set,
         preprocess,
         gates,
@@ -1721,7 +1756,7 @@ fn record(
                 };
                 core.pend(next, pending)?;
             }
-            core.shadows_used(&shadows, &uses);
+            core.shadows_used(&shadows, &uses, &[]);
             if let Some(creation) = creation {
                 core.executed(|| {
                     Execution::made_later(
@@ -1740,7 +1775,7 @@ fn record(
                 // below), and the pipelines are the variant's, one per region.
                 unsafe { recording.record(raw, command_buffer, made) }
             });
-            core.shadows_used(&shadows, &uses);
+            core.shadows_used(&shadows, &uses, &[]);
             core.executed(|| {
                 Execution::new(
                     ExecutedPipeline::Compute(Arc::clone(variant.shared_pipeline())),
@@ -1771,7 +1806,10 @@ fn record(
     }
     device.degrade_cross_class(&plan.diagnostics, formats);
     objects.announce_bound(
-        (std::slice::from_ref(&variant.pipeline().stage), None),
+        (
+            std::slice::from_ref(&variant.pipeline().stage),
+            CompiledPipeline::Kernel(variant.pipeline()),
+        ),
         regions
             .iter()
             .map(|region| (&region.specialization, Some(formats))),

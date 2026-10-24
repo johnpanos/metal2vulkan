@@ -5,7 +5,7 @@
 //! shadow of the stencil the function tests and writes itself, copied in before each run of such
 //! draws and back after it (`runtime/shadow_stencil.rs`). Each pass here runs on the device as
 //! opened and again with the extension withheld (`DeviceOptions::withheld_extensions`), so that
-//! every venue runs the shadow, and both give Metal's answer, RT6 Metal probe 9's.
+//! every venue runs the shadow, and both give Metal's answer, that of a Metal probe on an M4.
 //!
 //! The pass, as the probe drew it: a 4x1 `Stencil8` target of 1 or 4 samples, its stencil loaded
 //! by `Clear` to 0x40 or by `Load` of an earlier pass's clear to 0x40, the encoder's stencil
@@ -24,8 +24,8 @@
 //!
 //! The executed pass draws the same at 1 and 4 samples over a `Stencil8` target, its first and
 //! third draws as commands of an indirect command buffer executed between the encoder's draws, each
-//! under the encoder's state at the call, which Metal draws as the encoder's own (EVs RFL-inst-m3
-//! and -m4): Metal's stencil. Through the shadow each such command draws in a run of its own, the
+//! under the encoder's state at the call, which Metal draws as the encoder's own: Metal's stencil.
+//! Through the shadow each such command draws in a run of its own, the
 //! shadow filled before it and copied back after it. It then draws one execution of an output
 //! command, a plain command and an output command under the first draw's state, whose stencil is
 //! the first draw's outputs.
@@ -90,16 +90,16 @@ const THIRD: [u32; 4] = [0x11, 0x00, 0x50, 0x41];
 /// The encoder's stencil reference, which a function's output replaces.
 const REFERENCE: u32 = 0x99;
 
-/// Metal's stencil after the three draws, by pixel, in each of its samples (RT6 Metal probe 9, an
-/// M4 with macOS 27.0.1, with and without Metal's API validation, every case): the fullscreen
-/// triangle is back-facing under Metal's default winding, so the third draw takes the back face.
+/// Metal's stencil after the three draws, by pixel, in each of its samples (a Metal probe on an M4
+/// with macOS 27.0.1, with and without Metal's API validation, every case): the fullscreen triangle
+/// is back-facing under Metal's default winding, so the third draw takes the back face.
 const METAL: [u8; 4] = [0x01, 0xa1, 0x00, 0x01];
 
 /// The colours the memoryless pass's first and third draws return, every pixel.
 const COLORS: [u32; 2] = [1, 2];
 
-/// Metal's colour after the memoryless pass's three draws, by pixel (RT6 Metal probe 9b, an M4
-/// with macOS 27.0.1, with and without Metal's API validation): the third draw's colour where its
+/// Metal's colour after the memoryless pass's three draws, by pixel (a Metal probe on an M4 with
+/// macOS 27.0.1, with and without Metal's API validation): the third draw's colour where its
 /// stencil test passes, the first's where it fails.
 const METAL_COLOR: [u32; 4] = [2, 1, 2, 2];
 
