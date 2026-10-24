@@ -47,7 +47,38 @@
 //! that announce them: a device whose tessellator is not Apple's orders a patch's triangles its own
 //! way, and a device without `tessellationShader` draws the emulation's. Neither can move a mark,
 //! because a mark is a set member and not a position in a triangle stream; they are named because
-//! a notice our run announces that no case names is a divergence.
+//! a notice our run announces that no case names is a divergence. Neither fired on MoltenVK over an
+//! Apple M3 Max, which is what says that venue draws a patch through Metal's own tessellator.
+//!
+//! # What the recorded answers settle
+//!
+//! The numbers below are Metal's, from the committed recordings, on an Apple M3 Max under macOS
+//! 27.0.1. They are here because each is what makes a swept value non-vacuous, and three of them
+//! answer a question the product had to guess at.
+//!
+//! - **The four partition modes answer four different point sets, on both domains.** Marked cells
+//!   over the swept factors: 33, 24, 28 and 29 for `pow2`, `integer`, `fractionalOdd` and
+//!   `fractionalEven` on the quad, and 23, 15, 16 and 21 on the triangle. No two collapse
+//!   (`tests::no_two_partition_modes_answered_the_same_marks`), which is only true because the
+//!   swept factors are non-integral: at an integral factor the four agree by construction and the
+//!   sweep would compare one answer four times.
+//! - **The factor clamp is two collapses and three answers.** 0 marks nothing (the patch is
+//!   discarded), 0.5 and 1 both mark the four corners, and 64 and 65 both mark all 4225 cells. The
+//!   two collapses are Metal's own clamp — up to 1 below the floor, down to the maximum above it —
+//!   and `tests::the_factor_clamp_is_metals_own_two_collapses` holds them, so a side that stopped
+//!   clamping would part a pair this family states must stay equal.
+//! - **Metal's factor address counts the base instance.** The `base-instance-1` leg of
+//!   `MTLTessellationFactorStepFunctionPerInstance` marks 25 cells, which is factor-4's record and
+//!   not factor-1's, so a draw of one instance from base instance 1 reads the record instance 1
+//!   reads. That is exactly the reading the control stage's module docs list as taken from Metal's
+//!   documentation **without** a Metal observation — "whether the per-instance step's instance
+//!   index includes the base instance (taken to, as `[[instance_id]]` does)" — and the product's
+//!   assumption is what Metal does.
+//! - **A typed control-point index is implemented and exact.** Both `UInt16` and `UInt32` read the
+//!   case's reversing permutation and answer the same four words, which is the answer the untyped
+//!   draw does **not** give. `pipeline::descriptor`'s `TessellationDescriptor` doc comment says a
+//!   control-point index type other than `None` "is not implemented"; it is, and the comment is
+//!   stale.
 //!
 //! # Why no case here can hang the device
 //!
@@ -1365,6 +1396,164 @@ fn load(fixture: Fixture) -> Result<crate::fixture::Loaded, Abort> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes the recording of `case` holds at the leaf `path` (node names from the root,
+    /// `/`-separated, the reserved `case` root left out), or `None` where it holds no such leaf.
+    fn recorded_bytes(case: &str, path: &str) -> Option<Vec<u8>> {
+        let recording = crate::recording::read(case).ok()?;
+        for answer in &recording.answers {
+            for outcome in &answer.outcomes {
+                let mut node = &outcome.transcript.root;
+                for name in path.split('/') {
+                    node = node.child(name)?;
+                }
+                if let Value::Bytes(bytes) = &node.observed.value {
+                    return Some(bytes.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// The cells the mark region `bytes` holds a nonzero word at.
+    fn marked(bytes: &[u8]) -> usize {
+        bytes
+            .chunks_exact(4)
+            .filter(|word| word.iter().any(|byte| *byte != 0))
+            .count()
+    }
+
+    #[test]
+    fn no_two_partition_modes_answered_the_same_marks() {
+        // The partition sweep's non-vacuity, off Metal's own recorded answers: four modes, four
+        // different point sets, on each domain. A factor list that let two of them agree would be
+        // a sweep comparing one answer twice, and this is what fails if the list is edited.
+        for (case, patch_type) in [
+            ("tessellation-partition-modes-quad", "MTLPatchTypeQuad"),
+            (
+                "tessellation-partition-modes-triangle",
+                "MTLPatchTypeTriangle",
+            ),
+        ] {
+            let answers: Vec<(Partition, Vec<u8>)> = partitions()
+                .into_iter()
+                .filter_map(|mode| {
+                    let path = format!("{patch_type}/{}/marks", partition_site(mode));
+                    recorded_bytes(case, &path).map(|bytes| (mode, bytes))
+                })
+                .collect();
+            assert_eq!(
+                answers.len(),
+                partitions().len(),
+                "{case}: every mode's marks are recorded under {patch_type}"
+            );
+            for (a, (first, left)) in answers.iter().enumerate() {
+                assert!(
+                    marked(left) > 0,
+                    "{case}: {first:?} marked no cell at all, so it compares nothing"
+                );
+                for (second, right) in answers.iter().skip(a + 1) {
+                    assert_ne!(
+                        left, right,
+                        "{case}: {first:?} and {second:?} answered the same marks, so one of the \
+                         two compares nothing new"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_factor_clamp_is_metals_own_two_collapses() {
+        // What the factor sweep measured, held as the claim the module docs make: a factor of 0
+        // marks nothing, the pair around the floor agree, the pair around the maximum agree, and
+        // the three answers are different from each other. Both collapses are Metal's clamp, so a
+        // side that stopped clamping parts a pair this test says must stay equal, and a side that
+        // stopped culling marks a region this test says must be empty.
+        let at = |site: &str| {
+            recorded_bytes("tessellation-edge-factors", &format!("{site}/marks"))
+                .unwrap_or_else(|| panic!("the recording holds {site}"))
+        };
+        let (zero, below, one, max, above) = (
+            at("factor-0"),
+            at("factor-below-1"),
+            at("factor-1"),
+            at("factor-max"),
+            at("factor-above-max"),
+        );
+        assert_eq!(marked(&zero), 0, "a factor of 0 discards the patch");
+        assert_eq!(below, one, "Metal clamps a factor below 1 up to 1");
+        assert_eq!(above, max, "Metal clamps a factor above the maximum to it");
+        assert_eq!(marked(&one), 4, "a factor of 1 marks the domain's corners");
+        assert_eq!(
+            marked(&max),
+            MARK_WORDS as usize,
+            "a factor of 64 marks every cell of the 65-by-65 grid"
+        );
+    }
+
+    #[test]
+    fn metals_factor_address_counts_the_base_instance() {
+        // The reading the control stage took from Metal's documentation with no observation behind
+        // it, now measured: a draw of one instance from base instance 1 reads the record instance 1
+        // reads, not instance 0's. The two per-instance steps are the ones the address's instance
+        // term reaches, so both are held, and the per-patch leg beside each is the control that
+        // says the move is the instance's and not the patch's.
+        for step in [Step::PerInstance, Step::PerPatchAndPerInstance] {
+            let at = |leg: &str| {
+                recorded_bytes(
+                    "tessellation-factor-steps",
+                    &format!("{}/{leg}/marks", step.name()),
+                )
+                .unwrap_or_else(|| panic!("the recording holds {}/{leg}", step.name()))
+            };
+            let (first, base_one, two) =
+                (at("patch-0"), at("base-instance-1"), at("two-instances"));
+            assert_ne!(
+                first, base_one,
+                "{step:?}: base instance 1 read instance 0's record, so Metal's factor address \
+                 does not count the base instance and the control stage's reading is wrong"
+            );
+            assert_eq!(
+                base_one, two,
+                "{step:?}: base instance 1 read the record a second drawn instance reads"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_control_point_index_answers_what_the_untyped_draw_does_not() {
+        // Both widths read the case's reversing permutation, so they answer the same words; the
+        // untyped draw reads each patch's own control points, so it does not. The first assertion
+        // is what says the two widths are a real pair rather than two spellings of one, and the
+        // second is what says the permutation reached the tessellator at all.
+        let at = |index_type: IndexType| {
+            recorded_bytes(
+                "tessellation-patch-indices",
+                &format!("{}/words", index_type.name()),
+            )
+        };
+        let short = at(IndexType::UInt16).expect("the UInt16 words");
+        let long = at(IndexType::UInt32).expect("the UInt32 words");
+        assert_eq!(
+            short, long,
+            "the two index widths name the same permutation, so they answer the same words"
+        );
+        let tags = recorded_bytes(
+            "tessellation-patch-indices",
+            "MTLTessellationControlPointIndexTypeNone/MTLVertexStepFunctionPerPatchControlPoint",
+        )
+        .expect("the untyped draw's control-point tags");
+        // The untyped draw's patch `p` reads tags `(3p, 3p + 1, 3p + 2)`, which the reversing
+        // permutation does not give any patch.
+        let expected: Vec<u8> = (0..PATCH_COUNT * CONTROL_POINTS)
+            .map(|tag| tag as u8)
+            .collect();
+        assert_eq!(
+            tags, expected,
+            "the untyped draw reads each patch's own control points in order"
+        );
+    }
 
     #[test]
     fn the_half_bits_are_metals_own() {
