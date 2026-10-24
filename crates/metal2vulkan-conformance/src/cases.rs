@@ -160,6 +160,7 @@ pub mod tile_threadgroups;
 pub mod two_plane_copies;
 pub mod two_plane_heap_blits;
 pub mod two_plane_samples;
+pub mod vertex_formats;
 pub mod visibility;
 pub mod wide_points;
 pub mod ycbcr_minify;
@@ -270,6 +271,9 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     for case in int_attributes::all() {
+        cases.push(Box::new(case));
+    }
+    for case in vertex_formats::all() {
         cases.push(Box::new(case));
     }
     for case in extended_range_planes::all() {
