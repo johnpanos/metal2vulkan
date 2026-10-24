@@ -58,6 +58,20 @@
 //!   in turn, rows packed, through a blit into a shared buffer (a two-plane format's plane 0; a
 //!   memoryless or multisampled texture is not read), a buffer's whole length.
 //!
+//! - Captured frames (NativeMetal's frame capture, `scripts/pipeline-census/frames_manifest.py`)
+//!   take these as well: a metallib with several slices is read at its AIR64 slice; a function
+//!   without `library` is looked up by name; a constant may be `"name"`d in place of its
+//!   `"index"`; a render pipeline takes `"vertexDescriptor"` (`{"attributes": [{"index", "format",
+//!   "offset", "buffer"}], "layouts": [{"index", "stride", "step", "rate"}]}`) and
+//!   `"rasterization"`; a texture may lie over a buffer (`"buffer"`, `"offset"`, `"row"`:
+//!   `newTextureWithDescriptor:offset:bytesPerRow:`); an attachment takes `"level"` and
+//!   `"slice"`; a command buffer may be `{"uploads": [{"buffer", "file"}], "encoders": [...]}`,
+//!   each upload written through the buffer's contents before the command buffer is encoded; an
+//!   encoder may be `{"blit": {"commands": [...]}}` with `copyBuffer`, `fillBuffer`,
+//!   `copyTexture`, `bufferToTexture`, `textureToBuffer` and `generateMipmaps`; and the render
+//!   commands include `{"fill": n}` and `{"depthBias": [bias, slope, clamp]}`. `--metal-level
+//!   newest` and `--unorm8-filter device` open the device as the NativeMetal bridge does.
+//!
 //! `DIR/status.txt` says `leg runtime`, `device <name>`, each degrade notice the run raised
 //! (`notice <code>`), and `ok` or `error <where>: <message>`: the first failure stops the run,
 //! and the readbacks done so far stay. The exit status is 0 for `ok`, 1 for a run that stopped,
@@ -73,15 +87,17 @@ use metal2vulkan::metal::{
     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType,
     PixelFormat, PrimitiveTopologyClass, PrimitiveType, RenderStages, ResourceUsage,
     SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter,
-    StencilOperation, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage, Winding,
+    StencilOperation, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage,
+    TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, TileRenderPipelineDescriptor,
+    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
     BlitOption, Buffer, CommandBuffer, CommandBufferStatus, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, DepthStencilState, Device, DeviceOptions, Function, Heap, HeapDescriptor,
-    HeapType, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction, MessageSink, Origin,
+    HeapType, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction, MessageSink, MetalLevel, Origin,
     PipelineOptions, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
     ResourceOptions, ResourceRef, SamplerState, ScissorRect, ShaderCacheOptions, Size, StoreAction,
     SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport,
@@ -96,7 +112,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const USAGE: &str = "usage: command-replay run --manifest FILE --out DIR --device-type cpu|gpu \
-                     --shader-cache DIR";
+                     --shader-cache DIR [--metal-level newest] [--unorm8-filter device]";
 
 /// How long a command buffer may run.
 const WAIT: Duration = Duration::from_secs(300);
@@ -189,6 +205,13 @@ fn run(options: &BTreeMap<String, String>) -> i32 {
     let notices: Arc<Mutex<Vec<String>>> = Arc::default();
     let mut device_options = DeviceOptions::default();
     device_options.shader_cache = ShaderCacheOptions::in_directory(&options["shader-cache"]);
+    if options.get("metal-level").map(String::as_str) == Some("newest") {
+        device_options.metal_level = Some(MetalLevel::NEWEST);
+    }
+    if options.get("unorm8-filter").map(String::as_str) == Some("device") {
+        device_options.policy.unorm8_linear_filter =
+            metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
+    }
     let sink = Arc::clone(&notices);
     device_options.messages = Some(MessageSink::new(move |m| {
         if m.id_name.starts_with("metal2vulkan-degrade") || m.id_name.starts_with("VUID") {
@@ -323,6 +346,60 @@ fn hex(text: &str) -> Result<Vec<u8>, String> {
 }
 
 /// The bytes of one texel of `format` (plane 0's for a two-plane format).
+/// A metallib's AIR64 slice, or the bytes themselves where they are not a fat file.
+fn air_slice(bytes: &[u8]) -> Option<&[u8]> {
+    const AIR64: u32 = 0x0100_0017;
+    let word = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    if word(0)? != 0xcafe_babe {
+        return Some(bytes);
+    }
+    for i in 0..(word(4)? as usize).min(16) {
+        let at = 8 + 20 * i;
+        if word(at)? == AIR64 {
+            let (offset, size) = (word(at + 8)? as usize, word(at + 12)? as usize);
+            return bytes.get(offset..offset.checked_add(size)?);
+        }
+    }
+    None
+}
+
+/// A render pipeline's `vertexDescriptor`: `attributes` (`index`, `format`, `offset`, `buffer`)
+/// and `layouts` (`index`, `stride`, `step`, `rate`), raw Metal enums.
+fn vertex_descriptor(vd: &Value) -> Result<VertexDescriptor, String> {
+    let mut inputs = VertexDescriptor::new();
+    for a in vd
+        .get("attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        inputs.attributes.insert(
+            u(a, "index", 0) as u32,
+            VertexAttributeDescriptor::new(
+                raw::<VertexFormat>(a, "format", 0)?,
+                u(a, "offset", 0) as u32,
+                u(a, "buffer", 0) as u32,
+            ),
+        );
+    }
+    for l in vd
+        .get("layouts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let mut layout = VertexBufferLayoutDescriptor::new(Some(u(l, "stride", 0) as u32));
+        layout.step_function = raw::<VertexStepFunction>(l, "step", 1)?;
+        layout.step_rate = u(l, "rate", 1) as u32;
+        inputs.layouts.insert(u(l, "index", 0) as u32, layout);
+    }
+    Ok(inputs)
+}
+
 fn texel_bytes(format: PixelFormat) -> Option<u64> {
     use PixelFormat as P;
     Some(match format {
@@ -399,7 +476,8 @@ impl Replay {
                 .as_str()
                 .ok_or_else(|| format!("{at}: not a file name"))?;
             let bytes = std::fs::read(self.dir.join(file)).map_err(e(&at))?;
-            let library = self.device.new_library_with_data(&bytes).map_err(e(&at))?;
+            let air = air_slice(&bytes).ok_or_else(|| format!("{at}: no AIR64 slice"))?;
+            let library = self.device.new_library_with_data(air).map_err(e(&at))?;
             self.libraries.insert(id, library);
         }
         self.functions(m)?;
@@ -417,7 +495,19 @@ impl Replay {
         for (k, encoders) in buffers.iter().enumerate() {
             let at = format!("command buffer {k}");
             let cb = self.queue().command_buffer().map_err(e(&at))?;
-            for (j, encoder) in encoders.as_array().into_iter().flatten().enumerate() {
+            for up in encoders
+                .get("uploads")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                self.upload(up).map_err(|w| format!("{at} upload: {w}"))?;
+            }
+            let list = match encoders.get("encoders") {
+                Some(list) => list,
+                None => encoders,
+            };
+            for (j, encoder) in list.as_array().into_iter().flatten().enumerate() {
                 let at = format!("command buffer {k} encoder {j}");
                 if let Some(r) = encoder.get("render") {
                     self.render_encoder(&cb, r)
@@ -425,8 +515,11 @@ impl Replay {
                 } else if let Some(c) = encoder.get("compute") {
                     self.compute_encoder(&cb, c)
                         .map_err(|w| format!("{at}: {w}"))?;
+                } else if let Some(c) = encoder.get("blit") {
+                    self.blit_encoder(&cb, c)
+                        .map_err(|w| format!("{at}: {w}"))?;
                 } else {
-                    return Err(format!("{at}: neither render nor compute"));
+                    return Err(format!("{at}: neither render, compute nor blit"));
                 }
             }
             finish(&cb).map_err(|w| format!("{at}: {w}"))?;
@@ -442,11 +535,15 @@ impl Replay {
     fn functions(&mut self, m: &Value) -> Result<(), String> {
         for (id, fv) in table(m, "functions") {
             let name = s(&fv, "name")?;
-            let lid = fv.get("library").and_then(Value::as_str).unwrap_or("");
-            let library = self
-                .libraries
-                .get(lid)
-                .ok_or_else(|| format!("function {id}: no library {lid:?}"))?;
+            let library = match fv.get("library").and_then(Value::as_str) {
+                Some(lid) => self.libraries.get(lid),
+                None => self.libraries.get("").or_else(|| {
+                    self.libraries
+                        .values()
+                        .find(|l| l.function_names().iter().any(|n| n == name))
+                }),
+            }
+            .ok_or_else(|| format!("function {id} ({name}): in no library"))?;
             let mut constants = FunctionConstantValues::defaults();
             for c in fv
                 .get("constants")
@@ -456,8 +553,14 @@ impl Replay {
             {
                 let ty: DataType = raw(c, "type", 0)?;
                 let bytes = hex(s(c, "hex")?)?;
-                let index = u32::try_from(u(c, "index", 0)).map_err(|e| e.to_string())?;
-                constants = constants.with_index(index, FunctionConstantValue::new(ty, bytes));
+                let value = FunctionConstantValue::new(ty, bytes);
+                constants = match c.get("name").and_then(Value::as_str) {
+                    Some(n) => constants.with_name(n, value),
+                    None => {
+                        let index = u32::try_from(u(c, "index", 0)).map_err(|e| e.to_string())?;
+                        constants.with_index(index, value)
+                    }
+                };
             }
             let function = match constants.is_empty() {
                 true => library.new_function_with_name(name),
@@ -631,6 +734,14 @@ impl Replay {
                 self.textures.insert(id, (texture, d));
                 continue;
             }
+            if let Some(bid) = tv.get("buffer").and_then(Value::as_str) {
+                let buffer = self.buffer(bid)?;
+                let texture = buffer
+                    .new_texture(&d, u(&tv, "offset", 0), u(&tv, "row", 0))
+                    .map_err(e(&at))?;
+                self.textures.insert(id, (texture, d));
+                continue;
+            }
             let texture = match tv.get("heap").and_then(Value::as_str) {
                 Some(h) => {
                     let heap = self
@@ -801,6 +912,10 @@ impl Replay {
             d.raster_sample_count = u(&pv, "samples", 1) as u32;
             d.alpha_to_coverage = b(&pv, "alphaToCoverage", false);
             d.input_primitive_topology = raw::<PrimitiveTopologyClass>(&pv, "topology", 0)?;
+            d.rasterization_enabled = b(&pv, "rasterization", true);
+            if let Some(vd) = pv.get("vertexDescriptor").filter(|v| v.is_object()) {
+                d.vertex_descriptor = Some(vertex_descriptor(vd)?);
+            }
             let state = self
                 .device
                 .new_render_pipeline_state(&d, &options)
@@ -894,6 +1009,8 @@ impl Replay {
             }
             let a = &mut pass.color_attachments[k];
             a.texture = Some(self.texture(s(c, "texture")?)?.clone());
+            a.level = u(c, "level", 0);
+            a.slice = u(c, "slice", 0);
             a.load_action = LoadAction::from_raw(u(c, "load", 0)).map_err(e("load"))?;
             a.store_action = StoreAction::from_raw(u(c, "store", 1)).map_err(e("store"))?;
             let cc = nums(c, "clear");
@@ -903,6 +1020,8 @@ impl Replay {
         if let Some(dv) = r.get("depth").filter(|v| !v.is_null()) {
             let a = &mut pass.depth_attachment;
             a.texture = Some(self.texture(s(dv, "texture")?)?.clone());
+            a.level = u(dv, "level", 0);
+            a.slice = u(dv, "slice", 0);
             a.load_action = LoadAction::from_raw(u(dv, "load", 0)).map_err(e("depth load"))?;
             a.store_action = StoreAction::from_raw(u(dv, "store", 0)).map_err(e("depth store"))?;
             a.clear_depth = f(dv, "clear", 1.0);
@@ -910,6 +1029,8 @@ impl Replay {
         if let Some(sv) = r.get("stencil").filter(|v| !v.is_null()) {
             let a = &mut pass.stencil_attachment;
             a.texture = Some(self.texture(s(sv, "texture")?)?.clone());
+            a.level = u(sv, "level", 0);
+            a.slice = u(sv, "slice", 0);
             a.load_action = LoadAction::from_raw(u(sv, "load", 0)).map_err(e("stencil load"))?;
             a.store_action =
                 StoreAction::from_raw(u(sv, "store", 0)).map_err(e("stencil store"))?;
@@ -1067,6 +1188,21 @@ impl Replay {
                 enc.set_front_facing_winding(w);
                 Ok(())
             }
+            "fill" => {
+                let mode =
+                    TriangleFillMode::try_from(v.as_u64().unwrap_or(0) as u32).map_err(e(name))?;
+                enc.set_triangle_fill_mode(mode).map_err(e(name))
+            }
+            "depthBias" => {
+                let n: Vec<f64> = v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_f64)
+                    .collect();
+                let at = |i: usize| n.get(i).copied().unwrap_or(0.0) as f32;
+                enc.set_depth_bias(at(0), at(1), at(2)).map_err(e(name))
+            }
             "useResource" => {
                 let id = s(v, "id")?;
                 let usage = raw::<ResourceUsage>(v, "usage", 1)?;
@@ -1199,6 +1335,118 @@ impl Replay {
                 .map_err(e(name)),
             other => Err(format!("unknown compute command {other}")),
         }
+    }
+
+    /// A buffer's bytes from a file, written through its contents (shared storage) before the
+    /// command buffer that names it is encoded.
+    fn upload(&self, up: &Value) -> Result<(), String> {
+        let buffer = self.buffer(s(up, "buffer")?)?;
+        let bytes = std::fs::read(self.dir.join(s(up, "file")?)).map_err(e("upload"))?;
+        let at = buffer.contents().ok_or("a buffer without host contents")?;
+        let n = bytes.len().min(buffer.length() as usize);
+        // SAFETY: a host-visible buffer of `length` bytes; the earlier command buffers completed.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at.as_ptr(), n) };
+        Ok(())
+    }
+
+    fn blit_encoder(&self, cb: &CommandBuffer, c: &Value) -> Result<(), String> {
+        let mut enc = cb
+            .blit_command_encoder()
+            .map_err(e("blit_command_encoder"))?;
+        let triple = |v: &Value, key: &str| -> [u64; 3] {
+            let n: Vec<u64> = v
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64)
+                .collect();
+            [0, 1, 2].map(|i| n.get(i).copied().unwrap_or(0))
+        };
+        for (k, cmd) in c
+            .get("commands")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let (name, v) = cmd
+                .as_object()
+                .and_then(|o| o.iter().next())
+                .ok_or("an empty command")?;
+            let at = format!("command {k} {name}");
+            match name.as_str() {
+                "copyBuffer" => enc.copy_from_buffer_to_buffer(
+                    self.buffer(s(v, "from")?)?,
+                    u(v, "fromOffset", 0),
+                    self.buffer(s(v, "to")?)?,
+                    u(v, "toOffset", 0),
+                    u(v, "size", 0),
+                ),
+                "fillBuffer" => {
+                    let start = u(v, "offset", 0);
+                    enc.fill_buffer(
+                        self.buffer(s(v, "buffer")?)?,
+                        start..start + u(v, "length", 0),
+                        u(v, "value", 0) as u8,
+                    )
+                }
+                "copyTexture" => {
+                    let (o, z, d) = (
+                        triple(v, "fromOrigin"),
+                        triple(v, "size"),
+                        triple(v, "toOrigin"),
+                    );
+                    enc.copy_from_texture_to_texture(
+                        self.texture(s(v, "from")?)?,
+                        u(v, "fromSlice", 0),
+                        u(v, "fromLevel", 0),
+                        Origin::new(o[0], o[1], o[2]),
+                        Size::new(z[0], z[1], z[2]),
+                        self.texture(s(v, "to")?)?,
+                        u(v, "toSlice", 0),
+                        u(v, "toLevel", 0),
+                        Origin::new(d[0], d[1], d[2]),
+                    )
+                }
+                "bufferToTexture" => {
+                    let (z, d) = (triple(v, "size"), triple(v, "origin"));
+                    enc.copy_from_buffer_to_texture(
+                        self.buffer(s(v, "buffer")?)?,
+                        u(v, "offset", 0),
+                        u(v, "row", 0),
+                        u(v, "image", 0),
+                        Size::new(z[0], z[1], z[2]),
+                        self.texture(s(v, "texture")?)?,
+                        u(v, "slice", 0),
+                        u(v, "level", 0),
+                        Origin::new(d[0], d[1], d[2]),
+                        BlitOption::None,
+                    )
+                }
+                "textureToBuffer" => {
+                    let (o, z) = (triple(v, "origin"), triple(v, "size"));
+                    enc.copy_from_texture_to_buffer(
+                        self.texture(s(v, "texture")?)?,
+                        u(v, "slice", 0),
+                        u(v, "level", 0),
+                        Origin::new(o[0], o[1], o[2]),
+                        Size::new(z[0], z[1], z[2]),
+                        self.buffer(s(v, "buffer")?)?,
+                        u(v, "offset", 0),
+                        u(v, "row", 0),
+                        u(v, "image", 0),
+                        BlitOption::None,
+                    )
+                }
+                "generateMipmaps" => {
+                    enc.generate_mipmaps(self.texture(v.as_str().ok_or("texture id")?)?)
+                }
+                other => return Err(format!("unknown blit command {other}")),
+            }
+            .map_err(e(&at))?;
+        }
+        enc.end_encoding().map_err(e("end_encoding"))
     }
 
     /// Every readback the manifest asks for, written to the output directory.
