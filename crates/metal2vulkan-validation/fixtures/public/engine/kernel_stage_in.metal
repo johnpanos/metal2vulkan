@@ -13,10 +13,12 @@ struct Fetched {
     uint4 u [[attribute(1)]];
     int i [[attribute(2)]];
     half2 h [[attribute(3)]];
+    int4 v [[attribute(4)]];
 };
 
 // Thread t = y * width + x reports every attribute's bits:
-//     out[3t] = bits(f), out[3t + 1] = u, out[3t + 2] = (bits(i), bits(h.x), bits(h.y), t)
+//     out[4t] = bits(f), out[4t + 1] = u, out[4t + 2] = (bits(i), bits(h.x), bits(h.y), t),
+//     out[4t + 3] = bits(v)
 kernel void stage_in_fetch(
     Fetched in [[stage_in]],
     device uint4 *out [[buffer(0)]],
@@ -24,9 +26,10 @@ kernel void stage_in_fetch(
     uint2 grid [[threads_per_grid]])
 {
     uint t = gid.y * grid.x + gid.x;
-    out[3 * t] = as_type<uint4>(in.f);
-    out[3 * t + 1] = in.u;
-    out[3 * t + 2] = uint4(as_type<uint>(in.i), as_type<ushort>(in.h.x), as_type<ushort>(in.h.y), t);
+    out[4 * t] = as_type<uint4>(in.f);
+    out[4 * t + 1] = in.u;
+    out[4 * t + 2] = uint4(as_type<uint>(in.i), as_type<ushort>(in.h.x), as_type<ushort>(in.h.y), t);
+    out[4 * t + 3] = as_type<uint4>(in.v);
 }
 
 struct Sample {
