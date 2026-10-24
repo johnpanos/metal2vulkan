@@ -37,7 +37,7 @@
 //! # Which values of the sweep change the observed result, and which cannot
 //!
 //! - **The option bit changes it**, at the fourth row of the table above, for compute and for
-//!   render. That is the falsifying pair, and [`FOUR_CELL`] is the family that holds it.
+//!   render. That is the falsifying pair, and the `binary-archive-fail-on-miss` case is what holds it.
 //! - **Whether an archive is listed changes it**, at the fifth row: the same bit over the same
 //!   missing key is refused with an archive listed and created without one.
 //! - **Which archives are listed changes it**, at the sixth row: an archive that holds nothing
