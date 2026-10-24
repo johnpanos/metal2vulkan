@@ -82,9 +82,6 @@ pub const USAGE_WRITE: u64 = 1 << 1;
 /// `MTLBarrierScopeBuffers`.
 pub const SCOPE_BUFFERS: u64 = 1 << 0;
 
-/// `MTLBarrierScopeTextures`.
-pub const SCOPE_TEXTURES: u64 = 1 << 1;
-
 /// `MTLAttributeStrideStatic`: the `attributeStride` argument that sets **no** per-bind stride, so
 /// the index is read as the plain setters leave it.
 ///
