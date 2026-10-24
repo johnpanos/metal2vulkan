@@ -709,6 +709,15 @@ pub enum SpecKey {
     /// which an emulated anisotropic sample reads. A slot bound to an isotropic sampler, or to
     /// none, takes 0.
     SamplerAnisotropy(SlotRef),
+    /// The bind offset of the buffer bound to a uniform-view slot modulo 16 (`u32`, default 0; a
+    /// slot bound to inline bytes, which the binder places at an aligned offset, or to nothing,
+    /// takes 0): the low bits of the slot's `SlotBindOffset` residual, which is congruent to the
+    /// bind offset modulo 16. A leaf through the view reads the residual's other bits from the push
+    /// field and these from the constant, so the driver knows each load's place in its 16-byte
+    /// vector: a constant buffer read at a constant offset from the binding is one component of one
+    /// vector, which a driver can promote to its constant registers, rather than a select among the
+    /// four (the A630's `cmps`/`sel` ladders, which held a blur's every tap weight).
+    SlotOffsetLow(SlotRef),
 }
 
 impl SpecKey {

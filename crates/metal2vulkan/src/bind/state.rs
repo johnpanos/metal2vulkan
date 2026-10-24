@@ -933,6 +933,7 @@ impl BoundBuffer {
                 device_address: device_address.is_some(),
                 length_class: length_class(length),
                 offset_alignment: offset_alignment(offset),
+                offset_low: (offset % 16) as u8,
             },
             BoundBuffer::Bytes {
                 attribute_stride, ..
@@ -1729,6 +1730,9 @@ pub enum BufferShape {
         length_class: u8,
         /// The alignment class of the bind offset, as [`BindState::shape`] computes it.
         offset_alignment: u32,
+        /// The bind offset modulo 16 (`SpecKey::SlotOffsetLow`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        offset_low: u8,
     },
     /// Inline bytes (`set*Bytes`).
     Bytes {

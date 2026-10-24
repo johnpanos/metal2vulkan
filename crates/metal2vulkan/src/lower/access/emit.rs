@@ -275,6 +275,26 @@ pub(super) fn prepare(
         return Err(cx.fail("an access names an undeclared slot view"));
     };
     let residual = cx.push_field(fb, PushField::SlotBindOffset(choice.slot))?;
+    // A uniform view's residual takes its low four bits from `SpecKey::SlotOffsetLow`: each load's
+    // place in its 16-byte vector is then a constant to the driver.
+    let residual = match view.kind {
+        ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. } => {
+            let u32_ = fb.module().ty(crate::spirv::ir::Type::Int {
+                width: 32,
+                signed: false,
+            })?;
+            let c = fb.module().spec(
+                crate::pipeline::sym::SpecKey::SlotOffsetLow(choice.slot),
+                u32_,
+                crate::spirv::ir::ConstBits(0),
+            )?;
+            let low = fb.module().const_value(c)?;
+            let mask = k32(fb, !15u32)?;
+            let high = u32_op(fb, BinOp::BitwiseAnd, residual, mask)?;
+            u32_op(fb, BinOp::BitwiseOr, high, low)?
+        }
+        ViewKind::Storage => residual,
+    };
     let off = u32_op(fb, BinOp::IAdd, residual, m)?;
     let inb = match (t.check, view.kind) {
         (Check::None, _) => None,

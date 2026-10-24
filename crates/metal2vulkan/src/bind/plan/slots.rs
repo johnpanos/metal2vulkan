@@ -181,6 +181,7 @@ pub(crate) fn bound_value(
         SpecKey::SparseTexture(slot) => sparse_texture(shape, slot),
         SpecKey::ConstantLanes(slot) => constant_lanes(shape, slot),
         SpecKey::OffsetBaseAxes(slot) => offset_base_axes(shape, slot),
+        SpecKey::SlotOffsetLow(slot) => offset_low(shape, slot),
         _ => return Ok(None),
     }))
 }
@@ -209,6 +210,19 @@ pub(crate) fn record_specialized(
         }
     }
     Ok(())
+}
+
+/// The `SpecKey::SlotOffsetLow` of `slot` for `shape`: the bind offset of the buffer bound there
+/// modulo 16; 0 for inline bytes (placed at an aligned offset) or nothing.
+fn offset_low(shape: &BindShape, slot: SlotRef) -> u64 {
+    match shape
+        .stages
+        .get(&slot.stage)
+        .and_then(|s| s.buffers.get(&slot.index))
+    {
+        Some(BufferShape::Buffer { offset_low, .. }) => u64::from(*offset_low),
+        _ => 0,
+    }
 }
 
 /// Whether `shape` binds anything at `slot`.
