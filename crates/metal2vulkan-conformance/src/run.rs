@@ -5,7 +5,7 @@
 use crate::case::{Case, Side};
 use crate::cost::{self, CaseCost, Counts};
 use crate::device::{self, Notices, Policy, ScratchCache, Venues};
-use crate::replay::replay_known;
+use crate::replay::replay;
 use crate::report::{CostRow, Report};
 use crate::runtime_side::RuntimeSide;
 
@@ -40,20 +40,14 @@ pub fn replay_on_under(
     policy: Policy,
     cases: &[Box<dyn Case>],
 ) -> Result<Report, String> {
-    let notices = Notices::default();
+    let mut notices = Notices::default();
     let cache = ScratchCache::new().map_err(|error| error.to_string())?;
     let device = device::open_under(venues, policy, &notices, &cache)?;
     // The notices a device announces as it is made are the venue's, not any case's: they say what
     // this host's driver and release cost, once, before a case runs. They go in the report's venue
-    // line, and the sink is cleared so a case's own notices site holds only what its work
-    // announced.
+    // line; no case's scope was open for them, so none of them can reach a case.
     let mut report = Report::new();
-    report.venue_announced(device.name(), notices.take());
-    // A notice is announced once per device per kind, so the codes a case provokes are the ones
-    // nothing earlier in the run provoked. The set carries forward: a case's own notices site
-    // holds its own work's notices alone, and the device's notices justify a loosened field in
-    // any case of the run.
-    let mut announced_on_device: Vec<String> = Vec::new();
+    report.venue_announced(device.name(), notices.venue());
     // The cost half's gate: the counts the runtime moved over each case, held to the bounds the
     // case's own recording carries for this venue. It rides along with the correctness replay
     // because the two readings must be of the same run, and it is cheap: two reads of
@@ -61,11 +55,12 @@ pub fn replay_on_under(
     let whole_set = cases.len() == crate::cases::all().len();
     let venue_label = device.name().to_owned();
     for case in cases {
-        let taker = notices.clone();
         let before = read_counts(&device);
         let started = std::time::Instant::now();
-        let mut side = RuntimeSide::new(&device, move || taker.take());
-        let replayed = replay_known(case.as_ref(), &mut side, &announced_on_device);
+        // The case's own notice scope, open for exactly as long as its side lives. Nothing it
+        // announces can reach another case, and nothing another case announced can reach it.
+        let mut side = RuntimeSide::new(&device, notices.open(case.name()));
+        let replayed = replay(case.as_ref(), &mut side);
         drop(side);
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let moved = match (before, read_counts(&device)) {
@@ -78,13 +73,6 @@ pub fn replay_on_under(
         };
         degraded.sort();
         degraded.dedup();
-        if let Ok(replayed) = &replayed {
-            for code in replayed.ours.announced_notices().into_keys() {
-                if !announced_on_device.contains(&code) {
-                    announced_on_device.push(code);
-                }
-            }
-        }
         report.add_cost(cost_row(
             case.as_ref(),
             &venue_label,
@@ -96,6 +84,9 @@ pub fn replay_on_under(
         ));
         report.add_result(replayed);
     }
+    // A notice that arrived with no case's scope open is the harness's own gap in attribution, not
+    // any case's difference, so it is reported rather than charged to whichever case drained next.
+    report.unattributed_notices(notices.unattributed());
     Ok(report)
 }
 
@@ -206,16 +197,16 @@ pub fn cost_on_under(
     let mut held: Vec<CaseCost> = Vec::new();
     let mut venue = String::new();
     for round in 0..runs.max(1) {
-        let notices = Notices::default();
+        let mut notices = Notices::default();
         let cache = ScratchCache::new().map_err(|error| error.to_string())?;
         let device = device::open_under(venues, policy, &notices, &cache)?;
-        notices.take();
+        // The device's own notices, read off so no case's scope ever holds them.
+        notices.venue();
         venue = device.name().to_owned();
         for (index, case) in cases.iter().enumerate() {
-            let taker = notices.clone();
             let before = read_counts(&device)?;
             let started = std::time::Instant::now();
-            let mut side = RuntimeSide::new(&device, move || taker.take());
+            let mut side = RuntimeSide::new(&device, notices.open(case.name()));
             let mut sites = crate::transcript::Sites::new();
             let inputs = case
                 .inputs()
@@ -512,7 +503,7 @@ fn open(venues: Venues, policy: Policy) -> Result<Open, String> {
     let cache = ScratchCache::new().map_err(|error| error.to_string())?;
     let device = device::open_under(venues, policy, &notices, &cache)?;
     // The notices the device announced as it was made are the venue's, not any case's.
-    notices.take();
+    notices.venue();
     Ok(Open {
         device,
         notices,
@@ -561,8 +552,10 @@ pub fn times_on_under(
             };
             let open = warm.as_mut().or(cold.as_mut()).expect("one of the two");
             venue = open.device.name().to_owned();
-            let taker = open.notices.clone();
-            let side = RuntimeSide::new(&open.device, move || taker.take());
+            let Open {
+                device, notices, ..
+            } = open;
+            let side = RuntimeSide::new(device, notices.open(case.name()));
             round.push(timed(case.as_ref(), side)?);
         }
         taken.push(round);
