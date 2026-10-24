@@ -670,7 +670,7 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
         DriverId::INTEL_OPEN_SOURCE_MESA,
         (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
     ),
-    // Turnip (Mesa 26.2.0-devel with the Darwin KMD) on the Adreno 630 of the OnePlus 6T (fajita, UniXNU): the device's 8-bit
+    // Turnip (Mesa 26.2.0-devel, driverVersion 26.1.99, with the Darwin KMD) on the Adreno 630 of the OnePlus 6T (fajita, UniXNU): the device's 8-bit
     // linear filter, taken by the owner of that port to drop the exact emulation that made the render server's fragment
     // functions ~1,000 instructions on that GPU. Checked against the exact filter on the render server's own frames (lock and
     // home screens, 540x1170 captures: no channel more than one code apart), not by the deviation probe.
@@ -679,7 +679,8 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
         driver: DriverId::MESA_TURNIP,
         vendor: Some(QUALCOMM_VENDOR_ID),
         device: Some(QUALCOMM_ADRENO_630),
-        first: mesa(26, 2, 0),
+        // 26.2.0-devel reports driverVersion 26.1.99 (vk_get_driver_version).
+        first: mesa(26, 1, 99),
         last: mesa(26, 2, 0),
     },
     Measured {
