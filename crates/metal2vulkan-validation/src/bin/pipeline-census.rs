@@ -17,8 +17,16 @@
 //! metallib with several slices is read at its AIR64 slice, as the Apple platforms' Metal reads it.
 //!
 //! A state's creation makes the `VkPipeline` its first draw is predicted to take, inside the
-//! creation, so the driver compiles each state's shaders here; draws that bind other textures or
-//! strides make other pipelines, which this does not see (`command-replay` runs them). The device
+//! creation, so the driver compiles each state's shaders here. A draw whose bindings key another
+//! pipeline makes its own at the draw: the manifest's `draws` table (`{DID: {"render": PID,
+//! "primitive", "indexType"?, "pass": {"colors": [{"format", "samples"} or null], "depth"?,
+//! "stencil"?, "samples"}, "depthStencil"?, "raster"?: [cull, winding, fill], "slots": {"<v|f><b|t|s><index>":
+//! {"buffer": length, "offset"} | {"bytes": length} | <texture: "type", "format", "width",
+//! "height", "depth", "levels", "samples", "array", "usage", "options", "over"?, "offset", "row">
+//! | <sampler: command-replay's keys and "lodAverage">}}}`) encodes each draw alone, of three
+//! vertices, over zeroed resources of those shapes, in a pass of at most 64x64, commits it and
+//! waits for the runtime to go quiet; its row reports what the draw made (`on_predicted`: the
+//! draw ran on its state's predicted pipeline; `variant_pipelines`). The device
 //! is the default device (`VK_DRIVER_FILES` and the ICD's own variables choose it), opened with
 //! the newest Metal level, a new empty shader cache, the creation log on
 //! (`METAL2VULKAN_LOG_PIPELINES`), and, unless `--unorm8-filter exact`, the device's own 8-bit
@@ -29,7 +37,7 @@
 //! parsed for the driver's statistics lines (`; <STAGE> prog <n>/<v>: ...`). `--keep-logs` keeps
 //! each state's file as `DIR/logs/<id>.log`.
 //!
-//! **Outputs.** `DIR/census.tsv`: one row per state and driver shader (a state whose driver printed
+//! **Outputs.** `DIR/census.tsv`: one row per state or draw and driver shader (a state whose driver printed
 //! nothing has one row with empty statistics), columns named on its first line. `DIR/census.jsonl`:
 //! one object per state with the same values. `DIR/status.txt`: the device, each failure, and `ok`.
 //! The exit status is 0 when every state was made, 1 when any was refused, 2 for a harness failure.
@@ -37,18 +45,24 @@
 //! GUEST DATA: a manifest made from a guest's capture, its libraries and every output here are the
 //! consumer's: they stay on the hosts the guest data rule allows and are never committed.
 
+use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{
-    BlendFactor, BlendOperation, ColorWriteMask, DataType, PixelFormat, PrimitiveTopologyClass,
-    VertexFormat, VertexStepFunction,
+    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType,
+    PixelFormat, PrimitiveTopologyClass, PrimitiveType, SamplerAddressMode, SamplerBorderColor,
+    SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType, TextureUsage,
+    TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
-    Device, DeviceOptions, Function, Library, MessageSink, MetalLevel, PipelineOptions,
-    ShaderCacheOptions,
+    Buffer, CommandBufferStatus, CommandQueue, Device, DeviceOptions, Function, Library,
+    LoadAction, MessageSink, MetalLevel, PipelineOptions, RenderPassDescriptor,
+    RenderPipelineState, ResourceOptions, SamplerState, ShaderCacheOptions, StoreAction, Texture,
+    TextureDescriptor,
 };
 use metal2vulkan_validation::candidate::runtime_case::{open_device, ScratchCache};
 use metal2vulkan_validation::gpu::DeviceType;
@@ -304,10 +318,45 @@ fn largest_words(lines: &[String]) -> Option<u64> {
     lines
         .iter()
         .filter_map(|l| {
+            let l = l.strip_prefix("metal2vulkan-pipeline-creation: ")?;
             let at = l.find("largest module ")? + "largest module ".len();
             l[at..].split(' ').next()?.parse::<u64>().ok()
         })
         .max()
+}
+
+/// One state's or draw's rows: one per driver shader (one with empty statistics where the driver
+/// printed none) in the TSV, and its record with the shaders in the JSON lines.
+fn write_rows(
+    tsv: &mut std::fs::File,
+    jsonl: &mut std::fs::File,
+    base: &[String],
+    found: &[Shader],
+    mut record: Value,
+) -> Result<(), String> {
+    let rows: Vec<Option<&Shader>> = match found.is_empty() {
+        true => vec![None],
+        false => found.iter().map(Some).collect(),
+    };
+    for shader in rows {
+        let mut cells: Vec<String> = base.to_vec();
+        cells.push(shader.map(|s| s.stage.clone()).unwrap_or_default());
+        cells.push(shader.map(|s| s.program.clone()).unwrap_or_default());
+        for k in STATS {
+            cells.push(
+                shader
+                    .and_then(|s| s.stats.get(k))
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        writeln!(tsv, "{}", cells.join("\t")).map_err(|e| e.to_string())?;
+    }
+    record["shaders"] = found
+        .iter()
+        .map(|s| json!({"stage": s.stage, "program": s.program, "stats": s.stats}))
+        .collect();
+    writeln!(jsonl, "{record}").map_err(|e| e.to_string())
 }
 
 struct Census {
@@ -318,6 +367,8 @@ struct Census {
     creation_log: Arc<Mutex<Vec<String>>>,
     out: PathBuf,
     keep_logs: bool,
+    states: BTreeMap<String, RenderPipelineState>,
+    queue: Option<CommandQueue>,
 }
 
 fn run(options: &BTreeMap<String, String>) -> i32 {
@@ -366,10 +417,8 @@ fn run(options: &BTreeMap<String, String>) -> i32 {
             metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
     }
     device_options.messages = Some(MessageSink::new(move |m| {
-        if m.id_name == "metal2vulkan-pipeline-creation" {
-            if let Ok(mut lines) = sink.lock() {
-                lines.push(m.text.clone());
-            }
+        if let Ok(mut lines) = sink.lock() {
+            lines.push(format!("{}: {}", m.id_name, m.text));
         }
     }));
     let device = match open_device(DeviceType::Gpu, device_options) {
@@ -389,6 +438,8 @@ fn run(options: &BTreeMap<String, String>) -> i32 {
         creation_log,
         out: out.clone(),
         keep_logs: options.contains_key("keep-logs"),
+        states: BTreeMap::new(),
+        queue: None,
     };
     let only: Option<Vec<String>> = options
         .get("only")
@@ -491,16 +542,16 @@ impl Census {
             let (wall0, cpu0) = (Instant::now(), thread_cpu());
             if result.is_ok() {
                 result = match kind {
-                    "render" => self.render(&pv),
+                    "render" => self.render(&pv).map(|state| {
+                        self.states.insert(id.clone(), state);
+                    }),
                     _ => self.compute(&pv),
                 };
             }
             let (wall, cpu) = (wall0.elapsed(), thread_cpu() - cpu0);
             capture.end().map_err(|e| format!("capture: {e}"))?;
             let text = std::fs::read_to_string(&log_path).unwrap_or_default();
-            if !self.keep_logs {
-                let _ = std::fs::remove_file(&log_path);
-            }
+            self.finish_log(&log_path);
             let words = self
                 .creation_log
                 .lock()
@@ -540,37 +591,405 @@ impl Census {
                 cpu.as_micros().to_string(),
                 words.map(|w| w.to_string()).unwrap_or_default(),
             ];
-            let rows: Vec<Option<&Shader>> = match found.is_empty() {
-                true => vec![None],
-                false => found.iter().map(Some).collect(),
-            };
-            for shader in rows {
-                let mut cells: Vec<String> = base.to_vec();
-                cells.push(shader.map(|s| s.stage.clone()).unwrap_or_default());
-                cells.push(shader.map(|s| s.program.clone()).unwrap_or_default());
-                for k in STATS {
-                    cells.push(
-                        shader
-                            .and_then(|s| s.stats.get(k))
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
-                    );
-                }
-                writeln!(tsv, "{}", cells.join("\t")).map_err(|e| e.to_string())?;
-            }
             let record = json!({
                 "id": id, "kind": kind, "label": label, "ok": result.is_ok(),
                 "error": result.as_ref().err(), "vertex": vertex, "fragment": fragment,
                 "fn_wall_us": fn_wall, "fn_cpu_us": fn_cpu,
                 "wall_us": wall.as_micros() as u64, "cpu_us": cpu.as_micros() as u64,
                 "spirv_words": words,
-                "shaders": found.iter().map(|s| json!({
-                    "stage": s.stage, "program": s.program, "stats": s.stats,
-                })).collect::<Vec<_>>(),
             });
-            writeln!(jsonl, "{record}").map_err(|e| e.to_string())?;
+            write_rows(&mut tsv, &mut jsonl, &base, &found, record)?;
+        }
+        refused += self.draws(m, only, status, &mut tsv, &mut jsonl)?;
+        Ok(refused)
+    }
+
+    /// Encodes each of the manifest's `draws` on its state, alone in a pass of its own, and commits
+    /// it: the `VkPipeline` the draw's bindings key is made at the draw. The number refused.
+    fn draws(
+        &mut self,
+        m: &Value,
+        only: Option<&[String]>,
+        status: &mut std::fs::File,
+        tsv: &mut std::fs::File,
+        jsonl: &mut std::fs::File,
+    ) -> Result<usize, String> {
+        let mut refused = 0;
+        for (id, dv) in table(m, "draws") {
+            let Ok(pid) = s(&dv, "render") else { continue };
+            if only.is_some_and(|o| !o.iter().any(|x| x == &id || x == pid)) {
+                continue;
+            }
+            if !self.states.contains_key(pid) {
+                continue;
+            }
+            if self.queue.is_none() {
+                self.queue = Some(self.device.new_command_queue().map_err(|e| e.to_string())?);
+            }
+            let log_path = self.out.join("logs").join(format!("{id}.log"));
+            let capture = Capture::begin(&log_path).map_err(|e| format!("capture: {e}"))?;
+            if let Ok(mut lines) = self.creation_log.lock() {
+                lines.clear();
+            }
+            let (wall0, cpu0) = (Instant::now(), thread_cpu());
+            let before = self.device.work_counts();
+            let result = self.draw(pid, &dv);
+            self.settle();
+            let after = self.device.work_counts();
+            let (wall, cpu) = (wall0.elapsed(), thread_cpu() - cpu0);
+            capture.end().map_err(|e| format!("capture: {e}"))?;
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            self.finish_log(&log_path);
+            let words = self
+                .creation_log
+                .lock()
+                .ok()
+                .and_then(|l| largest_words(&l));
+            let found = shaders(&text);
+            if let Err(why) = &result {
+                refused += 1;
+                let _ = writeln!(status, "refused draw {id}: {why}");
+            }
+            let p = table(m, "renderPipelines")
+                .into_iter()
+                .find(|(k, _)| k == pid)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            let name_of = |key: &str| -> String {
+                p.get(key)
+                    .and_then(Value::as_str)
+                    .and_then(|f| self.function_us.get(f))
+                    .map(|(_, _, n)| n.clone())
+                    .unwrap_or_default()
+            };
+            let label = p.get("label").and_then(Value::as_str).unwrap_or("-");
+            let (vertex, fragment) = (name_of("vertex"), name_of("fragment"));
+            let base = [
+                id.clone(),
+                format!("draw:{pid}"),
+                label.to_string(),
+                u8::from(result.is_ok()).to_string(),
+                vertex.clone(),
+                fragment.clone(),
+                String::new(),
+                String::new(),
+                wall.as_micros().to_string(),
+                cpu.as_micros().to_string(),
+                words.map(|w| w.to_string()).unwrap_or_default(),
+            ];
+            let record = json!({
+                "id": id, "kind": "draw", "render": pid, "label": label, "ok": result.is_ok(),
+                "on_predicted": after.creation_pipelines_drawn - before.creation_pipelines_drawn,
+                "variant_pipelines": after.variant_pipelines_made - before.variant_pipelines_made,
+                "shader_modules": after.shader_modules_made - before.shader_modules_made,
+                "error": result.as_ref().err(), "vertex": vertex, "fragment": fragment,
+                "wall_us": wall.as_micros() as u64, "cpu_us": cpu.as_micros() as u64,
+                "spirv_words": words,
+            });
+            write_rows(tsv, jsonl, &base, &found, record)?;
         }
         Ok(refused)
+    }
+
+    /// One draw of state `pid` with the bindings `dv` records, committed and waited for.
+    fn draw(&self, pid: &str, dv: &Value) -> Result<(), String> {
+        let state = &self.states[pid];
+        let queue = self.queue.as_ref().ok_or("no queue")?;
+        let pass_v = dv.get("pass").cloned().unwrap_or_default();
+        let size = |key: &str| u(&pass_v, key, 16).clamp(1, 64);
+        let (width, height) = (size("width"), size("height"));
+        let attachment = |a: &Value| -> Result<Option<Texture>, String> {
+            if a.is_null() || a.get("format").is_none() {
+                return Ok(None);
+            }
+            let format: PixelFormat = raw(a, "format", 0)?;
+            let mut d = TextureDescriptor::texture_2d(format, width, height, false);
+            d.sample_count = u(a, "samples", 1).max(1);
+            if d.sample_count > 1 {
+                d.texture_type = TextureType::Type2DMultisample;
+            }
+            d.usage = TextureUsage::RENDER_TARGET;
+            self.device
+                .new_texture(&d)
+                .map(Some)
+                .map_err(|e| format!("attachment: {e}"))
+        };
+        let mut pass = RenderPassDescriptor::new();
+        for (k, c) in pass_v
+            .get("colors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if k < pass.color_attachments.len() {
+                if let Some(t) = attachment(c)? {
+                    let a = &mut pass.color_attachments[k];
+                    a.texture = Some(t);
+                    a.load_action = LoadAction::Clear;
+                    a.store_action = StoreAction::Store;
+                }
+            }
+        }
+        let depth = pass_v.get("depth").cloned().unwrap_or_default();
+        let stencil = pass_v.get("stencil").cloned().unwrap_or_default();
+        let depth_texture = attachment(&depth)?;
+        let stencil_texture = match (stencil.get("format"), depth.get("format")) {
+            (Some(a), Some(b)) if a == b => depth_texture.clone(),
+            _ => attachment(&stencil)?,
+        };
+        if let Some(t) = depth_texture {
+            pass.depth_attachment.texture = Some(t);
+            pass.depth_attachment.load_action = LoadAction::Clear;
+            pass.depth_attachment.store_action = StoreAction::DontCare;
+        }
+        if let Some(t) = stencil_texture {
+            pass.stencil_attachment.texture = Some(t);
+            pass.stencil_attachment.load_action = LoadAction::Clear;
+            pass.stencil_attachment.store_action = StoreAction::DontCare;
+        }
+        pass.render_target_width = width;
+        pass.render_target_height = height;
+        pass.default_raster_sample_count = u(&pass_v, "samples", 1).max(1);
+        let cb = queue.command_buffer().map_err(|e| e.to_string())?;
+        let mut enc = cb
+            .render_command_encoder(&pass)
+            .map_err(|e| format!("render encoder: {e}"))?;
+        enc.set_render_pipeline_state(state)
+            .map_err(|e| format!("pipeline: {e}"))?;
+        // Every resource lives until the command buffer completed.
+        let mut keep: (Vec<Buffer>, Vec<Texture>, Vec<SamplerState>) = Default::default();
+        let slots = dv
+            .get("slots")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (slot, bv) in &slots {
+            let (stage, rest) = slot.split_at(1);
+            let (kind, index) = rest.split_at(1);
+            let index: u32 = index.parse().map_err(|_| format!("slot {slot}"))?;
+            let fragment = match stage {
+                "v" => false,
+                "f" => true,
+                _ => continue,
+            };
+            let at = format!("slot {slot}");
+            match kind {
+                "b" if bv.get("bytes").is_some() => {
+                    let bytes = vec![0u8; u(bv, "bytes", 0) as usize];
+                    match fragment {
+                        true => enc.set_fragment_bytes(&bytes, index),
+                        false => enc.set_vertex_bytes(&bytes, index),
+                    }
+                    .map_err(|e| format!("{at}: {e}"))?;
+                }
+                "b" => {
+                    let offset = u(bv, "offset", 0);
+                    let length = u(bv, "buffer", 4096).clamp(offset + 16, 1 << 22);
+                    let buffer = self
+                        .device
+                        .new_buffer(length, ResourceOptions::shared())
+                        .map_err(|e| format!("{at}: {e}"))?;
+                    match fragment {
+                        true => enc.set_fragment_buffer(Some(&buffer), offset, index),
+                        false => enc.set_vertex_buffer(Some(&buffer), offset, index),
+                    }
+                    .map_err(|e| format!("{at}: {e}"))?;
+                    keep.0.push(buffer);
+                }
+                "t" => {
+                    let texture = self
+                        .texture(bv, &mut keep.0)
+                        .map_err(|e| format!("{at}: {e}"))?;
+                    match fragment {
+                        true => enc.set_fragment_texture(Some(&texture), index),
+                        false => enc.set_vertex_texture(Some(&texture), index),
+                    }
+                    .map_err(|e| format!("{at}: {e}"))?;
+                    keep.1.push(texture);
+                }
+                "s" => {
+                    let sampler = self.sampler(bv).map_err(|e| format!("{at}: {e}"))?;
+                    match fragment {
+                        true => enc.set_fragment_sampler_state(Some(&sampler), index),
+                        false => enc.set_vertex_sampler_state(Some(&sampler), index),
+                    }
+                    .map_err(|e| format!("{at}: {e}"))?;
+                    keep.2.push(sampler);
+                }
+                _ => return Err(format!("{at}: unknown kind")),
+            }
+        }
+        let depth_stencil = match dv.get("depthStencil").filter(|v| v.is_object()) {
+            Some(ds) => {
+                let mut d = DepthStencilDescriptor::default();
+                d.depth_compare_function = raw::<CompareFunction>(ds, "compare", 7)?;
+                d.depth_write_enabled = b(ds, "write", false);
+                if let Some(sv) = ds.get("stencil").filter(|v| v.is_object()) {
+                    let mut face = StencilDescriptor::default();
+                    face.stencil_compare_function = raw::<CompareFunction>(sv, "compare", 7)?;
+                    face.stencil_failure_operation = raw::<StencilOperation>(sv, "fail", 0)?;
+                    face.depth_failure_operation = raw::<StencilOperation>(sv, "depthFail", 0)?;
+                    face.depth_stencil_pass_operation = raw::<StencilOperation>(sv, "pass", 0)?;
+                    face.read_mask = u(sv, "read", 0xffff_ffff) as u32;
+                    face.write_mask = u(sv, "write", 0xffff_ffff) as u32;
+                    d.front_face_stencil = face;
+                    d.back_face_stencil = face;
+                }
+                Some(
+                    self.device
+                        .new_depth_stencil_state(&d)
+                        .map_err(|e| format!("depth-stencil: {e}"))?,
+                )
+            }
+            None => None,
+        };
+        if let Some(ds) = &depth_stencil {
+            enc.set_depth_stencil_state(ds)
+                .map_err(|e| format!("depth-stencil: {e}"))?;
+        }
+        let raster: Vec<u64> = dv
+            .get("raster")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .collect();
+        if let [cull, winding, fill] = raster[..] {
+            enc.set_cull_mode(CullMode::try_from(cull as u32).map_err(|e| format!("cull: {e:?}"))?);
+            enc.set_front_facing_winding(
+                Winding::try_from(winding as u32).map_err(|e| format!("winding: {e:?}"))?,
+            );
+            enc.set_triangle_fill_mode(
+                TriangleFillMode::try_from(fill as u32).map_err(|e| format!("fill: {e:?}"))?,
+            )
+            .map_err(|e| format!("fill: {e}"))?;
+        }
+        let primitive: PrimitiveType = raw(dv, "primitive", 3)?;
+        match dv.get("indexType").and_then(Value::as_u64) {
+            Some(k) => {
+                let indices = self
+                    .device
+                    .new_buffer(64, ResourceOptions::shared())
+                    .map_err(|e| format!("index buffer: {e}"))?;
+                enc.draw_indexed_primitives(
+                    primitive,
+                    3,
+                    IndexType::try_from(k as u32).map_err(|e| format!("index type: {e:?}"))?,
+                    &indices,
+                    0,
+                    1,
+                    0,
+                    0,
+                )
+                .map_err(|e| format!("draw: {e}"))?;
+                keep.0.push(indices);
+            }
+            None => enc
+                .draw_primitives(primitive, 0, 3, 1, 0)
+                .map_err(|e| format!("draw: {e}"))?,
+        }
+        enc.end_encoding().map_err(|e| format!("end: {e}"))?;
+        cb.commit().map_err(|e| format!("commit: {e}"))?;
+        cb.wait_until_completed_for(std::time::Duration::from_secs(60))
+            .map_err(|_| "the command buffer did not complete".to_string())?;
+        drop(keep);
+        match cb.status() {
+            CommandBufferStatus::Completed => Ok(()),
+            other => Err(format!(
+                "the command buffer ended {other:?}: {:?}",
+                cb.error()
+            )),
+        }
+    }
+
+    /// A texture as the capture recorded it bound: over a buffer at its offset and rows where it
+    /// was (a surface's or a buffer's), else its own; a view is made as a texture of its own.
+    fn texture(&self, tv: &Value, keep: &mut Vec<Buffer>) -> Result<Texture, String> {
+        let format: PixelFormat = raw(tv, "format", 0)?;
+        let width = u(tv, "width", 1).clamp(1, 4096);
+        let height = u(tv, "height", 1).clamp(1, 4096);
+        let mut d = TextureDescriptor::texture_2d(format, width, height, false);
+        d.texture_type = raw::<TextureType>(tv, "type", 2)?;
+        d.depth = u(tv, "depth", 1).max(1);
+        d.mipmap_level_count = u(tv, "levels", 1).max(1);
+        d.array_length = u(tv, "array", 1).max(1);
+        d.sample_count = u(tv, "samples", 1).max(1);
+        d.usage = raw::<TextureUsage>(tv, "usage", 1)?;
+        d.resource_options =
+            ResourceOptions::from_raw(u(tv, "options", 0)).map_err(|e| e.to_string())?;
+        let over = tv.get("over").and_then(Value::as_str);
+        let row = u(tv, "row", 0);
+        if over.is_some() && row > 0 {
+            let offset = u(tv, "offset", 0);
+            let length = offset + row * height + 4096;
+            let buffer = self
+                .device
+                .new_buffer(length, d.resource_options)
+                .map_err(|e| format!("buffer: {e}"))?;
+            let texture = buffer
+                .new_texture(&d, offset, row)
+                .map_err(|e| format!("texture over buffer: {e}"))?;
+            keep.push(buffer);
+            return Ok(texture);
+        }
+        self.device.new_texture(&d).map_err(|e| e.to_string())
+    }
+
+    fn sampler(&self, sv: &Value) -> Result<SamplerState, String> {
+        let mut d = SamplerDescriptor::default();
+        d.min_filter = raw::<SamplerMinMagFilter>(sv, "min", 0)?;
+        d.mag_filter = raw::<SamplerMinMagFilter>(sv, "mag", 0)?;
+        d.mip_filter = raw::<SamplerMipFilter>(sv, "mip", 0)?;
+        d.s_address_mode = raw::<SamplerAddressMode>(sv, "s", 0)?;
+        d.t_address_mode = raw::<SamplerAddressMode>(sv, "t", 0)?;
+        d.r_address_mode = raw::<SamplerAddressMode>(sv, "r", 0)?;
+        d.border_color = raw::<SamplerBorderColor>(sv, "border", 0)?;
+        d.normalized_coordinates = b(sv, "normalized", true);
+        d.lod_min_clamp = sv.get("lodMin").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        d.lod_max_clamp = sv
+            .get("lodMax")
+            .and_then(Value::as_f64)
+            .unwrap_or(f64::from(f32::MAX)) as f32;
+        d.lod_average = b(sv, "lodAverage", false);
+        d.max_anisotropy = u(sv, "maxAniso", 1).max(1) as u32;
+        d.compare_function = raw::<CompareFunction>(sv, "compare", 0)?;
+        self.device.new_sampler_state(&d).map_err(|e| e.to_string())
+    }
+
+    /// Waits until the runtime has said nothing for 300 ms (at most 10 s): a draw whose own
+    /// pipeline is not made yet runs on its state's predicted one while its own is made on a pool
+    /// thread, which reports through the creation log when it is done.
+    fn settle(&self) {
+        let count = || self.creation_log.lock().map(|l| l.len()).unwrap_or(0);
+        let began = Instant::now();
+        let (mut seen, mut quiet) = (count(), Instant::now());
+        while began.elapsed() < std::time::Duration::from_secs(10)
+            && quiet.elapsed() < std::time::Duration::from_millis(300)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let now = count();
+            if now != seen {
+                (seen, quiet) = (now, Instant::now());
+            }
+        }
+    }
+
+    /// Keeps a creation's log with the runtime's creation-log lines after the driver's output
+    /// (`--keep-logs`), or removes it.
+    fn finish_log(&self, path: &Path) {
+        if !self.keep_logs {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        if let (Ok(mut f), Ok(lines)) = (
+            std::fs::OpenOptions::new().append(true).open(path),
+            self.creation_log.lock(),
+        ) {
+            for line in lines.iter() {
+                let _ = writeln!(f, "metal2vulkan: {line}");
+            }
+        }
     }
 
     /// Makes function `id` once, timing its specialization.
@@ -633,7 +1052,7 @@ impl Census {
         Ok(StageSource::Function(f.function_descriptor()))
     }
 
-    fn render(&self, pv: &Value) -> Result<(), String> {
+    fn render(&self, pv: &Value) -> Result<RenderPipelineState, String> {
         let mut d = RenderPipelineDescriptor::new(self.stage(s(pv, "vertex")?)?);
         d.fragment = match pv.get("fragment").and_then(Value::as_str) {
             Some(fid) => Some(self.stage(fid)?),
@@ -704,7 +1123,6 @@ impl Census {
         }
         self.device
             .new_render_pipeline_state(&d, &PipelineOptions::default())
-            .map(drop)
             .map_err(|e| e.to_string())
     }
 
