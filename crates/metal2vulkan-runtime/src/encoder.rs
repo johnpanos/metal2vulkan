@@ -719,8 +719,9 @@ impl EncoderCore {
     /// Note a recorded command that used the shadowed textures `shadows` and had `uses`.
     pub(super) fn shadows_used(&mut self, shadows: &[ShadowUse], uses: &[Use<ResourceKey>]) {
         let aliased = self.aliased(uses);
-        self.shadows
-            .after(shadows, aliased.as_deref().unwrap_or(uses));
+        let uses = aliased.as_deref().unwrap_or(uses);
+        self.device().shared().stated_shadows.written(uses);
+        self.shadows.after(shadows, uses);
     }
 
     /// Record shadowed textures' `copies` as commands of the encoder: ordered as any command
@@ -730,6 +731,8 @@ impl EncoderCore {
         for copy in copies {
             let stages = copy.stages();
             let uses = copy.uses();
+            // A copy back (or merge) of another shadow over the same bytes writes them.
+            self.device().shared().stated_shadows.written(&uses);
             if self.uses.ordered() {
                 self.command(stages, &uses, |device, raw| {
                     // SAFETY: the encoder's command buffer is recording outside a render pass;

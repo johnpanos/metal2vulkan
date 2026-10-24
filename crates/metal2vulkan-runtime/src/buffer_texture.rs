@@ -997,6 +997,7 @@ impl Texels {
             },
             tracked: self.tracked(),
             drops_writes: false,
+            held: Default::default(),
         })
     }
 
@@ -1140,6 +1141,7 @@ impl Texels {
             shadow_range,
             tracked: texels.tracked(),
             drops_writes: false,
+            held: Default::default(),
         };
         texels.staged = Some(Arc::new(copies));
         let (offset, alignment) = (
@@ -1260,6 +1262,7 @@ impl Texels {
             },
             tracked: self.tracked(),
             drops_writes: false,
+            held: Default::default(),
         })
     }
 

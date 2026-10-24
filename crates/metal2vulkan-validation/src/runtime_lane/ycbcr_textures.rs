@@ -1566,6 +1566,157 @@ fn ycbcr_textures_follow_writes_of_their_planes() {
     });
 }
 
+/// A texture whose owner states its surface's contents (`Texture::set_contents_generation`, an
+/// IOSurface's seed) converts at its first encoder and not again while the generation stands and
+/// nothing writes its planes: reads in later command buffers take no conversion. Every way the
+/// planes' bytes are written still converts again before the next read: through the textures
+/// over the planes (in an earlier command buffer, an earlier encoder, an earlier dispatch), a
+/// blit, and the CPU, whose writes the owner states as a new generation.
+#[test]
+fn a_stated_ycbcr_texture_converts_once_until_its_planes_change() {
+    on_device(|device, _messages| {
+        let kernels = Kernels::new(device);
+        let surface = buffer_with(device, &uniform(0, 0, 0)).unwrap();
+        let texture = ycbcr_texture(
+            &surface,
+            Some(facts(VIDEO, None)),
+            TextureUsage::SHADER_READ,
+        )
+        .unwrap();
+        let luma = plane_texture(&surface, PixelFormat::R8Unorm, [W, H], 0);
+        let chroma = plane_texture(&surface, PixelFormat::RG8Unorm, [CW, CH], CHROMA_AT);
+        let queue = device.new_command_queue().unwrap();
+        let mut generation = 1;
+        texture.set_contents_generation(generation);
+        let copies = || device.work_counts().shadow_copies;
+        // Unwritten: one conversion, then none.
+        let zero = ycbcr_texel(YCbCrRange::Video, YCbCrMatrix::Bt601, 0, 0, 0);
+        let before = copies();
+        for _ in 0..3 {
+            let got = grid(&texels_of(device, &kernels.read, &texture, None));
+            assert!(got.iter().all(|t| *t == zero));
+        }
+        assert_eq!(copies() - before, 1, "one conversion for three reads");
+        let writers = [
+            Writer::EarlierCommandBuffer,
+            Writer::EarlierEncoder,
+            Writer::EarlierDispatch,
+            Writer::Blit,
+            Writer::Cpu,
+        ];
+        let out = device
+            .new_buffer(16 * W * H, ResourceOptions::shared())
+            .unwrap();
+        for (round, writer) in writers.into_iter().enumerate() {
+            let k = round as u8;
+            let (y, cb, cr) = (40 + 37 * k, 200 - 23 * k, 60 + 31 * k);
+            let code = |c: u8| f32::from(c) / 255.0;
+            let fill = |texture: &Texture, value: [f32; 4]| {
+                let bytes: Vec<u8> = value.iter().flat_map(|v| v.to_le_bytes()).collect();
+                (texture.clone(), buffer_with(device, &bytes).unwrap())
+            };
+            let fills = [
+                (fill(&luma, [code(y), 0.0, 0.0, 1.0]), [W, H]),
+                (fill(&chroma, [code(cb), code(cr), 0.0, 1.0]), [CW, CH]),
+            ];
+            let command_buffer = queue.command_buffer().unwrap();
+            let write_kernels = |command_buffer: &CommandBuffer| {
+                for ((texture, value), size) in &fills {
+                    dispatch(command_buffer, &kernels.fill, texture, value, None, *size);
+                }
+            };
+            match writer {
+                Writer::EarlierCommandBuffer => {
+                    let earlier = queue.command_buffer().unwrap();
+                    write_kernels(&earlier);
+                    earlier.commit().unwrap();
+                    earlier.wait_until_completed_for(WAIT).unwrap();
+                }
+                Writer::EarlierEncoder => write_kernels(&command_buffer),
+                Writer::EarlierDispatch => {}
+                Writer::Blit => {
+                    let source = buffer_with(device, &uniform(y, cb, cr)).unwrap();
+                    let mut blit = command_buffer.blit_command_encoder().unwrap();
+                    for (texture, offset, size) in
+                        [(&luma, 0, [W, H]), (&chroma, CHROMA_AT, [CW, CH])]
+                    {
+                        blit.copy_from_buffer_to_texture(
+                            &source,
+                            offset,
+                            ROW,
+                            0,
+                            Size::new(size[0], size[1], 1),
+                            texture,
+                            0,
+                            0,
+                            Origin::new(0, 0, 0),
+                            BlitOption::None,
+                        )
+                        .unwrap();
+                    }
+                    blit.end_encoding().unwrap();
+                }
+                Writer::Cpu => {
+                    let bytes = uniform(y, cb, cr);
+                    let contents = surface.contents().unwrap();
+                    // SAFETY: a Shared buffer of `LENGTH` bytes no command uses now (every
+                    // round waits for its command buffer).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            contents.as_ptr(),
+                            LENGTH as usize,
+                        )
+                    };
+                    // The owner sees the CPU's write as a new seed.
+                    generation += 1;
+                    texture.set_contents_generation(generation);
+                }
+            }
+            {
+                let mut encoder = command_buffer.compute_command_encoder().unwrap();
+                if matches!(writer, Writer::EarlierDispatch) {
+                    for ((texture, value), size) in &fills {
+                        encoder.set_compute_pipeline_state(&kernels.fill).unwrap();
+                        encoder.set_texture(Some(texture), 0).unwrap();
+                        encoder.set_buffer(Some(value), 0, 0).unwrap();
+                        encoder
+                            .dispatch_threads(Size::new(size[0], size[1], 1), Size::new(8, 8, 1))
+                            .unwrap();
+                    }
+                }
+                encoder.set_compute_pipeline_state(&kernels.read).unwrap();
+                encoder.set_texture(Some(&texture), 0).unwrap();
+                encoder.set_buffer(Some(&out), 0, 0).unwrap();
+                encoder
+                    .dispatch_threads(Size::new(W, H, 1), Size::new(8, 8, 1))
+                    .unwrap();
+                encoder.end_encoding().unwrap();
+            }
+            command_buffer.commit().unwrap();
+            command_buffer.wait_until_completed_for(WAIT).unwrap();
+            let want = ycbcr_texel(YCbCrRange::Video, YCbCrMatrix::Bt601, y, cb, cr);
+            let got = grid(&read_buffer(&out, 0, 16 * W * H).unwrap());
+            let stale = got.iter().filter(|t| **t != want).count();
+            assert_eq!(stale, 0, "{writer:?}: {stale} texels not the new codes'");
+            // Then reads with nothing written take no conversion.
+            let before = copies();
+            for _ in 0..2 {
+                let got = grid(&texels_of(device, &kernels.read, &texture, None));
+                assert!(got.iter().all(|t| *t == want), "{writer:?}: a later read");
+            }
+            // A write in the reader's own encoder is copied back just before the conversion,
+            // whose record then forgets it conservatively: one more conversion, then none.
+            let extra = u64::from(matches!(writer, Writer::EarlierDispatch));
+            assert_eq!(
+                copies() - before,
+                extra,
+                "{writer:?}: reads after the write"
+            );
+        }
+    });
+}
+
 /// A draw samples the planes as written before it (the render pass twin of
 /// [`ycbcr_textures_follow_writes_of_their_planes`]; `shadow.rs`'s render passes): a fragment
 /// function's linear sample of a `YCBCR8_420_2P` texture over a Shared buffer, and over a no-copy

@@ -109,6 +109,7 @@ use ash::vk;
 use metal2vulkan::error::{Feature, Unsupported};
 use metal2vulkan::metal::PixelFormat;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// What a shadowed texture's copies need: its truth, its shadow, and the copies between them.
@@ -126,6 +127,90 @@ pub(super) struct ShadowCopies {
     /// ZCI2-rotprobe5-m4). Such a shadow is never copied back, and a command writing through it
     /// leaves it to copy in again at its next use.
     pub(super) drops_writes: bool,
+    /// What the shadow holds across encoders where its owner states its truth's contents
+    /// ([`ShadowHeld`]).
+    pub(super) held: ShadowHeld,
+}
+
+/// A shadow's contents across encoders: the owner's statement of its truth's contents
+/// ([`Texture::set_contents_generation`]) and the statement the shadow was last copied in under.
+///
+/// The module's rules copy a shadow in before the first command of every encoder that uses it,
+/// because the truth's bytes are the CPU's to write unseen. Where the owner states a generation
+/// (a number that changes whenever the bytes may have changed: an IOSurface's seed, say), an
+/// encoder's first use of a shadow copied in under the generation still stated takes no copy in:
+/// the image still holds the bytes. Any write a command records through the shadow or to its
+/// truth's bytes forgets the generation the copy was under, so the next encoder copies in again.
+/// Generation 0, the default, states nothing: every encoder copies in, as before.
+/// The shadows of a device whose owners stated their contents: a command's write of a truth's
+/// bytes, in any encoder (one that never uses the shadow among them), forgets the generation its
+/// shadow was copied in under. Empty, it costs a command one lock-free check.
+#[derive(Default)]
+pub(super) struct StatedShadows {
+    any: std::sync::atomic::AtomicBool,
+    shadows: std::sync::Mutex<Vec<std::sync::Weak<ShadowCopies>>>,
+}
+
+impl StatedShadows {
+    /// Keep `copies` in the set (once).
+    pub(super) fn add(&self, copies: &Arc<ShadowCopies>) {
+        let Ok(mut shadows) = self.shadows.lock() else {
+            return;
+        };
+        shadows.retain(|w| w.strong_count() > 0);
+        if !shadows
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(copies)))
+        {
+            shadows.push(Arc::downgrade(copies));
+        }
+        self.any.store(true, Ordering::Release);
+    }
+
+    /// A command's `uses`: each write meeting a stated shadow's truth forgets its copy.
+    pub(super) fn written(&self, uses: &[Use<ResourceKey>]) {
+        if !self.any.load(Ordering::Acquire) || uses.iter().all(|u| u.write.is_empty()) {
+            return;
+        }
+        let Ok(shadows) = self.shadows.lock() else {
+            return;
+        };
+        for copies in shadows.iter().filter_map(std::sync::Weak::upgrade) {
+            if uses.iter().any(|u| !u.write.is_empty() && copies.meets(u)) {
+                copies.held.forget();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct ShadowHeld {
+    stated: AtomicU64,
+    copied: AtomicU64,
+}
+
+impl ShadowHeld {
+    /// Whether the shadow still holds its truth: copied in under the generation stated now.
+    fn holds(&self) -> bool {
+        let stated = self.stated.load(Ordering::Acquire);
+        stated != 0 && self.copied.load(Ordering::Acquire) == stated
+    }
+
+    /// A copy in recorded under the generation stated now.
+    fn copied_in(&self) {
+        self.copied
+            .store(self.stated.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// A write through the shadow or to its truth: the next encoder copies in.
+    fn forget(&self) {
+        self.copied.store(0, Ordering::Release);
+    }
+
+    /// The owner's generation of the truth's contents (0: none stated).
+    pub(super) fn state(&self, generation: u64) {
+        self.stated.store(generation, Ordering::Release);
+    }
 }
 
 /// A shadow's truth: what the shadow holds a copy of between an encoder's copies (the module's
@@ -988,6 +1073,8 @@ struct Entry<M> {
     /// The scratch the image was kept in before a command that writes its bytes two ways, until
     /// the merge after it.
     merge: Option<M>,
+    /// The encoder has not yet copied the shadow in, nor found it stale.
+    fresh: bool,
 }
 
 /// A command's use of a shadowed texture: its copies, and whether it writes through it.
@@ -1049,6 +1136,7 @@ impl<M: Clone> ShadowSync<M> {
                     dirty: false,
                     area: None,
                     merge: None,
+                    fresh: true,
                 });
                 self.entries.len() - 1
             }
@@ -1086,9 +1174,13 @@ impl<M: Clone> ShadowSync<M> {
             kept: false,
             area,
         });
+        // The copy back replaces the truth's bytes: no shadow over them holds them any more.
+        written.held.forget();
         for (j, other) in self.entries.iter_mut().enumerate() {
             if j != i && other.copies.shares_truth(&written) {
                 other.current = false;
+                other.fresh = false;
+                other.copies.held.forget();
             }
         }
     }
@@ -1148,15 +1240,24 @@ impl<M: Clone> ShadowSync<M> {
                     .iter()
                     .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
             if !self.entries[i].current {
-                if !overwrites {
+                // An encoder's first use of a shadow that still holds its truth (`ShadowHeld`)
+                // takes no copy in; a later one, after a write left it stale, always does.
+                // A copy back just planned of another shadow over the same bytes writes them.
+                let written = copies.iter().any(|c: &ShadowCopy<M>| {
+                    !matches!(c.step, Step::Into) && c.copies.shares_truth(&shadow.copies)
+                });
+                let held = self.entries[i].fresh && !written && shadow.copies.held.holds();
+                if !overwrites && !held {
                     copies.push(ShadowCopy {
                         copies: Arc::clone(&shadow.copies),
                         step: Step::Into,
                         kept: shadow.kept,
                         area: None,
                     });
+                    shadow.copies.held.copied_in();
                 }
                 self.entries[i].current = true;
+                self.entries[i].fresh = false;
             }
         }
         for (shadow, merge) in kept {
@@ -1183,12 +1284,16 @@ impl<M: Clone> ShadowSync<M> {
                 .any(|used| !used.write.is_empty() && entry.copies.meets(used));
             if stale {
                 entry.current = false;
+                entry.fresh = false;
+                entry.copies.held.forget();
             }
         }
         for shadow in shadows.iter().filter(|shadow| shadow.writes) {
             let i = self.entry(&shadow.copies);
             // Writes Metal drops are not copied back, and the image no longer holds the bytes.
             let entry = &mut self.entries[i];
+            entry.copies.held.forget();
+            entry.fresh = false;
             match shadow.copies.drops_writes {
                 true => entry.current = false,
                 false => {
@@ -1208,6 +1313,9 @@ impl<M: Clone> ShadowSync<M> {
     /// that work may have written.
     pub(super) fn leave(&mut self) -> Vec<ShadowCopy<M>> {
         let copies = self.finish();
+        for entry in &self.entries {
+            entry.copies.held.forget();
+        }
         self.entries.clear();
         copies
     }

@@ -163,6 +163,7 @@ impl Texture {
                 },
                 tracked: texels.tracked(),
                 drops_writes: false,
+                held: Default::default(),
             };
             let storage = Storage::Shadow {
                 image: image.shared(),

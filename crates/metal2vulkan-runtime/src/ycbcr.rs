@@ -49,7 +49,10 @@
 //!   bytes like any other, which the tracker orders after the writes of the same and earlier
 //!   command buffers. The surface's bytes are the CPU's to write unseen, so the runtime cannot
 //!   tell cheaply that they are unchanged since the last conversion, and converts at every
-//!   encoder that uses the texture.
+//!   encoder that uses the texture, unless the texture's owner states the surface's contents
+//!   (`Texture::set_contents_generation`, an IOSurface's seed): an encoder then converts only
+//!   where the generation changed or a command wrote the planes' bytes since the last conversion
+//!   (`shadow.rs`, `ShadowHeld`).
 //! - **The texels Metal's copies move** are the luma plane's bytes, a code's bytes a texel
 //!   (EVs TXN2-ycr2-m4, TXN2-ycr4-m4 for 4:2:2 and 4:4:4 and, for the code formats,
 //!   XRR2-ycr540c-m4 and XRR2-ycr541-m4):

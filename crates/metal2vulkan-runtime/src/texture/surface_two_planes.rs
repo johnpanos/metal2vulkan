@@ -234,6 +234,7 @@ impl Device {
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            held: Default::default(),
         };
         self.degrade(Degradation::ShadowedTexture, || {
             let [width, height, _] = layout.extent;

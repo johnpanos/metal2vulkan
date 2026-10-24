@@ -190,6 +190,7 @@ impl Device {
             tracked: texels.tracked(),
             // Metal drops a function's writes to the texture (EV XRR2-ycc1-m4).
             drops_writes: true,
+            held: Default::default(),
         };
         Ok(Storage::Shadow {
             image: image.shared(),
@@ -344,6 +345,7 @@ impl Texture {
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            held: Default::default(),
         };
         Ok((image, copies))
     }
@@ -472,6 +474,7 @@ impl Texture {
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            held: Default::default(),
         };
         let storage = Storage::Shadow {
             image: image.shared(),

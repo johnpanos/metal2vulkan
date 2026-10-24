@@ -2543,6 +2543,7 @@ impl Device {
                 shadow_range,
                 tracked: identity.tracked,
                 drops_writes: false,
+                held: Default::default(),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -2629,6 +2630,7 @@ impl Device {
                 shadow_range,
                 tracked: identity.tracked,
                 drops_writes: false,
+                held: Default::default(),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -2706,6 +2708,7 @@ impl Device {
                 shadow_range,
                 tracked: identity.tracked,
                 drops_writes: false,
+                held: Default::default(),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,

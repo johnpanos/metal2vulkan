@@ -5472,6 +5472,25 @@ impl Texture {
         })
     }
 
+    /// No Metal counterpart: the owner's statement of the contents of the bytes a shadowed
+    /// texture lies over (a two-plane YCbCr texture over an IOSurface, a texture over a buffer the
+    /// device views through an image), as a generation that changes whenever those bytes may have
+    /// changed since it was last stated: an IOSurface's seed, combined with the owner's count of
+    /// the GPU work it gave that may write them. An encoder's first use of the texture then copies
+    /// (or converts) the bytes into its image only where the generation differs from the one its
+    /// image was last copied in under; a write the runtime records through the texture or to its
+    /// bytes still leaves the next encoder to copy in. 0 states nothing (the default): every
+    /// encoder copies in, as Metal reads bytes the CPU may have written unseen. A texture that is
+    /// not shadowed ignores it.
+    pub fn set_contents_generation(&self, generation: u64) {
+        if let Some(copies) = self.shadow() {
+            if generation != 0 {
+                self.device().shared().stated_shadows.add(copies);
+            }
+            copies.held.state(generation);
+        }
+    }
+
     /// `getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:`: read `region` of
     /// the texture's `level` and `slice` into `bytes`, rows `bytes_per_row` apart and images
     /// `bytes_per_image` apart (read only for a region of more than one image). The bytes

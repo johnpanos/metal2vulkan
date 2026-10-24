@@ -349,6 +349,9 @@ pub(super) struct DeviceShared {
     pub(super) spares: Spares,
     /// Counts of its commit path's work, for the lanes (`work_counts.rs`).
     pub(super) counts: super::work_counts::Counters,
+    /// The shadows whose owners stated their contents (`shadow::ShadowHeld`), which any
+    /// command's write of their truth makes copy in again.
+    pub(super) stated_shadows: super::shadow::StatedShadows,
     /// Its command buffers made and not committed, over all its queues (`queue.rs`).
     pub(super) uncommitted: Arc<super::queue::Uncommitted>,
     /// The threads that make `VkPipeline`s ahead of the draws that record them
@@ -1276,6 +1279,7 @@ impl Device {
             sparse,
             spares: Spares::default(),
             counts: Default::default(),
+            stated_shadows: Default::default(),
             uncommitted: Arc::default(),
             pipeline_pool: Default::default(),
             reaper: Default::default(),

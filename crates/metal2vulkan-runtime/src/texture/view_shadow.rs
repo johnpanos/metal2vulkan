@@ -313,6 +313,7 @@ impl Device {
                     shadow_range,
                     tracked: identity.tracked,
                     drops_writes: false,
+                    held: Default::default(),
                 };
                 Owner::ViewShadow(Box::new(ViewShadow {
                     placement,

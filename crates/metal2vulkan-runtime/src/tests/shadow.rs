@@ -46,6 +46,7 @@ fn shadow_joined(
         },
         tracked: true,
         drops_writes: false,
+        held: Default::default(),
     })
 }
 
@@ -573,6 +574,7 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
         shadow_range: range,
         tracked: true,
         drops_writes: false,
+        held: Default::default(),
     })
 }
 
@@ -688,4 +690,60 @@ fn a_command_writing_an_image_through_a_views_shadow_and_another_way_is_refused(
             .collect();
         assert_eq!(named(&copies), into);
     }
+}
+
+#[test]
+fn a_shadow_whose_owner_states_its_contents_is_copied_in_once_across_encoders() {
+    let buffer = ResourceKey::new();
+    let t = shadow(buffer, 0..1024);
+    let encoder = |t: &Arc<ShadowCopies>| {
+        let mut sync = ShadowSync::default();
+        let first = command(&mut sync, &[(t, false)], &[]);
+        assert_eq!(command(&mut sync, &[(t, false)], &[]), []);
+        assert_eq!(named(&sync.finish()), []);
+        first
+    };
+    // No generation stated: every encoder copies in, as Metal reads the CPU's writes.
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    // A generation stated: the first encoder under it copies in, later ones do not.
+    t.held.state(7);
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    assert_eq!(encoder(&t), []);
+    assert_eq!(encoder(&t), []);
+    // A new generation (the CPU wrote the bytes): copied in again, once.
+    t.held.state(8);
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    assert_eq!(encoder(&t), []);
+    // A command writing the bytes another way leaves the image stale: the encoder's next use
+    // copies in again (the image then holds the written bytes, which later encoders keep).
+    let mut sync = ShadowSync::default();
+    assert_eq!(
+        command(&mut sync, &[(&t, false)], &[bytes(buffer, 0..16, true)]),
+        []
+    );
+    assert_eq!(
+        command(&mut sync, &[(&t, false)], &[]),
+        [(t.shadow_key, true)]
+    );
+    sync.finish();
+    assert_eq!(encoder(&t), []);
+    // A write of the bytes as an encoder's last use of them: the next encoder copies in.
+    let mut sync = ShadowSync::default();
+    assert_eq!(
+        command(&mut sync, &[(&t, false)], &[bytes(buffer, 0..16, true)]),
+        []
+    );
+    sync.finish();
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    assert_eq!(encoder(&t), []);
+    // A write through the texture (copied back at the encoder's end): copied in again next.
+    let mut sync = ShadowSync::default();
+    assert_eq!(command(&mut sync, &[(&t, true)], &[]), []);
+    assert_eq!(named(&sync.finish()), [(t.shadow_key, false)]);
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    // Stating 0 states nothing again.
+    t.held.state(0);
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    assert_eq!(encoder(&t), [(t.shadow_key, true)]);
 }
