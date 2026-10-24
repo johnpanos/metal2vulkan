@@ -70,8 +70,8 @@
 //! the **source** product to the attachment's precision and carries the **destination** product
 //! into the sum unrounded -- `round(round(Sf * S) + Df * D)`, one fused multiply-add on the
 //! destination term -- and our side is the mirror image, `round(Sf * S + round(Df * D))`. Each rule
-//! holds at all 5,376 compared words of the eight sites, and
-//! [`tests::metals_recorded_codes_hold_the_rounding_the_divergent_sites_measure`] keeps Metal's
+//! holds at all 5,376 compared words of the eight sites, and this module's own
+//! `metals_recorded_codes_hold_the_rounding_the_divergent_sites_measure` keeps Metal's
 //! half of that against the committed recordings. So the gap is not half-precision rounding but
 //! which of the two products the arithmetic keeps unrounded, which is why the two 32-bit float
 //! formats differ too and why `sc-dc`, whose source product `S * S` is exact in the attachment,
