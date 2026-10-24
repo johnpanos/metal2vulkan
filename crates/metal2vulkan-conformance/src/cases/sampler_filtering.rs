@@ -1,16 +1,17 @@
 //! What a runtime sampler's mip filter, LOD clamp, third address mode, comparison and reduction
 //! make Metal read.
 //!
-//! `MTLSamplerDescriptor` has sixteen items and the suite reached seven of them, all six of whose
-//! address modes and both of whose min and mag filters it already compared by value. The nine it
-//! did not reach are the whole of the descriptor's **filtering** behaviour, and this module is
-//! four of them put to Metal through fixtures already in the tree, with the fifth recorded as the
-//! one thing Metal does with it on this oracle.
+//! `MTLSamplerDescriptor` has sixteen items and the suite reached seven of them. The nine it did
+//! not reach are the whole of the descriptor's **filtering** behaviour, and this module puts five
+//! of them to Metal through fixtures already in the tree: `mipFilter`, `lodMinClamp`,
+//! `rAddressMode`, `compareFunction` and `reductionMode`, the last recorded as the one thing Metal
+//! does with it on this oracle. Two more families close two enums the depth axis read short of
+//! their own values, `MTLSamplerBorderColor` at 1 of 3 and `MTLSamplerMinMagFilter` at 2 of 3.
 //!
 //! Every row's observable is **a texel Metal filtered**, never a field read back. A sampler state
 //! is not observable; what it makes a sample return is.
 //!
-//! # The four families
+//! # The six families
 //!
 //! **`mip`** — the owned fixture `msf_runtime_samplers`' `msf_slot2d_linear_edge` samples a 2D
 //! texture twice a lane: through its own constexpr `filter::linear, address::clamp_to_edge`
@@ -103,6 +104,21 @@
 //! behaviour on this oracle* these three rows compare nothing, and they are not claimed to: what
 //! they hold is the agreement, for a venue where one side might not.
 //!
+//! **`border`** — the same 3D fixture over an `RGBA8Unorm` texture, sampled through each of the
+//! two address modes that read a border with each of the three `MTLSamplerBorderColor` values.
+//! Four channels and not one: Metal fills a one-channel format's sample as `(r, 0, 0, 1)`, so
+//! transparent black and opaque black both read `0` in the only channel `R32Float` has and that
+//! format cannot part them. Three distinct answers of the three colours under **both** modes, and
+//! `ClampToZero` reads exactly what `ClampToBorderColor` reads for every one of the three.
+//!
+//! **`cubic`** — one row, a `Cubic` min and mag filter, which is the third value of
+//! `MTLSamplerMinMagFilter` and no device's own. The coordinates are a quarter of a texel past
+//! each texel's lower corner, where a sixteen-texel kernel's weights all differ rather than
+//! collapsing onto the texel a symmetric kernel would read at a centre. Every one of the sixteen
+//! samples compares with Metal bit for bit; the case's verdict is `announced` and not `exact`
+//! because the runtime emulates the footprint and says its arithmetic is its own, which the case
+//! declares and which loosens nothing.
+//!
 //! # What is not here, and why
 //!
 //! - **`lodMaxClamp`** cannot be given a distinguishing value by any kernel in the tree. Every
@@ -126,9 +142,9 @@
 //! # Nothing here can fault a GPU
 //!
 //! One compute pass a row, textures of at most `SIDE` by `SIDE` by `DEPTH`, read-only, two
-//! buffers a row, one thread a lane, no loop. Every coordinate the `mip`, `compare` and
-//! `reduction` families sample at is inside its texture; the `r-address` family's coordinates
-//! reach outside on purpose, which is what an address mode is for.
+//! buffers a row, one thread a lane, no loop. Every coordinate the `mip`, `compare`, `reduction`
+//! and `cubic` families sample at is inside its texture; the `r-address` and `border` families'
+//! coordinates reach outside on purpose, which is what an address mode and a border are for.
 
 use crate::allowance::Allowance;
 use crate::case::{
