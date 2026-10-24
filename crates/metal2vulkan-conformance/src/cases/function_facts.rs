@@ -129,6 +129,26 @@ pub fn all() -> Vec<FunctionFactsCase> {
             entry: "rt6_resolve_white",
             constants: plain,
         },
+        // An object function of a mesh pipeline. `functionType` is the subject: `MTLFunctionType`
+        // has seven values and the three above were every one the suite reached, so the two a mesh
+        // pipeline's own stages carry were compared nowhere. An object function also answers nil
+        // for both attribute lists although it takes a payload, which is the fact that a payload is
+        // not a stage input.
+        FunctionFactsCase {
+            name: "function-facts-object",
+            fixture: "mesh_draws",
+            entry: "mesh_draws_object",
+            constants: plain,
+        },
+        // The mesh function the object function above dispatches, which is the other of the two.
+        // Its `[[mesh]]` output is a writable object rather than a stage input, so both attribute
+        // lists are nil here too and `functionType` is what separates it from the object function.
+        FunctionFactsCase {
+            name: "function-facts-mesh",
+            fixture: "mesh_draws",
+            entry: "mesh_draws_mesh",
+            constants: plain,
+        },
         // A vertex function with one `[[stage_in]]` attribute: the one shape where both lists
         // answer, and so the only way to `MTLVertexAttribute`'s own getters.
         FunctionFactsCase {
