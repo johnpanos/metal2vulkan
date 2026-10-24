@@ -44,8 +44,11 @@ m = {'version': 1, 'libraries': {}, 'functions': {}, 'renderPipelines': {}, 'com
      'buffers': {}, 'textures': {}, 'views': {}, 'samplers': {}, 'depthStencilStates': {}, 'commandBuffers': []}
 for r in lines('capture.jsonl'):
     if 'library' in r and 'file' in r:
+        if not os.path.exists(os.path.join(args.capture, r['file'])):
+            print('library %s (%d bytes) not pulled; left out' % (r['library'], r.get('bytes', 0)))
+            continue
         m['libraries'][r['library']] = rel(r['file'])
-    elif 'function' in r:
+    elif 'function' in r and 'name' in r:
         f = {'name': r['name'], 'constants': r.get('constants', [])}
         if r.get('library'):
             f['library'] = r['library']

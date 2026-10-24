@@ -35,8 +35,11 @@ for cap in args.captures:
             continue   # a line cut short by the process's end
         lines += 1
         if 'library' in r and 'file' in r:
+            if not os.path.exists(os.path.join(cap, r['file'])):
+                print('%s: library %s (%d bytes) not pulled; left out' % (cap, r['library'], r.get('bytes', 0)))
+                continue
             libraries[r['library']] = os.path.relpath(os.path.join(cap, r['file']), out_dir)
-        elif 'function' in r:
+        elif 'function' in r and 'name' in r:
             f = {'name': r['name'], 'constants': r.get('constants', [])}
             if r.get('library'):
                 f['library'] = r['library']

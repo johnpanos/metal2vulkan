@@ -18,6 +18,9 @@ The phone side: `NGPU_CAPTURE=1` (and `NGPU_CAPTURE_FRAMES=N`, `NGPU_CAPTURE_SKI
 (`ngpu-metal killall backboardd`) so its device opens with the variable set. Everything pulled is
 the render server's (Apple's shaders): it stays under the gitignored .cache/."""
 import argparse
+import functools
+import hashlib
+import shutil
 import json
 import os
 import re
@@ -35,7 +38,15 @@ ap.add_argument('--wait', type=float, default=600,
                 help='seconds to wait for each capture to end (its capture.done marker)')
 ap.add_argument('--timeout', type=float, default=900, help='seconds a single pull may take')
 ap.add_argument('--out', default=os.path.join(root, '.cache/fajita-census/capture-' + time.strftime('%Y%m%d-%H%M%S')))
+ap.add_argument('--have', default=os.path.join(root, '.cache/fajita-census'),
+                help='a directory of metallibs already on the host: a library whose digest matches one is copied, not pulled')
 args = ap.parse_args()
+print = functools.partial(print, flush=True)
+have = {}
+for name in os.listdir(args.have) if os.path.isdir(args.have) else []:
+    if name.endswith('.metallib'):
+        path = os.path.join(args.have, name)
+        have[hashlib.sha256(open(path, 'rb').read()).hexdigest()[:16]] = path
 os.makedirs(args.out, exist_ok=True)
 
 
@@ -50,11 +61,14 @@ def pull(remote, local, tries=3):
 
 def pull_once(remote, local, quiet=False):
     os.makedirs(os.path.dirname(local), exist_ok=True)
+    began = time.time()
+    print('%s pulling %s' % (time.strftime('%H:%M:%S'), remote))
     r = subprocess.run([sys.executable, args.hub, 'call', '--timeout', str(args.timeout), 'pull', remote, local],
                        capture_output=True, text=True)
     ok = r.returncode == 0 and os.path.exists(local) and 'pulled' in (r.stdout + r.stderr)
     if ok or not quiet:
-        print(('pulled ' if ok else 'FAILED ') + remote + ('' if ok else ': ' + (r.stdout + r.stderr).strip()[-200:]))
+        print(('pulled ' if ok else 'FAILED ') + remote + (' (%d bytes, %.0f s)' % (os.path.getsize(local), time.time() - began) if ok else
+              ': ' + (r.stdout + r.stderr).strip()[-200:]))
     return ok
 
 
@@ -98,7 +112,12 @@ for d in dirs:
         except json.JSONDecodeError:
             continue
         if 'file' in r and 'library' in r:
-            pull(d + '/' + r['file'], os.path.join(leaf, r['file']))
+            if r['library'] in have:
+                shutil.copyfile(have[r['library']], os.path.join(leaf, r['file']))
+                print('have %s (%s)' % (r['file'], os.path.basename(have[r['library']])))
+            else:
+                print('library %s: %d bytes' % (r['file'], r.get('bytes', 0)))
+                pull(d + '/' + r['file'], os.path.join(leaf, r['file']))
     # The frame capture (NGPU_CAPTURE_FRAMES): its records and every blob they name.
     if pull(d + '/frames.jsonl', os.path.join(leaf, 'frames.jsonl')):
         blobs = set()
