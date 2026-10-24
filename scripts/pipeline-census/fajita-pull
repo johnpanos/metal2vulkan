@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Pull fajita's pipeline captures (NativeMetal NGPU_CAPTURE) over the USB debug hub and build the
+census manifest from them.
+
+    scripts/pipeline-census/fajita-pull [--hub PATH] [--cache DIR] [--out DIR]
+
+It pulls the frontend's journal (CACHE/pipelines.log), reads its `X capture DIR` lines (one per
+process that captured), pulls each DIR/capture.jsonl and every library it names, writes them
+under OUT/<process>/ (default .cache/fajita-census/capture-<time>/), and runs capture_manifest.py
+into OUT/manifest.json. Then:
+
+    scripts/pipeline-census/a630-host --manifest OUT/manifest.json --out OUT/census
+
+The phone side: `NGPU_CAPTURE=1` in /private/var/ngpu/gpu-env, then the render server restarted
+(`ngpu-metal killall backboardd`) so its device opens with the variable set. Everything pulled is
+the render server's (Apple's shaders): it stays under the gitignored .cache/."""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(os.path.dirname(here))
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument('--hub', default='/home/john/src/UniXNU-fajita-ios16/scripts/fajita-usbdbg-hub.py')
+ap.add_argument('--cache', default='/private/var/mobile/Library/Caches/com.apple.backboardd/m2v',
+                help="the runtime's cache directory on the phone (the render server's)")
+ap.add_argument('--out', default=os.path.join(root, '.cache/fajita-census/capture-' + time.strftime('%Y%m%d-%H%M%S')))
+args = ap.parse_args()
+os.makedirs(args.out, exist_ok=True)
+
+
+def pull(remote, local):
+    os.makedirs(os.path.dirname(local), exist_ok=True)
+    r = subprocess.run([sys.executable, args.hub, 'call', 'pull', remote, local], capture_output=True, text=True)
+    ok = r.returncode == 0 and os.path.exists(local) and 'pulled' in (r.stdout + r.stderr)
+    print(('pulled ' if ok else 'FAILED ') + remote + ('' if ok else ': ' + (r.stdout + r.stderr).strip()[-200:]))
+    return ok
+
+
+journal = os.path.join(args.out, 'pipelines.log')
+if not pull(args.cache + '/pipelines.log', journal):
+    sys.exit('no journal: is the render server running with the plugin, and the hub up?')
+dirs = []
+for line in open(journal, errors='replace'):
+    m = re.match(r'X capture (\S+)', line)
+    if m and m.group(1) not in dirs:
+        dirs.append(m.group(1))
+if not dirs:
+    sys.exit('the journal names no capture: set NGPU_CAPTURE=1 in /private/var/ngpu/gpu-env and restart backboardd')
+local_dirs = []
+for d in dirs:
+    leaf = os.path.join(args.out, os.path.basename(d))
+    if not pull(d + '/capture.jsonl', os.path.join(leaf, 'capture.jsonl')):
+        continue
+    local_dirs.append(leaf)
+    for line in open(os.path.join(leaf, 'capture.jsonl'), errors='replace'):
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if 'file' in r and 'library' in r:
+            pull(d + '/' + r['file'], os.path.join(leaf, r['file']))
+if not local_dirs:
+    sys.exit('no capture pulled')
+subprocess.run([sys.executable, '-I', os.path.join(here, 'capture_manifest.py'), *local_dirs, '--out',
+                os.path.join(args.out, 'manifest.json')], check=True)
+print('next: %s/a630-host --manifest %s/manifest.json --out %s/census' % (here, args.out, args.out))
