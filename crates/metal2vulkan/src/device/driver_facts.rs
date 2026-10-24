@@ -459,6 +459,18 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
     ),
     nvidia_61571(DriverDeviation::MetalFloatDenormals, NVIDIA_RTX_3090),
     nvidia_61571(DriverDeviation::MetalFloatDenormals, NVIDIA_RTX_5080_LAPTOP),
+    // Turnip (Mesa 26.2.0-devel, driverVersion 26.1.99) on the Adreno 630 of the OnePlus 6T (fajita, UniXNU): the A6XX ALU
+    // has no f32 denormals (Turnip reports shaderDenormFlushToZeroFloat32 and no preserve), so its float operations read a
+    // denormal operand as a zero and flush a denormal result. Taken by the owner of that port to drop the per-operand
+    // flushes that made the render server's blur functions mostly integer selects; checked on the render server's frames.
+    Measured {
+        fact: DriverDeviation::MetalFloatDenormals,
+        driver: DriverId::MESA_TURNIP,
+        vendor: Some(QUALCOMM_VENDOR_ID),
+        device: Some(QUALCOMM_ADRENO_630),
+        first: mesa(26, 1, 99),
+        last: mesa(26, 2, 0),
+    },
     Measured {
         device: Some(APPLE_M3_MAX),
         ..moltenvk_141(DriverDeviation::MetalHalfQuantize)
