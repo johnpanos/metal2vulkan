@@ -31,16 +31,30 @@ ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDe
 ap.add_argument('--hub', default='/home/john/src/UniXNU-fajita-ios16/scripts/fajita-usbdbg-hub.py')
 ap.add_argument('--cache', default='/private/var/mobile/Library/Caches/com.apple.backboardd/m2v',
                 help="the runtime's cache directory on the phone (the render server's)")
+ap.add_argument('--wait', type=float, default=600,
+                help='seconds to wait for each capture to end (its capture.done marker)')
+ap.add_argument('--timeout', type=float, default=900, help='seconds a single pull may take')
 ap.add_argument('--out', default=os.path.join(root, '.cache/fajita-census/capture-' + time.strftime('%Y%m%d-%H%M%S')))
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 
 
-def pull(remote, local):
+def pull(remote, local, tries=3):
+    """One file; a file still being written (size/crc mismatch) is pulled again."""
+    for _ in range(tries - 1):
+        if pull_once(remote, local, quiet=True):
+            return True
+        time.sleep(5)
+    return pull_once(remote, local)
+
+
+def pull_once(remote, local, quiet=False):
     os.makedirs(os.path.dirname(local), exist_ok=True)
-    r = subprocess.run([sys.executable, args.hub, 'call', 'pull', remote, local], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, args.hub, 'call', '--timeout', str(args.timeout), 'pull', remote, local],
+                       capture_output=True, text=True)
     ok = r.returncode == 0 and os.path.exists(local) and 'pulled' in (r.stdout + r.stderr)
-    print(('pulled ' if ok else 'FAILED ') + remote + ('' if ok else ': ' + (r.stdout + r.stderr).strip()[-200:]))
+    if ok or not quiet:
+        print(('pulled ' if ok else 'FAILED ') + remote + ('' if ok else ': ' + (r.stdout + r.stderr).strip()[-200:]))
     return ok
 
 
@@ -54,9 +68,27 @@ for line in open(journal, errors='replace'):
         dirs.append(m.group(1))
 if not dirs:
     sys.exit('the journal names no capture: set NGPU_CAPTURE=1 in /private/var/ngpu/gpu-env and restart backboardd')
+def ended(d, leaf):
+    """Waits for the capture's capture.done marker (the hook writes no record after it)."""
+    limit = time.time() + args.wait
+    while True:
+        r = subprocess.run([sys.executable, args.hub, 'call', '--timeout', '60', 'pull', d + '/capture.done',
+                            os.path.join(leaf, 'capture.done')], capture_output=True, text=True)
+        if r.returncode == 0 and 'pulled' in r.stdout + r.stderr:
+            print('ended: %s: %s' % (d, open(os.path.join(leaf, 'capture.done')).read().strip()))
+            return True
+        if time.time() > limit:
+            print('NOT ENDED after %d s: %s' % (args.wait, d))
+            return False
+        time.sleep(15)
+
+
 local_dirs = []
 for d in dirs:
     leaf = os.path.join(args.out, os.path.basename(d))
+    os.makedirs(leaf, exist_ok=True)
+    if not ended(d, leaf):
+        continue   # a process that died before its capture ended (its files may be cut short)
     if not pull(d + '/capture.jsonl', os.path.join(leaf, 'capture.jsonl')):
         continue
     local_dirs.append(leaf)
@@ -77,7 +109,7 @@ for d in dirs:
                 continue
             if r.get('file'):
                 blobs.add(r['file'])
-            blobs.update(u['file'] for u in r.get('uploads', []))
+            blobs.update(u['file'] for u in r.get('uploads', []) if u.get('file'))
         for b in sorted(blobs):
             if not os.path.exists(os.path.join(leaf, b)):
                 pull(d + '/' + b, os.path.join(leaf, b))

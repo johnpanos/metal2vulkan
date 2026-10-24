@@ -60,7 +60,7 @@ for f in m['functions'].values():
 written = []
 for r in lines('frames.jsonl'):
     if 'commandBuffer' in r:
-        cb = {'uploads': [{'buffer': u['buffer'], 'file': rel(u['file'])} for u in r.get('uploads', [])],
+        cb = {'uploads': [{'buffer': u['buffer'], 'file': rel(u['file'])} for u in r.get('uploads', []) if u.get('file')],
               'encoders': r.get('encoders', [])}
         m['commandBuffers'].append(cb)
         for e in cb['encoders']:
