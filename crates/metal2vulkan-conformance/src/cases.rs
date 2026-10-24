@@ -44,6 +44,7 @@
 
 pub mod argument_encoders;
 pub mod astc_textures;
+pub mod attribute_formats;
 pub mod attribute_strides;
 pub mod binary_archives;
 pub mod blend_sweeps;
@@ -276,6 +277,10 @@ pub fn all() -> Vec<Box<dyn Case>> {
     for case in vertex_formats::all() {
         cases.push(Box::new(case));
     }
+    for case in attribute_formats::all() {
+        cases.push(Box::new(case));
+    }
+    cases.push(Box::new(attribute_formats::ClassCrossings));
     for case in extended_range_planes::all() {
         cases.push(Box::new(case));
     }
