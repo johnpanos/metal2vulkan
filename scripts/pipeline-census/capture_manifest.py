@@ -21,6 +21,9 @@ import os
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument('captures', nargs='+')
 ap.add_argument('--out', required=True)
+ap.add_argument('--xr-as-f16', action='store_true',
+                help="as NativeMetal 4101648's frontend does: the extended-range 10-bit formats (550-555) of pipelines, pass attachments "
+                     "and textures not over a buffer become RGBA16Float (115), for a capture made before it")
 args = ap.parse_args()
 out_dir = os.path.dirname(os.path.abspath(args.out))
 libraries, functions, render, compute, draws = {}, {}, {}, {}, {}
@@ -77,6 +80,22 @@ for cap in args.captures:
 for f in functions.values():
     if f.get('library') not in libraries:
         f.pop('library', None)
+def xr(f):
+    return 115 if args.xr_as_f16 and 550 <= f <= 555 else f
+
+
+if args.xr_as_f16:
+    for p in render.values():
+        for c in p.get('colors', []):
+            if c:
+                c['format'] = xr(c['format'])
+    for d in draws.values():
+        for c in d.get('pass', {}).get('colors', []):
+            if c:
+                c['format'] = xr(c['format'])
+        for slot, b in d.get('slots', {}).items():
+            if slot[1:2] == 't' and not b.get('over'):
+                b['format'] = xr(b['format'])
 manifest = {'version': 1, 'libraries': libraries, 'functions': functions, 'renderPipelines': render,
             'computePipelines': compute, 'draws': draws}
 with open(args.out, 'w') as f:
