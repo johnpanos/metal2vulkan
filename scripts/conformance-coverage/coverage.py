@@ -608,11 +608,12 @@ def write_option_space(w, space) -> None:
     site = sum(len(row["at_a_site"]) for row in rows)
     w(
         f"- **at a site** — the enumerator's name is a committed recording's site **name**, and "
-        f"not in anything that site observed: {site} of them. The comparison pairs sites by name, "
-        "so the value is in the compared text and the case did put it to Metal — but the name is "
-        "the **case's** label for the site, so it is no evidence that Metal said the value. This "
-        "was folded into *answered* and overstated it badly: 105 of the 172 values that column "
-        "held were a case's own spelling of a pixel format in a site name."
+        f"in nothing that site observed: {site} of them. The comparison pairs sites by name, so "
+        "the value is in the compared text and the case did put it to Metal — but the name is the "
+        "**case's** label for the site, so it is no evidence that Metal said the value. It is its "
+        "own column for that reason: read together with *answered* it reads as Metal having "
+        "named back values that a case spelled itself, which for `MTLPixelFormat` is most of "
+        "them."
     )
     w(
         "- **in effect** — a case module's own text names the value, and that module has at least "
@@ -632,13 +633,13 @@ def write_option_space(w, space) -> None:
     )
     w(
         "- **A spelling of a value this derivation does not read.** Both numerators read names, "
-        "and a name written in a shape the reading does not cover is counted nowhere. This has "
-        "gone wrong twice and was each time found by someone checking a count against the code: a "
-        "braced `use SamplerBorderColor::{..}` followed by bare variants read as **1 of 3** where "
-        "the case swept all three, and before it `use BlendFactor as F` lost a third of a "
-        "module's blend factors. The spellings now read are a variant beside its type, the "
-        "`objc2` spelling, a renaming `use`, and a braced `use`. A fourth would be invisible the "
-        "same way, so these counts are a floor by exactly that unknown."
+        "and a name written in a shape the reading does not cover is counted nowhere and looks "
+        "exactly like a value no case reaches. Four shapes are read: a variant beside its type, "
+        "`objc2`'s own spelling, a renaming `use`, and a braced `use` whose variants the module "
+        "then writes bare. A fifth shape would be invisible the same way, so every count here is "
+        "a floor by that unknown — and the two shapes already found were each caught by someone "
+        "checking a count against the code, not by this derivation, so the unknown is not small "
+        "on the evidence."
     )
     w(
         "- **A value a case states as a raw ordinal.** A case may hand the Metal leg an enum's "

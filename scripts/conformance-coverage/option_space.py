@@ -31,13 +31,12 @@ one. Two things, and as far as has been measured no third:
 1. **A value a case states as a raw ordinal**, which the next section is about. Measured where it
    can be: the document lists each type a recorded module names and states no value of by name,
    which is how a sweep over `0..n` reads, so the floor has a work list and not just a warning.
-2. **A spelling of a value that `_stated_in` does not read.** This is the one that has gone wrong
-   twice. A braced `use` was invisible until it was read — `border_swizzles` swept all three
-   `MTLSamplerBorderColor` values and the axis said 1 of 3 — and before it `use BlendFactor as F`
-   lost a third of a module's blend factors. Each was found by someone checking a count against
-   the code, not by this file. Every spelling now read is listed on `_stated_in`, and
-   `_resolved` is the one rule all of them go through; a spelling not in that list is counted
-   nowhere, and that is where the next one will be.
+2. **A spelling of a value that `_stated_in` does not read.** A name written in a shape the
+   reading does not cover is counted nowhere and looks exactly like a value no case reaches.
+   `_stated_in` lists every shape read and `_resolved` is the one rule they all go through, so a
+   shape not on that list is the floor. Two have been found, both by someone checking a printed
+   count against the code rather than by this file, which is the evidence for taking the unknown
+   seriously rather than calling it small.
 
 What is **not** part of the floor, because it is measured: the generated denominator (every type
 `regen-metal-enums` covers, by `ENUMS`, `OPTIONS` or `TABLE_ONLY`), the `#[cfg(test)]` exclusion,
@@ -303,7 +302,7 @@ def _stated_in(text: str, by_rust: dict[str, Type], by_metal: dict[str, Type]):
     - through a **braced `use`**, `use SamplerBorderColor::{OpaqueBlack, OpaqueWhite,
       TransparentBlack};`, after which the module writes the variants bare and names
       `SamplerBorderColor::` nowhere. `border_swizzles` sweeps all three border colours in nine
-      samplers that way and this read **1 of 3** until the `use` was read too.
+      samplers written that way, and a reading of `Head::Tail` alone finds none of them.
 
     A `use` is taken as the module naming the value, and the bare name is not looked for
     afterwards. That is sound here and nowhere else: an import nothing uses is a warning, warnings
@@ -410,10 +409,10 @@ def _site_and_observed(node, named: list[str], observed: list[str]) -> None:
     """A transcript's tokens, split by where they came from: a site's **name**, or what it observed.
 
     The split is the whole point. A node's name is the **case's** label for a site, chosen by
-    whoever wrote the case; what the node observed is Metal's answer. Reading them into one bag
-    credited a value to Metal because a case had spelled the enumerator in its own site name --
-    105 values of `MTLPixelFormat` across the committed recordings, which was 105 of the 172 the
-    *answered* column held.
+    whoever wrote the case; what the node observed is Metal's answer. Read into one bag they credit
+    a value to Metal because a case spelled the enumerator in its own site name, which across the
+    committed recordings is most of `MTLPixelFormat`: the suite labels the site it asks about with
+    the format's name and the site answers a number.
     """
     if not isinstance(node, dict):
         return
