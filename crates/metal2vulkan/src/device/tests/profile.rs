@@ -314,12 +314,12 @@ fn below_1_2_and_contradictory_policies_are_refused() {
 /// Each of the policy's choices between the device's answer and Metal's, with a function that
 /// flips it alone: the maths functions, the texel conversions, the `half` rounding, the NaN and
 /// minimum and maximum, the rounding order, the 16-bit float blend of a `half` output, and the
-/// conversion of a float color output.
-fn exactness_flips() -> [(&'static str, fn(DevicePolicy) -> DevicePolicy); 7] {
+/// conversion of a float color output, and the extended-range arithmetic.
+fn exactness_flips() -> [(&'static str, fn(DevicePolicy) -> DevicePolicy); 8] {
     use crate::device::{
-        ColorWritePolicy as C, FloatMathsPolicy as F, HalfBlendPolicy as B,
-        HalfRoundingPolicy as H, NanMinMaxPolicy as N, RoundingOrderPolicy as R,
-        TexelConversionPolicy as T,
+        ColorWritePolicy as C, ExtendedRangePolicy as X, FloatMathsPolicy as F,
+        HalfBlendPolicy as B, HalfRoundingPolicy as H, NanMinMaxPolicy as N,
+        RoundingOrderPolicy as R, TexelConversionPolicy as T,
     };
     [
         ("float_maths", |p| DevicePolicy {
@@ -371,13 +371,20 @@ fn exactness_flips() -> [(&'static str, fn(DevicePolicy) -> DevicePolicy); 7] {
             },
             ..p
         }),
+        ("extended_range", |p| DevicePolicy {
+            extended_range: match p.extended_range {
+                X::Device => X::Exact,
+                X::Exact => X::Device,
+            },
+            ..p
+        }),
     ]
 }
 
 /// On MoltenVK on the M3, whose functions, NaN, minimum and maximum and `half` rounding are
 /// measured to be Metal's, the maths functions', the `half` rounding's and the rounding order's
 /// choices change nothing, so each keys as the default does; the texel conversions' is the policy's
-/// own field there, as the 16-bit float blend's and the color writes' are (MoltenVK's blend is measured to store Metal's
+/// own field there, as the 16-bit float blend's, the color writes' and the extended-range arithmetic's are (MoltenVK's blend is measured to store Metal's
 /// bytes, but no profile fact states it), and the NaN and minimum and maximum's moves the texel NaN
 /// route (`TexelNanRoute`): a texel's NaN is the image's decode, which no arithmetic fact covers.
 #[test]
@@ -395,7 +402,11 @@ fn metal_s_own_answers_key_the_same_under_either_choice() {
             fp(flip(base)) == fp(base),
             !matches!(
                 name,
-                "texel_conversion" | "half_blend" | "color_writes" | "nan_and_min_max"
+                "texel_conversion"
+                    | "half_blend"
+                    | "color_writes"
+                    | "extended_range"
+                    | "nan_and_min_max"
             ),
             "{name}"
         );

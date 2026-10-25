@@ -143,6 +143,9 @@ pub struct ModuleBuilder {
     /// Whether a `half` texel keeps the NaN the device decoded under native half rounding too
     /// ([`ModuleBuilder::texel_nans`]).
     texel_nans: bool,
+    /// Whether an extended-range texel converts in the device's float arithmetic
+    /// ([`ModuleBuilder::extended_range_device`]).
+    extended_range_device: bool,
     /// The equal values offered for where no loop holds them (`FunctionBuilder::offer_outside_loops`),
     /// in offer order.
     pub(super) loop_free: Vec<Offer>,
@@ -285,6 +288,19 @@ impl ModuleBuilder {
     /// ([`ModuleBuilder::set_texel_nans`]).
     pub fn texel_nans(&self) -> bool {
         self.texel_nans
+    }
+
+    /// Convert extended-range texels in the device's float arithmetic where `device`
+    /// (`ExtendedRangePolicy::Device`), else Metal's exact one (`lower::arith::extended_range`).
+    /// Emission sets it before any instruction; a builder that never sets it is exact.
+    pub fn set_extended_range_device(&mut self, device: bool) {
+        self.extended_range_device = device;
+    }
+
+    /// Whether extended-range texels convert in the device's float arithmetic
+    /// ([`ModuleBuilder::set_extended_range_device`]).
+    pub fn extended_range_device(&self) -> bool {
+        self.extended_range_device
     }
 
     /// The heap bytes the builder holds, for the byte ledger: every input-scaled container's

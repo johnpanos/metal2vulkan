@@ -1483,6 +1483,17 @@ pub enum PrecisionNote {
     /// one within `3 * 2^-10 * (|x * (1 - t)| + |y * t|) + 2^-23`. Validation derives no
     /// tolerance from it.
     NativeMix,
+    /// An extended-range texel (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`, their `_sRGB` twins,
+    /// the padded 10-bit forms) is decoded and encoded in the device's float arithmetic, not
+    /// Metal's exact one, under `ExtendedRangePolicy::Device` (the default): a code's value is
+    /// `(c - 384)` times the `f32` nearest `1 / 510` (a padded code's `c` times that of
+    /// `1 / 1023`), a value's code the device's `RoundEven` of its `f32` product, and a `half`
+    /// Metal's tile or blend holds the device's `OpQuantizeToF16`. **Recorded bound:** a value
+    /// within one `f32` ulp of Metal's, one code where the product lies within an `f32` ulp of a
+    /// tie, a `half` rounded to nearest even where Metal rounds a tie away from zero, a `half`
+    /// denormal possibly flushed to zero. The bfloat forms and the toward-zero roundings stay
+    /// exact. Validation derives no tolerance from it.
+    DeviceExtendedRange,
 }
 
 /// The math mode of an entry's module, which decides, on a device whose `float` functions are

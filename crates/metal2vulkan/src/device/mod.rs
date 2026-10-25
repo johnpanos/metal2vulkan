@@ -66,9 +66,10 @@ pub use enables::{EnableSet, Exposure};
 pub(crate) use mechanism::mechanism;
 pub use metal::{MetalDeviceProperties, SimdSupport, StageSimd};
 pub use policy::{
-    ColorWritePolicy, ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy,
-    HalfRoundingPolicy, IdleColorsPolicy, NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy,
-    SamplingPolicy, TexelConversionPolicy, UniformOffsetPolicy, Unorm8LinearFilterPolicy,
+    ColorWritePolicy, ContainmentPolicy, DevicePolicy, ExtendedRangePolicy, FloatMathsPolicy,
+    HalfBlendPolicy, HalfRoundingPolicy, IdleColorsPolicy, NanMinMaxPolicy, PaddedReadsPolicy,
+    RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, UniformOffsetPolicy,
+    Unorm8LinearFilterPolicy,
 };
 pub(crate) use profile::whole_point_size;
 pub use profile::{DeviceProfile, SpirvValidation};

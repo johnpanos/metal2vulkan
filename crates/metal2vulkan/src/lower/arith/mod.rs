@@ -907,6 +907,13 @@ pub struct ArithPlan {
     /// (`narrow::round_texel`): where the profile's NaN is the translation's to answer as Metal's
     /// (`NanEncoding::Device`, the policy's `NanMinMaxPolicy::Exact`), decided by [`finish`].
     pub texel_nans: bool,
+    /// Whether the module converts an extended-range texel in the device's float arithmetic
+    /// (`ExtendedRangePolicy::Device`), decided by [`finish`].
+    pub extended_range_device: bool,
+    /// Whether a function converts an extended-range texel other than a bfloat one
+    /// ([`ArithPlan::converts`]), whose conversion [`finish`] notes under
+    /// `ExtendedRangePolicy::Device` (`PrecisionNote::DeviceExtendedRange`).
+    pub extended_range_used: bool,
     /// Whether Metal's `fmin`, `fmax`, `min3`, `max3`, `clamp` or `saturate` on `float` or `half`
     /// takes the device's `NMin`, `NMax` or `NClamp`, measured to be Metal's
     /// (`DriverDeviation::MetalMinMax`), recorded at selection: the module then requires
@@ -932,6 +939,7 @@ impl ArithPlan {
     /// ([`ArithPlan::extended_range_srgb`]) or a padded `_sRGB` form's
     /// ([`ArithPlan::padded_srgb`]).
     pub fn converts(&mut self, form: crate::metal::format::ExtendedRange) {
+        self.extended_range_used |= !form.bfloat();
         self.extended_range_srgb |= form.srgb();
         if form.padded_srgb() {
             self.padded_srgb.insert(form);
@@ -1059,6 +1067,11 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         narrow::native_rounding(cx.profile, cx.families.arith.quantize).is_some();
     // Where the NaN switch asks for Metal's NaN, a texel's NaN is its own through that rounding.
     cx.families.arith.texel_nans = nan::encoding(cx.profile) == NanEncoding::Device;
+    cx.families.arith.extended_range_device =
+        cx.profile.fields().extended_range == crate::device::ExtendedRangePolicy::Device;
+    if cx.families.arith.extended_range_device && cx.families.arith.extended_range_used {
+        cx.precision.insert(PrecisionNote::DeviceExtendedRange);
+    }
     cx.families.arith.mask = if cx
         .profile
         .fields()

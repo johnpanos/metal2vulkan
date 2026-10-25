@@ -29,7 +29,7 @@ fn the_shadow_load_is_valid_where_the_device_has_what_it_needs() {
         let profile = device.profile();
         for form in EVERY_FORM {
             let m = || {
-                extended_shadow_typed_module(form)
+                extended_shadow_typed_module(form, true)
                     .expect("a measured form")
                     .expect("built")
             };
@@ -51,7 +51,10 @@ fn the_shadow_load_is_valid_where_the_device_has_what_it_needs() {
             }
         }
         for form in UNMEASURED {
-            assert!(extended_shadow_typed_module(form).is_none(), "{form:?}");
+            assert!(
+                extended_shadow_typed_module(form, true).is_none(),
+                "{form:?}"
+            );
             match extended_shadow_module(&device, form) {
                 Err(Error::Unsupported(u)) => assert_eq!(
                     u,
@@ -67,7 +70,8 @@ fn the_shadow_load_is_valid_where_the_device_has_what_it_needs() {
 
 /// A shadow of 37 by 29 texels over codes of 40 by 30, in 5 by 4 workgroups: every texel of the
 /// shadow takes the tile value of the codes' texel there (each of the 1024 codes of every
-/// channel, the bits Metal does not read set), the codes stay, and the invocations past the
+/// channel, the bits Metal does not read set), exactly under `ExtendedRangePolicy::Exact` and
+/// within one `half` ulp under `ExtendedRangePolicy::Device`, the codes stay, and the invocations past the
 /// shadow touch nothing (the codes end at row 30, before the last workgroup row's 32), in either
 /// invocation order.
 #[test]
@@ -78,8 +82,8 @@ fn each_texel_of_the_shadow_takes_its_codes_tile_value() {
         height.div_ceil(ExtendedShadowModule::LOCAL_SIZE),
         1,
     ];
-    for form in EVERY_FORM {
-        let m = extended_shadow_typed_module(form)
+    for (form, device) in EVERY_FORM.into_iter().flat_map(|f| [(f, false), (f, true)]) {
+        let m = extended_shadow_typed_module(form, device)
             .expect("a measured form")
             .expect("built");
         let alpha = |c: u32| match form {
@@ -110,8 +114,23 @@ fn each_texel_of_the_shadow_takes_its_codes_tile_value() {
                 for x in 0..width {
                     let n = y * width + x;
                     let at = images[1].index(0, 0, 0, [x, y, 0]).expect("inside");
-                    let want = tile_model(form, codes_of(n % 1024)).map(f32::to_bits);
-                    assert_eq!(images[1].texels[at], want, "{form:?} ({x}, {y}) {order:?}");
+                    let model = tile_model(form, codes_of(n % 1024));
+                    let got = images[1].texels[at];
+                    if !device {
+                        let want = model.map(f32::to_bits);
+                        assert_eq!(got, want, "{form:?} ({x}, {y}) {order:?}");
+                        continue;
+                    }
+                    // `ExtendedRangePolicy::Device`: each lane within one `half` ulp of Metal's
+                    // (the bound `PrecisionNote::DeviceExtendedRange` records).
+                    for (g, w) in got.into_iter().zip(model) {
+                        let g = f32::from_bits(g);
+                        let ulp = (w.abs().max(2f32.powi(-14)).log2().floor() - 10.0).exp2();
+                        assert!(
+                            (g - w).abs() <= ulp,
+                            "{form:?} ({x}, {y}) {order:?}: {g} against Metal's {w}"
+                        );
+                    }
                 }
             }
         }

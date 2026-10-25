@@ -1978,7 +1978,7 @@ pub(super) fn blend_sources(
     second: Option<(Form, SValue)>,
 ) -> BResult<(SValue, Option<SValue>)> {
     let part = match form.float_fmt() {
-        Some(FloatFmt::F32) if !b.float => crate::lower::arith::texel_round::f32_to_half(
+        Some(FloatFmt::F32) if !b.float => crate::lower::arith::extended_range::half(
             fb,
             form,
             part,
@@ -1988,7 +1988,7 @@ pub(super) fn blend_sources(
     };
     let s1 = match (b.reads_second(), second) {
         (true, Some((form, s1))) => Some(match form.float_fmt() {
-            Some(FloatFmt::F32) => crate::lower::arith::texel_round::f32_to_half(
+            Some(FloatFmt::F32) => crate::lower::arith::extended_range::half(
                 fb,
                 form,
                 s1,

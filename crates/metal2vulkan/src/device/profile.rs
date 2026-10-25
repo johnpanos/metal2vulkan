@@ -379,6 +379,9 @@ pub struct ProfileFields {
     /// Whether a float color output is the device's conversion or rounded to Metal's code in the
     /// shader (the policy's).
     pub color_writes: crate::device::policy::ColorWritePolicy,
+    /// Whether an extended-range texel converts by the device's float arithmetic or Metal's exact
+    /// one (the policy's).
+    pub extended_range: crate::device::policy::ExtendedRangePolicy,
     /// Where a uniform view's load reads its residual's low bits (the policy's).
     pub uniform_offset: crate::device::policy::UniformOffsetPolicy,
     /// Whose `half` rounding a module takes: Metal's (a measured form, or the integer rounding

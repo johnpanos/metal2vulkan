@@ -80,17 +80,26 @@ const SHADOW: ResourceSlot = ResourceSlot {
 
 /// The shadow load of `form` as a typed module, before serialization: the module
 /// [`extended_shadow_module`] serializes. `None` for a form whose tile memory is unmeasured (a
-/// padded or bfloat form) or whose raw format has no typed storage declaration.
-pub(crate) fn extended_shadow_typed_module(form: ExtendedRange) -> Option<BResult<TypedModule>> {
+/// padded or bfloat form) or whose raw format has no typed storage declaration. Its decode is
+/// the device's float arithmetic where `device` (`ExtendedRangePolicy::Device`), else Metal's.
+pub(crate) fn extended_shadow_typed_module(
+    form: ExtendedRange,
+    device: bool,
+) -> Option<BResult<TypedModule>> {
     if form.padded() || form.bfloat() {
         return None;
     }
     let declared = crate::metal::format::spirv_image_format(form.raw_format())?;
-    Some(build(form, declared))
+    Some(build(form, declared, device))
 }
 
-fn build(form: ExtendedRange, declared: crate::spv::ImageFormat) -> BResult<TypedModule> {
+fn build(
+    form: ExtendedRange,
+    declared: crate::spv::ImageFormat,
+    device: bool,
+) -> BResult<TypedModule> {
     let mut b = ModuleBuilder::new();
+    b.set_extended_range_device(device);
     let u32_ = b.ty(Type::Int {
         width: 32,
         signed: false,
@@ -172,7 +181,9 @@ fn binding_of(sym: &crate::pipeline::sym::Symbol) -> Option<u32> {
 
 /// The shadow load of `form` on `device` (the module docs): built with the typed builder, checked
 /// by the owned verifier against the device's profile (requirements included), serialized, and
-/// numbered with the fixed bindings of [`ExtendedShadowModule`]. A padded or bfloat form is
+/// numbered with the fixed bindings of [`ExtendedShadowModule`]. Its decode takes the device's
+/// `ExtendedRangePolicy` (the draws it shadows for record `PrecisionNote::DeviceExtendedRange`
+/// under `ExtendedRangePolicy::Device`). A padded or bfloat form is
 /// `NotImplemented(Format)` (its tile memory is unmeasured, so no draw shadows it); a device
 /// without what the module needs is `Unsupported`, naming it, under `FramebufferFetch` (the
 /// shadowed draws' storage form).
@@ -180,10 +191,11 @@ pub fn extended_shadow_module(
     device: &Device,
     form: ExtendedRange,
 ) -> Result<ExtendedShadowModule, Error> {
-    let Some(m) = extended_shadow_typed_module(form) else {
+    let profile = device.profile();
+    let fast = profile.fields().extended_range == crate::device::ExtendedRangePolicy::Device;
+    let Some(m) = extended_shadow_typed_module(form, fast) else {
         return Err(Unsupported::not_implemented(Feature::Format).into());
     };
-    let profile = device.profile();
     let m = m?;
     profile
         .check(m.requirements())

@@ -229,6 +229,7 @@ surface! {
         enum RoundingOrderPolicy N;
         enum HalfBlendPolicy N;
         enum ColorWritePolicy N;
+        enum ExtendedRangePolicy N;
         enum PaddedReadsPolicy N;
         struct DeviceProfile O;
         struct SpirvValidation N;

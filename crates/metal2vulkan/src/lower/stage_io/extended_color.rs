@@ -190,7 +190,7 @@ pub(crate) fn held(
         false => HalfRounding::NearestEven,
     };
     match f.float_fmt() {
-        Some(FloatFmt::F32) => texel_round::f32_to_half(fb, FOUR, v, rounding),
+        Some(FloatFmt::F32) => extended_range::half(fb, FOUR, v, rounding),
         _ => Ok(v),
     }
 }

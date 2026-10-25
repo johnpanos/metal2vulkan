@@ -151,6 +151,47 @@ fn missing_table() -> crate::spirv::error::BuildError {
     }
 }
 
+/// `x` (`f32` lanes of form `f`) rounded to `half` as Metal's tile, read or blend of an
+/// extended-range texel rounds it in `mode`: Metal's exact rounding ([`f32_to_half`]), or, where
+/// the module converts extended-range texels in the device's arithmetic
+/// (`ModuleBuilder::extended_range_device`, `ExtendedRangePolicy::Device`), the device's
+/// `OpQuantizeToF16` for a rounding to nearest (a tie to even, a `half` denormal possibly
+/// flushed). A rounding toward zero stays exact either way.
+pub(crate) fn half(
+    fb: &mut FunctionBuilder<'_>,
+    f: Form,
+    x: Value,
+    mode: HalfRounding,
+) -> BResult<Value> {
+    let nearest = matches!(mode, HalfRounding::NearestEven | HalfRounding::NearestAway);
+    if nearest && fb.module().extended_range_device() {
+        return fb.unary(crate::spirv::ir::UnOp::QuantizeToF16, x);
+    }
+    f32_to_half(fb, f, x, mode)
+}
+
+/// The device's value of codes `n` (four `u32` lanes) over the divisors `d` (`ExtendedRangePolicy::Device`):
+/// `n` times the `f32` nearest each `1 / d`, within one `f32` ulp of the correctly rounded
+/// quotient [`ratio_to_f32`] gives.
+fn device_ratio(fb: &mut FunctionBuilder<'_>, n: Value, d: [f64; 4]) -> BResult<Value> {
+    let ft = crate::lower::arith::ops::ty(fb, floats())?;
+    let nf = fb.convert(ConvOp::ConvertUToF, n, ft)?;
+    let r = per_lane_f(fb, d.map(|d| (1.0 / d) as f32))?;
+    fb.binary(BinOp::FMul, nf, r)
+}
+
+/// The device's codes of magnitudes `m` (four `f32` lanes, at most 1.5) times the scales `s`
+/// (`ExtendedRangePolicy::Device`): the device's `RoundEven` of the `f32` product, as `u32`
+/// lanes; one code from [`round_exact_product_lanes`]'s where the product rounds onto or across
+/// a tie.
+fn device_product(fb: &mut FunctionBuilder<'_>, m: Value, s: [f64; 4]) -> BResult<Value> {
+    let ut = crate::lower::arith::ops::ty(fb, words())?;
+    let s = per_lane_f(fb, s.map(|s| s as f32))?;
+    let p = fb.binary(BinOp::FMul, m, s)?;
+    let r = fb.glsl(GlslOp::RoundEven, &[p])?;
+    fb.convert(ConvOp::ConvertFToU, r, ut)
+}
+
 /// A `uvec4` constant of the four lanes `v`.
 fn per_lane(fb: &mut FunctionBuilder<'_>, v: [u32; 4]) -> BResult<Value> {
     let ut = crate::lower::arith::ops::ty(fb, words())?;
@@ -227,7 +268,7 @@ pub fn tile_value(
             fb.glsl(GlslOp::FClamp, &[v, lo, hi])?
         }
     };
-    f32_to_half(fb, f, v, HalfRounding::NearestAway)
+    half(fb, f, v, HalfRounding::NearestAway)
 }
 
 /// Metal's read of the tile memory of an attachment of `form` that holds `held` (a `vec4` of
@@ -269,7 +310,7 @@ fn value_of_codes(
     form: ExtendedRange,
     c: Value,
     table: Option<GlobalId>,
-    half: bool,
+    half_result: bool,
 ) -> BResult<Value> {
     let (u, f) = (words(), floats());
     // A padded format's lane reads `c / 1023` correctly rounded, its `half` to nearest even
@@ -278,8 +319,13 @@ fn value_of_codes(
     // `s / 8192` (EV XRR2-x6c: every code), its `half` with ties away from zero (EV XRR2-x6fs:
     // every code).
     if form.padded() {
-        let d = splat(fb, u, 1023)?;
-        let v = ratio_to_f32(fb, u, c, d)?;
+        let v = match fb.module().extended_range_device() {
+            true => device_ratio(fb, c, [1023.0; 4])?,
+            false => {
+                let d = splat(fb, u, 1023)?;
+                ratio_to_f32(fb, u, c, d)?
+            }
+        };
         let (v, rounding) = match form {
             ExtendedRange::R10X6Srgb => {
                 let table = table.ok_or_else(missing_table)?;
@@ -295,8 +341,8 @@ fn value_of_codes(
             }
             _ => (v, HalfRounding::NearestEven),
         };
-        return match half {
-            true => f32_to_half(fb, f, v, rounding),
+        return match half_result {
+            true => self::half(fb, f, v, rounding),
             false => Ok(v),
         };
     }
@@ -320,8 +366,20 @@ fn value_of_codes(
         ),
         false => (splat(fb, u, 1020)?, fsplat(fb, f, 2.0)?),
     };
-    let q = ratio_to_f32(fb, u, n, d)?;
-    let mut v = fb.binary(BinOp::FMul, q, two)?;
+    let mut v = match fb.module().extended_range_device() {
+        true => {
+            let _ = (d, two);
+            let below = match planes {
+                true => [510.0, 510.0, 510.0, 255.0],
+                false => [510.0; 4],
+            };
+            device_ratio(fb, n, below)?
+        }
+        false => {
+            let q = ratio_to_f32(fb, u, n, d)?;
+            fb.binary(BinOp::FMul, q, two)?
+        }
+    };
     if let Some(table) = table {
         let ft = crate::lower::arith::ops::ty(fb, f)?;
         let mut lanes = Vec::with_capacity(4);
@@ -334,8 +392,8 @@ fn value_of_codes(
     }
     let minus = fb.unary(crate::spirv::ir::UnOp::FNegate, v)?;
     let v = fb.select(neg, minus, v)?;
-    match half {
-        true => f32_to_half(fb, f, v, HalfRounding::NearestAway),
+    match half_result {
+        true => self::half(fb, f, v, HalfRounding::NearestAway),
         false => Ok(v),
     }
 }
@@ -376,7 +434,10 @@ pub fn encode(
         let v = fb.select(nan, zero, v)?;
         let one = fsplat(fb, f, 1.0)?;
         let v = fb.glsl(GlslOp::FClamp, &[v, zero, one])?;
-        let k = round_exact_product_lanes(fb, f, v, &[1023], false)?;
+        let k = match fb.module().extended_range_device() {
+            true => device_product(fb, v, [1023.0; 4])?,
+            false => round_exact_product_lanes(fb, f, v, &[1023], false)?,
+        };
         let k = match form {
             ExtendedRange::R10X6Srgb | ExtendedRange::Rg10X12Srgb => {
                 let table = table.ok_or_else(missing_table)?;
@@ -559,7 +620,16 @@ fn linear_codes(
         true => &[510, 510, 510, 255],
         false => &[510],
     };
-    let k = round_exact_product_lanes(fb, f, m, scales, false)?;
+    let k = match fb.module().extended_range_device() {
+        true => {
+            let scale = match planes {
+                true => [510.0, 510.0, 510.0, 255.0],
+                false => [510.0; 4],
+            };
+            device_product(fb, m, scale)?
+        }
+        false => round_exact_product_lanes(fb, f, m, scales, false)?,
+    };
     let zero_code = splat(fb, u, 384)?;
     let up = fb.binary(BinOp::IAdd, zero_code, k)?;
     let down = fb.binary(BinOp::ISub, zero_code, k)?;

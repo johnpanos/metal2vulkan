@@ -101,7 +101,7 @@ use crate::error::{Error, ExtendedRangeBlend, Feature, Unsupported};
 use crate::lower::arith::fma::{float_fma_exact, half_sum};
 use crate::lower::arith::legal::{FloatFmt, Form, Held};
 use crate::lower::arith::ops::{fsplat, ty};
-use crate::lower::arith::texel_round::{f32_to_half, HalfRounding};
+use crate::lower::arith::texel_round::HalfRounding;
 use crate::metal::format::ExtendedRange;
 use crate::metal::{BlendFactor, BlendOperation, ColorWriteMask};
 use crate::pipeline::lower_inputs::BlendEquation;
@@ -1140,7 +1140,7 @@ impl<'a> Class<'a> {
         let f = self.lanes.floats();
         let one = fsplat(fb, f, 1.0)?;
         let m = fb.binary(BinOp::FSub, one, x)?;
-        f32_to_half(fb, f, m, HalfRounding::NearestEven)
+        super::half(fb, f, m, HalfRounding::NearestEven)
     }
 
     fn node(&mut self, fb: &mut FunctionBuilder<'_>, n: Node) -> BResult<Value> {
@@ -1198,7 +1198,7 @@ impl<'a> Class<'a> {
     }
 
     fn round(&self, fb: &mut FunctionBuilder<'_>, x: Value) -> BResult<Value> {
-        f32_to_half(fb, self.lanes.floats(), x, HalfRounding::NearestEven)
+        super::half(fb, self.lanes.floats(), x, HalfRounding::NearestEven)
     }
 
     /// `h(a · b + c)`: of `half` values exactly ([`half_sum`]); where the product or the addend
@@ -1220,7 +1220,7 @@ impl<'a> Class<'a> {
             }
             (false, false) => half_sum(fb, f.with(Held::Float(FloatFmt::Half)), a, b, c)?,
         };
-        f32_to_half(fb, f, s, HalfRounding::NearestEven)
+        super::half(fb, f, s, HalfRounding::NearestEven)
     }
 
     /// `sign · operand`, and the factor, of `(sign, term)`.
@@ -1398,7 +1398,7 @@ pub fn blend(
     let (sf, s) = match b.float {
         true => (
             Some(clamped(fb, s, FLOAT_SOURCE_RANGE)?),
-            f32_to_half(fb, f, s, HalfRounding::NearestEven)?,
+            super::half(fb, f, s, HalfRounding::NearestEven)?,
         ),
         false => (None, s),
     };
@@ -1461,7 +1461,7 @@ pub fn blend_half_float(
         Some(words) => {
             let ft = ty(fb, floats())?;
             let c = fb.convert(ConvOp::Bitcast, words, ft)?;
-            let c = f32_to_half(fb, floats(), c, HalfRounding::NearestEven)?;
+            let c = super::half(fb, floats(), c, HalfRounding::NearestEven)?;
             Some((c, c, c))
         }
         None => None,

@@ -332,6 +332,7 @@ fn derive_fields(
         texel_conversion: policy.texel_conversion,
         half_blend: policy.half_blend,
         color_writes: policy.color_writes,
+        extended_range: policy.extended_range,
         uniform_offset: policy.uniform_offset,
         // Metal's where a form is measured to be Metal's or the policy asks for Metal's rounding;
         // elsewhere the device's own.

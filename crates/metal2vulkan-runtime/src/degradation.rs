@@ -1677,6 +1677,11 @@ degradations! {
         /// (1 - t)| + |y * t|)` of Metal's; a `half` one within `3 * 2^-10 * (|x * (1 - t)| + |y *
         /// t|) + 2^-23`.
         NativeMix = "native-mix";
+        /// Class: the device's extended-range arithmetic. An extended-range texel is decoded and
+        /// encoded in the device's float arithmetic (`ExtendedRangePolicy::Device`, the default;
+        /// `Exact` keeps Metal's). Recorded bound: a value within one `f32` ulp, one code within
+        /// an ulp of a tie, a `half` tie rounded to even, a `half` denormal possibly flushed.
+        DeviceExtendedRange = "device-extended-range";
     }
 }
 

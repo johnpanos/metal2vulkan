@@ -1952,6 +1952,11 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   Metal's `mix(x, y, t)` on `float`, or on `half` where its fused multiply-add is not the measured
   16-bit one, is the device's `FMix` (a `half` one computed in `float` and rounded once to `half`),
   not Metal's `fma(t, y, fma(-t, x, x))`, under `RoundingOrderPolicy::Native`.
+- `metal2vulkan-degrade-device-extended-range` (precision). `PrecisionNote::DeviceExtendedRange`:
+  An extended-range texel (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`, the `_sRGB` twins, the
+  padded 10-bit forms) is decoded and encoded in the device's float arithmetic, and the `half`s of
+  Metal's tile and blend model round by the device's `OpQuantizeToF16`, under
+  `ExtendedRangePolicy::Device`.
 
 - `metal2vulkan-degrade-depth-twin-comparison` (retired). Replaced by
   metal2vulkan-degrade-device-depth-comparison and, on a device without

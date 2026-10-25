@@ -57,6 +57,10 @@ pub struct DevicePolicy {
     /// Whether a float color output to a normalized, sRGB or small-float attachment is converted
     /// by the device (the default) or rounded in the shader to the code Metal stores.
     pub color_writes: ColorWritePolicy,
+    /// Whether an extended-range texel's value and code (`BGR10_XR`, `BGRA10_XR`,
+    /// `RGB10A8_2P_XR10`, their `_sRGB` twins and the padded 10-bit forms, emulated over a raw
+    /// format) are the device's float arithmetic (the default) or Metal's, exact.
+    pub extended_range: ExtendedRangePolicy,
     /// Whether a texture over a buffer whose rows (or slices) lie with bytes between them, and
     /// which only reads (its usage holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block
     /// writes), is an image over the buffer's bytes at Metal's row pitch (the default) or the
@@ -80,7 +84,8 @@ impl DevicePolicy {
     /// emulation runs, native device sampling, native device maths, the device's own texel
     /// conversions, native half rounding, the device's NaN and minimum and maximum, the device's
     /// rounding order, the device's blend of a `half` output into a 16-bit float attachment, the
-    /// device's conversion of a float color output, and an image over a texture's padded rows where the texture only reads.
+    /// device's conversion of a float color output, the device's arithmetic for an extended-range
+    /// texel, and an image over a texture's padded rows where the texture only reads.
     pub const UNTRUSTED: DevicePolicy = DevicePolicy {
         pointer_domain: PointerDomain::ResidentTable,
         handle_domain: HandleDomain::Table,
@@ -96,6 +101,7 @@ impl DevicePolicy {
         rounding_order: RoundingOrderPolicy::Native,
         half_blend: HalfBlendPolicy::Device,
         color_writes: ColorWritePolicy::Device,
+        extended_range: ExtendedRangePolicy::Device,
         padded_reads: PaddedReadsPolicy::Alias,
         uniform_offset: UniformOffsetPolicy::Pushed,
         idle_colors: IdleColorsPolicy::Kept,
@@ -107,7 +113,7 @@ impl DevicePolicy {
     /// NaN and minimum and maximum ([`NanMinMaxPolicy::Exact`]), its rounding order
     /// ([`RoundingOrderPolicy::Exact`]), its 16-bit float blend of a `half` output
     /// ([`HalfBlendPolicy::Exact`]), its float color conversions ([`ColorWritePolicy::Exact`]),
-    /// and the bytes between a texture's rows that no first move of
+    /// its extended-range arithmetic ([`ExtendedRangePolicy::Exact`]), and the bytes between a texture's rows that no first move of
     /// an image over them reaches ([`PaddedReadsPolicy::Shadow`]). Sampling and every other field
     /// are kept.
     pub const fn exact_answers(self) -> DevicePolicy {
@@ -119,6 +125,7 @@ impl DevicePolicy {
             rounding_order: RoundingOrderPolicy::Exact,
             half_blend: HalfBlendPolicy::Exact,
             color_writes: ColorWritePolicy::Exact,
+            extended_range: ExtendedRangePolicy::Exact,
             padded_reads: PaddedReadsPolicy::Shadow,
             ..self
         }
@@ -408,6 +415,28 @@ pub enum ColorWritePolicy {
     /// device stores as that code (`lower::arith::color_write`): about fourteen instructions a
     /// unorm channel, more for sRGB and the small floats, and the draw selects the rule of an
     /// attachment by its rule word.
+    Exact,
+}
+
+/// How an extended-range texel (`metal::format::ExtendedRange`, held in a raw format the shader
+/// decodes and encodes: `lower::arith::extended_range`) converts between its codes and values,
+/// and how the `half` values Metal's tile and blend hold round, outside the bfloat forms.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ExtendedRangePolicy {
+    /// The device's float arithmetic (the default): a code's value is `(c - 384)` times the `f32`
+    /// nearest `1 / 510` (a padded code's `c` times that of `1 / 1023`), a value's code the
+    /// device's `RoundEven` of its `f32` product with 510 (1023), and a `half` the tile or a
+    /// blend rounds to the device's `OpQuantizeToF16`. Within an `f32` ulp of Metal's value, one
+    /// code where the product lies within an ulp of a tie, the `half` rounded to nearest even
+    /// where Metal rounds a tie away from zero, a `half` denormal possibly flushed; recorded as
+    /// [`PrecisionNote::DeviceExtendedRange`](crate::pipeline::PrecisionNote::DeviceExtendedRange).
+    #[default]
+    Device,
+    /// Metal's answers, exact on every device: each value correctly rounded by integer
+    /// division, each code the exact product rounded, each `half` by integer rounding in Metal's
+    /// mode (`lower::arith::extended_range`).
     Exact,
 }
 

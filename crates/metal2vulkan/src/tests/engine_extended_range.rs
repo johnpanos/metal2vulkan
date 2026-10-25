@@ -170,7 +170,21 @@ fn inputs(form: ExtendedRange, source: Source) -> LowerInputs {
     i
 }
 
+/// The profiles the exactness tests run on, under Metal's extended-range arithmetic
+/// (`ExtendedRangePolicy::Exact`): the default policy otherwise.
 fn profiles() -> Vec<(&'static str, crate::device::profile::DeviceProfile)> {
+    let policy = DevicePolicy {
+        extended_range: crate::device::ExtendedRangePolicy::Exact,
+        ..DevicePolicy::default()
+    };
+    ["lavapipe", "moltenvk-m3"]
+        .into_iter()
+        .map(|stem| (stem, profile(stem, policy).expect("profile")))
+        .collect()
+}
+
+/// The same profiles under the default policy (`ExtendedRangePolicy::Device`).
+fn device_arithmetic_profiles() -> Vec<(&'static str, crate::device::profile::DeviceProfile)> {
     ["lavapipe", "moltenvk-m3"]
         .into_iter()
         .map(|stem| {
@@ -454,6 +468,81 @@ fn reads_and_writes_of_every_code_are_metals() {
                             assert_eq!(
                                 got, want,
                                 "{what}: texel {n} channel {c} code {code}: {got:#x} vs {want:#x}"
+                            );
+                        }
+                    }
+                    let target = texels_of(&images, 1);
+                    let layout = image(1, |_| [0; 4]);
+                    for n in 0..SIDE * SIDE {
+                        let at = layout
+                            .index(0, 0, 0, [n % SIDE, n / SIDE, 0])
+                            .expect("texel");
+                        let lanes = raw_lanes(form);
+                        assert_eq!(
+                            target[at][..lanes],
+                            written(form, n)[..lanes],
+                            "{what}: texel {n} written"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Under the default `ExtendedRangePolicy::Device`, every code of every linear and `_sRGB` form
+/// reads within one ulp of Metal's value (`float`: an `f32` ulp; `half`: a `half` ulp), every
+/// texel written back from its own read is Metal's raw texel (each code's value encodes back to
+/// the code), and the module records `PrecisionNote::DeviceExtendedRange`; the same kernels are
+/// exactly Metal's under `ExtendedRangePolicy::Exact` ([`reads_and_writes_of_every_code_are_metals`]).
+#[test]
+fn under_the_device_s_arithmetic_every_code_reads_within_an_ulp_and_writes_back() {
+    use crate::pipeline::PrecisionNote;
+    for source in [Source::Read, Source::ReadWrite] {
+        for half in [false, true] {
+            let what = format!("{source:?} {}", if half { "half" } else { "float" });
+            let Some(bc) = assemble(&what, &kernel(source, half, 0)) else {
+                return;
+            };
+            for (stem, p) in device_arithmetic_profiles() {
+                for form in FORMS {
+                    let what = format!("{what} {form:?} on {stem}");
+                    let (plan, m) = typed_module_with(&bc, "k", &p, &inputs(form, source))
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert!(
+                        plan.precision.contains(&PrecisionNote::DeviceExtendedRange),
+                        "{what}: {:?}",
+                        plan.precision
+                    );
+                    let bytes = if half { 8 } else { 16 };
+                    let images = [image(0, |n| raw_texel(form, n)), image(1, |_| [0; 4])];
+                    let (out, images) = run(&m, &resources(&plan, bytes, &[]), &images);
+                    for n in 0..SIDE * SIDE {
+                        for (c, code) in codes_in(form, n).into_iter().enumerate() {
+                            let v = value(form, c, code);
+                            let got = lane(&out, half, n, c);
+                            let (got, want, ulp) = match half {
+                                true => {
+                                    let g = crate::float16::f16_bits_to_f32(got as u16);
+                                    let w = crate::float16::f16_bits_to_f32(half_bits(v));
+                                    (
+                                        g,
+                                        w,
+                                        (w.abs().max(2f32.powi(-14)).log2().floor() - 10.0).exp2(),
+                                    )
+                                }
+                                false => {
+                                    let g = f32::from_bits(got);
+                                    (
+                                        g,
+                                        v,
+                                        (v.abs().max(2f32.powi(-126)).log2().floor() - 23.0).exp2(),
+                                    )
+                                }
+                            };
+                            assert!(
+                                (got - want).abs() <= ulp,
+                                "{what}: texel {n} channel {c} code {code}: {got} vs Metal's {want}"
                             );
                         }
                     }
