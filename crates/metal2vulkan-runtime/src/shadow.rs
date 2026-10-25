@@ -177,7 +177,7 @@ impl StatedShadows {
         };
         for copies in shadows.iter().filter_map(std::sync::Weak::upgrade) {
             if uses.iter().any(|u| !u.write.is_empty() && copies.meets(u)) {
-                copies.held.forget();
+                copies.held.forget(1);
             }
         }
     }
@@ -187,6 +187,10 @@ impl StatedShadows {
 pub(super) struct ShadowHeld {
     stated: AtomicU64,
     copied: AtomicU64,
+    /// Why the last [`forget`](Self::forget) forgot (M2V_SHADOW_LOG's `why=`): 1 a command wrote
+    /// the truth's bytes, 2 a merge, 3 a copy back of another shadow over the bytes, 4 a write of
+    /// the bytes in the encoder, 5 a write through the shadow, 6 the encoder left for apart work.
+    why: std::sync::atomic::AtomicU8,
 }
 
 impl ShadowHeld {
@@ -203,7 +207,8 @@ impl ShadowHeld {
     }
 
     /// A write through the shadow or to its truth: the next encoder copies in.
-    fn forget(&self) {
+    fn forget(&self, why: u8) {
+        self.why.store(why, Ordering::Relaxed);
         self.copied.store(0, Ordering::Release);
     }
 
@@ -1184,13 +1189,13 @@ impl<M: Clone> ShadowSync<M> {
         if back {
             written.held.copied_in();
         } else {
-            written.held.forget();
+            written.held.forget(2);
         }
         for (j, other) in self.entries.iter_mut().enumerate() {
             if j != i && other.copies.shares_truth(&written) {
                 other.current = false;
                 other.fresh = false;
-                other.copies.held.forget();
+                other.copies.held.forget(3);
             }
         }
     }
@@ -1296,14 +1301,14 @@ impl<M: Clone> ShadowSync<M> {
             if stale {
                 entry.current = false;
                 entry.fresh = false;
-                entry.copies.held.forget();
+                entry.copies.held.forget(4);
             }
         }
         for shadow in shadows.iter().filter(|shadow| shadow.writes) {
             let i = self.entry(&shadow.copies);
             // Writes Metal drops are not copied back, and the image no longer holds the bytes.
             let entry = &mut self.entries[i];
-            entry.copies.held.forget();
+            entry.copies.held.forget(5);
             entry.fresh = false;
             match shadow.copies.drops_writes {
                 true => entry.current = false,
@@ -1325,7 +1330,7 @@ impl<M: Clone> ShadowSync<M> {
     pub(super) fn leave(&mut self) -> Vec<ShadowCopy<M>> {
         let copies = self.finish();
         for entry in &self.entries {
-            entry.copies.held.forget();
+            entry.copies.held.forget(6);
         }
         self.entries.clear();
         copies
@@ -1399,8 +1404,9 @@ fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
     if let Ok(mut out) = log.lock() {
         let _ = writeln!(
             out,
-            "{t:.3} {:?} {kind} {bytes} {w}x{h} {reason} stated={stated} copied={copied}",
-            copies.shadow_key
+            "{t:.3} {:?} {kind} {bytes} {w}x{h} {reason} stated={stated} copied={copied} why={}",
+            copies.shadow_key,
+            copies.held.why.load(Ordering::Relaxed)
         );
         if out.buffer().len() > (1 << 15) {
             let _ = out.flush();
