@@ -191,6 +191,9 @@ pub(super) struct ShadowHeld {
     /// the truth's bytes, 2 a merge, 3 a copy back of another shadow over the bytes, 4 a write of
     /// the bytes in the encoder, 5 a write through the shadow, 6 the encoder left for apart work.
     why: std::sync::atomic::AtomicU8,
+    /// The generation of the last copy in, with bit 63 set (0: never copied in), for
+    /// M2V_SHADOW_UPPER_BOUND's measurement.
+    ever: AtomicU64,
 }
 
 impl ShadowHeld {
@@ -202,6 +205,8 @@ impl ShadowHeld {
 
     /// A copy in recorded under the generation stated now.
     fn copied_in(&self) {
+        self.ever
+            .store(self.stated.load(Ordering::Acquire) | 1 << 63, Ordering::Relaxed);
         self.copied
             .store(self.stated.load(Ordering::Acquire), Ordering::Release);
     }
@@ -1262,6 +1267,12 @@ impl<M: Clone> ShadowSync<M> {
                     !matches!(c.step, Step::Into) && c.copies.shares_truth(&shadow.copies)
                 });
                 let held = self.entries[i].fresh && !written && shadow.copies.held.holds();
+                // M2V_SHADOW_UPPER_BOUND=1, a measurement and UNSAFE (stale texels are possible): no copy in
+                // of a shadow copied in before under the generation stated now, whatever wrote it since.
+                let held = held || (upper_bound() && {
+                    let ever = shadow.copies.held.ever.load(Ordering::Relaxed);
+                    ever != 0 && ever & !(1 << 63) == shadow.copies.held.stated.load(Ordering::Acquire)
+                });
                 if !overwrites && !held {
                     copy_in_log(&shadow.copies, self.entries[i].fresh, written);
                     copies.push(ShadowCopy {
@@ -1412,4 +1423,12 @@ fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
             let _ = out.flush();
         }
     }
+}
+
+/// `M2V_SHADOW_UPPER_BOUND=1` (read once): copy a shadow in only at its first use and when its
+/// owner's generation moved, ignoring every other reason. Wrong texels are possible: it measures
+/// what the copies in cost, never a mode to run.
+fn upper_bound() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("M2V_SHADOW_UPPER_BOUND").as_deref() == Ok("1"))
 }
