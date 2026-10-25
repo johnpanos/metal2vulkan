@@ -203,7 +203,8 @@ pub(super) struct ShadowHeld {
     copied: AtomicU64,
     /// Why the last [`forget`](Self::forget) forgot (M2V_SHADOW_LOG's `why=`): 1 a command wrote
     /// the truth's bytes, 2 a merge, 3 a copy back of another shadow over the bytes, 4 a write of
-    /// the bytes in the encoder, 5 a write through the shadow, 6 the encoder left for apart work.
+    /// the bytes in the encoder, 5 a write through the shadow, 6 the encoder left for apart work,
+    /// 7 a CPU write of the bytes through the runtime (`replace_region`).
     why: std::sync::atomic::AtomicU8,
     /// The generation of the last copy in, with bit 63 set (0: never copied in), for
     /// M2V_SHADOW_UPPER_BOUND's measurement.
@@ -226,7 +227,7 @@ impl ShadowHeld {
     }
 
     /// A write through the shadow or to its truth: the next encoder copies in.
-    fn forget(&self, why: u8) {
+    pub(super) fn forget(&self, why: u8) {
         self.why.store(why, Ordering::Relaxed);
         self.copied.store(0, Ordering::Release);
     }

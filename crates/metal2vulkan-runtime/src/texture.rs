@@ -5368,11 +5368,16 @@ impl Texture {
             Storage::Texels(texels)
             | Storage::Alias { texels, .. }
             | Storage::Shadow { texels, .. } => {
-                return texels.write(CALL, &image_region, &host, bytes)
+                // The CPU writes the truth's bytes: a shadow that held them no longer does, whatever
+                // generation its owner states (fajita: glyph atlases updated by replaceRegion showed
+                // stale texels under a stated generation).
+                self.forget_held_shadow();
+                return texels.write(CALL, &image_region, &host, bytes);
             }
         };
         // A heap shadow's texels are the heap's bytes.
         if let Owner::HeapShadow(shadow) = &image.owner {
+            shadow.copies.held.forget(7);
             return shadow.write(CALL, image.plan(), &image_region, &host, bytes);
         }
         // A two-plane texture's color words over its texels as they are, the alpha words kept.
@@ -5490,6 +5495,14 @@ impl Texture {
     /// bytes still leaves the next encoder to copy in. 0 states nothing (the default): every
     /// encoder copies in, as Metal reads bytes the CPU may have written unseen. A texture that is
     /// not shadowed ignores it.
+    /// A CPU write of the texels' bytes: the shadow over them (if any) copies in again at its next
+    /// use whatever generation its owner states.
+    fn forget_held_shadow(&self) {
+        if let Some(copies) = self.shadow() {
+            copies.held.forget(7);
+        }
+    }
+
     pub fn set_contents_generation(&self, generation: u64) {
         if let Some(copies) = self.shadow() {
             if generation != 0 {
