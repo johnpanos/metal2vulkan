@@ -1168,14 +1168,24 @@ impl<M: Clone> ShadowSync<M> {
         entry.dirty = false;
         entry.area = None;
         let written = Arc::clone(&entry.copies);
+        let back = matches!(step, Step::Back);
         copies.push(ShadowCopy {
             copies: Arc::clone(&written),
             step,
             kept: false,
             area,
         });
-        // The copy back replaces the truth's bytes: no shadow over them holds them any more.
-        written.held.forget();
+        // The copy back replaces the truth's bytes: no other shadow over them holds them any more.
+        // The shadow copied back does: its texels outside the copied area are what its last copy
+        // in left, which the truth still holds (a write of the truth another way forgets it). So
+        // where the owner states the truth's generation, the next encoder takes no copy in until
+        // the generation moves (fajita: CoreAnimation's surfaces it renders into were copied in
+        // again at every frame, 14 copies and 4.6 ms of GPU a frame). A merge leaves it to copy in.
+        if back {
+            written.held.copied_in();
+        } else {
+            written.held.forget();
+        }
         for (j, other) in self.entries.iter_mut().enumerate() {
             if j != i && other.copies.shares_truth(&written) {
                 other.current = false;
