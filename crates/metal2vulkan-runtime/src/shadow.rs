@@ -1258,6 +1258,7 @@ impl<M: Clone> ShadowSync<M> {
                 });
                 let held = self.entries[i].fresh && !written && shadow.copies.held.holds();
                 if !overwrites && !held {
+                    copy_in_log(&shadow.copies, self.entries[i].fresh, written);
                     copies.push(ShadowCopy {
                         copies: Arc::clone(&shadow.copies),
                         step: Step::Into,
@@ -1340,5 +1341,64 @@ impl<M: Clone> ShadowSync<M> {
             }
         }
         copies
+    }
+}
+
+/// `M2V_SHADOW_LOG=PATH` (read once): one line a copy in, appended to PATH, of why the shadow's
+/// held contents did not apply (`ShadowHeld`): `unstated` (its owner states no generation),
+/// `forgotten` (a write through it or of its truth's bytes since its last copy), `moved` (the
+/// owner's generation changed: the truth's bytes were written outside the runtime, by the CPU),
+/// `stale` (a write earlier in the same encoder), `shared` (a copy back of another shadow over the
+/// same bytes just planned). A diagnostic for the render server's copy-ins (fajita); it changes
+/// nothing it logs.
+fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
+    use std::io::Write;
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
+        std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(log) = LOG.get_or_init(|| {
+        let path = std::env::var_os("M2V_SHADOW_LOG")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 16, file)))
+    }) else {
+        return;
+    };
+    let stated = copies.held.stated.load(Ordering::Acquire);
+    let copied = copies.held.copied.load(Ordering::Acquire);
+    let reason = if written {
+        "shared"
+    } else if !fresh {
+        "stale"
+    } else if stated == 0 {
+        "unstated"
+    } else if copied == 0 {
+        "forgotten"
+    } else {
+        "moved"
+    };
+    let (kind, bytes, extent) = match &copies.source {
+        ShadowSource::Bytes { bytes, target, .. } => {
+            let extent = match target {
+                ShadowTarget::Image { regions, .. } => regions
+                    .first()
+                    .map(|r| (r.image_extent.width, r.image_extent.height)),
+                _ => None,
+            };
+            ("bytes", bytes.end - bytes.start, extent)
+        }
+        ShadowSource::Image { .. } => ("image", 0, None),
+        _ => ("other", 0, None),
+    };
+    let (w, h) = extent.unwrap_or_default();
+    let t = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+    if let Ok(mut out) = log.lock() {
+        let _ = writeln!(
+            out,
+            "{t:.3} {:?} {kind} {bytes} {w}x{h} {reason} stated={stated} copied={copied}",
+            copies.shadow_key
+        );
+        if out.buffer().len() > (1 << 15) {
+            let _ = out.flush();
+        }
     }
 }
