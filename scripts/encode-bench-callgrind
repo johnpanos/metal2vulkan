@@ -1,39 +1,74 @@
 #!/usr/bin/env bash
 # The encode benchmark's per-draw cost in instructions and heap allocations, deterministic (callgrind, lavapipe):
 #   scripts/encode-bench-callgrind [FRAMES]   (default 60; draws a frame: DRAWS, default 60)
+#   STEADY=1 scripts/encode-bench-callgrind [FRAMES]   (default 20: runs FRAMES and 2*FRAMES and prints the difference
+#                                                       per draw, the steady state without setup; TOP=N functions, default 30)
 # Builds the release example (crates/metal2vulkan-runtime/examples/encode_bench.rs) and prints the inclusive instructions of
 # RenderCommandEncoder::draw_primitives and end_encoding per draw, and malloc/calloc/realloc calls per draw over the whole run.
+# Extra environment (M2V_*) is passed through to the bench, so A/B runs of a switch are `M2V_X=0 STEADY=1 ...`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-FRAMES=${1:-60}; DRAWS=${DRAWS:-60}
+STEADY=${STEADY:-0}
+if [ "$STEADY" = 1 ]; then FRAMES=${1:-20}; else FRAMES=${1:-60}; fi
+DRAWS=${DRAWS:-60}; TOP=${TOP:-30}
 cargo +1.98.0 build -q --release -p metal2vulkan-runtime --example encode_bench
 out=$(mktemp -d "${TMPDIR:-/tmp}/encode-cg.XXXXXX"); trap 'rm -rf "$out"' EXIT
 icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | grep -m1 "$(uname -m)" || true)
-FRAMES=$FRAMES DRAWS=$DRAWS VK_ICD_FILENAMES=$icd valgrind --tool=callgrind --callgrind-out-file="$out/cg" \
-  target/release/examples/encode_bench >/dev/null 2>&1
-callgrind_annotate --inclusive=yes --threshold=100 "$out/cg" > "$out/incl" 2>/dev/null
-callgrind_annotate --tree=caller --threshold=100 "$out/cg" > "$out/caller" 2>/dev/null
-python3 -I - "$out" "$FRAMES" "$DRAWS" <<'PY'
+run() { # frames tag
+  FRAMES=$1 DRAWS=$DRAWS VK_ICD_FILENAMES=$icd valgrind --tool=callgrind --callgrind-out-file="$out/cg$2" $collect \
+    target/release/examples/encode_bench >/dev/null 2>&1
+  callgrind_annotate --inclusive=yes --threshold=100 "$out/cg$2" > "$out/incl$2" 2>/dev/null
+  callgrind_annotate --threshold=100 "$out/cg$2" > "$out/self$2" 2>/dev/null
+  callgrind_annotate --tree=caller --threshold=100 "$out/cg$2" > "$out/caller$2" 2>/dev/null
+}
+# Steady mode collects only inside the encoder's draw and end calls, so the tables and allocation counts are the encoder's.
+collect=""; [ "$STEADY" = 1 ] && collect="--toggle-collect=*RenderCommandEncoder*draw_primitives* --toggle-collect=*RenderCommandEncoder*end_encoding*"
+if [ "$STEADY" = 1 ]; then run "$FRAMES" a; run $((FRAMES * 2)) b; else run "$FRAMES" a; fi
+python3 -I - "$out" "$FRAMES" "$DRAWS" "$STEADY" "$TOP" <<'PY'
 import re, sys
-out, frames, draws = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+out, frames, draws, steady, top = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4] == '1', int(sys.argv[5])
 n = frames * draws
-incl = open(out + '/incl').read().splitlines()
-def ir(name):
-    for l in incl:
-        if name in l and '*' not in l:
-            m = re.match(r'\s*([\d,]+)', l)
-            if m: return int(m.group(1).replace(',', ''))
-    return 0
-for name in ['RenderCommandEncoder>::draw_primitives ', 'RenderCommandEncoder>::end_encoding ']:
-    print('%-40s %8.0f instructions a draw' % (name.strip(), ir(name) / n))
-calls = 0
-lines = open(out + '/caller').read().splitlines()
-for i, l in enumerate(lines):
-    if '*  ' in l and re.search(r'malloc\.c:(malloc|calloc|realloc) ', l):
-        j = i - 1
-        while j >= 0 and lines[j].strip():
-            m = re.search(r'\(([\d,]+)x\)', lines[j])
-            if m: calls += int(m.group(1).replace(',', ''))
-            j -= 1
-print('%-40s %8.1f a draw (whole run, setup included)' % ('malloc+calloc+realloc calls', calls / n))
+def table(path):
+    t = {}
+    for l in open(path).read().splitlines():
+        m = re.match(r'\s*([\d,]+)\s+\(\s*[\d.]+%\)\s+(\S.*)$', l) or re.match(r'\s*([\d,]+)\s+(\S.*)$', l)
+        if not m or '*' in l[:40]: continue
+        name = m.group(2)
+        name = re.sub(r'^[^:]*:', '', name, count=1) if re.match(r'^\S+\.(rs|c|h|S|cc|cpp):', name) or name.startswith('???:') else name
+        name = re.sub(r' \[[^\]]*\]$', '', name)
+        t[name] = t.get(name, 0) + int(m.group(1).replace(',', ''))
+    return t
+def ir(t, key):
+    return sum(v for k, v in t.items() if key in k)
+def mallocs(tag):
+    calls = 0
+    lines = open(out + '/caller' + tag).read().splitlines()
+    for i, l in enumerate(lines):
+        if '*  ' in l and re.search(r'malloc\.c:(malloc|calloc|realloc) ', l):
+            j = i - 1
+            while j >= 0 and lines[j].strip():
+                m = re.search(r'\(([\d,]+)x\)', lines[j])
+                if m: calls += int(m.group(1).replace(',', ''))
+                j -= 1
+    return calls
+keys = ['RenderCommandEncoder>::draw_primitives', 'RenderCommandEncoder>::end_encoding']
+if not steady:
+    incl = table(out + '/incla')
+    for k in keys: print('%-40s %8.0f instructions a draw' % (k, ir(incl, k) / n))
+    print('%-40s %8.1f a draw (whole run, setup included)' % ('malloc+calloc+realloc calls', mallocs('a') / n))
+    sys.exit()
+ia, ib, sa, sb = table(out + '/incla'), table(out + '/inclb'), table(out + '/selfa'), table(out + '/selfb')
+d = lambda a, b, k: (b.get(k, 0) - a.get(k, 0)) / n
+print('steady state per draw (%d-frame run minus %d-frame run, %d draws)' % (2 * frames, frames, n))
+for k in keys + ['draw_resident']:
+    print('  %-44s %8.0f' % (k, (ir(ib, k) - ir(ia, k)) / n))
+print('  %-44s %8.1f' % ('malloc+calloc+realloc calls', (mallocs('b') - mallocs('a')) / n))
+print('top inclusive (per draw):')
+rows = sorted(((d(ia, ib, k), k) for k in ib), reverse=True)
+for v, k in rows[:top]:
+    if v >= 50 and k != 'PROGRAM TOTALS': print('  %8.0f  %s' % (v, k[:150]))
+print('top self (per draw):')
+rows = sorted(((d(sa, sb, k), k) for k in sb), reverse=True)
+for v, k in rows[:top]:
+    if v >= 50 and k != 'PROGRAM TOTALS': print('  %8.0f  %s' % (v, k[:150]))
 PY
