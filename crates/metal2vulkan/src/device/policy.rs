@@ -54,6 +54,9 @@ pub struct DevicePolicy {
     /// attachment in the device's blend (the default) or in Metal's `half` arithmetic, which the
     /// function computes in the shader.
     pub half_blend: HalfBlendPolicy,
+    /// Whether a float color output to a normalized, sRGB or small-float attachment is converted
+    /// by the device (the default) or rounded in the shader to the code Metal stores.
+    pub color_writes: ColorWritePolicy,
     /// Whether a texture over a buffer whose rows (or slices) lie with bytes between them, and
     /// which only reads (its usage holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block
     /// writes), is an image over the buffer's bytes at Metal's row pitch (the default) or the
@@ -76,8 +79,8 @@ impl DevicePolicy {
     /// ordered framebuffer fetch required, Metal's 8-bit linear filter emulated exactly where the
     /// emulation runs, native device sampling, native device maths, the device's own texel
     /// conversions, native half rounding, the device's NaN and minimum and maximum, the device's
-    /// rounding order, the device's blend of a `half` output into a 16-bit float attachment, and
-    /// an image over a texture's padded rows where the texture only reads.
+    /// rounding order, the device's blend of a `half` output into a 16-bit float attachment, the
+    /// device's conversion of a float color output, and an image over a texture's padded rows where the texture only reads.
     pub const UNTRUSTED: DevicePolicy = DevicePolicy {
         pointer_domain: PointerDomain::ResidentTable,
         handle_domain: HandleDomain::Table,
@@ -92,6 +95,7 @@ impl DevicePolicy {
         nan_and_min_max: NanMinMaxPolicy::Native,
         rounding_order: RoundingOrderPolicy::Native,
         half_blend: HalfBlendPolicy::Device,
+        color_writes: ColorWritePolicy::Device,
         padded_reads: PaddedReadsPolicy::Alias,
         uniform_offset: UniformOffsetPolicy::Pushed,
         idle_colors: IdleColorsPolicy::Kept,
@@ -102,7 +106,8 @@ impl DevicePolicy {
     /// ([`TexelConversionPolicy::Exact`]), its `half` rounding ([`HalfRoundingPolicy::Exact`]), its
     /// NaN and minimum and maximum ([`NanMinMaxPolicy::Exact`]), its rounding order
     /// ([`RoundingOrderPolicy::Exact`]), its 16-bit float blend of a `half` output
-    /// ([`HalfBlendPolicy::Exact`]), and the bytes between a texture's rows that no first move of
+    /// ([`HalfBlendPolicy::Exact`]), its float color conversions ([`ColorWritePolicy::Exact`]),
+    /// and the bytes between a texture's rows that no first move of
     /// an image over them reaches ([`PaddedReadsPolicy::Shadow`]). Sampling and every other field
     /// are kept.
     pub const fn exact_answers(self) -> DevicePolicy {
@@ -113,6 +118,7 @@ impl DevicePolicy {
             nan_and_min_max: NanMinMaxPolicy::Exact,
             rounding_order: RoundingOrderPolicy::Exact,
             half_blend: HalfBlendPolicy::Exact,
+            color_writes: ColorWritePolicy::Exact,
             padded_reads: PaddedReadsPolicy::Shadow,
             ..self
         }
@@ -382,6 +388,26 @@ pub enum HalfBlendPolicy {
     /// precede, alpha to coverage, multiview, a format the device does not store, a blend of the
     /// second source), the device blends and the pipeline records the note as under
     /// [`HalfBlendPolicy::Device`].
+    Exact,
+}
+
+/// How a fragment function's float color output reaches a color attachment whose format
+/// converts it (unorm, snorm, 8-bit sRGB, half and the small floats; `LoweringInputs::color_writes`)
+/// on a device that does not store Metal's codes itself (`VkProperty::MetalColorWrites`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ColorWritePolicy {
+    /// The device converts the output as written (the default): near a rounding tie it may store
+    /// the code next to Metal's, a NaN as the device converts it, the bound
+    /// [`PrecisionNote::DeviceColorConversion`](crate::pipeline::PrecisionNote::DeviceColorConversion)
+    /// records. No rounding code is emitted.
+    #[default]
+    Device,
+    /// The function rounds each such output to the code Metal stores and writes the `f32` the
+    /// device stores as that code (`lower::arith::color_write`): about fourteen instructions a
+    /// unorm channel, more for sRGB and the small floats, and the draw selects the rule of an
+    /// attachment by its rule word.
     Exact,
 }
 

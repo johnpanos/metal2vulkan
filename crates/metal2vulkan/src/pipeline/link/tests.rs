@@ -33,6 +33,12 @@ pub(super) fn profile(stem: &str) -> DeviceProfile {
     crate::pipeline::testing::profile(stem, DevicePolicy::default()).expect("profile")
 }
 
+/// Committed profile `stem` with Metal's color writes (`ColorWritePolicy::Exact`).
+pub(super) fn profile_exact_writes(stem: &str) -> DeviceProfile {
+    crate::pipeline::testing::profile(stem, crate::pipeline::testing::EXACT_COLOR_WRITES)
+        .expect("profile")
+}
+
 /// The key of user varying `name`.
 pub(super) fn key(name: &str) -> VaryingKey {
     VaryingKey::user(name.as_bytes())

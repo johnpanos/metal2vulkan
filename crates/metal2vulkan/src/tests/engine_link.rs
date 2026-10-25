@@ -55,6 +55,11 @@ fn prof(stem: &str) -> DeviceProfile {
     profile(stem, DevicePolicy::default()).expect("committed profile")
 }
 
+/// Committed profile `stem` with Metal's color writes (`ColorWritePolicy::Exact`).
+fn prof_exact_writes(stem: &str) -> DeviceProfile {
+    profile(stem, crate::pipeline::testing::EXACT_COLOR_WRITES).expect("committed profile")
+}
+
 /// Committed profile `stem` without buffer robustness: its containment is checked in the shader.
 fn without_robustness(stem: &str) -> DeviceProfile {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -621,7 +626,7 @@ fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
         ("moltenvk-m3", false, false),
         ("moltenvk-m4", false, false),
     ] {
-        let p = prof(stem);
+        let p = prof_exact_writes(stem);
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
         for (entry, noted) in [
             ("rt6_fill_rgba32float", float_note),
@@ -753,7 +758,7 @@ fn half_attachments_round_to_nearest_even_under_mode_two() {
         "amd-780m-radv",
         "nvidia-rtx5080-laptop",
     ] {
-        let p = prof(stem);
+        let p = prof_exact_writes(stem);
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
         let mut r = RenderLinkInputs::new();
         r.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float));
@@ -968,16 +973,22 @@ fn measured_color_conversions_are_left_to_the_device() {
         let text = std::fs::read_to_string(path).expect("profile");
         let mut d = DeviceDescription::from_khronos_json(&text, None).expect("description");
         d.device_id = crate::device::driver_facts::NVIDIA_RTX_3090;
-        Device::new(d, DevicePolicy::default())
+        Device::new(d, crate::pipeline::testing::EXACT_COLOR_WRITES)
             .expect("device")
             .profile()
             .clone()
     };
     for (stem, p, small_taken, norm16_taken, nan_selected) in [
-        ("amd-780m-radv", prof("amd-780m-radv"), true, true, false),
+        (
+            "amd-780m-radv",
+            prof_exact_writes("amd-780m-radv"),
+            true,
+            true,
+            false,
+        ),
         (
             "intel-irisxe-rplp-anv",
-            prof("intel-irisxe-rplp-anv"),
+            prof_exact_writes("intel-irisxe-rplp-anv"),
             true,
             false,
             false,
@@ -985,19 +996,25 @@ fn measured_color_conversions_are_left_to_the_device() {
         ("rtx-3090", rtx_3090, true, false, true),
         (
             "intel-uhd770-rpls-anv",
-            prof("intel-uhd770-rpls-anv"),
+            prof_exact_writes("intel-uhd770-rpls-anv"),
             true,
             false,
             false,
         ),
         (
             "nvidia-rtx5080-laptop",
-            prof("nvidia-rtx5080-laptop"),
+            prof_exact_writes("nvidia-rtx5080-laptop"),
             false,
             false,
             false,
         ),
-        ("lavapipe", prof("lavapipe"), false, false, false),
+        (
+            "lavapipe",
+            prof_exact_writes("lavapipe"),
+            false,
+            false,
+            false,
+        ),
     ] {
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
         for (entry, float) in [

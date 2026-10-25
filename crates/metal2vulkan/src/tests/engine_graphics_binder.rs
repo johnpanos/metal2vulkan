@@ -70,6 +70,11 @@ fn fixture(stem: &str) -> Option<Vec<u8>> {
 
 /// Every committed profile as a device, by stem.
 fn devices() -> Vec<(String, Device)> {
+    devices_under(DevicePolicy::default())
+}
+
+/// Every committed profile as a device under `policy`, by stem.
+fn devices_under(policy: DevicePolicy) -> Vec<(String, Device)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
     let mut out = Vec::new();
     for e in std::fs::read_dir(&dir).expect("profiles") {
@@ -83,13 +88,19 @@ fn devices() -> Vec<(String, Device)> {
             .unwrap_or_default();
         let text = std::fs::read_to_string(&path).expect("profile");
         let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        out.push((
-            stem,
-            Device::new(desc, DevicePolicy::default()).expect("device"),
-        ));
+        out.push((stem, Device::new(desc, policy).expect("device")));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Committed profile `stem` as a device with Metal's color writes (`ColorWritePolicy::Exact`).
+fn exact_writes_device(stem: &str) -> Device {
+    devices_under(crate::pipeline::testing::EXACT_COLOR_WRITES)
+        .into_iter()
+        .find(|(s, _)| s == stem)
+        .map(|(_, d)| d)
+        .expect("committed profile")
 }
 
 fn device(stem: &str) -> Device {
@@ -216,7 +227,7 @@ fn an_srgb_color_write_binds_the_color_table() {
         ("lavapipe", storage),
         ("moltenvk-m3", None),
     ] {
-        let dev = device(stem);
+        let dev = exact_writes_device(stem);
         for (pf, want) in [
             (PixelFormat::RGBA8UnormSRGB, ty),
             (PixelFormat::RGBA8Unorm, None),
@@ -1102,7 +1113,7 @@ fn a_draw_writes_its_attachments_color_write_rule() {
         "intel-irisxe-rplp-anv",
         "nvidia-rtx5080-laptop",
     ] {
-        let dev = device(stem);
+        let dev = exact_writes_device(stem);
         let takes = |d| dev.profile().takes_driver_deviation(d);
         let metal = takes(DriverDeviation::MetalColorWrites);
         let small = takes(DriverDeviation::MetalSmallFloatColorWrites);

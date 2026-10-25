@@ -64,6 +64,13 @@ pub const EXACT_SAMPLING: DevicePolicy = DevicePolicy {
     ..DevicePolicy::UNTRUSTED.exact_answers()
 };
 
+/// The default policy with Metal's color writes (`ColorWritePolicy::Exact`): the policy of a test
+/// of the in-shader rounding of a float color output, which the default leaves to the device.
+pub const EXACT_COLOR_WRITES: DevicePolicy = DevicePolicy {
+    color_writes: crate::device::ColorWritePolicy::Exact,
+    ..DevicePolicy::UNTRUSTED
+};
+
 /// Committed profile `stem` (`validation/profiles/<stem>.json`) derived under `policy`.
 pub fn profile(stem: &str, policy: DevicePolicy) -> Result<DeviceProfile, String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

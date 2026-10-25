@@ -1883,7 +1883,8 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
     };
     let compile = |stem: &str, d: &RenderPipelineDescriptor| {
         let desc = description(stem);
-        let dev = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
+        let dev = Device::new(desc.clone(), crate::pipeline::testing::EXACT_COLOR_WRITES)
+            .expect("device");
         let pipe = dev.compile_render_pipeline(d, &Budget::standard())?;
         let enables = desc
             .required_enables(&pipe.requirements)
@@ -1929,7 +1930,7 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
         assert!(!pipe.requirements.features.contains(&INDEPENDENT), "{stem}");
     }
     // Attachment 0 blends with (one, zero, add), which lavapipe's `RGBA8Unorm` write rounds in
-    // the function: no Vulkan blend, so every element is the same.
+    // the function (`ColorWritePolicy::Exact`): no Vulkan blend, so every element is the same.
     let mut d = descriptor(&fragment, false);
     if let Some(a) = d.color_attachments[0].as_mut() {
         a.blending_enabled = true;

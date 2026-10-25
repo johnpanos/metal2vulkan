@@ -77,3 +77,68 @@ fn a_blended_32_bit_float_channel_is_the_devices() {
         "no committed profile blends on the device"
     );
 }
+
+/// `ColorWritePolicy`: on every committed profile that does not store Metal's color writes, an
+/// unblended 8-bit unorm, 8-bit sRGB or 16-bit float attachment's channels are the device's
+/// conversion under the default policy (no rounding emitted, `PrecisionNote::DeviceColorConversion`
+/// recorded), and rounded in the shader under `ColorWritePolicy::Exact` (a rule each channel or
+/// the draw's selected one); a profile that stores Metal's codes maps the same under either.
+#[test]
+fn a_color_write_is_the_devices_conversion_unless_the_policy_asks_for_metal_s() {
+    use crate::device::{ColorWritePolicy, Device, DevicePolicy};
+    let mut checked = 0;
+    for (stem, desc) in crate::metal::format::tests::committed_descriptions() {
+        let device = |color_writes| {
+            let policy = DevicePolicy {
+                color_writes,
+                ..DevicePolicy::default()
+            };
+            Device::new(desc.clone(), policy).expect("device derives")
+        };
+        let (fast, exact) = (
+            device(ColorWritePolicy::Device),
+            device(ColorWritePolicy::Exact),
+        );
+        let metal = fast
+            .profile()
+            .fields()
+            .enabled
+            .properties
+            .contains(&VkProperty::MetalColorWrites);
+        for pf in [
+            PixelFormat::BGRA8Unorm,
+            PixelFormat::RGBA8Unorm,
+            PixelFormat::BGRA8UnormSRGB,
+            PixelFormat::RGBA16Float,
+        ] {
+            let map = |dev: &Device| {
+                let colors = [Some(attachment(pf, None))];
+                color_writes(
+                    [0],
+                    &colors,
+                    (false, TextureWriteRoundingMode::TowardZero),
+                    dev.profile(),
+                )
+            };
+            let (f, e) = (map(&fast), map(&exact));
+            if metal {
+                assert_eq!(f, e, "{stem} {pf:?}");
+                continue;
+            }
+            assert_eq!(
+                f.get(&0),
+                Some(&[Some(ChannelWrite::Device); 4]),
+                "{stem} {pf:?} default"
+            );
+            let rounds = e.get(&0).is_some_and(|rules| {
+                rules
+                    .iter()
+                    .flatten()
+                    .all(|r| !matches!(r, ChannelWrite::Device))
+            });
+            assert!(rounds, "{stem} {pf:?} exact: {e:?}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no committed profile converts on the device");
+}

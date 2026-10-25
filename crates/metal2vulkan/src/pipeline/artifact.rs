@@ -960,7 +960,9 @@ pub enum PrecisionNote {
     /// between two codes the device may store the other one (every Vulkan driver measured but
     /// MoltenVK rounds the `f32` product with ties to even and encodes sRGB by its own
     /// approximation, where Metal rounds the exact product and encodes through its twelve-bit
-    /// table). Every other float color write rounds to Metal's code in the shader. A 32-bit float
+    /// table). Under `ColorWritePolicy::Device` (the default) every float color write to such a
+    /// format is the device's conversion; under `ColorWritePolicy::Exact` every other one rounds
+    /// to Metal's code in the shader. A 32-bit float
     /// attachment that so blends stores the device's blend arithmetic (NVIDIA's 615.71.09 one `f32`
     /// ulp from Metal's in some source-over sums, a NaN as `0x7fffffff` where Metal stores
     /// `0x7fc00000`).

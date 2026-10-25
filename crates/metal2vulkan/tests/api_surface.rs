@@ -228,6 +228,7 @@ surface! {
         enum NanMinMaxPolicy N;
         enum RoundingOrderPolicy N;
         enum HalfBlendPolicy N;
+        enum ColorWritePolicy N;
         enum PaddedReadsPolicy N;
         struct DeviceProfile O;
         struct SpirvValidation N;
@@ -1007,6 +1008,14 @@ fn device(stem: &str) -> Device {
     device_under(stem, DevicePolicy::default())
 }
 
+/// Committed profile `stem` as a device with Metal's color writes
+/// (`ColorWritePolicy::Exact`), the default policy otherwise.
+fn exact_writes_device(stem: &str) -> Device {
+    let mut policy = DevicePolicy::default();
+    policy.color_writes = metal2vulkan::device::ColorWritePolicy::Exact;
+    device_under(stem, policy)
+}
+
 /// [`device`] under `policy`.
 fn device_under(stem: &str, policy: DevicePolicy) -> Device {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1262,7 +1271,7 @@ fn a_signed_integer_attachment_compiles_the_fragment_for_it() {
         d
     };
     for stem in ["moltenvk-m3", "lavapipe"] {
-        let dev = device(stem);
+        let dev = exact_writes_device(stem);
         let signed = descriptor(
             StageSource::Function(fragment.clone()),
             PixelFormat::RGBA32Sint,
@@ -1357,7 +1366,7 @@ fn a_multisampled_pipeline_compiles_the_fragment_for_it() {
         ("lavapipe", None),
     ] {
         let dev = match release {
-            None => device(stem),
+            None => exact_writes_device(stem),
             Some(version) => {
                 let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../metal2vulkan-validation/profiles")
@@ -1366,7 +1375,9 @@ fn a_multisampled_pipeline_compiles_the_fragment_for_it() {
                 let mut desc =
                     DeviceDescription::from_khronos_json(&text, None).expect("description");
                 desc.driver_version = version;
-                Device::new(desc, DevicePolicy::default()).expect("device")
+                let mut policy = DevicePolicy::default();
+                policy.color_writes = metal2vulkan::device::ColorWritePolicy::Exact;
+                Device::new(desc, policy).expect("device")
             }
         };
         let mut multisampled = with_color_writes(&dev, LoweringInputs::new(), &[(0, half)]);
@@ -1567,7 +1578,7 @@ fn compiled_render_stages_round_trip_through_the_public_api() {
         d
     };
     for stem in ["moltenvk-m3", "lavapipe"] {
-        let dev = device(stem);
+        let dev = exact_writes_device(stem);
         let from_functions = descriptor(
             StageSource::Function(vertex.clone()),
             StageSource::Function(fragment.clone()),

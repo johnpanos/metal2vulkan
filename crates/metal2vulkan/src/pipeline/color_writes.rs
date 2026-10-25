@@ -12,6 +12,12 @@
 //! value, which every measured driver stores as that code. On MoltenVK the map keeps the half-float
 //! channels alone, which round nothing and record the device's NaN encoding of a `half` output.
 //!
+//! That rounding is `ColorWritePolicy::Exact`'s. Under the default, `ColorWritePolicy::Device`,
+//! every channel it would round is the device's conversion instead ([`ChannelWrite::Device`],
+//! recorded as `PrecisionNote::DeviceColorConversion`), and the function emits no rounding: about
+//! seventy instructions a fragment on the Adreno 630 for a four-channel 8-bit attachment
+//! (docs/FAST-PATHS.md).
+//!
 //! Under `TextureWriteRoundingMode::NearestEven` (Apple's `textureWriteRoundingMode` 2) Metal
 //! rounds a render state's half-float channels to nearest even ([`HALF_NEAREST`]), which no device
 //! does for a conversion it stores after a blend or as Metal's default: the function rounds each
@@ -34,6 +40,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::device::requirements::VkProperty;
+use crate::device::ColorWritePolicy;
 use crate::device::DeviceProfile;
 use crate::error::{Error, RuntimeInput};
 use crate::library::FunctionArtifact;
@@ -97,6 +104,9 @@ pub(crate) fn exact_writes(
     p: &DeviceProfile,
 ) -> BTreeMap<u32, [Option<ChannelWrite>; 4]> {
     let metal = metal_color_writes(p);
+    // `ColorWritePolicy::Device`: the device converts every output it would round
+    // ([`device_converted`]); a device that stores Metal's codes keeps its own map.
+    let device_converts = !metal && p.fields().color_writes == ColorWritePolicy::Device;
     let mut out = BTreeMap::new();
     for attachment in written {
         let Some(c) = colors.get(attachment as usize).copied().flatten() else {
@@ -113,11 +123,28 @@ pub(crate) fn exact_writes(
             }
             _ => write,
         };
+        let write = match device_converts {
+            true => write.map(device_converted),
+            false => write,
+        };
         if let Some(write) = write {
             out.insert(attachment, write);
         }
     }
     out
+}
+
+/// The channels `rules` under `ColorWritePolicy::Device`: every rule that rounds in the shader is
+/// the device's conversion ([`ChannelWrite::Device`], recorded as
+/// `PrecisionNote::DeviceColorConversion`); a channel without a rule keeps none, and a
+/// half-float channel rounded after its blend ([`ChannelWrite::BlendedNearestEven`]) is the
+/// device's blend already and keeps its own note.
+fn device_converted(rules: [Option<ChannelWrite>; 4]) -> [Option<ChannelWrite>; 4] {
+    rules.map(|rule| match rule {
+        None => None,
+        Some(r @ ChannelWrite::BlendedNearestEven { .. }) => Some(r),
+        Some(_) => Some(ChannelWrite::Device),
+    })
 }
 
 /// A rule word's code of a channel that takes no rule: the output as written.

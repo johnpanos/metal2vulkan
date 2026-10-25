@@ -376,6 +376,9 @@ pub struct ProfileFields {
     /// Whether a `half4` output of a module without fast math blends into a 16-bit float
     /// attachment in the device's blend or in Metal's, computed by the function (the policy's).
     pub half_blend: crate::device::policy::HalfBlendPolicy,
+    /// Whether a float color output is the device's conversion or rounded to Metal's code in the
+    /// shader (the policy's).
+    pub color_writes: crate::device::policy::ColorWritePolicy,
     /// Where a uniform view's load reads its residual's low bits (the policy's).
     pub uniform_offset: crate::device::policy::UniformOffsetPolicy,
     /// Whose `half` rounding a module takes: Metal's (a measured form, or the integer rounding

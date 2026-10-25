@@ -7,9 +7,9 @@
 //! classed, and so reaches the ledger.
 
 use crate::device::{
-    DevicePolicy, FloatMathsPolicy, FramebufferFetchPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-    NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
-    Unorm8LinearFilterPolicy,
+    ColorWritePolicy, DevicePolicy, FloatMathsPolicy, FramebufferFetchPolicy, HalfBlendPolicy,
+    HalfRoundingPolicy, NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy,
+    TexelConversionPolicy, Unorm8LinearFilterPolicy,
 };
 use crate::pipeline::PrecisionNote;
 use std::collections::BTreeSet;
@@ -68,6 +68,7 @@ fn choices() -> Vec<Choice> {
         nan_and_min_max: _,
         rounding_order: _,
         half_blend: _,
+        color_writes: _,
         // The runtime's: whether a texture over padded rows that only reads aliases them.
         padded_reads: _,
         // Where a uniform load reads its offset's low bits: the same answers, a speed choice.
@@ -85,6 +86,7 @@ fn choices() -> Vec<Choice> {
         choice!(p.nan_and_min_max: NanMinMaxPolicy { Native, Exact }),
         choice!(p.rounding_order: RoundingOrderPolicy { Native, Exact }),
         choice!(p.half_blend: HalfBlendPolicy { Device, Exact }),
+        choice!(p.color_writes: ColorWritePolicy { Device, Exact }),
         choice!(p.padded_reads: PaddedReadsPolicy { Alias, Shadow }),
     ]
 }
@@ -133,6 +135,7 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             NativeHalfConversion,
             NativeHalfQuantize,
             HalfOutputPrecision,
+            DeviceColorConversion,
         ],
         NotBuilt: [
             ExtendedRangeBlendSource,
@@ -178,7 +181,6 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             DeviceDepthComparison,
             BeyondMeasuredDeviation,
             ViewBaseTexelOffset,
-            DeviceColorConversion,
             QuadsSplitByClipping,
             VertexSimdgroupGrouping,
             FragmentSimdgroupGrouping,

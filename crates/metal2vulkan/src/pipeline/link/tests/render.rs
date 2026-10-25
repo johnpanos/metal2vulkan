@@ -166,7 +166,7 @@ fn color_writes_are_the_pipelines() {
         false,
     );
     for stem in ["lavapipe", "amd-rdna3-radv"] {
-        let p = profile(stem);
+        let p = profile_exact_writes(stem);
         let writes = |inputs: &LinkInputs, exact: bool| match inputs {
             LinkInputs::Render(r) => {
                 let colors = &r.color_attachments;
@@ -331,7 +331,7 @@ fn half_colors_round_to_nearest_even_under_mode_two() {
     let blended = Some(HALF_BLENDED);
     let device = Some(C::Device);
     for stem in ["moltenvk-m3", "lavapipe", "amd-780m-radv"] {
-        let p = profile(stem);
+        let p = profile_exact_writes(stem);
         let writes = |inputs: &LinkInputs| match inputs {
             LinkInputs::Render(r) => crate::pipeline::color_writes::wanted(
                 &fa,
