@@ -5485,6 +5485,14 @@ impl Texture {
         })
     }
 
+    /// A CPU write of the texels' bytes: the shadow over them (if any) copies in again at its next
+    /// use whatever generation its owner states.
+    fn forget_held_shadow(&self) {
+        if let Some(copies) = self.shadow() {
+            copies.held.forget(7);
+        }
+    }
+
     /// No Metal counterpart: the owner's statement of the contents of the bytes a shadowed
     /// texture lies over (a two-plane YCbCr texture over an IOSurface, a texture over a buffer the
     /// device views through an image), as a generation that changes whenever those bytes may have
@@ -5495,14 +5503,6 @@ impl Texture {
     /// bytes still leaves the next encoder to copy in. 0 states nothing (the default): every
     /// encoder copies in, as Metal reads bytes the CPU may have written unseen. A texture that is
     /// not shadowed ignores it.
-    /// A CPU write of the texels' bytes: the shadow over them (if any) copies in again at its next
-    /// use whatever generation its owner states.
-    fn forget_held_shadow(&self) {
-        if let Some(copies) = self.shadow() {
-            copies.held.forget(7);
-        }
-    }
-
     pub fn set_contents_generation(&self, generation: u64) {
         if let Some(copies) = self.shadow() {
             if generation != 0 {

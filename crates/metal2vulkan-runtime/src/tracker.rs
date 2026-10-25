@@ -909,7 +909,7 @@ fn coalesce(entries: &mut Vec<Entry>) {
 /// The uses one per key and range, sorted by key, without the ones that touch nothing.
 fn merged<S: Copy + Ord + Hash>(uses: impl IntoIterator<Item = Use<S>>) -> Vec<Use<S>> {
     let mut merged: Vec<Use<S>> = Vec::new();
-    let mut index: HashMap<(S, UseRange), usize> = HashMap::new();
+    let mut index: KeyMap<(S, UseRange), usize> = KeyMap::default();
     for used in uses {
         if used.is_nothing() {
             continue;
@@ -945,7 +945,7 @@ pub(super) struct EncoderUses<K> {
     /// Whether Metal runs the commands in encoded order (blit encoders, serial compute encoders).
     ordered: bool,
     /// The accesses of the current part's commands so far, for that order.
-    inside: HashMap<Class<K>, Vec<Entry>>,
+    inside: KeyMap<Class<K>, Vec<Entry>>,
     /// The parts, in order: the last is the current one. Never empty.
     parts: Vec<Part<K>>,
     /// The fences waited for: before the encoder's first part.
@@ -957,14 +957,14 @@ pub(super) struct EncoderUses<K> {
 /// The uses of one part of an encoder.
 struct Part<K> {
     /// The tracked uses so far, one per range, at most [`ENTRIES_PER_KEY`] per resource.
-    tracked: HashMap<K, Vec<Use<K>>>,
+    tracked: KeyMap<K, Vec<Use<K>>>,
     stages: vk::PipelineStageFlags2,
 }
 
 impl<K> Part<K> {
     fn new() -> Part<K> {
         Part {
-            tracked: HashMap::new(),
+            tracked: KeyMap::default(),
             stages: vk::PipelineStageFlags2::NONE,
         }
     }
@@ -975,7 +975,7 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
     pub(super) fn new(ordered: bool) -> EncoderUses<K> {
         EncoderUses {
             ordered,
-            inside: HashMap::new(),
+            inside: KeyMap::default(),
             parts: vec![Part::new()],
             waits: Vec::new(),
             updates: Vec::new(),

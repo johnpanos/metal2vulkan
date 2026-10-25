@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# The encode benchmark's per-draw cost in instructions and heap allocations, deterministic (callgrind, lavapipe):
+#   scripts/encode-bench-callgrind [FRAMES]   (default 60; draws a frame: DRAWS, default 60)
+# Builds the release example (crates/metal2vulkan-runtime/examples/encode_bench.rs) and prints the inclusive instructions of
+# RenderCommandEncoder::draw_primitives and end_encoding per draw, and malloc/calloc/realloc calls per draw over the whole run.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+FRAMES=${1:-60}; DRAWS=${DRAWS:-60}
+cargo +1.98.0 build -q --release -p metal2vulkan-runtime --example encode_bench
+out=$(mktemp -d "${TMPDIR:-/tmp}/encode-cg.XXXXXX"); trap 'rm -rf "$out"' EXIT
+icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | grep -m1 "$(uname -m)" || true)
+FRAMES=$FRAMES DRAWS=$DRAWS VK_ICD_FILENAMES=$icd valgrind --tool=callgrind --callgrind-out-file="$out/cg" \
+  target/release/examples/encode_bench >/dev/null 2>&1
+callgrind_annotate --inclusive=yes --threshold=100 "$out/cg" > "$out/incl" 2>/dev/null
+callgrind_annotate --tree=caller --threshold=100 "$out/cg" > "$out/caller" 2>/dev/null
+python3 -I - "$out" "$FRAMES" "$DRAWS" <<'PY'
+import re, sys
+out, frames, draws = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+n = frames * draws
+incl = open(out + '/incl').read().splitlines()
+def ir(name):
+    for l in incl:
+        if name in l and '*' not in l:
+            m = re.match(r'\s*([\d,]+)', l)
+            if m: return int(m.group(1).replace(',', ''))
+    return 0
+for name in ['RenderCommandEncoder>::draw_primitives ', 'RenderCommandEncoder>::end_encoding ']:
+    print('%-40s %8.0f instructions a draw' % (name.strip(), ir(name) / n))
+calls = 0
+lines = open(out + '/caller').read().splitlines()
+for i, l in enumerate(lines):
+    if '*  ' in l and re.search(r'malloc\.c:(malloc|calloc|realloc) ', l):
+        j = i - 1
+        while j >= 0 and lines[j].strip():
+            m = re.search(r'\(([\d,]+)x\)', lines[j])
+            if m: calls += int(m.group(1).replace(',', ''))
+            j -= 1
+print('%-40s %8.1f a draw (whole run, setup included)' % ('malloc+calloc+realloc calls', calls / n))
+PY
