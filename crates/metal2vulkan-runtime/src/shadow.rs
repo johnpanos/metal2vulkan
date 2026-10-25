@@ -1344,7 +1344,8 @@ impl<M: Clone> ShadowSync<M> {
     }
 }
 
-/// `M2V_SHADOW_LOG=PATH` (read once): one line a copy in, appended to PATH, of why the shadow's
+/// `M2V_SHADOW_LOG=PATH` (read once): one line a copy in, appended to PATH (its truth's bytes: `host`
+/// pages such as an IOSurface's, or `fixed`, the runtime's own memory such as a heap's), of why the shadow's
 /// held contents did not apply (`ShadowHeld`): `unstated` (its owner states no generation),
 /// `forgotten` (a write through it or of its truth's bytes since its last copy), `moved` (the
 /// owner's generation changed: the truth's bytes were written outside the runtime, by the CPU),
@@ -1377,14 +1378,18 @@ fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
         "moved"
     };
     let (kind, bytes, extent) = match &copies.source {
-        ShadowSource::Bytes { bytes, target, .. } => {
+        ShadowSource::Bytes { bytes, target, buffer, .. } => {
+            let kind = match buffer {
+                ShadowBuffer::Fixed(_) => "fixed",
+                ShadowBuffer::Rebound(_) => "host",
+            };
             let extent = match target {
                 ShadowTarget::Image { regions, .. } => regions
                     .first()
                     .map(|r| (r.image_extent.width, r.image_extent.height)),
                 _ => None,
             };
-            ("bytes", bytes.end - bytes.start, extent)
+            (kind, bytes.end - bytes.start, extent)
         }
         ShadowSource::Image { .. } => ("image", 0, None),
         _ => ("other", 0, None),
