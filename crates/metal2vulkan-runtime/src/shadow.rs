@@ -1382,16 +1382,33 @@ impl<M: Clone> ShadowSync<M> {
 /// `stale` (a write earlier in the same encoder), `shared` (a copy back of another shadow over the
 /// same bytes just planned). A diagnostic for the render server's copy-ins (fajita); it changes
 /// nothing it logs.
-fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
-    use std::io::Write;
+fn shadow_log() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
     static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
         std::sync::OnceLock::new();
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let Some(log) = LOG.get_or_init(|| {
+    LOG.get_or_init(|| {
         let path = std::env::var_os("M2V_SHADOW_LOG")?;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
         Some(std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 16, file)))
-    }) else {
+    })
+    .as_ref()
+}
+
+/// Under M2V_SHADOW_LOG, a `made` line: a texture over a buffer was made a shadow, and why no image
+/// lies over the bytes (the reason `Degradation::ShadowedTexture` reports once a device).
+pub(super) fn shadow_made_log(object: &str, why: &str) {
+    use std::io::Write;
+    let Some(log) = shadow_log() else {
+        return;
+    };
+    if let Ok(mut out) = log.lock() {
+        let _ = writeln!(out, "made pid={} {object}: {why}", std::process::id());
+    }
+}
+
+fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
+    use std::io::Write;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(log) = shadow_log() else {
         return;
     };
     let stated = copies.held.stated.load(Ordering::Acquire);

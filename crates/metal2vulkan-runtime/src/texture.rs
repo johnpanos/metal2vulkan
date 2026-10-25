@@ -2031,6 +2031,14 @@ impl Device {
         // Its copies keep its own image, which it presents again once the bytes lie in pages.
         self.stand_in_while_detached(&texels.buffer, &image)?;
         let (offset, bytes_per_row) = (texels.layout.offset, texels.layout.row_pitch);
+        {
+            let format = descriptor.pixel_format;
+            let [width, height, _] = layout.extent;
+            super::shadow::shadow_made_log(
+                &format!("{format:?} {width}x{height} offset {offset} rows {bytes_per_row}"),
+                &why,
+            );
+        }
         self.degrade(Degradation::ShadowedTexture, || {
             let format = descriptor.pixel_format;
             let [width, height, _] = layout.extent;
