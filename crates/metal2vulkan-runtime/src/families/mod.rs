@@ -404,8 +404,17 @@ impl Device {
     /// no family. The module docs say how each family's rows are chosen and judged;
     /// [`family_blockers`](Device::family_blockers) names what keeps a family false.
     pub fn supports_family(&self, family: i64) -> bool {
-        GpuFamily::from_raw(family)
-            .is_some_and(|family| self.family_rows(family).iter().all(|r| !r.state.blocks()))
+        // The rows are fixed for the device's life (its facts and format answers are), and Metal
+        // asks for every texture's level layout (`MTLGetTextureLevelInfoForDeviceWithOptions`):
+        // the render server spent 46% of its CPU auditing families before this memo (fajita).
+        let answers = &self.shared().textures.family_answers;
+        if let Some(&answer) = crate::device::lock(answers).get(&family) {
+            return answer;
+        }
+        let answer = GpuFamily::from_raw(family)
+            .is_some_and(|family| self.family_rows(family).iter().all(|r| !r.state.blocks()));
+        crate::device::lock(answers).insert(family, answer);
+        answer
     }
 
     /// Every row `family` lists, with its state on this device.

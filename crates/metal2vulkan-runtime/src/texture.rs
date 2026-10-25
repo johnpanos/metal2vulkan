@@ -192,6 +192,10 @@ pub(super) struct TextureState {
     /// Each pixel format's texture capabilities, worked out at its first query
     /// (`families/formats.rs`).
     pub(super) format_answers: Mutex<HashMap<PixelFormat, FormatAnswers>>,
+    /// Each GPU family's `supportsFamily:` answer, worked out at its first query from the rows
+    /// above (`families/mod.rs`): Metal asks it for every texture's level layout, so the audit runs
+    /// once per family, not once per question.
+    pub(super) family_answers: Mutex<HashMap<i64, bool>>,
     /// Each Vulkan format's `DRM_FORMAT_MOD_LINEAR` tiling features, asked of the driver at the
     /// first image of that tiling planned in it (`dma_buf.rs`'s `modifier_features`): one entry
     /// per format at most.
@@ -235,6 +239,7 @@ impl TextureState {
             neutrals: Mutex::new(Neutrals::default()),
             usage_answers: Mutex::new(UsageAnswers::default()),
             format_answers: Mutex::new(HashMap::new()),
+            family_answers: Mutex::new(HashMap::new()),
             #[cfg(unix)]
             modifier_features: Mutex::new(HashMap::new()),
             #[cfg(unix)]
