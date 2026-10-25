@@ -1429,9 +1429,10 @@ fn copy_in_log(copies: &ShadowCopies, fresh: bool, written: bool) {
     if let Ok(mut out) = log.lock() {
         let _ = writeln!(
             out,
-            "{t:.3} {:?} {kind} {bytes} {w}x{h} {reason} stated={stated} copied={copied} why={}",
+            "{t:.3} {:?} {kind} {bytes} {w}x{h} {reason} stated={stated} copied={copied} why={} pid={}",
             copies.shadow_key,
-            copies.held.why.load(Ordering::Relaxed)
+            copies.held.why.load(Ordering::Relaxed),
+            std::process::id()
         );
         if out.buffer().len() > (1 << 15) {
             let _ = out.flush();
