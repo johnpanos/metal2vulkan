@@ -1204,7 +1204,8 @@ impl<'a> Class<'a> {
     /// `h(a · b + c)`: of `half` values exactly ([`half_sum`]); where the product or the addend
     /// (`raw`) reads an unrounded source ([`Atom::Sf`]), the exact value rounded to `float` first,
     /// as Metal's `float` arithmetic rounds it ([`float_fma_exact`]; a product of `half`s is
-    /// exact in `float`, so a `float` addend's sum is one addition).
+    /// exact in `float`, so a `float` addend's sum is one addition). Under
+    /// `ExtendedRangePolicy::Device` the device's `f32` product and sum.
     fn fma(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -1212,7 +1213,14 @@ impl<'a> Class<'a> {
         [a, b, c]: [Value; 3],
     ) -> BResult<Value> {
         let f = self.lanes.floats();
+        // `ExtendedRangePolicy::Device`: the `f32` product and sum, rounded once to `half` below;
+        // apart from Metal's exact value only where the `f32` result lands on a `half` tie.
+        let device = fb.module().extended_range_device();
         let s = match (raw_product, raw_addend) {
+            _ if device => {
+                let p = fb.binary(BinOp::FMul, a, b)?;
+                fb.binary(BinOp::FAdd, p, c)?
+            }
             (true, _) => float_fma_exact(fb, f, a, b, c)?,
             (false, true) => {
                 let p = fb.binary(BinOp::FMul, a, b)?;

@@ -130,9 +130,17 @@ fn word(
     f.access_chain(base, &[zero, at])
 }
 
+thread_local! {
+    /// Whether [`kernel`] builds its module under `ExtendedRangePolicy::Device`
+    /// (`ModuleBuilder::set_extended_range_device`); the tests of Metal's exact arithmetic leave
+    /// it off.
+    static DEVICE_ARITHMETIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A kernel whose invocation `i` reads `op`'s words from buffer 0 and writes four to buffer 1.
 fn kernel(form: ExtendedRange, op: Op) -> BResult<TypedModule> {
     let mut b = ModuleBuilder::new();
+    b.set_extended_range_device(DEVICE_ARITHMETIC.with(std::cell::Cell::get));
     let f32_ = b.ty(Type::Float { width: 32 })?;
     let u32_ = b.ty(Type::Int {
         width: 32,
@@ -1204,6 +1212,52 @@ fn every_blend_computes_its_arithmetic() {
             .unwrap_or_else(|e| panic!("{eq:?} {mask:?} without fast math: {e}"));
         arithmetic_holds(&mut r, &b, (&eq, form, mask), rounded);
     }
+}
+
+/// Under `ExtendedRangePolicy::Device` the shader's blend of every color key (each paired with an
+/// alpha key in turn), on each linear form, under several masks, over random texels, sources
+/// and blend colors, is within four `half` ulps of Metal's arithmetic in every lane plus `2^-12`
+/// where intermediate `half` denormals flush (a NaN where Metal's is one): each sum and product the device's `f32` arithmetic and `OpQuantizeToF16`,
+/// the tile value the device's decode (`PrecisionNote::DeviceExtendedRange`).
+#[test]
+fn under_the_device_s_arithmetic_every_blend_is_within_four_half_ulps() {
+    DEVICE_ARITHMETIC.with(|d| d.set(true));
+    let keys = keys();
+    let mut r = Rng(0x5852_4233);
+    let mut checked = 0;
+    for (i, &color) in keys.iter().enumerate() {
+        let eq = equation(color, keys[(i * 31 + 7) % keys.len()]);
+        let form = LINEAR[i % LINEAR.len()];
+        let mask = MASKS[i % MASKS.len()];
+        for (output, math) in [
+            (FloatFmt::Half, BlendMath::Fast),
+            (FloatFmt::F32, BlendMath::Fast),
+        ] {
+            let Ok(b) = Blend::for_output(&eq, form, mask, (Some(output), math)) else {
+                continue;
+            };
+            let color = [0u8; 4].map(|_| half(r.half_bits()));
+            let (lanes, inputs) = blend_lanes(&mut r, form, 12, color, output);
+            let got = run(form, Op::Blend(eq, mask, output, math), &lanes);
+            let rows = constant_words(color);
+            for ((g, (codes, s)), words) in got.iter().zip(&inputs).zip(&lanes) {
+                let d = tile_model(form, *codes);
+                let s1: [f32; 4] = std::array::from_fn(|k| f32::from_bits(words[16 + k]));
+                let want = blend_value(&b, (*s, s1), d, rows);
+                for (g, w) in g.map(f32::from_bits).into_iter().zip(want) {
+                    let ulp = (w.abs().max(2f32.powi(-14)).log2().floor() - 10.0).exp2();
+                    assert!(
+                        (w.is_nan() && g.is_nan()) || (g - w).abs() <= 4.0 * ulp + 2f32.powi(-12),
+                        "{form:?} {eq:?} {mask:?} {output:?}: {b:?}, source {s:?} over codes \
+                         {codes:?}: {g} against Metal's {w}"
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    DEVICE_ARITHMETIC.with(|d| d.set(false));
+    assert!(checked > keys.len(), "{checked} blends checked");
 }
 
 /// The shader's blend `b` of `eq` into `form` under `mask`, of an output of `output` in a function

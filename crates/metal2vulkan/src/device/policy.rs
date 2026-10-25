@@ -427,8 +427,10 @@ pub enum ColorWritePolicy {
 pub enum ExtendedRangePolicy {
     /// The device's float arithmetic (the default): a code's value is `(c - 384)` times the `f32`
     /// nearest `1 / 510` (a padded code's `c` times that of `1 / 1023`), a value's code the
-    /// device's `RoundEven` of its `f32` product with 510 (1023), and a `half` the tile or a
-    /// blend rounds to the device's `OpQuantizeToF16`. Within an `f32` ulp of Metal's value, one
+    /// device's `RoundEven` of its `f32` product with 510 (1023), a `half` the tile or a blend
+    /// rounds the device's `OpQuantizeToF16`, and a blend's products and sums the device's `f32`
+    /// arithmetic (a blended lane within four `half` ulps, plus `2^-12` where intermediate `half`
+    /// denormals flush). Within an `f32` ulp of Metal's value, one
     /// code where the product lies within an ulp of a tie, the `half` rounded to nearest even
     /// where Metal rounds a tie away from zero, a `half` denormal possibly flushed; recorded as
     /// [`PrecisionNote::DeviceExtendedRange`](crate::pipeline::PrecisionNote::DeviceExtendedRange).
