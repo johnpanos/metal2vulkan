@@ -169,6 +169,17 @@ impl StatedShadows {
 
     /// A command's `uses`: each write meeting a stated shadow's truth forgets its copy.
     pub(super) fn written(&self, uses: &[Use<ResourceKey>]) {
+        self.written_except(uses, None);
+    }
+
+    /// [`written`](Self::written), but a copy back's own shadow keeps its held contents: the
+    /// copy makes the truth's bytes what that shadow holds (fajita: CoreAnimation's frame surface
+    /// forgot its own copy back, `why=1`, and was copied in again at every frame, 32 GB in 86 s).
+    pub(super) fn written_except(
+        &self,
+        uses: &[Use<ResourceKey>],
+        except: Option<&Arc<ShadowCopies>>,
+    ) {
         if !self.any.load(Ordering::Acquire) || uses.iter().all(|u| u.write.is_empty()) {
             return;
         }
@@ -176,6 +187,9 @@ impl StatedShadows {
             return;
         };
         for copies in shadows.iter().filter_map(std::sync::Weak::upgrade) {
+            if except.is_some_and(|own| Arc::ptr_eq(own, &copies)) {
+                continue;
+            }
             if uses.iter().any(|u| !u.write.is_empty() && copies.meets(u)) {
                 copies.held.forget(1);
             }

@@ -731,8 +731,10 @@ impl EncoderCore {
         for copy in copies {
             let stages = copy.stages();
             let uses = copy.uses();
-            // A copy back (or merge) of another shadow over the same bytes writes them.
-            self.device().shared().stated_shadows.written(&uses);
+            // A copy back (or merge) of another shadow over the same bytes writes them; a copy
+            // back leaves its own shadow holding them.
+            let own = matches!(copy.step, Step::Back).then_some(&copy.copies);
+            self.device().shared().stated_shadows.written_except(&uses, own);
             if self.uses.ordered() {
                 self.command(stages, &uses, |device, raw| {
                     // SAFETY: the encoder's command buffer is recording outside a render pass;
