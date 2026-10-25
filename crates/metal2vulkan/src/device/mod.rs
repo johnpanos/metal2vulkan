@@ -69,7 +69,7 @@ pub use policy::{
     ColorWritePolicy, ContainmentPolicy, DevicePolicy, ExtendedRangePolicy, FloatMathsPolicy,
     HalfBlendPolicy, HalfRoundingPolicy, IdleColorsPolicy, NanMinMaxPolicy, PaddedReadsPolicy,
     RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, UniformOffsetPolicy,
-    Unorm8LinearFilterPolicy,
+    Unorm8LinearFilterPolicy, YCbCrLinearFilterPolicy,
 };
 pub(crate) use profile::whole_point_size;
 pub use profile::{DeviceProfile, SpirvValidation};

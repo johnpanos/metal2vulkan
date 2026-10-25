@@ -25,6 +25,10 @@ pub struct DevicePolicy {
     /// filter on a device measured within one code of Metal; by default it is Metal's filter,
     /// emulated exactly.
     pub unorm8_linear_filter: Unorm8LinearFilterPolicy,
+    /// How a two-plane YCbCr texture's linear sample is filtered on a device that samples
+    /// natively: Metal's filter on its 1/2048 grid emulated in the function (the default), or the
+    /// device's filter of the converted image.
+    pub ycbcr_linear_filter: YCbCrLinearFilterPolicy,
     /// Whether a device that does not sample through Metal's own sampler samples natively (the
     /// default) or emulates Metal's sampler exactly.
     pub sampling: SamplingPolicy,
@@ -93,6 +97,7 @@ impl DevicePolicy {
         isolation: GuestIsolation::On,
         framebuffer_fetch: FramebufferFetchPolicy::RequireOrdered,
         unorm8_linear_filter: Unorm8LinearFilterPolicy::Exact,
+        ycbcr_linear_filter: YCbCrLinearFilterPolicy::Exact,
         sampling: SamplingPolicy::NativeDevice,
         float_maths: FloatMathsPolicy::Native,
         texel_conversion: TexelConversionPolicy::Device,
@@ -171,6 +176,24 @@ pub enum Unorm8LinearFilterPolicy {
     /// [`PrecisionNote::DeviceUnorm8LinearFilter`](crate::pipeline::PrecisionNote::DeviceUnorm8LinearFilter)
     /// and requires `VkProperty::Unorm8LinearFilter`. An unmeasured device keeps Metal's filter.
     DeviceWithinOneCode,
+}
+
+/// How a two-plane YCbCr texture's linear sample is filtered (`lower::sampler::linear`) on a device
+/// that samples natively (`SamplingPolicy::NativeDevice`): its converted image (`R16G16B16A16_SFLOAT`
+/// of the converted values, the runtime's `texture/ycbcr_image.rs`) through the function's
+/// emulation of Metal's filter on the 1/2048 grid (the default, exact), or through the device's
+/// own filter, within the grid's step of Metal's: one sample instead of four fetches and the
+/// emulation's integer arithmetic (fajita: a full-screen sample of a 4:2:0 surface was a
+/// 1079-instruction fragment function, 3.5 ms a draw on the Adreno 630).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum YCbCrLinearFilterPolicy {
+    /// Metal's filter, emulated exactly (the default).
+    #[default]
+    Exact,
+    /// The device's filter of the converted image.
+    Device,
 }
 
 /// How a device that does not sample through Metal's own sampler (MoltenVK on Apple's GPU,

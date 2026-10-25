@@ -379,6 +379,9 @@ pub struct ProfileFields {
     /// Whether a float color output is the device's conversion or rounded to Metal's code in the
     /// shader (the policy's).
     pub color_writes: crate::device::policy::ColorWritePolicy,
+    /// Whether a YCbCr texture's linear sample is Metal's emulated filter or the device's (the
+    /// policy's).
+    pub ycbcr_linear_filter: crate::device::policy::YCbCrLinearFilterPolicy,
     /// Whether an extended-range texel converts by the device's float arithmetic or Metal's exact
     /// one (the policy's).
     pub extended_range: crate::device::policy::ExtendedRangePolicy,

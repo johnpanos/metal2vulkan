@@ -61,6 +61,9 @@ fn choices() -> Vec<Choice> {
         // The accuracy choices, below.
         framebuffer_fetch: _,
         unorm8_linear_filter: _,
+        // A YCbCr texture's linear filter: Metal's by default; the device's on request (not a
+        // fast default, so no row here).
+        ycbcr_linear_filter: _,
         sampling: _,
         float_maths: _,
         texel_conversion: _,

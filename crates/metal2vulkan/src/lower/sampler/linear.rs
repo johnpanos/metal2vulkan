@@ -527,7 +527,12 @@ pub(super) fn select(
     // for a slot under its YCbCr variant; on one that samples natively, the device's filter is the
     // answer.
     let metal_sampler = cx.profile.device_samples();
-    if metal_sampler && !crate::lower::texture::ycbcr_texture(cx, image, shape)? {
+    let device_ycbcr = cx.profile.fields().ycbcr_linear_filter
+        == crate::device::YCbCrLinearFilterPolicy::Device
+        && !cx.profile.fields().enabled.properties.contains(
+            &crate::device::requirements::VkProperty::MetalSampler,
+        );
+    if metal_sampler && (device_ycbcr || !crate::lower::texture::ycbcr_texture(cx, image, shape)?) {
         cx.families.sampler.metal_sampler = true;
         return Ok(None);
     }
@@ -689,7 +694,12 @@ pub(super) fn filter_note(
         }
     }
     let metal = cx.profile.device_samples();
-    let device_metal = metal && !crate::lower::texture::ycbcr_slot(cx, image)?;
+    let device_ycbcr = cx.profile.fields().ycbcr_linear_filter
+        == crate::device::YCbCrLinearFilterPolicy::Device
+        && !cx.profile.fields().enabled.properties.contains(
+            &crate::device::requirements::VkProperty::MetalSampler,
+        );
+    let device_metal = metal && (device_ycbcr || !crate::lower::texture::ycbcr_slot(cx, image)?);
     Ok((!device_metal).then_some(note))
 }
 
