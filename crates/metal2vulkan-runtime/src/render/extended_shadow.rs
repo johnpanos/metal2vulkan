@@ -422,6 +422,7 @@ impl RenderCommandEncoder {
     /// into one that leaves them out where they wrote them.
     pub(super) fn start_extended_shadows(&mut self, pipeline: &DrawingState) -> Result<(), Error> {
         if !self.extended.holds
+            || !extended_shadows_wanted()
             || self.replaying
             || self.rerouting
             || self.capture_addresses().is_some()
@@ -604,4 +605,13 @@ fn new_shadow(maker: &CommandBuffer, extent: [u32; 2]) -> Result<Target, Error> 
         samples: 1,
         extent,
     })
+}
+
+/// `M2V_EXTENDED_SHADOWS=0` (read once; an experiment, on by default): start no `half` shadow, so
+/// draws that blend into or read an extended-range color an earlier draw wrote see the stored
+/// codes, as the announcement says (`extended-range-blends-stored-codes`): fajita measures what the
+/// shadowed variants cost (a full-screen one of 1079 instructions, 3.5 ms a draw on the A630).
+fn extended_shadows_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("M2V_EXTENDED_SHADOWS").as_deref() != Ok("0"))
 }
