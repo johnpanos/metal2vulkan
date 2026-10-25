@@ -148,7 +148,10 @@ pub(super) struct ShadowCopies {
 #[derive(Default)]
 pub(super) struct StatedShadows {
     any: std::sync::atomic::AtomicBool,
-    shadows: std::sync::Mutex<Vec<std::sync::Weak<ShadowCopies>>>,
+    /// By the keys a command's use of the truth names (the truth's own and its alias's), so a
+    /// command checks the shadows over what it writes alone: the render server states hundreds,
+    /// and every draw writes its attachments.
+    shadows: std::sync::Mutex<crate::key_hash::KeyMap<ResourceKey, Vec<std::sync::Weak<ShadowCopies>>>>,
 }
 
 impl StatedShadows {
@@ -157,12 +160,16 @@ impl StatedShadows {
         let Ok(mut shadows) = self.shadows.lock() else {
             return;
         };
-        shadows.retain(|w| w.strong_count() > 0);
-        if !shadows
-            .iter()
-            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(copies)))
-        {
-            shadows.push(Arc::downgrade(copies));
+        let (key, _) = copies.truth();
+        for key in [Some(key), copies.alias()].into_iter().flatten() {
+            let list = shadows.entry(key).or_default();
+            list.retain(|w| w.strong_count() > 0);
+            if !list
+                .iter()
+                .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(copies)))
+            {
+                list.push(Arc::downgrade(copies));
+            }
         }
         self.any.store(true, Ordering::Release);
     }
@@ -183,15 +190,21 @@ impl StatedShadows {
         if !self.any.load(Ordering::Acquire) || uses.iter().all(|u| u.write.is_empty()) {
             return;
         }
-        let Ok(shadows) = self.shadows.lock() else {
+        let Ok(mut shadows) = self.shadows.lock() else {
             return;
         };
-        for copies in shadows.iter().filter_map(std::sync::Weak::upgrade) {
-            if except.is_some_and(|own| Arc::ptr_eq(own, &copies)) {
+        for used in uses.iter().filter(|u| !u.write.is_empty()) {
+            let Some(list) = shadows.get_mut(&used.key) else {
                 continue;
-            }
-            if uses.iter().any(|u| !u.write.is_empty() && copies.meets(u)) {
-                copies.held.forget(1);
+            };
+            list.retain(|w| w.strong_count() > 0);
+            for copies in list.iter().filter_map(std::sync::Weak::upgrade) {
+                if except.is_some_and(|own| Arc::ptr_eq(own, &copies)) {
+                    continue;
+                }
+                if copies.meets(used) {
+                    copies.held.forget(1);
+                }
             }
         }
     }
