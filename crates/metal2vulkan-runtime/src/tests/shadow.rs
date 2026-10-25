@@ -737,11 +737,16 @@ fn a_shadow_whose_owner_states_its_contents_is_copied_in_once_across_encoders() 
     sync.finish();
     assert_eq!(encoder(&t), [(t.shadow_key, true)]);
     assert_eq!(encoder(&t), []);
-    // A write through the texture (copied back at the encoder's end): copied in again next.
+    // A write through the texture (copied back at the encoder's end): the image still holds the
+    // bytes it copied back, so the next encoder takes no copy in under the same generation.
     let mut sync = ShadowSync::default();
     assert_eq!(command(&mut sync, &[(&t, true)], &[]), []);
     assert_eq!(named(&sync.finish()), [(t.shadow_key, false)]);
+    assert_eq!(encoder(&t), []);
+    // A new generation after it: copied in again, once.
+    t.held.state(9);
     assert_eq!(encoder(&t), [(t.shadow_key, true)]);
+    assert_eq!(encoder(&t), []);
     // Stating 0 states nothing again.
     t.held.state(0);
     assert_eq!(encoder(&t), [(t.shadow_key, true)]);
