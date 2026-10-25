@@ -1963,6 +1963,24 @@ impl Device {
         // where the texture only reads, by the policy (`linear_plan::holding`); else why none may.
         let policy = self.compile_device().policy().padded_reads;
         let holds = holding(&texels.layout, usage, policy);
+        // M2V_ALIAS_PADDED_TARGETS=1 (an experiment, off by default): a texture over host pages (an
+        // IOSurface's) whose padded rows its render passes or writes would reach is an image over
+        // them too, padding included: the bytes between a surface's rows are nobody's texels, so
+        // the copy in before and the copy back after every pass (fajita: CoreAnimation's frame
+        // surfaces, 1.3 ms of GPU a frame) give way to rendering in place, at the cost of the
+        // image's compression. Metal keeps those bytes as the program wrote them; this does not.
+        let holds = match holds {
+            Err(_)
+                if padded_targets()
+                    && matches!(
+                        texels.buffer.caller_memory(),
+                        Some(crate::buffer::CallerMemory::HostPages)
+                    ) =>
+            {
+                Ok(crate::linear_plan::Holds::Padding)
+            }
+            holds => holds,
+        };
         // Over bytes detached from their pages (`detach.rs`) no image aliases them: the texture
         // is their shadow, which presents a stand-in until they lie in pages again.
         let detached = texels.buffer.detached();
@@ -5841,4 +5859,10 @@ struct HostCopy {
     /// A two-plane extended-range texture's color words, its image's texels 8 bytes each
     /// (`two_planes.rs`).
     planes: bool,
+}
+
+/// `M2V_ALIAS_PADDED_TARGETS=1` (read once): see `Device::texture_over_texels`.
+fn padded_targets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("M2V_ALIAS_PADDED_TARGETS").as_deref() == Ok("1"))
 }
