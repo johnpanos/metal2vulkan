@@ -233,7 +233,7 @@ use std::collections::BTreeMap;
 
 use crate::bind::heap::{planner, HeapPlanner};
 use crate::bind::instantiate::{
-    bind_buffers, descriptor_range, put, slot_field, BufferExtent, BufferRange, DescriptorBytes,
+    bind_buffers, descriptor_range, put, slot_field, BufferExtent, BufferRange, DescriptorBytes, FieldBytes,
     DescriptorRange, IndexBufferRef, IndirectRef, PushConstantWrite, PushHole, RangeError,
     RootTable,
 };
@@ -3326,7 +3326,7 @@ fn instantiate(
             }
         ];
         for f in &st.fields {
-            let bytes: Vec<u8> = match f.field {
+            let bytes: FieldBytes = match f.field {
                 PushField::RootTableAddress
                 | PushField::ExecutionStatusAddress
                 | PushField::CaptureAddress
@@ -3355,27 +3355,27 @@ fn instantiate(
                     let Some(shadow) = &t.shadow_stencil else {
                         return Err(internal("a stencil state without its shader-side stencil"));
                     };
-                    shadow_stencil_words(shadow, state)?
+                    shadow_stencil_words(shadow, state)?.into()
                 }
                 PushField::ShaderTestsState => {
                     if t.shader_tests.is_none() {
                         return Err(internal("a depth state without its in-shader depth test"));
                     }
-                    shader_tests_words(state)
+                    shader_tests_words(state).into()
                 }
                 PushField::ShaderStencilState => {
                     if t.shader_tests.is_none() {
                         return Err(internal("a stencil state without its in-shader tests"));
                     }
-                    shader_stencil_words(state)
+                    shader_stencil_words(state).into()
                 }
                 PushField::DispatchRegion => match mesh.as_ref().and_then(|m| m.region(st.stage)) {
-                    Some(region) => region.to_vec(),
+                    Some(region) => region.iter().copied().collect(),
                     None => return Err(internal("a dispatch region outside a mesh draw")),
                 },
-                PushField::ViewportCount => state.viewport_count.to_le_bytes().to_vec(),
+                PushField::ViewportCount => state.viewport_count.to_le_bytes().into(),
                 PushField::RenderTargetArrayLength => {
-                    state.render_target_array_length.to_le_bytes().to_vec()
+                    state.render_target_array_length.to_le_bytes().into()
                 }
                 // The identity where the state holds none: a plan states its variant, so
                 // instantiation under another shape asks for the other one first.
@@ -3396,7 +3396,7 @@ fn instantiate(
                     .viewport_compensation
                     .map_or(0, |c| c.mirrors)
                     .to_le_bytes()
-                    .to_vec(),
+                    .into(),
                 // No vertex's depth clamped where the state holds none.
                 PushField::VertexDepthClamp => state
                     .viewport_compensation
@@ -3411,11 +3411,11 @@ fn instantiate(
                     .iter()
                     .flat_map(|v| v.to_le_bytes())
                     .collect(),
-                PushField::StorageKeptChannels => t.storage_kept.to_le_bytes().to_vec(),
+                PushField::StorageKeptChannels => t.storage_kept.to_le_bytes().into(),
                 // The attachment's rule word, as link derived it from the pipeline's attachment.
                 PushField::ColorWriteRule(color) => {
                     match t.color_write_rules.iter().find(|(c, _)| *c == color) {
-                        Some((_, word)) => word.to_le_bytes().to_vec(),
+                        Some((_, word)) => word.to_le_bytes().into(),
                         None => return Err(internal("a color write rule link gave no word")),
                     }
                 }
@@ -3440,11 +3440,11 @@ fn instantiate(
                 | PushField::AmplificationViewportOffset => {
                     amplification_word(f.field, 0, &t.amplifications)?
                         .to_le_bytes()
-                        .to_vec()
+                        .into()
                 }
                 PushField::BaseVertexInstance => {
                     reads_base = true;
-                    let mut b = base[0].to_le_bytes().to_vec();
+                    let mut b = FieldBytes::from(base[0].to_le_bytes());
                     b.extend_from_slice(&base[1].to_le_bytes());
                     b
                 }
@@ -3471,7 +3471,7 @@ fn instantiate(
                             )))
                         }
                     };
-                    stride.to_le_bytes().to_vec()
+                    stride.to_le_bytes().into()
                 }
                 field => slot_field(field, &bound.residuals, &t.resources, state)
                     .ok_or_else(|| internal(format!("a render push field {field:?}")))?,

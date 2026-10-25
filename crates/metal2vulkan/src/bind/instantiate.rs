@@ -621,7 +621,7 @@ pub(crate) fn slot_field(
     residuals: &[(SlotRef, u32)],
     resources: &crate::bind::plan::ResourceTemplate,
     state: &BindState,
-) -> Option<Vec<u8>> {
+) -> Option<FieldBytes> {
     match field {
         // The bound structure's instance count, 0 for an unbound slot.
         PushField::InstanceCount(slot) => {
@@ -630,38 +630,38 @@ pub(crate) fn slot_field(
                 .get(&slot.stage)
                 .and_then(|t| t.acceleration_structures.get(&slot.index))
                 .map_or(0, |s| s.instance_count);
-            Some(count.to_le_bytes().to_vec())
+            Some(count.to_le_bytes().into())
         }
         // The level count the plan bound.
         PushField::TextureLevels(slot) => resources
             .texture_levels
             .iter()
             .find(|(s, _)| *s == slot)
-            .map(|(_, levels)| levels.to_le_bytes().to_vec()),
+            .map(|(_, levels)| levels.to_le_bytes().into()),
         // The value the bound resources decide, as the plan recorded it.
         PushField::Specialized(key) => resources
             .specialized
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, value)| value.to_le_bytes().to_vec()),
+            .map(|(_, value)| value.to_le_bytes().into()),
         // Whether the texture the plan bound holds 16-bit float channels.
         PushField::TextureHalfChannels(slot) => resources
             .texture_half_channels
             .iter()
             .find(|(s, _)| *s == slot)
-            .map(|(_, half)| half.to_le_bytes().to_vec()),
+            .map(|(_, half)| half.to_le_bytes().into()),
         // The integer channel widths of the texture the plan bound.
         PushField::TextureIntegerChannels(slot) => resources
             .texture_integer_channels
             .iter()
             .find(|(s, _)| *s == slot)
-            .map(|(_, word)| word.to_le_bytes().to_vec()),
+            .map(|(_, word)| word.to_le_bytes().into()),
         PushField::SlotBindOffset(slot) => {
             let r = residuals
                 .iter()
                 .find(|(s, _)| *s == slot)
                 .map_or(0, |r| r.1);
-            Some(r.to_le_bytes().to_vec())
+            Some(r.to_le_bytes().into())
         }
         PushField::SlotGuestBase(slot) => {
             let base = match state
@@ -676,9 +676,76 @@ pub(crate) fn slot_field(
                 }) => gpu_address.wrapping_add(offset),
                 _ => 0,
             };
-            Some(base.to_le_bytes().to_vec())
+            Some(base.to_le_bytes().into())
         }
         _ => None,
+    }
+}
+
+/// A push field's bytes, held inline up to 32 (every field but an unusually long one): the
+/// per-draw push writes made a heap allocation a field before (`slot_field`, the render and
+/// compute instantiations).
+#[derive(Clone, Debug)]
+pub(crate) enum FieldBytes {
+    Inline([u8; 32], u8),
+    Heap(Vec<u8>),
+}
+
+impl FieldBytes {
+    pub(crate) fn extend_from_slice(&mut self, more: &[u8]) {
+        match self {
+            FieldBytes::Inline(buf, len) if (*len as usize) + more.len() <= buf.len() => {
+                let at = *len as usize;
+                buf[at..at + more.len()].copy_from_slice(more);
+                *len += more.len() as u8;
+            }
+            FieldBytes::Inline(buf, len) => {
+                let mut v = buf[..*len as usize].to_vec();
+                v.extend_from_slice(more);
+                *self = FieldBytes::Heap(v);
+            }
+            FieldBytes::Heap(v) => v.extend_from_slice(more),
+        }
+    }
+}
+
+impl Default for FieldBytes {
+    fn default() -> Self {
+        FieldBytes::Inline([0; 32], 0)
+    }
+}
+
+impl std::ops::Deref for FieldBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            FieldBytes::Inline(buf, len) => &buf[..*len as usize],
+            FieldBytes::Heap(v) => v,
+        }
+    }
+}
+
+impl From<Vec<u8>> for FieldBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        FieldBytes::Heap(bytes)
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for FieldBytes {
+    fn from(bytes: [u8; N]) -> Self {
+        let mut out = FieldBytes::default();
+        out.extend_from_slice(&bytes);
+        out
+    }
+}
+
+impl FromIterator<u8> for FieldBytes {
+    fn from_iter<I: IntoIterator<Item = u8>>(iter: I) -> Self {
+        let mut out = FieldBytes::default();
+        for byte in iter {
+            out.extend_from_slice(&[byte]);
+        }
+        out
     }
 }
 

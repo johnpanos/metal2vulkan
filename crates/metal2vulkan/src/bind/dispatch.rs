@@ -58,7 +58,7 @@
 
 use crate::bind::indirect_clamp::IndirectClamp;
 use crate::bind::instantiate::{
-    bind_buffers, put, slot_field, texel_ranges, BufferExtent, DescriptorBytes, DescriptorRange,
+    bind_buffers, put, slot_field, texel_ranges, BufferExtent, DescriptorBytes, DescriptorRange, FieldBytes,
     IndirectRef, PushConstantWrite, PushHole, RootEntry, RootTable,
 };
 use crate::bind::plan::compute::{internal, not_implemented, spec_key};
@@ -834,7 +834,7 @@ fn instantiate(
 
     // Push fields that do not change per region.
     for f in &t.fields {
-        let bytes: Vec<u8> = match f.field {
+        let bytes: FieldBytes = match f.field {
             // Only a preprocess writes region records.
             PushField::ReplayRegionAddress if records == Records::Binder => {
                 return Err(not_implemented(Feature::GpuEncodedIndirectCommands));
@@ -864,7 +864,8 @@ fn instantiate(
             PushField::DispatchRegion => continue,
             PushField::StageInRegion => stage_in_region_bytes(region.ok_or_else(|| {
                 internal("a stage-in region push field without the region's fact")
-            })?),
+            })?)
+            .into(),
             // The stride the encoder bound the stage-in buffer with, 0 without one, as Metal
             // reads a dynamic layout; inline bytes' alike, but at `MTLAttributeStrideStatic`, whose
             // answer is not measured.
@@ -894,7 +895,7 @@ fn instantiate(
                     ) => s,
                     _ => 0,
                 };
-                stride.to_le_bytes().to_vec()
+                stride.to_le_bytes().into()
             }
             field => slot_field(field, &bound.residuals, &t.resources, state)
                 .ok_or_else(|| internal(format!("a compute push field {field:?}")))?,
