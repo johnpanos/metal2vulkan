@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Run pipeline-census on the Adreno 630 as fajita's Turnip compiles for it, on a Linux host: the
+# UniXNU tree's Linux Turnip build (scripts/build-turnip-linux-host.py) over its host copy of the
+# NativeAdreno kernel stack (libhostiokit.so, scripts/check-turnip-darwin-linux-host.py), with
+# the phone's Turnip debug flags. Nothing executes on the host; every pipeline is compiled to IR3.
+#
+#   UNIXNU=/path/to/UniXNU scripts/pipeline-census/a630-host --manifest M.json --out DIR [census options]
+#
+# UNIXNU defaults to /home/john/src/UniXNU-ios16-stack-gpuuser. TU_DEBUG defaults to the
+# plugin's sysmem,nocb. Builds the census (release) first.
+set -euo pipefail
+here=$(cd "$(dirname "$0")/../.." && pwd)
+unixnu=${UNIXNU:-/home/john/src/UniXNU-ios16-stack-gpuuser}
+icd=$unixnu/build/mesa-tu-linux/src/freedreno/vulkan/freedreno_devenv_icd.x86_64.json
+shim=$unixnu/build/turnip-darwin-linux-host/libhostiokit.so
+[ -f "$icd" ] || { echo "a630-host: no $icd (run scripts/build-turnip-linux-host.py in $unixnu)" >&2; exit 69; }
+[ -f "$shim" ] || { echo "a630-host: no $shim (run scripts/check-turnip-darwin-linux-host.py --gpu a630 in $unixnu)" >&2; exit 69; }
+# The census measures the translator of this checkout: say so when it does not hold the one the
+# UniXNU tree's plugin pins (scripts/data/gpu-metal-vulkan-inputs.json).
+pin=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['translator']['commit'])" \
+      "$unixnu/scripts/data/gpu-metal-vulkan-inputs.json" 2>/dev/null || true)
+if [ -n "$pin" ] && ! git -C "$here" merge-base --is-ancestor "$pin" HEAD 2>/dev/null; then
+  echo "a630-host: warning: this checkout does not contain the plugin's translator pin $pin ($unixnu)" >&2
+fi
+cargo +1.98.0 build --quiet --release --manifest-path "$here/Cargo.toml" -p metal2vulkan-validation --bin pipeline-census
+exec env VK_DRIVER_FILES="$icd" LD_PRELOAD="$shim" HOSTSIM_GPU=a630 IR3_SHADER_DEBUG="${IR3_SHADER_DEBUG:-disasm}" \
+    MESA_SHADER_CACHE_DISABLE=true MESA_LOG= TU_DEBUG="${TU_DEBUG:-sysmem,nocb}" \
+    "$here/target/release/pipeline-census" run "$@"
