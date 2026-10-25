@@ -414,8 +414,25 @@ impl Replay {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // M2V_REPLAY_TIMES=N (a host encode benchmark): the command buffers N times over, each pass's
+        // encode (command buffer made to its encoders ended) timed, and the encode time per draw
+        // printed at the end (the last N-1 times, after the first warmed the caches).
+        let times: usize = std::env::var("M2V_REPLAY_TIMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let draws: usize = buffers
+            .iter()
+            .flat_map(|cb| cb.as_array().into_iter().flatten())
+            .filter_map(|enc| enc.get("render").and_then(|r| r.get("commands")).and_then(Value::as_array))
+            .flatten()
+            .filter(|c| c.get("draw").is_some() || c.get("drawIndexed").is_some())
+            .count();
+        let mut encode = std::time::Duration::ZERO;
+        for round in 0..times {
+        if round == 1 {
+            encode = std::time::Duration::ZERO;
+        }
         for (k, encoders) in buffers.iter().enumerate() {
             let at = format!("command buffer {k}");
+            let began = std::time::Instant::now();
             let cb = self.queue().command_buffer().map_err(e(&at))?;
             for (j, encoder) in encoders.as_array().into_iter().flatten().enumerate() {
                 let at = format!("command buffer {k} encoder {j}");
@@ -429,8 +446,21 @@ impl Replay {
                     return Err(format!("{at}: neither render nor compute"));
                 }
             }
+            encode += began.elapsed();
             finish(&cb).map_err(|w| format!("{at}: {w}"))?;
-            status.line(&format!("committed {k}"));
+            if times == 1 {
+                status.line(&format!("committed {k}"));
+            }
+        }
+        }
+        if times > 1 {
+            let rounds = (times - 1) as f64;
+            let ms = encode.as_secs_f64() * 1e3 / rounds;
+            status.line(&format!(
+                "encode: {ms:.3} ms a replay of {} command buffers and {draws} draws, {:.2} us a draw",
+                buffers.len(),
+                if draws > 0 { ms * 1e3 / draws as f64 } else { 0.0 }
+            ));
         }
         Ok(())
     }
