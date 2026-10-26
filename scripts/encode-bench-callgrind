@@ -16,7 +16,7 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/encode-cg.XXXXXX"); trap 'rm -rf "$out"' EXIT
 icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | grep -m1 "$(uname -m)" || true)
 run() { # frames tag
   FRAMES=$1 DRAWS=$DRAWS VK_ICD_FILENAMES=$icd valgrind --tool=callgrind --callgrind-out-file="$out/cg$2" $collect \
-    target/release/examples/encode_bench >/dev/null 2>&1
+    "${CARGO_TARGET_DIR:-target}"/release/examples/encode_bench >/dev/null 2>&1
   callgrind_annotate --inclusive=yes --threshold=100 "$out/cg$2" > "$out/incl$2" 2>/dev/null
   callgrind_annotate --threshold=100 "$out/cg$2" > "$out/self$2" 2>/dev/null
   callgrind_annotate --tree=caller --threshold=100 "$out/cg$2" > "$out/caller$2" 2>/dev/null
