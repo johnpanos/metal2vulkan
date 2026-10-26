@@ -7422,7 +7422,7 @@ impl RenderCommandEncoder {
         // variant; a pipeline that rasterizes nothing draws through no viewport.
         let base = &pipeline.base().graphics;
         let device = self.core.device();
-        let native = render_state::native_depth_range(device.compile_device().profile());
+        let native = device.native_depth_range();
         // A saturating or offsetting depth bias folds into a compensated depth, or is refused
         // there (`EncoderState::compensation`).
         let bias = self
