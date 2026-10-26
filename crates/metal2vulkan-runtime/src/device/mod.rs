@@ -186,6 +186,10 @@ pub(super) struct DeviceShared {
     properties: DeviceProperties,
     /// The kinds of degradation the device announced (`degradation.rs`).
     pub(super) announced: Announced,
+    /// Whether the device takes a viewport depth range past `[0, 1]` natively
+    /// (`render_state::native_depth_range` of the compile device's profile): fixed for the
+    /// device's life and asked at every draw, so worked out once.
+    pub(super) native_depth_range: bool,
     /// Buffers carry Vulkan device addresses (`bufferDeviceAddress` is enabled).
     pub(super) device_address: bool,
     /// The alignment of every upload (`upload.rs`): 16 bytes, and the device's storage and
@@ -627,6 +631,13 @@ impl Device {
 
     pub(super) fn shared(&self) -> &DeviceShared {
         &self.0
+    }
+
+    /// Whether the device takes a viewport depth range past `[0, 1]` natively
+    /// (`render_state::native_depth_range`), worked out when the device was made. No Metal
+    /// counterpart.
+    pub(crate) fn native_depth_range(&self) -> bool {
+        self.0.native_depth_range
     }
 
     /// Keep room in the memory pools the runtime's encodings and commits place their own
@@ -1192,7 +1203,9 @@ impl Device {
         }
         let resource_ids: Arc<Mutex<ResourceIds>> = Arc::default();
         let sampler_ids = lock(&resource_ids).sampler_id_reads();
+        let native_depth_range = crate::render_state::native_depth_range(compile.profile());
         let shared = Arc::new(DeviceShared {
+            native_depth_range,
             instance,
             physical,
             functions,
