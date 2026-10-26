@@ -5205,7 +5205,14 @@ impl RenderCommandEncoder {
     /// location the state has no color; and in a routed draw each location its subpass leaves
     /// out where the state has no color, which the function may write all the same. Empty for a
     /// state without a fragment function, which writes no color.
-    fn dropped_colors(&self, pipeline: &DrawingState, routing: &Routing) -> BTreeSet<u32> {
+    /// `zeroed` is [`RenderCommandEncoder::zeroed_colors`] of the same pipeline and routing (the
+    /// draw works it out once for both).
+    fn dropped_colors(
+        &self,
+        pipeline: &DrawingState,
+        routing: &Routing,
+        zeroed: &BTreeMap<u32, PixelFormat>,
+    ) -> BTreeSet<u32> {
         let descriptor = pipeline.descriptor();
         if descriptor.vertex().is_some_and(|d| d.fragment.is_none()) {
             return BTreeSet::new();
@@ -5219,7 +5226,7 @@ impl RenderCommandEncoder {
                 .is_none_or(|pf| pf == PixelFormat::Invalid)
         };
         let mut dropped = routing.dropped.clone();
-        if Self::writes_colors(pipeline) && self.zeroed_colors(pipeline, routing).is_empty() {
+        if Self::writes_colors(pipeline) && zeroed.is_empty() {
             dropped.extend(routing.uncovered.keys().copied().filter(|&l| lacks(l)));
         }
         let left_out = (0u32..).zip(&routing.locations);
@@ -7536,7 +7543,7 @@ impl RenderCommandEncoder {
             .routing(pipeline)
             .map_err(|_| internal("a draw of a state its pass refuses"))?;
         let zeroed_colors = self.zeroed_colors(pipeline, &routing);
-        let dropped_colors = self.dropped_colors(pipeline, &routing);
+        let dropped_colors = self.dropped_colors(pipeline, &routing, &zeroed_colors);
         // A compensated depth, which a vertex clamp takes natively too, replaces the native
         // range (`clamp_draw_depth`).
         let compensated = compensation.is_some_and(|c| c.depth.is_some());
