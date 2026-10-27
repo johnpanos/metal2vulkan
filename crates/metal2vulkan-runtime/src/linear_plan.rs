@@ -753,6 +753,27 @@ impl Holds {
     }
 }
 
+/// Whether a render pass that keeps a texture `width` texels wide over `layout`'s texels in tile
+/// memory stores it back within the bytes an image over them may hold, in a buffer of
+/// `buffer_length` bytes: a tile store reaching the texture's right or bottom edge writes whole
+/// 16x4-texel blocks, so up to 15 texels past a row's last and 3 rows past its last row. Every
+/// row's block must end within its pitch, and the last block within the buffer; one slice only.
+/// (Upstream NativeMetal 2d35c57's bridge patch 0016, for the padded-target alias below.)
+pub(super) fn tile_store_fits(layout: &BufferLayout, width: u64, buffer_length: u64) -> bool {
+    const TILE: (u64, u64) = (16, 4);
+    if layout.slices != 1 || width == 0 || !layout.row_bytes.is_multiple_of(width) {
+        return false;
+    }
+    let block_row = width.next_multiple_of(TILE.0) * (layout.row_bytes / width);
+    let last_row = layout.rows.next_multiple_of(TILE.1) - 1;
+    layout.row_pitch >= block_row
+        && layout
+            .offset
+            .saturating_add(layout.row_pitch.saturating_mul(last_row))
+            .saturating_add(block_row)
+            <= buffer_length
+}
+
 /// Whether a texture of Metal `usage` (as Metal reports it: `Unknown` as `ShaderRead |
 /// ShaderWrite | RenderTarget | PixelFormatView`, `texture_descriptor::texture_usage`) only reads:
 /// no render pass takes its image as an attachment (`RenderTarget`), and no shader writes it

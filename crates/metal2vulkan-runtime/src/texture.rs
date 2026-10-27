@@ -1975,11 +1975,19 @@ impl Device {
         // surfaces, 1.3 ms of GPU a frame) give way to rendering in place, at the cost of the
         // image's compression. Metal keeps those bytes as the program wrote them; this does not.
         let holds = match holds {
+            // Only where the passes' tile stores stay within the rows' pitch and the buffer
+            // (`linear_plan::tile_store_fits`): a surface whose height is no multiple of 4, or
+            // whose pitch leaves no room for a row's last 16-texel block, would be written past.
             Err(_)
                 if padded_targets()
                     && matches!(
                         texels.buffer.caller_memory(),
                         Some(crate::buffer::CallerMemory::HostPages)
+                    )
+                    && crate::linear_plan::tile_store_fits(
+                        &texels.layout,
+                        u64::from(layout.extent[0]),
+                        texels.buffer.length(),
                     ) =>
             {
                 Ok(crate::linear_plan::Holds::Padding)
